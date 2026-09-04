@@ -405,9 +405,13 @@ void screenEditMyName() {
 uint8_t g_currentWifiSlotIndex = 0;
 char g_chosenSsid[33];
 
-void wifiSlotTrampoline0() { g_currentWifiSlotIndex = 0; Menu::pushScreen(screenWifiSlotDetail); }
-void wifiSlotTrampoline1() { g_currentWifiSlotIndex = 1; Menu::pushScreen(screenWifiSlotDetail); }
-void wifiSlotTrampoline2() { g_currentWifiSlotIndex = 2; Menu::pushScreen(screenWifiSlotDetail); }
+// goBack() before pushScreen(): these trampolines are one-shot dispatchers,
+// not real screens, so they must remove themselves from the stack first —
+// otherwise backing out of screenWifiSlotDetail would land back on the
+// trampoline, which would just unconditionally re-push it again.
+void wifiSlotTrampoline0() { g_currentWifiSlotIndex = 0; Menu::goBack(); Menu::pushScreen(screenWifiSlotDetail); }
+void wifiSlotTrampoline1() { g_currentWifiSlotIndex = 1; Menu::goBack(); Menu::pushScreen(screenWifiSlotDetail); }
+void wifiSlotTrampoline2() { g_currentWifiSlotIndex = 2; Menu::goBack(); Menu::pushScreen(screenWifiSlotDetail); }
 ScreenHandlerFn kWifiSlotTrampolines[Settings::kMaxWifiSlots] = {wifiSlotTrampoline0, wifiSlotTrampoline1,
                                                                  wifiSlotTrampoline2};
 
@@ -415,8 +419,8 @@ SettingItem g_wifiSlotItems[Settings::kMaxWifiSlots];
 char g_wifiSlotLabelBuf[Settings::kMaxWifiSlots][40];
 ListMenu g_wifiSlotListMenu;
 
-void wifiDetailScan() { Menu::pushScreen(screenWifiScanResults); }
-void wifiDetailTest() { Menu::pushScreen(screenWifiTestConnection); }
+void wifiDetailScan() { Menu::goBack(); Menu::pushScreen(screenWifiScanResults); }
+void wifiDetailTest() { Menu::goBack(); Menu::pushScreen(screenWifiTestConnection); }
 void wifiDetailClear() {
   Settings::clearWifiSlot(g_currentWifiSlotIndex);
   SettingsChangeInfo info{SET_WIFI_CHANGED, g_currentWifiSlotIndex, {0}};
@@ -558,20 +562,20 @@ void screenWifiTestConnection() {
 uint8_t g_currentGroupIndex = 0;
 char g_pendingGroupName[21];
 
-void groupTrampoline0() { g_currentGroupIndex = 0; Menu::pushScreen(screenGroupDetail); }
-void groupTrampoline1() { g_currentGroupIndex = 1; Menu::pushScreen(screenGroupDetail); }
-void groupTrampoline2() { g_currentGroupIndex = 2; Menu::pushScreen(screenGroupDetail); }
-void groupTrampoline3() { g_currentGroupIndex = 3; Menu::pushScreen(screenGroupDetail); }
-void groupTrampoline4() { g_currentGroupIndex = 4; Menu::pushScreen(screenGroupDetail); }
+void groupTrampoline0() { g_currentGroupIndex = 0; Menu::goBack(); Menu::pushScreen(screenGroupDetail); }
+void groupTrampoline1() { g_currentGroupIndex = 1; Menu::goBack(); Menu::pushScreen(screenGroupDetail); }
+void groupTrampoline2() { g_currentGroupIndex = 2; Menu::goBack(); Menu::pushScreen(screenGroupDetail); }
+void groupTrampoline3() { g_currentGroupIndex = 3; Menu::goBack(); Menu::pushScreen(screenGroupDetail); }
+void groupTrampoline4() { g_currentGroupIndex = 4; Menu::goBack(); Menu::pushScreen(screenGroupDetail); }
 ScreenHandlerFn kGroupTrampolines[Settings::kMaxGroups] = {groupTrampoline0, groupTrampoline1, groupTrampoline2,
                                                            groupTrampoline3, groupTrampoline4};
-void addGroupTrampoline() { Menu::pushScreen(screenAddGroupName); }
+void addGroupTrampoline() { Menu::goBack(); Menu::pushScreen(screenAddGroupName); }
 
 SettingItem g_groupListItems[Settings::kMaxGroups + 1];
 char g_groupListLabelBuf[Settings::kMaxGroups][21];
 ListMenu g_groupListMenu;
 
-void groupDetailRename() { Menu::pushScreen(screenGroupRenameEntry); }
+void groupDetailRename() { Menu::goBack(); Menu::pushScreen(screenGroupRenameEntry); }
 void groupDetailDeleteYes() {
   Settings::FamilyGroup g = Settings::getGroup(g_currentGroupIndex);
   SettingsChangeInfo info{SET_GROUP_DELETED, g_currentGroupIndex, {0}};
@@ -585,6 +589,7 @@ void groupDetailDeleteYes() {
 void groupDetailDelete() {
   ConfirmPromptConfig cfg{"Delete this group?", "All history will be lost.", false, groupDetailDeleteYes, nullptr};
   Menu::startConfirmPrompt(cfg);
+  Menu::goBack();
   Menu::pushScreen(Menu::confirmPromptScreen);
 }
 const SettingItem kGroupDetailItems[] = {
@@ -684,14 +689,17 @@ ListMenu g_settingsRootListMenu;
 // ---- Training Game shell ----------------------------------------------------
 void trampolineSolo() {
   ScreenHandlerFn fn = getGameSubModeHandler(GameSubModes::SOLO);
+  Menu::goBack();
   Menu::pushScreen(fn != nullptr ? fn : comingSoonScreen);
 }
 void trampolineFriend() {
   ScreenHandlerFn fn = getGameSubModeHandler(GameSubModes::FRIEND);
+  Menu::goBack();
   Menu::pushScreen(fn != nullptr ? fn : comingSoonScreen);
 }
 void trampolineRace() {
   ScreenHandlerFn fn = getGameSubModeHandler(GameSubModes::RACE);
+  Menu::goBack();
   Menu::pushScreen(fn != nullptr ? fn : comingSoonScreen);
 }
 const SettingItem kNumberGuessingItems[] = {
@@ -721,7 +729,7 @@ void screenMorsePracticeLevelPicker() {
   g_levelListMenu.tick("Select Level");
 }
 
-void morsePracticeStart() { Menu::pushScreen(comingSoonScreen); }
+void morsePracticeStart() { Menu::goBack(); Menu::pushScreen(comingSoonScreen); }
 SettingItem g_morsePracticeItems[1 + kMaxSettingListItems];
 ListMenu g_morsePracticeListMenu;
 void screenMorsePractice() {

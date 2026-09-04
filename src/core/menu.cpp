@@ -14,16 +14,26 @@ ScreenHandlerFn g_stack[kMaxStackDepth];
 uint8_t g_stackSize = 0;
 bool g_justEntered = false;
 
+// These are one-shot dispatchers, not real screens: they must remove
+// themselves from the navigation stack (goBack) before pushing their
+// target, otherwise backing out of the target would land back on the
+// trampoline, which would just unconditionally re-push the same target —
+// the user could never actually leave. Every "delegate to another screen"
+// trampoline in this codebase follows this same goBack()-then-pushScreen()
+// pattern.
 void trampolineText() {
   ScreenHandlerFn fn = getModeHandler(Modes::TEXT);
+  Menu::goBack();
   Menu::pushScreen(fn != nullptr ? fn : comingSoonScreen);
 }
 void trampolineEnigma() {
   ScreenHandlerFn fn = getModeHandler(Modes::ENIGMA);
+  Menu::goBack();
   Menu::pushScreen(fn != nullptr ? fn : comingSoonScreen);
 }
 void trampolineRadio() {
   ScreenHandlerFn fn = getModeHandler(Modes::RADIO);
+  Menu::goBack();
   Menu::pushScreen(fn != nullptr ? fn : comingSoonScreen);
 }
 
@@ -36,17 +46,25 @@ const SettingItem kMainMenuItems[] = {
 };
 constexpr uint8_t kMainMenuItemCount = sizeof(kMainMenuItems) / sizeof(kMainMenuItems[0]);
 
+BadgeFn g_mainMenuBadges[kMainMenuItemCount] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+
 ListMenu g_mainMenuList;
 
 void mainMenuScreen() {
   if (Menu::consumeJustEntered()) {
-    g_mainMenuList.configure(kMainMenuItems, kMainMenuItemCount);
+    g_mainMenuList.configure(kMainMenuItems, kMainMenuItemCount, g_mainMenuBadges);
   }
   Display::drawStatusBar();
   g_mainMenuList.tick("Morse Buddy");
 }
 
 }  // namespace
+
+namespace Menu {
+void registerMainMenuBadge(uint8_t itemIndex, BadgeFn fn) {
+  if (itemIndex < kMainMenuItemCount) g_mainMenuBadges[itemIndex] = fn;
+}
+}  // namespace Menu
 
 namespace Menu {
 
@@ -85,8 +103,9 @@ bool consumeJustEntered() {
 
 }  // namespace Menu
 
-void ListMenu::configure(const SettingItem* items, uint8_t count) {
+void ListMenu::configure(const SettingItem* items, uint8_t count, const BadgeFn* badges) {
   items_ = items;
+  badges_ = badges;
   count_ = count;
   selected_ = 0;
 }
@@ -124,6 +143,9 @@ void ListMenu::tick(const char* title) {
     tft.setCursor(2, y);
     tft.print(i == selected_ ? "> " : "  ");
     tft.print(items_[i].label);
+    if (badges_ != nullptr && badges_[i] != nullptr && badges_[i]()) {
+      tft.print(" *");
+    }
     y += 12;
   }
 }

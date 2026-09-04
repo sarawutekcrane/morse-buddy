@@ -27,20 +27,37 @@ bool consumeJustEntered();
 
 }  // namespace Menu
 
+// Returns true while the item it's bound to should show an unread/pending
+// badge marker.
+using BadgeFn = bool (*)();
+
 // Reusable wrapping list widget (Addendum: "all menu/list encoder
 // navigation wraps"). DOT/DASH confirms the highlighted item by pushing
 // its onSelect screen; Encoder long goes back.
 class ListMenu {
  public:
-  void configure(const SettingItem* items, uint8_t count);
+  // badges, when given, must point to an array the same length as items
+  // (entries may be nullptr for "no badge"); the array must outlive this
+  // ListMenu instance (a static/global array, as with items).
+  void configure(const SettingItem* items, uint8_t count, const BadgeFn* badges = nullptr);
   void tick(const char* title);
   uint8_t selectedIndex() const { return selected_; }
 
  private:
   const SettingItem* items_ = nullptr;
+  const BadgeFn* badges_ = nullptr;
   uint8_t count_ = 0;
   uint8_t selected_ = 0;
 };
+
+namespace Menu {
+// Registers a badge provider for one Main Menu item (Addendum/Phase 2
+// section 14: "Main Menu Text badge"). itemIndex matches Modes::MainMenuIndex.
+// fn is polled every Main Menu render; return true to show a marker next
+// to that item's label. Phase 1 shipped with no badge concept at all —
+// this is the one small additive hook agreed for Phase 2.
+void registerMainMenuBadge(uint8_t itemIndex, BadgeFn fn);
+}  // namespace Menu
 
 // Fallback screen for any unregistered Mode/Game-submode handler.
 void comingSoonScreen();
