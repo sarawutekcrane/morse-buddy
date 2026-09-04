@@ -18,9 +18,16 @@ enum class InputEventType : uint8_t {
 };
 
 struct InputEvent {
-  InputEventType type = InputEventType::NONE;
-  int8_t value = 0;
-  uint32_t durationMs = 0;
+  InputEventType type;
+  int8_t value;
+  uint32_t durationMs;
+
+  // Default member initializers would make this a non-aggregate under
+  // C++11 (the standard PlatformIO's arduino-esp32 core builds with),
+  // breaking brace-init call sites like InputEvent{type, value, dur} — so
+  // this is a plain constructor instead.
+  InputEvent(InputEventType t = InputEventType::NONE, int8_t v = 0, uint32_t d = 0)
+      : type(t), value(v), durationMs(d) {}
 };
 
 namespace Input {

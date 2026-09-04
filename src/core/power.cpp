@@ -8,6 +8,16 @@
 
 namespace {
 
+// ADC_ATTEN_DB_11 is deprecated on newer ESP-IDF releases in favor of
+// ADC_ATTEN_DB_12 (same attenuation setting the Addendum specifies as
+// "11dB", just renamed for accuracy). Referencing the old, still-correct
+// name is confined to this one spot and the warning silenced here, rather
+// than guessing which name a given toolchain provides.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+constexpr adc_atten_t kBatteryAdcAtten = ADC_ATTEN_DB_11;
+#pragma GCC diagnostic pop
+
 // R1/R2 = 100k/100k -> ADC node sees half of the sensed rail.
 constexpr float kDividerRatio = 2.0f;  // (R1+R2)/R2
 
@@ -91,8 +101,8 @@ void init() {
   digitalWrite(Pins::kBatterySenseControl, LOW);  // divider off by default
 
   adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_11);
-  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &g_adcChars);
+  adc1_config_channel_atten(ADC1_CHANNEL_6, kBatteryAdcAtten);
+  esp_adc_cal_characterize(ADC_UNIT_1, kBatteryAdcAtten, ADC_WIDTH_BIT_12, 1100, &g_adcChars);
 
   // One immediate provisional reading at boot (Addendum section 20).
   uint32_t mv = takeBlockingSampleMv();

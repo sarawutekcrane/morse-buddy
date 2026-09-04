@@ -38,9 +38,14 @@ void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0) {
 // ---------------------------------------------------------------------------
 struct DebouncedButton {
   int pin;
-  bool stablePressed = false;
-  bool lastRaw = false;
-  uint32_t lastChangeMs = 0;
+  bool stablePressed;
+  bool lastRaw;
+  uint32_t lastChangeMs;
+
+  // Plain constructor (not default member initializers) so this stays
+  // usable with direct-list-init like DebouncedButton g_dot{Pins::kDotDash}
+  // under C++11.
+  explicit DebouncedButton(int p) : pin(p), stablePressed(false), lastRaw(false), lastChangeMs(0) {}
 };
 
 void updateDebounce(DebouncedButton& b, uint32_t now) {
