@@ -42,6 +42,16 @@ bool isChatOpenFor(const char* group_code, const char* contact_key) {
   return g_chatIsOpen && strcmp(g_chatOpenGroup, group_code) == 0 && strcmp(g_chatOpenContact, contact_key) == 0;
 }
 
+void setOpenConversationImpl(const char* group_code, const char* contact_key) {
+  strncpy(g_chatOpenGroup, group_code, sizeof(g_chatOpenGroup) - 1);
+  g_chatOpenGroup[sizeof(g_chatOpenGroup) - 1] = '\0';
+  strncpy(g_chatOpenContact, contact_key, sizeof(g_chatOpenContact) - 1);
+  g_chatOpenContact[sizeof(g_chatOpenContact) - 1] = '\0';
+  g_chatIsOpen = true;
+}
+
+void clearOpenConversationImpl() { g_chatIsOpen = false; }
+
 // ---- canonical raw-Morse builder (shared by compose + TEXT RenderFn) -------
 void buildCanonicalRawMorse(const char* text, char* out, size_t outSize) {
   size_t pos = 0;
@@ -370,29 +380,37 @@ void handleComposeEvent(const InputEvent& e) {
   }
 }
 
+// Dispatches one MessageEventType to whichever type owns the currently
+// focused history entry (TEXT/ENIGMA/GAME) — the generic mechanism Phase 2
+// built EVT_ENCODER_SHORT/EVT_COMBINED_REVEAL for, so a Game challenge or
+// Enigma message viewed from Text's own Chat (same Unified Thread) still
+// gets its type-specific Encoder/reveal behavior without this file being
+// restructured per phase.
+void dispatchHistoryMessageEvent(const MessageStore::ConversationIndexEntry& entry, MessageEventType eventType) {
+  MessageRef ref = refForIndexEntry(entry);
+  StoredMessageView view;
+  if (!MessageStore::loadMessage(ref, &view)) return;
+  MessageEventFn fn = getMessageEventFn(view.envelope.message_type);
+  if (fn != nullptr) fn(ref, eventType);
+}
+
 void handleHistoryFocusEvent(const InputEvent& e) {
   const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(g_historyCursor);
   if (e.type == InputEventType::DOT_PRESS_START) {
-    if (entry != nullptr) {
-      MessageRef ref = refForIndexEntry(*entry);
-      StoredMessageView view;
-      if (MessageStore::loadMessage(ref, &view)) {
-        MessageEventFn fn = getMessageEventFn(view.envelope.message_type);
-        if (fn != nullptr) fn(ref, EVT_DOT_HOLD_START);
-      }
-    }
+    if (entry != nullptr) dispatchHistoryMessageEvent(*entry, EVT_DOT_HOLD_START);
   } else if (e.type == InputEventType::DOT_RELEASE) {
     if (entry != nullptr) {
+      dispatchHistoryMessageEvent(*entry, EVT_DOT_HOLD_END);
       MessageRef ref = refForIndexEntry(*entry);
       StoredMessageView view;
-      if (MessageStore::loadMessage(ref, &view)) {
-        MessageEventFn fn = getMessageEventFn(view.envelope.message_type);
-        if (fn != nullptr) fn(ref, EVT_DOT_HOLD_END);
-      }
-      if (view.header.flags & MessageStore::FLAG_UNREAD) {
+      if (MessageStore::loadMessage(ref, &view) && (view.header.flags & MessageStore::FLAG_UNREAD)) {
         Notifications::clearUnread(g_selectedGroupCode, g_selectedContactKey, ref);
       }
     }
+  } else if (e.type == InputEventType::ENCODER_SHORT) {
+    if (entry != nullptr) dispatchHistoryMessageEvent(*entry, EVT_ENCODER_SHORT);
+  } else if (e.type == InputEventType::COMBINED_REVEAL) {
+    if (entry != nullptr) dispatchHistoryMessageEvent(*entry, EVT_COMBINED_REVEAL);
   } else if (e.type == InputEventType::ENCODER_LONG) {
     g_chatIsOpen = false;
     Menu::goBack();
@@ -511,24 +529,22 @@ void onTextMessageEvent(const MessageRef& ref, MessageEventType eventType) {
 }
 
 // =============================================================================
-// Incoming PK_MESSAGE handler
+// Incoming PK_MESSAGE handler: decodes the envelope once, runs the shared
+// dedup + timestamp-fallback logic once, then dispatches by
+// envelope.message_type to whichever handler that type registered (see
+// text_message.h — the registry only allows one PK_MESSAGE claim, so this
+// is the fan-out underneath it).
 // =============================================================================
-void handleIncomingMessagePacket(const char* group_code, const char* topic, const uint8_t* payload,
-                                 size_t payloadLen) {
-  PacketCodec::MessageEnvelope env;
-  const uint8_t* typePayload = nullptr;
-  uint16_t typePayloadLen = 0;
-  if (!PacketCodec::decodeMessageEnvelope(payload, payloadLen, &env, &typePayload, &typePayloadLen)) return;
-  if (env.message_type != PacketCodec::MSG_TYPE_TEXT) return;  // not ours (yet) — ignored safely
+constexpr uint8_t kMaxIncomingHandlers = 4;
+struct IncomingHandlerEntry {
+  bool used;
+  uint8_t messageType;
+  TextMessage::IncomingMessageHandlerFn fn;
+};
+IncomingHandlerEntry g_incomingHandlers[kMaxIncomingHandlers];
 
-  bool isBroadcast = (strcmp(topic, "broadcast") == 0);
-  const char* contact_key = isBroadcast ? MessageStore::kEveryone : env.sender_device_id;
-
-  if (MessageStore::isDuplicateAndRecord(group_code, contact_key, env.message_id)) return;
-
-  uint32_t effectiveTs = env.timestamp;
-  if (effectiveTs == 0 && WifiManager::isNtpSynced()) effectiveTs = WifiManager::getUnixTime();
-
+void handleTextArrival(const char* group_code, const char* contact_key, const PacketCodec::MessageEnvelope& env,
+                       uint32_t effectiveTs, const uint8_t* typePayload, uint16_t typePayloadLen) {
   static uint8_t wireBuf[PacketCodec::kHeaderSize + 400];
   size_t wireLen = PacketCodec::encodeMessagePacket(env, typePayload, typePayloadLen, wireBuf, sizeof(wireBuf));
   if (wireLen == 0) return;
@@ -542,6 +558,31 @@ void handleIncomingMessagePacket(const char* group_code, const char* topic, cons
   bool conversationOpen = isChatOpenFor(group_code, contact_key);
   if (conversationOpen) markIndexDirty();
   Notifications::onMessageArrived(group_code, contact_key, ref, Notifications::BADGE_TEXT, conversationOpen);
+}
+
+void handleIncomingMessagePacket(const char* group_code, const char* topic, const uint8_t* payload,
+                                 size_t payloadLen) {
+  PacketCodec::MessageEnvelope env;
+  const uint8_t* typePayload = nullptr;
+  uint16_t typePayloadLen = 0;
+  if (!PacketCodec::decodeMessageEnvelope(payload, payloadLen, &env, &typePayload, &typePayloadLen)) return;
+
+  bool isBroadcast = (strcmp(topic, "broadcast") == 0);
+  const char* contact_key = isBroadcast ? MessageStore::kEveryone : env.sender_device_id;
+
+  if (MessageStore::isDuplicateAndRecord(group_code, contact_key, env.message_id)) return;
+
+  uint32_t effectiveTs = env.timestamp;
+  if (effectiveTs == 0 && WifiManager::isNtpSynced()) effectiveTs = WifiManager::getUnixTime();
+
+  for (auto& entry : g_incomingHandlers) {
+    if (entry.used && entry.messageType == env.message_type) {
+      entry.fn(group_code, contact_key, env, effectiveTs, typePayload, typePayloadLen);
+      return;
+    }
+  }
+  // Unregistered message_type: logged and ignored safely, same policy as
+  // an unregistered packet_kind.
 }
 
 // =============================================================================
@@ -564,13 +605,38 @@ void screenTextEntry() {
   Menu::pushScreen(target);
 }
 
+bool registerIncomingMessageHandlerImpl(uint8_t messageType, TextMessage::IncomingMessageHandlerFn fn) {
+  for (auto& e : g_incomingHandlers) {
+    if (e.used && e.messageType == messageType) return false;
+  }
+  for (auto& e : g_incomingHandlers) {
+    if (!e.used) {
+      e = {true, messageType, fn};
+      return true;
+    }
+  }
+  return false;
+}
+
 struct Registrar {
   Registrar() {
     registerModeHandler(Modes::TEXT, screenTextEntry);
     registerMessageType(PacketCodec::MSG_TYPE_TEXT, renderTextMessage, onTextMessageEvent);
     registerNetworkPacketHandler(PacketCodec::PK_MESSAGE, handleIncomingMessagePacket);
+    registerIncomingMessageHandlerImpl(PacketCodec::MSG_TYPE_TEXT, handleTextArrival);
   }
 };
 Registrar g_registrar;
 
 }  // namespace
+
+namespace TextMessage {
+bool registerIncomingMessageHandler(uint8_t messageType, IncomingMessageHandlerFn fn) {
+  return registerIncomingMessageHandlerImpl(messageType, fn);
+}
+void setOpenConversation(const char* group_code, const char* contact_key) {
+  setOpenConversationImpl(group_code, contact_key);
+}
+void clearOpenConversation() { clearOpenConversationImpl(); }
+bool isConversationOpen(const char* group_code, const char* contact_key) { return isChatOpenFor(group_code, contact_key); }
+}  // namespace TextMessage

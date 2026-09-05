@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "core/hooks.h"  // ScreenHandlerFn
+
 namespace Settings {
 
 constexpr uint8_t kMaxWifiSlots = 3;
@@ -56,6 +58,13 @@ void setPracticeLevel(uint8_t level);
 // registers Audio Preview and Reveal Answer into this same list ID without
 // touching this file.
 constexpr uint8_t kMorsePracticeListId = 0;
+
+// Phase 1's "Start Practice" item had no real game to point at yet, so it
+// was hardcoded to the built-in Coming Soon screen. This lets Phase 3
+// register the actual gameplay screen without touching that hardcoding
+// site more than once; unregistered (fn == nullptr) keeps today's
+// Coming Soon behavior.
+void registerMorsePracticeStartHandler(ScreenHandlerFn fn);
 
 // ---- WiFi slots ---------------------------------------------------------
 WifiSlot getWifiSlot(uint8_t index);

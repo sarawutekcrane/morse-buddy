@@ -729,7 +729,11 @@ void screenMorsePracticeLevelPicker() {
   g_levelListMenu.tick("Select Level");
 }
 
-void morsePracticeStart() { Menu::goBack(); Menu::pushScreen(comingSoonScreen); }
+ScreenHandlerFn g_morsePracticeStartHandler = nullptr;
+void morsePracticeStart() {
+  Menu::goBack();
+  Menu::pushScreen(g_morsePracticeStartHandler != nullptr ? g_morsePracticeStartHandler : comingSoonScreen);
+}
 SettingItem g_morsePracticeItems[1 + kMaxSettingListItems];
 ListMenu g_morsePracticeListMenu;
 void screenMorsePractice() {
@@ -801,5 +805,7 @@ void screenTrainingGame() {
   Display::drawStatusBar();
   g_trainingGameListMenu.tick("Training Game");
 }
+
+void registerMorsePracticeStartHandler(ScreenHandlerFn fn) { g_morsePracticeStartHandler = fn; }
 
 }  // namespace Settings
