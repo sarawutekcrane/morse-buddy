@@ -618,6 +618,21 @@ bool registerIncomingMessageHandlerImpl(uint8_t messageType, TextMessage::Incomi
   return false;
 }
 
+// Number Guessing's post-challenge quick-switch (Phase 3 section 11): reset
+// the stack and leave Recipient Selection (this group, already known)
+// underneath the directly-pushed Chat, so Encoder long from Chat lands on
+// "that mode's normal Recipient Selection" per the spec's closing rule,
+// instead of whatever deep Game-creation stack was in progress.
+void navigateToChatDirectImpl(const char* group_code, const char* contact_key) {
+  strncpy(g_selectedGroupCode, group_code, sizeof(g_selectedGroupCode) - 1);
+  g_selectedGroupCode[sizeof(g_selectedGroupCode) - 1] = '\0';
+  strncpy(g_selectedContactKey, contact_key, sizeof(g_selectedContactKey) - 1);
+  g_selectedContactKey[sizeof(g_selectedContactKey) - 1] = '\0';
+  Menu::init();
+  Menu::pushScreen(screenRecipient);
+  Menu::pushScreen(screenChat);
+}
+
 struct Registrar {
   Registrar() {
     registerModeHandler(Modes::TEXT, screenTextEntry);
@@ -639,4 +654,7 @@ void setOpenConversation(const char* group_code, const char* contact_key) {
 }
 void clearOpenConversation() { clearOpenConversationImpl(); }
 bool isConversationOpen(const char* group_code, const char* contact_key) { return isChatOpenFor(group_code, contact_key); }
+void navigateToChatDirect(const char* group_code, const char* contact_key) {
+  navigateToChatDirectImpl(group_code, contact_key);
+}
 }  // namespace TextMessage

@@ -37,4 +37,11 @@ void setOpenConversation(const char* group_code, const char* contact_key);
 void clearOpenConversation();
 bool isConversationOpen(const char* group_code, const char* contact_key);
 
+// Used by Number Guessing's post-challenge-send quick-switch ("Text: direct
+// Chat same contact" — Phase 3 section 11). Resets the navigation stack and
+// leaves Text's own Recipient Selection (for this group) underneath the
+// pushed Chat screen, so Encoder long from Chat returns there per section
+// 11's closing rule, not to whatever screen the quick-switch was raised from.
+void navigateToChatDirect(const char* group_code, const char* contact_key);
+
 }  // namespace TextMessage

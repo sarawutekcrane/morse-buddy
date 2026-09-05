@@ -1132,11 +1132,17 @@ Registrar g_registrar;
 
 namespace Enigma {
 
+// Resets the stack and leaves Recipient Selection (this group) underneath
+// the directly-pushed Chat, so Encoder long from Chat lands on "that mode's
+// normal Recipient Selection" (Phase 3 section 11's closing rule) rather
+// than whatever deep Game-creation stack the quick-switch was raised from.
 void navigateToChatDirect(const char* group_code, const char* contact_key) {
   strncpy(g_selectedGroupCode, group_code, sizeof(g_selectedGroupCode) - 1);
   g_selectedGroupCode[sizeof(g_selectedGroupCode) - 1] = '\0';
   strncpy(g_selectedContactKey, contact_key, sizeof(g_selectedContactKey) - 1);
   g_selectedContactKey[sizeof(g_selectedContactKey) - 1] = '\0';
+  Menu::init();
+  Menu::pushScreen(screenRecipient);
   Menu::pushScreen(screenEnigmaChat);
 }
 
