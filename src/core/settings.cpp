@@ -13,6 +13,7 @@
 #include "core/morse.h"
 #include "core/sleep.h"
 #include "core/storage_init.h"
+#include "ota/ota_manager.h"
 
 // =============================================================================
 // Persistence (RAM cache backed by compact NVS namespaces, Addendum 4.4).
@@ -677,12 +678,25 @@ void screenConnectivity() {
   g_connectivityListMenu.tick("Connectivity");
 }
 
+// ---- System (Phase 5 section 21: "Adding the System Settings category is
+// explicitly approved for Phase 5") -------------------------------------
+const SettingItem kSystemItems[] = {
+    {"Firmware Update", Ota::screenFirmwareUpdate},
+};
+ListMenu g_systemListMenu;
+void screenSystem() {
+  if (Menu::consumeJustEntered()) g_systemListMenu.configure(kSystemItems, 1);
+  Display::drawStatusBar();
+  g_systemListMenu.tick("System");
+}
+
 // ---- Settings root ---------------------------------------------------------
 const SettingItem kSettingsRootItems[] = {
     {"Connectivity", screenConnectivity},
     {"My Name", screenEditMyName},
     {"Display & Sound", screenDisplaySound},
     {"Speed & Power", screenSpeedPower},
+    {"System", screenSystem},
 };
 ListMenu g_settingsRootListMenu;
 
@@ -762,7 +776,7 @@ ListMenu g_trainingGameListMenu;
 namespace Settings {
 
 void screenRoot() {
-  if (Menu::consumeJustEntered()) g_settingsRootListMenu.configure(kSettingsRootItems, 4);
+  if (Menu::consumeJustEntered()) g_settingsRootListMenu.configure(kSettingsRootItems, 5);
   Display::drawStatusBar();
   g_settingsRootListMenu.tick("Settings");
 }

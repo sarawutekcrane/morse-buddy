@@ -250,8 +250,11 @@ bool publishAudioPacket(const char* group_code, const char* topic_suffix, AudioS
 
 namespace {
 
+bool g_maintenanceMode = false;
+
 void handleRadioAudioPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
   (void)topic;
+  if (g_maintenanceMode) return;  // Phase 5 OTA: incoming Radio playback disabled
   if (payload == nullptr || payloadLen < 1 + kDeviceIdLen + kIdLen + 2 + 2) return;
   size_t pos = 0;
   AudioScope scope = static_cast<AudioScope>(payload[pos++]);
@@ -908,6 +911,7 @@ Registrar g_registrar;
 void setUiContext(UiContext ctx) { g_uiContext = ctx; }
 
 void startPrivateCall(const char* group_code, const char* recipient_device_id) {
+  if (g_maintenanceMode) return;  // Phase 5 OTA: no new Radio session may begin
   if (g_call.state != PrivateState::IDLE) return;
   ensureUdpBegun();
   strncpy(g_call.group_code, group_code, sizeof(g_call.group_code) - 1);
@@ -923,12 +927,12 @@ void startPrivateCall(const char* group_code, const char* recipient_device_id) {
   sendClaim();
 }
 
-void stopPrivateCall() {
-  // Callee side: our own PTT press never actually claims anything while a
-  // call is active (startPrivateCall no-ops unless state == IDLE), so the
-  // matching release must not tear down an incoming call we're receiving.
-  if (!g_call.isCaller) return;
-  if (g_call.state == PrivateState::IDLE && !g_call.denied) return;
+// Publishes a RELEASE (if we currently hold the claim as caller) and tears
+// the local call down. Factored out of stopPrivateCall() so Phase 5's
+// Maintenance Mode can force-stop a call from either side (see
+// setMaintenanceModeActive below) without duplicating the RELEASE-build
+// logic.
+void releaseAndResetPrivateCall() {
   if (g_call.isCaller && g_call.state != PrivateState::IDLE) {
     uint8_t payload[1 + kDeviceIdLen + kIdLen];
     size_t len = buildBusyPayload(BUSY_RELEASE, Identity::deviceId(), g_call.session_id, payload, sizeof(payload));
@@ -947,10 +951,20 @@ void stopPrivateCall() {
   resetPrivateCall();
 }
 
+void stopPrivateCall() {
+  // Callee side: our own PTT press never actually claims anything while a
+  // call is active (startPrivateCall no-ops unless state == IDLE), so the
+  // matching release must not tear down an incoming call we're receiving.
+  if (!g_call.isCaller) return;
+  if (g_call.state == PrivateState::IDLE && !g_call.denied) return;
+  releaseAndResetPrivateCall();
+}
+
 PrivateState getPrivateState() { return g_call.state; }
 bool isPrivateDenied() { return g_call.denied; }
 
 void startBroadcastCall(const char* group_code) {
+  if (g_maintenanceMode) return;  // Phase 5 OTA: no new Radio session may begin
   if (g_broadcastActive) return;
   strncpy(g_broadcastGroup, group_code, sizeof(g_broadcastGroup) - 1);
   g_broadcastGroup[sizeof(g_broadcastGroup) - 1] = '\0';
@@ -965,6 +979,18 @@ void stopBroadcastCall() {
   RadioAudio::stopCapture();
   setRadioAudioActive(false);
   g_broadcastActive = false;
+}
+
+void setMaintenanceModeActive(bool active) {
+  g_maintenanceMode = active;
+  if (active) {
+    // Force-stop any in-progress call regardless of caller/callee side --
+    // stopPrivateCall()'s own isCaller guard is deliberate for a normal
+    // PTT-release, but Maintenance Mode needs "no active PTT session is
+    // running" (Phase 5 section 18) unconditionally.
+    releaseAndResetPrivateCall();
+    stopBroadcastCall();
+  }
 }
 
 bool isBroadcasting() { return g_broadcastActive; }

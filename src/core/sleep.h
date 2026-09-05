@@ -15,6 +15,12 @@ uint8_t getTimeoutMinutes();
 // Later phases add Notification and incoming-Radio-audio-played activity.
 void notifyActivity();
 
+// Phase 5: OTA Maintenance Mode suspends the deep-sleep timeout entirely
+// for the duration of an update (section 19: "Sleep Timeout suspended").
+// Leaving suspension also resets the inactivity timer, so the device
+// doesn't immediately sleep the instant a long OTA session ends.
+void setSuspended(bool suspended);
+
 // Call every loop() iteration. Enters deep sleep once the timeout elapses:
 // runs BeforeSleep hooks, turns the backlight and battery-sense divider
 // off, then calls esp_deep_sleep_start() with no wake source configured

@@ -33,6 +33,7 @@ struct GroupClient {
 };
 
 GroupClient g_clients[Settings::kMaxGroups];
+bool g_maintenanceMode = false;
 
 GroupClient* findClientSlot(const char* group_code) {
   for (auto& c : g_clients) {
@@ -292,7 +293,11 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
   }
 }
 
-void onBeforeSleep() {
+// Bounded best-effort OFFLINE publish across every connected group. Shared
+// by the existing BeforeSleep hook and Phase 5 OTA Maintenance Mode entry
+// (section 19: "best-effort publish OFFLINE Presence for all groups; do
+// not block OTA indefinitely if Presence publish fails").
+void publishOfflineAllGroupsBounded() {
   uint32_t start = millis();
   for (auto& gc : g_clients) {
     if (millis() - start >= 2000) break;
@@ -301,6 +306,8 @@ void onBeforeSleep() {
     }
   }
 }
+
+void onBeforeSleep() { publishOfflineAllGroupsBounded(); }
 
 uint8_t connectivityStatusProvider() {
   if (!WifiManager::isConnected()) return CONN_OFFLINE;
@@ -322,6 +329,7 @@ void serviceInit() {
 }
 
 void serviceTick() {
+  if (g_maintenanceMode) return;  // Phase 5 OTA: reconnect/receive paused
   if (!WifiManager::isConnected()) return;  // never block; just wait until WiFi is up
   for (auto& gc : g_clients) {
     if (!gc.active || gc.mqtt == nullptr) continue;
@@ -353,6 +361,17 @@ bool isAnyGroupConnected() {
     if (gc.active && gc.mqtt != nullptr && gc.mqtt->connected()) return true;
   }
   return false;
+}
+
+void setMaintenanceModeActive(bool active) {
+  if (active == g_maintenanceMode) return;
+  if (active) {
+    publishOfflineAllGroupsBounded();
+    for (auto& gc : g_clients) {
+      if (gc.active && gc.mqtt != nullptr && gc.mqtt->connected()) gc.mqtt->disconnect();
+    }
+  }
+  g_maintenanceMode = active;  // leaving simply un-pauses serviceTick(), which reconnects normally
 }
 
 bool publishRaw(const char* group_code, const char* topic_suffix, const char* payload, bool retained, int qos) {

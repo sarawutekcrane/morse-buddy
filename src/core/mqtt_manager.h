@@ -15,6 +15,14 @@ constexpr uint16_t kBrokerPort = 1883;
 bool isGroupConnected(const char* group_code);
 bool isAnyGroupConnected();
 
+// Phase 5 OTA Maintenance Mode (section 19). On entry: best-effort
+// publishes OFFLINE presence for every group (bounded, same as the
+// existing BeforeSleep hook -- never blocks OTA if publish fails), then
+// disconnects every group's MQTT client and pauses reconnect/receive
+// processing. On exit: simply stops suppressing serviceTick(), which
+// reconnects each group exactly like a normal WiFi-drop recovery.
+void setMaintenanceModeActive(bool active);
+
 // topic_suffix is relative to "morsebuddy/<group_code>/", e.g.
 // "presence/AABBCCDDEEFF", "msg/AABBCCDDEEFF", "broadcast". Returns false
 // if this group has no connected client right now (caller's job to fall

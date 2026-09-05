@@ -39,6 +39,15 @@ bool publishAudioPacket(const char* group_code, const char* topic_suffix, AudioS
 enum class UiContext : uint8_t { NONE, RADIO_TALK, RACE_ROOM };
 void setUiContext(UiContext ctx);
 
+// Phase 5 OTA Maintenance Mode (section 19). While active: blocks any new
+// Private/Broadcast call from starting, force-stops one already in
+// progress (regardless of caller/callee side), and drops incoming
+// PK_RADIO_AUDIO frames instead of playing them. Race Room voice is
+// unaffected directly -- it is screen-lifecycle-bound in race.cpp and
+// cannot be running concurrently with the Firmware Update screen -- but
+// its incoming audio is still dropped by the same PK_RADIO_AUDIO guard.
+void setMaintenanceModeActive(bool active);
+
 // ---- Private (one recipient) ------------------------------------------------
 // Starts a PTT burst: claims the channel, and on GRANT negotiates transport
 // and starts streaming captured mic audio. No-op if already active.

@@ -10,6 +10,7 @@
 namespace {
 uint8_t g_timeoutMinutes = 5;  // 0 = Disabled
 uint32_t g_lastActivityMs = 0;
+bool g_suspended = false;
 
 void enterDeepSleep() {
   runBeforeSleepHooks();
@@ -39,7 +40,13 @@ uint8_t getTimeoutMinutes() { return g_timeoutMinutes; }
 
 void notifyActivity() { g_lastActivityMs = millis(); }
 
+void setSuspended(bool suspended) {
+  g_suspended = suspended;
+  if (!suspended) g_lastActivityMs = millis();
+}
+
 void update() {
+  if (g_suspended) return;
   if (g_timeoutMinutes == 0) return;  // Disabled
 
   uint32_t timeoutMs = static_cast<uint32_t>(g_timeoutMinutes) * 60000UL;
