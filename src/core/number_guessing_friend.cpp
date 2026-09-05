@@ -47,14 +47,15 @@ char g_challengeContactKey[MessageStore::kContactKeyLen];
 uint8_t g_pendingRandomSecret[4];
 
 // =============================================================================
-// Local payload: game state + FIFO(90) guess history (Addendum section 12;
+// Local payload: game state + FIFO(50) guess history (Addendum section 12;
 // Phase 3 sections 10-13). kMaxLocalPayloadLen is a shared 400-byte cap
 // across every message type (Phase 1/2 constant), so a full 255-attempt
-// history (1020 bytes) cannot fit; per user confirmation this keeps the 90
-// most-recent attempts before a correct guess (FIFO ring, not the first 90)
-// while totalAttempts always counts every real attempt made.
-// =============================================================================
-constexpr uint8_t kMaxFriendHistory = 90;
+// history (1020 bytes) cannot fit; per user confirmation this keeps the
+// most-recent attempts before a correct guess (FIFO ring, not the first N)
+// while totalAttempts always counts every real attempt made. Trimmed from
+// an initial 90 to 50 to fix a DRAM link overflow (each of the 6 static
+// FriendGameState/Reassembly instances embeds one of these arrays).
+constexpr uint8_t kMaxFriendHistory = 50;
 constexpr uint8_t STATE_LOCKED = 0;
 constexpr uint8_t STATE_UNLOCKED = 1;
 
