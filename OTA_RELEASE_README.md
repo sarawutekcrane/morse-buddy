@@ -4,6 +4,45 @@ Phase 5 firmware updates are pulled by the device over HTTPS from a static
 file host. There is no build server, no database, and no dynamic API —
 publishing a release means uploading two files.
 
+## Initial Phase 5 installation (one-time, USB)
+
+`partitions.csv` is aligned to the standard Arduino-ESP32/PlatformIO USB
+flash layout for `esp32dev`:
+
+| Partition | Offset | Size |
+|---|---|---|
+| `phy_init` | `0xD000` | `0x1000` |
+| `otadata` (also where `boot_app0.bin` is expected) | `0xE000` | `0x2000` |
+| `ota_0` (normal PlatformIO application upload target) | `0x10000` | `0x160000` |
+| `ota_1` | `0x170000` | `0x160000` |
+| `nvs` | `0x2D0000` | `0x10000` |
+| `littlefs` | `0x2E0000` | `0x120000` |
+
+This intentionally puts `nvs` *after* both OTA app slots rather than in its
+customary low position — the low region (`0xD000`-`0x10000`) is where
+`boot_app0.bin` and a normal, unmodified `pio run --target upload` both
+expect to write, so `nvs` cannot live there without either corrupting
+`boot_app0.bin` or requiring a non-standard `upload_addr` override. No such
+override is used or needed: `ota_0` sits exactly at PlatformIO's default
+`0x10000` application offset.
+
+**This is a breaking layout change from every earlier partition table Morse
+Buddy has ever used** (Phase 1-4's single-`factory`-partition layout, and
+an earlier, since-corrected draft of this same Phase 5 layout that put
+`nvs` at `0x9000` — that draft was never shipped to hardware). Flashing
+this table via USB onto a device that was running *any* earlier layout
+will make **both its old NVS contents and its old LittleFS contents
+inaccessible** — the physical flash regions those partitions occupied no
+longer line up. This is accepted deliberately, once, before any device is
+deployed with real user history; do not attempt a live migration of old
+data into the new layout.
+
+**This one-time exception ends here.** Once a device is running the Phase
+5 layout above, *every* future OTA update must continue to preserve both
+`nvs` and `littlefs` exactly as Phase 5's other requirements already
+specify — OTA writes only to the inactive `ota_0`/`ota_1` slot, never to
+`nvs` or `littlefs`.
+
 ## 1. Build
 
 ```
