@@ -6,6 +6,7 @@
 
 #include "core/display.h"
 #include "core/hooks.h"
+#include "core/identity.h"
 #include "core/input.h"
 #include "core/menu.h"
 #include "core/power.h"
@@ -22,6 +23,13 @@ void setup() {
   // May draw a blocking error/retry/format-confirm prompt on the TFT if
   // LittleFS fails to mount (Addendum section 8).
   Storage::init();
+
+  // Reads the MAC and loads the persistent id_counter from mb_core; must
+  // run after Storage::init() (identity.h's own documented contract) and
+  // before initRegisteredServices() below, since mqtt_manager's
+  // AppService::init already calls Identity::deviceId() while building
+  // each group's MQTT client ID.
+  Identity::init();
 
   Power::init();
   Sleep::init(5);  // default; Settings::init() below applies the persisted value
