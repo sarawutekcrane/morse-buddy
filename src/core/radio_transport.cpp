@@ -85,41 +85,65 @@ constexpr const char* kStunHost = "stun.l.google.com";
 constexpr uint16_t kStunPort = 19302;
 
 constexpr uint32_t kClaimRefreshMs = 2000;
-constexpr uint32_t kClaimReplyTimeoutMs = 1500;
+constexpr uint32_t kClaimRetryIntervalMs = 250;   // Phase 4 acceptance: retry CLAIM every 250ms...
+constexpr uint32_t kClaimTotalTimeoutMs = 1000;   // ...for up to 1s total before failing the PTT attempt
 constexpr uint32_t kBusyTtlMs = 5000;
 constexpr uint32_t kNegotiateTimeoutMs = 2000;
 constexpr uint32_t kJitterFrameMs = 20;
 constexpr uint32_t kBroadcastSpeakerStaleMs = 500;
 
-size_t buildBusyPayload(uint8_t type, const char* claimerDeviceId, uint8_t* out, size_t cap) {
-  size_t need = 1 + kDeviceIdLen;
+// CLAIM/RELEASE and GRANT/DENY both carry the exact session_id (Addendum:
+// Channel Busy must be correlated per-session, not just per-device — a
+// stale RELEASE or stale GRANT/DENY from an earlier call with the same
+// peer must never affect a newer one).
+size_t buildBusyPayload(uint8_t type, const char* claimerDeviceId, const char* sessionId, uint8_t* out, size_t cap) {
+  size_t need = 1 + kDeviceIdLen + kIdLen;
   if (cap < need) return 0;
-  out[0] = type;
-  memset(out + 1, 0, kDeviceIdLen);
-  strncpy(reinterpret_cast<char*>(out + 1), claimerDeviceId, kDeviceIdLen - 1);
-  return need;
+  size_t pos = 0;
+  out[pos++] = type;
+  memset(out + pos, 0, kDeviceIdLen);
+  strncpy(reinterpret_cast<char*>(out + pos), claimerDeviceId, kDeviceIdLen - 1);
+  pos += kDeviceIdLen;
+  memset(out + pos, 0, kIdLen);
+  strncpy(reinterpret_cast<char*>(out + pos), sessionId, kIdLen - 1);
+  pos += kIdLen;
+  return pos;
 }
-bool parseBusyPayload(const uint8_t* data, uint16_t len, uint8_t* outType, char* outDeviceId) {
-  if (data == nullptr || len < 1 + kDeviceIdLen) return false;
-  *outType = data[0];
-  memcpy(outDeviceId, data + 1, kDeviceIdLen);
+bool parseBusyPayload(const uint8_t* data, uint16_t len, uint8_t* outType, char* outDeviceId, char* outSessionId) {
+  if (data == nullptr || len < 1 + kDeviceIdLen + kIdLen) return false;
+  size_t pos = 0;
+  *outType = data[pos++];
+  memcpy(outDeviceId, data + pos, kDeviceIdLen);
   outDeviceId[kDeviceIdLen - 1] = '\0';
+  pos += kDeviceIdLen;
+  memcpy(outSessionId, data + pos, kIdLen);
+  outSessionId[kIdLen - 1] = '\0';
   return true;
 }
 
-size_t buildReplyPayload(uint8_t type, const char* responderDeviceId, uint8_t* out, size_t cap) {
-  size_t need = 1 + kDeviceIdLen;
+size_t buildReplyPayload(uint8_t type, const char* responderDeviceId, const char* sessionId, uint8_t* out,
+                         size_t cap) {
+  size_t need = 1 + kDeviceIdLen + kIdLen;
   if (cap < need) return 0;
-  out[0] = type;
-  memset(out + 1, 0, kDeviceIdLen);
-  strncpy(reinterpret_cast<char*>(out + 1), responderDeviceId, kDeviceIdLen - 1);
-  return need;
+  size_t pos = 0;
+  out[pos++] = type;
+  memset(out + pos, 0, kDeviceIdLen);
+  strncpy(reinterpret_cast<char*>(out + pos), responderDeviceId, kDeviceIdLen - 1);
+  pos += kDeviceIdLen;
+  memset(out + pos, 0, kIdLen);
+  strncpy(reinterpret_cast<char*>(out + pos), sessionId, kIdLen - 1);
+  pos += kIdLen;
+  return pos;
 }
-bool parseReplyPayload(const uint8_t* data, uint16_t len, uint8_t* outType, char* outDeviceId) {
-  if (data == nullptr || len < 1 + kDeviceIdLen) return false;
-  *outType = data[0];
-  memcpy(outDeviceId, data + 1, kDeviceIdLen);
+bool parseReplyPayload(const uint8_t* data, uint16_t len, uint8_t* outType, char* outDeviceId, char* outSessionId) {
+  if (data == nullptr || len < 1 + kDeviceIdLen + kIdLen) return false;
+  size_t pos = 0;
+  *outType = data[pos++];
+  memcpy(outDeviceId, data + pos, kDeviceIdLen);
   outDeviceId[kDeviceIdLen - 1] = '\0';
+  pos += kDeviceIdLen;
+  memcpy(outSessionId, data + pos, kIdLen);
+  outSessionId[kIdLen - 1] = '\0';
   return true;
 }
 
@@ -270,15 +294,22 @@ bool backgroundPlaybackAllowed() {
 struct ReceiverBusy {
   bool busy = false;
   char claimerDeviceId[kDeviceIdLen] = {0};
+  char sessionId[kIdLen] = {0};
   uint32_t lastRefreshMs = 0;
 };
 ReceiverBusy g_receiverBusy;
 
-void resetPrivateCall();  // defined with the rest of the private-call state, below
+// g_call (PrivateCall) is declared further below; these two are forward-
+// declared so handleRadioBusyPacket — which needs to react to a same-
+// session RELEASE/TTL-expiry on the callee side — can compile here without
+// moving the Busy protocol code down past the rest of the private-call
+// state. Implementations sit right after `PrivateCall g_call;` is declared.
+void resetPrivateCall();
+void releaseCalleeCallIfMatches(const char* claimerDeviceId, const char* sessionId);
 
-void sendBusyReply(const char* group_code, const char* toDeviceId, uint8_t type) {
-  uint8_t payload[1 + kDeviceIdLen];
-  size_t len = buildReplyPayload(type, Identity::deviceId(), payload, sizeof(payload));
+void sendBusyReply(const char* group_code, const char* toDeviceId, const char* sessionId, uint8_t type) {
+  uint8_t payload[1 + kDeviceIdLen + kIdLen];
+  size_t len = buildReplyPayload(type, Identity::deviceId(), sessionId, payload, sizeof(payload));
   if (len == 0) return;
   uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
   if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY_REPLY, static_cast<uint16_t>(len), wireBuf,
@@ -296,29 +327,32 @@ void handleRadioBusyPacket(const char* group_code, const char* topic, const uint
   (void)topic;
   uint8_t type;
   char claimer[kDeviceIdLen];
-  if (!parseBusyPayload(payload, static_cast<uint16_t>(payloadLen), &type, claimer)) return;
+  char sessionId[kIdLen];
+  if (!parseBusyPayload(payload, static_cast<uint16_t>(payloadLen), &type, claimer, sessionId)) return;
 
   if (type == BUSY_CLAIM) {
+    // Same claimer is accepted even with a different session_id (a fresh
+    // re-claim after a clean hang-up) — only a DIFFERENT claimer while
+    // busy is denied.
     bool sameClaimant = g_receiverBusy.busy && strcmp(g_receiverBusy.claimerDeviceId, claimer) == 0;
     if (!g_receiverBusy.busy || sameClaimant) {
       g_receiverBusy.busy = true;
       strncpy(g_receiverBusy.claimerDeviceId, claimer, sizeof(g_receiverBusy.claimerDeviceId) - 1);
+      strncpy(g_receiverBusy.sessionId, sessionId, sizeof(g_receiverBusy.sessionId) - 1);
       g_receiverBusy.lastRefreshMs = millis();
-      sendBusyReply(group_code, claimer, REPLY_GRANT);
+      sendBusyReply(group_code, claimer, sessionId, REPLY_GRANT);
     } else {
-      sendBusyReply(group_code, claimer, REPLY_DENY);
+      sendBusyReply(group_code, claimer, sessionId, REPLY_DENY);
     }
   } else if (type == BUSY_RELEASE) {
-    if (g_receiverBusy.busy && strcmp(g_receiverBusy.claimerDeviceId, claimer) == 0) {
+    // Only honor a RELEASE that matches the exact session we granted —
+    // otherwise a stale RELEASE from an earlier call with this same peer
+    // could tear down a newer, still-active grant.
+    if (g_receiverBusy.busy && strcmp(g_receiverBusy.claimerDeviceId, claimer) == 0 &&
+        strcmp(g_receiverBusy.sessionId, sessionId) == 0) {
       g_receiverBusy.busy = false;
     }
-    // Tear down our own (callee-side) call state too — otherwise it would
-    // stay stale forever and permanently refuse this peer's next call
-    // (handleRadioSessionPacket rejects a new session_id while g_call is
-    // still non-IDLE from the ended one).
-    if (!g_call.isCaller && g_call.state != PrivateState::IDLE && strcmp(g_call.peer_device_id, claimer) == 0) {
-      resetPrivateCall();
-    }
+    releaseCalleeCallIfMatches(claimer, sessionId);
   }
 }
 
@@ -362,7 +396,8 @@ struct PrivateCall {
   char group_code[33] = {0};
   char peer_device_id[kDeviceIdLen] = {0};
   char session_id[kIdLen] = {0};
-  uint32_t claimSentMs = 0;
+  uint32_t claimFirstSentMs = 0;  // when CLAIMING started — bounds the 1s total retry window
+  uint32_t claimLastSentMs = 0;   // last CLAIM sent — paced at 250ms while CLAIMING, 2s once active
   uint32_t negotiateStartMs = 0;
   bool myEndpointKnown = false;
   IPAddress myIp;
@@ -374,6 +409,36 @@ struct PrivateCall {
   bool denied = false;
 };
 PrivateCall g_call;
+
+// Sends (or resends) a CLAIM for the current g_call — used for the initial
+// claim, the 250ms/1s retry cadence while CLAIMING, and the 2s keep-alive
+// refresh once active. Always carries g_call's own session_id so replies
+// and TTL tracking stay correlated to this exact call.
+void sendClaim() {
+  uint8_t payload[1 + kDeviceIdLen + kIdLen];
+  size_t len = buildBusyPayload(BUSY_CLAIM, Identity::deviceId(), g_call.session_id, payload, sizeof(payload));
+  if (len == 0) return;
+  uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
+  if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY, static_cast<uint16_t>(len), wireBuf, sizeof(wireBuf))) {
+    return;
+  }
+  memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
+  char topicSuffix[32];
+  snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", g_call.peer_device_id);
+  MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
+                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+}
+
+// Definition of the helper forward-declared alongside resetPrivateCall,
+// above the Busy protocol code — tears down our own (callee-side) call
+// state when a matching-session RELEASE or TTL expiry arrives, so it never
+// lingers stale and blocks this peer's next call.
+void releaseCalleeCallIfMatches(const char* claimerDeviceId, const char* sessionId) {
+  if (!g_call.isCaller && g_call.state != PrivateState::IDLE &&
+      strcmp(g_call.peer_device_id, claimerDeviceId) == 0 && strcmp(g_call.session_id, sessionId) == 0) {
+    resetPrivateCall();
+  }
+}
 
 WiFiUDP g_udp;
 bool g_udpBegun = false;
@@ -536,8 +601,10 @@ void handleRadioBusyReplyPacket(const char* group_code, const char* topic, const
   if (g_call.state != PrivateState::CLAIMING) return;
   uint8_t type;
   char responder[kDeviceIdLen];
-  if (!parseReplyPayload(payload, static_cast<uint16_t>(payloadLen), &type, responder)) return;
+  char sessionId[kIdLen];
+  if (!parseReplyPayload(payload, static_cast<uint16_t>(payloadLen), &type, responder, sessionId)) return;
   if (strcmp(responder, g_call.peer_device_id) != 0) return;
+  if (strcmp(sessionId, g_call.session_id) != 0) return;  // stale GRANT/DENY for an earlier attempt
 
   if (type == REPLY_GRANT) {
     beginNegotiation();
@@ -590,8 +657,11 @@ void handleRadioSessionPacket(const char* group_code, const char* topic, const u
   if (strcmp(toId, Identity::deviceId()) != 0) return;  // not addressed to me
 
   if (type == SESSION_START) {
-    // Callee side: a valid private claim must already have granted `fromId`.
+    // Callee side: a valid private claim for this exact session must
+    // already have been granted to `fromId` — rejects a START tied to a
+    // stale/superseded claim from the same peer.
     if (!g_receiverBusy.busy || strcmp(g_receiverBusy.claimerDeviceId, fromId) != 0) return;
+    if (strcmp(g_receiverBusy.sessionId, sessionId) != 0) return;
     if (g_call.state != PrivateState::IDLE && strcmp(g_call.session_id, sessionId) != 0) return;
 
     strncpy(g_call.group_code, group_code, sizeof(g_call.group_code) - 1);
@@ -788,16 +858,18 @@ void serviceTick() {
   uint32_t now = millis();
 
   if (g_receiverBusy.busy && (now - g_receiverBusy.lastRefreshMs) > kBusyTtlMs) {
-    if (!g_call.isCaller && g_call.state != PrivateState::IDLE &&
-        strcmp(g_call.peer_device_id, g_receiverBusy.claimerDeviceId) == 0) {
-      resetPrivateCall();  // crash fallback: same stale-session risk as the explicit RELEASE path
-    }
+    // Crash fallback: same stale-session risk as the explicit RELEASE
+    // path, so it goes through the same session-matched teardown helper.
+    releaseCalleeCallIfMatches(g_receiverBusy.claimerDeviceId, g_receiverBusy.sessionId);
     g_receiverBusy.busy = false;
   }
 
   if (g_call.state == PrivateState::CLAIMING) {
-    if (now - g_call.claimSentMs > kClaimReplyTimeoutMs) {
-      resetPrivateCall();  // no reply: give up quietly, matching a DENY-like outcome
+    if (now - g_call.claimFirstSentMs >= kClaimTotalTimeoutMs) {
+      resetPrivateCall();  // no matching GRANT within 1s total: fail the PTT attempt
+    } else if (now - g_call.claimLastSentMs >= kClaimRetryIntervalMs) {
+      sendClaim();
+      g_call.claimLastSentMs = now;
     }
   } else if (g_call.state == PrivateState::NEGOTIATING) {
     if (now - g_call.negotiateStartMs > kNegotiateTimeoutMs) {
@@ -805,21 +877,9 @@ void serviceTick() {
       if (g_call.isCaller) flushPreBuffer();
     }
   } else if (g_call.isCaller && g_call.state != PrivateState::IDLE && g_call.state != PrivateState::STOPPING) {
-    if (now - g_call.claimSentMs > kClaimRefreshMs) {
-      uint8_t payload[1 + kDeviceIdLen];
-      size_t len = buildBusyPayload(BUSY_CLAIM, Identity::deviceId(), payload, sizeof(payload));
-      if (len > 0) {
-        uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
-        if (PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY, static_cast<uint16_t>(len), wireBuf,
-                                      sizeof(wireBuf))) {
-          memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
-          char topicSuffix[32];
-          snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", g_call.peer_device_id);
-          MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
-                                     static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
-        }
-      }
-      g_call.claimSentMs = now;
+    if (now - g_call.claimLastSentMs > kClaimRefreshMs) {
+      sendClaim();
+      g_call.claimLastSentMs = now;
     }
   }
 
@@ -856,28 +916,22 @@ void startPrivateCall(const char* group_code, const char* recipient_device_id) {
   g_call.isCaller = true;
   g_call.denied = false;
   g_call.state = PrivateState::CLAIMING;
-  g_call.claimSentMs = millis();
+  uint32_t now = millis();
+  g_call.claimFirstSentMs = now;
+  g_call.claimLastSentMs = now;
   setRadioAudioActive(true);
-
-  uint8_t payload[1 + kDeviceIdLen];
-  size_t len = buildBusyPayload(BUSY_CLAIM, Identity::deviceId(), payload, sizeof(payload));
-  if (len == 0) return;
-  uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
-  if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY, static_cast<uint16_t>(len), wireBuf, sizeof(wireBuf))) {
-    return;
-  }
-  memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
-  char topicSuffix[32];
-  snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", recipient_device_id);
-  MqttManager::publishBinary(group_code, topicSuffix, wireBuf,
-                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  sendClaim();
 }
 
 void stopPrivateCall() {
+  // Callee side: our own PTT press never actually claims anything while a
+  // call is active (startPrivateCall no-ops unless state == IDLE), so the
+  // matching release must not tear down an incoming call we're receiving.
+  if (!g_call.isCaller) return;
   if (g_call.state == PrivateState::IDLE && !g_call.denied) return;
   if (g_call.isCaller && g_call.state != PrivateState::IDLE) {
-    uint8_t payload[1 + kDeviceIdLen];
-    size_t len = buildBusyPayload(BUSY_RELEASE, Identity::deviceId(), payload, sizeof(payload));
+    uint8_t payload[1 + kDeviceIdLen + kIdLen];
+    size_t len = buildBusyPayload(BUSY_RELEASE, Identity::deviceId(), g_call.session_id, payload, sizeof(payload));
     if (len > 0) {
       uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
       if (PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY, static_cast<uint16_t>(len), wireBuf,
