@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <MQTT.h>
 #include <WiFi.h>
+#include <new>
 #include <string.h>
 
 #include "core/crc32.h"
@@ -55,12 +56,21 @@ GroupClient* findClientByMqttPtr(MQTTClient* client) {
 constexpr uint8_t kQueueCapacity = 16;
 constexpr uint16_t kMaxStoredPacketSize = 1024;
 
+// `data` is a heap pointer sized to the exact incoming packet length (not a
+// fixed 1024-byte array) — kMaxStoredPacketSize remains the cap on what a
+// single packet may occupy, it just no longer pre-reserves that much .bss
+// for every one of the 16 slots regardless of what's actually queued.
+// Lifecycle: onMqttMessage() allocates+copies+takes ownership on enqueue;
+// drainReceiveQueue() frees exactly once and nulls the pointer after a
+// slot's payload has been fully processed, whatever path that took
+// (malformed topic, presence, malformed packet, unknown kind, or a
+// successful dispatch) — see processQueuedMessage()/drainReceiveQueue().
 struct QueuedMessage {
   bool used = false;
   char group_code[33] = {0};
   char topic[64] = {0};
   uint16_t len = 0;
-  uint8_t data[kMaxStoredPacketSize];
+  uint8_t* data = nullptr;
 };
 
 QueuedMessage g_queue[kQueueCapacity];
@@ -75,14 +85,33 @@ void onMqttMessage(MQTTClient* client, char topic[], char bytes[], int length) {
   GroupClient* gc = findClientByMqttPtr(client);
   if (gc == nullptr) return;
 
+  // Allocate (sized exactly to this packet) and copy BEFORE touching the
+  // queue slot or its indexes, so a failed allocation can't corrupt state
+  // or overwrite another item — the slot at g_queueTail is only touched
+  // once we know the payload copy has already succeeded.
+  uint8_t* buf = nullptr;
+  if (length > 0) {
+    buf = new (std::nothrow) uint8_t[static_cast<size_t>(length)];
+    if (buf == nullptr) {
+      Serial.println("[mqtt] payload allocation failed; dropping incoming packet");
+      return;  // drop safely: queue indexes/state untouched, nothing else to free
+    }
+    memcpy(buf, bytes, static_cast<size_t>(length));  // never keep a pointer into the callback's own buffer
+  }
+  // length == 0 is a legitimate empty payload (e.g. a zero-length retained
+  // "clear" publish), not an allocation failure — buf stays null and is
+  // queued as such; decodeHeader()/handleIncoming() both bounds-check len
+  // before ever touching the pointer.
+
   QueuedMessage& q = g_queue[g_queueTail];
+  delete[] q.data;  // defensive: should already be null in correct steady-state operation
+  q.data = buf;
   q.used = true;
   strncpy(q.group_code, gc->group_code, sizeof(q.group_code) - 1);
   q.group_code[sizeof(q.group_code) - 1] = '\0';
   strncpy(q.topic, topic, sizeof(q.topic) - 1);
   q.topic[sizeof(q.topic) - 1] = '\0';
   q.len = static_cast<uint16_t>(length);
-  memcpy(q.data, bytes, q.len);  // never keep a pointer into the callback's own buffer
 
   g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueCapacity);
   g_queueCount++;
@@ -98,27 +127,43 @@ const char* extractTopicSuffix(const char* fullTopic) {
   return p + 1;
 }
 
+// One dequeued item's worth of dispatch — factored out of drainReceiveQueue
+// so every exit from this function (malformed topic, presence, malformed
+// packet, unregistered kind, or a successful dispatch) returns to exactly
+// one place that frees the slot's payload, guaranteeing it happens once
+// regardless of which path was taken.
+void processQueuedMessage(const QueuedMessage& q) {
+  const char* suffix = extractTopicSuffix(q.topic);
+  if (suffix == nullptr) return;
+
+  if (strncmp(suffix, "presence/", 9) == 0) {
+    Presence::handleIncoming(q.group_code, reinterpret_cast<const char*>(q.data), q.len);
+    return;
+  }
+
+  PacketCodec::Header hdr;
+  const uint8_t* payload = nullptr;
+  if (!PacketCodec::decodeHeader(q.data, q.len, &hdr, &payload)) return;  // malformed: log+ignore
+
+  NetworkPacketHandlerFn handler = getNetworkPacketHandler(hdr.packet_kind);
+  if (handler != nullptr) handler(q.group_code, suffix, payload, hdr.payload_length);
+  // else: unregistered kind (nothing has claimed it yet in this phase) — ignored safely.
+}
+
 void drainReceiveQueue() {
   while (g_queueCount > 0) {
     QueuedMessage& q = g_queue[g_queueHead];
     g_queueHead = static_cast<uint8_t>((g_queueHead + 1) % kQueueCapacity);
     g_queueCount--;
 
-    const char* suffix = extractTopicSuffix(q.topic);
-    if (suffix == nullptr) continue;
+    processQueuedMessage(q);
 
-    if (strncmp(suffix, "presence/", 9) == 0) {
-      Presence::handleIncoming(q.group_code, reinterpret_cast<const char*>(q.data), q.len);
-      continue;
-    }
-
-    PacketCodec::Header hdr;
-    const uint8_t* payload = nullptr;
-    if (!PacketCodec::decodeHeader(q.data, q.len, &hdr, &payload)) continue;  // malformed: log+ignore
-
-    NetworkPacketHandlerFn handler = getNetworkPacketHandler(hdr.packet_kind);
-    if (handler != nullptr) handler(q.group_code, suffix, payload, hdr.payload_length);
-    // else: unregistered kind (nothing has claimed it yet in this phase) — ignored safely.
+    // Free exactly once, then reset the slot, no matter which path
+    // processQueuedMessage took.
+    delete[] q.data;
+    q.data = nullptr;
+    q.used = false;
+    q.len = 0;
   }
 }
 
