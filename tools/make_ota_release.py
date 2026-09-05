@@ -33,8 +33,9 @@ OUTPUT_DIR = REPO_ROOT / "ota_release"
 
 # Manifest path prefix served under OtaConfig::kBaseUrl (ota_config.h).
 # Kept as one constant here so a real deployment only needs to edit it in
-# one place if the hosting layout ever changes.
-RELEASE_PATH_PREFIX = "/morse-buddy/releases"
+# one place if the hosting layout ever changes. Matches the real host:
+# https://sarawutekcrane.github.io/morse-buddy-ota/releases/<version>/...
+RELEASE_PATH_PREFIX = "/morse-buddy-ota/releases"
 
 # Phase 5 section 6: warn strongly above this fraction of the OTA slot.
 WARN_THRESHOLD_FRACTION = 0.85
