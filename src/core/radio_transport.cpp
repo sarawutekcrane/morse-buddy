@@ -987,9 +987,25 @@ void setMaintenanceModeActive(bool active) {
     // Force-stop any in-progress call regardless of caller/callee side --
     // stopPrivateCall()'s own isCaller guard is deliberate for a normal
     // PTT-release, but Maintenance Mode needs "no active PTT session is
-    // running" (Phase 5 section 18) unconditionally.
+    // running" (Phase 5 section 18) unconditionally. releaseAndResetPrivateCall()
+    // already covers both roles: it publishes RELEASE only when we hold the
+    // claim as caller (using g_call.session_id captured before the reset,
+    // so it can never carry a stale/wrong session), then always tears down
+    // our own g_call via resetPrivateCall() -- which itself frees the
+    // Radio pre-buffer, clears the jitter buffer, and stops capture --
+    // regardless of whether we were the caller or the callee.
     releaseAndResetPrivateCall();
     stopBroadcastCall();
+
+    // g_receiverBusy is separate from g_call: it tracks a claim we, as
+    // receiver, GRANTED to some other caller. resetPrivateCall() above
+    // never touches it, and there is no wire message for a granter to
+    // withdraw a grant, so the only safe local action is to drop our own
+    // "busy" bookkeeping immediately -- otherwise a stale grant could
+    // incorrectly DENY a legitimate new caller for up to kBusyTtlMs after
+    // Maintenance Mode ends and MQTT reconnects, instead of self-healing
+    // only via serviceTick()'s passive TTL sweep.
+    g_receiverBusy = ReceiverBusy{};
   }
 }
 

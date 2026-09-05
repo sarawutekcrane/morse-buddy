@@ -116,12 +116,22 @@ bool runHealthCheck() {
 
 // Runs once at boot (called from AppService::init). Implements the
 // corrected Section I early-boot sequence plus the locked anti-loop
-// requirements 4-7. Never touches NVS unless update_pending is actually
-// set, so a device that has never done an OTA update pays this function
-// exactly one cheap isKey() check per boot.
+// requirements 4-7, PLUS (Phase 5 audit turn) explicit handling for
+// interrupted/inconsistent metadata: update_pending/previous_build/
+// target_build are written in that exact order with update_pending last
+// (see runDownloadAndInstallBlocking()), so any power loss between
+// Update.end() committing the new boot partition and our own NVS writes
+// finishing can only ever leave update_pending==false -- never true with
+// a stale/mismatched target_build. That already prevents an incorrect
+// automatic-rollback trigger from a torn write. What it can leave behind
+// is esp_ota itself reporting PENDING_VERIFY for a build our own
+// bookkeeping never actually recorded (or recorded differently) -- that
+// case is handled explicitly below by resolving PENDING_VERIFY to VALID
+// and continuing on the currently-running firmware, and deliberately
+// never invalidating/rolling back on ambiguous data, since doing so is
+// exactly how two slots could end up alternating rollbacks forever.
 void runPostOtaValidation() {
-  if (!nvsGetPending()) return;
-
+  bool pending = nvsGetPending();
   uint32_t targetBuild = nvsGetTargetBuild();
   uint32_t prevBuild = nvsGetPrevBuild();
   uint32_t lastFailBuild = nvsGetLastFailBuild();
@@ -131,8 +141,10 @@ void runPostOtaValidation() {
   // build was already marked valid the last time *it* was the freshly
   // installed build, so by the time we're back here its partition state
   // is plain VALID, not PENDING_VERIFY. Our own bookkeeping is the only
-  // signal that this boot is a rollback-recovery boot at all.
-  if (FW_BUILD_NUMBER == prevBuild && lastFailBuild != 0 && lastFailBuild == targetBuild) {
+  // signal that this boot is a rollback-recovery boot at all. Requires
+  // pending==true so an unrelated coincidental build-number match can
+  // never be misread as a recovery event.
+  if (pending && FW_BUILD_NUMBER == prevBuild && lastFailBuild != 0 && lastFailBuild == targetBuild) {
     nvsSetPending(false);
     // last_failed_ota_build is deliberately retained (requirement 7) so
     // the Firmware Update screen can still warn if the server offers that
@@ -142,17 +154,50 @@ void runPostOtaValidation() {
     return;  // normal startup continues; never perform another rollback here
   }
 
-  // Requirement 4: only proceed to a health check when this running build
-  // is the one we ourselves recorded as the OTA target...
-  if (FW_BUILD_NUMBER != targetBuild) return;
-
-  // ...and esp_ota independently agrees this partition is still pending
-  // its first-boot verification.
   const esp_partition_t* running = esp_ota_get_running_partition();
   esp_ota_img_states_t state;
-  if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
-  if (state != ESP_OTA_IMG_PENDING_VERIFY) return;
+  bool pendingVerify =
+      (esp_ota_get_state_partition(running, &state) == ESP_OK) && (state == ESP_OTA_IMG_PENDING_VERIFY);
 
+  if (!pendingVerify) {
+    // Not a post-OTA boot from esp_ota's own point of view (the normal
+    // case for every ordinary boot). If our own bookkeeping still thinks
+    // one is in flight -- stale from an interrupted write, a manual
+    // rollback, or a USB reflash outside the OTA path entirely -- clear
+    // it now rather than letting it misfire on some later boot. Never
+    // triggers rollback: requirement 8 ("a failed build must never cause
+    // an automatic reinstall") applies equally to never taking an
+    // automatic *action* off data we can't corroborate.
+    if (pending) {
+      Serial.println("[ota] clearing stale update_pending: esp_ota reports this partition is not PENDING_VERIFY");
+      nvsSetPending(false);
+    }
+    return;
+  }
+
+  // esp_ota independently confirms this partition is pending its
+  // first-boot verification. Requirement 4 only wants the real health
+  // check to run when our own bookkeeping exactly corroborates that --
+  // this running build must equal the target we ourselves recorded
+  // writing. When it does NOT (update_pending was never durably set
+  // before a power loss, or names a different build than the one
+  // actually running), the safe resolution is to mark the currently-
+  // running firmware valid -- it has, after all, already reached
+  // AppService::init, which is itself real evidence of a working boot --
+  // and continue with it, rather than leave PENDING_VERIFY unresolved
+  // forever or guess at an automatic rollback with no reliable metadata
+  // to justify it.
+  if (!(pending && FW_BUILD_NUMBER == targetBuild)) {
+    Serial.printf(
+        "[ota] inconsistent OTA metadata at a PENDING_VERIFY boot (pending=%d target_build=%u running_build=%u) "
+        "-- marking this build valid without an automatic-rollback decision and continuing\n",
+        pending, static_cast<unsigned>(targetBuild), static_cast<unsigned>(FW_BUILD_NUMBER));
+    nvsSetPending(false);
+    if (kBootloaderRollbackCompiledIn) esp_ota_mark_app_valid_cancel_rollback();
+    return;
+  }
+
+  // Exact match: this is genuinely the build we ourselves just installed.
   bool healthy = runHealthCheck();
   if (healthy) {
     nvsSetPending(false);

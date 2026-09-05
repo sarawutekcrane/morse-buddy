@@ -366,12 +366,53 @@ bool isAnyGroupConnected() {
 void setMaintenanceModeActive(bool active) {
   if (active == g_maintenanceMode) return;
   if (active) {
+    // Set the flag first so serviceTick() stops reconnecting/re-queuing
+    // for the rest of this call, then drain what's already queued
+    // ourselves -- serviceTick() (the only other caller of
+    // drainReceiveQueue()) is now gated behind this same flag and would
+    // otherwise never run again for the whole OTA HTTPS/TLS operation,
+    // leaving every already-queued payload's heap allocation parked for
+    // that entire duration. onMqttMessage() only ever enqueues (parsing/
+    // dispatch happens exclusively in drainReceiveQueue()), so everything
+    // already sitting in g_queue[] was fully received before this call
+    // and is safe to process synchronously right here, exactly like a
+    // normal serviceTick() would -- this preserves existing message
+    // persistence/dedup behavior instead of discarding queued messages.
+    g_maintenanceMode = true;
+    drainReceiveQueue();
+
+    // Defensive verification, not expected to ever fire: drainReceiveQueue()
+    // unconditionally loops until g_queueCount reaches 0, and nothing on
+    // that synchronous path can re-enter onMqttMessage() to re-queue
+    // something (that only ever happens from inside gc.mqtt->loop(),
+    // which serviceTick() -- now paused -- is the only caller of). Kept
+    // as an explicit, leak-proof fallback rather than trusting that
+    // invariant silently: if it ever fires, every dynamic payload still
+    // marked used is freed exactly once here rather than left allocated
+    // for the duration of OTA.
+    if (g_queueCount != 0) {
+      Serial.printf("[mqtt] maintenance mode: %u receive-queue payload(s) left after drain; forcing release\n",
+                   static_cast<unsigned>(g_queueCount));
+      for (auto& q : g_queue) {
+        if (q.used) {
+          delete[] q.data;
+          q.data = nullptr;
+          q.used = false;
+          q.len = 0;
+        }
+      }
+      g_queueHead = 0;
+      g_queueTail = 0;
+      g_queueCount = 0;
+    }
+
     publishOfflineAllGroupsBounded();
     for (auto& gc : g_clients) {
       if (gc.active && gc.mqtt != nullptr && gc.mqtt->connected()) gc.mqtt->disconnect();
     }
+  } else {
+    g_maintenanceMode = false;  // un-pauses serviceTick(), which reconnects normally
   }
-  g_maintenanceMode = active;  // leaving simply un-pauses serviceTick(), which reconnects normally
 }
 
 bool publishRaw(const char* group_code, const char* topic_suffix, const char* payload, bool retained, int qos) {

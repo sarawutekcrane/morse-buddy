@@ -42,7 +42,13 @@ void notifyActivity() { g_lastActivityMs = millis(); }
 
 void setSuspended(bool suspended) {
   g_suspended = suspended;
-  if (!suspended) g_lastActivityMs = millis();
+  // Reuse the existing activity-reset API rather than a second timer: on
+  // leaving suspension (Maintenance Mode ending, whether OTA succeeded,
+  // failed, or preparation was aborted before any write began) the
+  // inactivity clock gets a fresh baseline, so the device never resumes
+  // counting from a stale pre-OTA timestamp and risks falling straight
+  // into deep sleep the instant Maintenance Mode ends.
+  if (!suspended) notifyActivity();
 }
 
 void update() {
