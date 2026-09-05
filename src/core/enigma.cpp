@@ -1119,8 +1119,18 @@ void screenEnigmaEntry() {
   Menu::pushScreen(target);
 }
 
+// Storage::init() runs from setup() after every global constructor has
+// already run, so EnigmaKeys::init()'s NVS read must happen in an
+// AppService.init callback (invoked by initRegisteredServices(), also from
+// setup(), after Storage::init()) rather than directly in this constructor.
+void serviceInit() { EnigmaKeys::init(); }
+
 struct Registrar {
   Registrar() {
+    AppService svc;
+    svc.init = serviceInit;
+    svc.tick = nullptr;
+    registerAppService(svc);
     registerModeHandler(Modes::ENIGMA, screenEnigmaEntry);
     registerMessageType(PacketCodec::MSG_TYPE_ENIGMA, renderEnigmaMessage, onEnigmaMessageEvent);
     TextMessage::registerIncomingMessageHandler(PacketCodec::MSG_TYPE_ENIGMA, handleEnigmaArrival);
