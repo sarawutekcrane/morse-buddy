@@ -59,10 +59,15 @@ Result fetchManifest(OtaManifest::Manifest* outManifest) {
 
   char url[256];
   snprintf(url, sizeof(url), "%s%s", OtaConfig::kBaseUrl, OtaConfig::kManifestPath);
-  if (!http.begin(client, url)) return Result::HTTPS_CONNECT_FAILED;
+  Serial.printf("[ota] fetching manifest: %s\n", url);
+  if (!http.begin(client, url)) {
+    Serial.println("[ota] manifest fetch: http.begin() failed (malformed URL or TLS setup failure)");
+    return Result::HTTPS_CONNECT_FAILED;
+  }
 
   int code = http.GET();
   if (code != 200) {
+    Serial.printf("[ota] manifest fetch failed: HTTP GET returned %d\n", code);
     http.end();
     if (code == 404) return Result::MANIFEST_NOT_FOUND;
     return Result::HTTPS_CONNECT_FAILED;  // covers TLS handshake/verify failures surfaced by HTTPClient too
@@ -70,12 +75,15 @@ Result fetchManifest(OtaManifest::Manifest* outManifest) {
 
   int contentLen = http.getSize();
   if (contentLen <= 0 || static_cast<size_t>(contentLen) > OtaConfig::kManifestMaxSize) {
+    Serial.printf("[ota] manifest fetch failed: Content-Length=%d exceeds max=%u or is missing/chunked\n", contentLen,
+                 static_cast<unsigned>(OtaConfig::kManifestMaxSize));
     http.end();
     return Result::MANIFEST_TOO_LARGE;
   }
 
   char* buf = new (std::nothrow) char[static_cast<size_t>(contentLen)];
   if (buf == nullptr) {
+    Serial.printf("[ota] manifest fetch failed: could not allocate %d bytes\n", contentLen);
     http.end();
     return Result::MANIFEST_TOO_LARGE;
   }
@@ -85,6 +93,8 @@ Result fetchManifest(OtaManifest::Manifest* outManifest) {
   uint32_t lastProgressMs = millis();
   while (got < static_cast<size_t>(contentLen)) {
     if (millis() - lastProgressMs > OtaConfig::kReadNoProgressTimeoutMs) {
+      Serial.printf("[ota] manifest fetch failed: no progress for >%ums (%u/%d bytes received)\n",
+                   static_cast<unsigned>(OtaConfig::kReadNoProgressTimeoutMs), static_cast<unsigned>(got), contentLen);
       delete[] buf;
       http.end();
       return Result::DOWNLOAD_TIMEOUT;
@@ -104,21 +114,38 @@ Result fetchManifest(OtaManifest::Manifest* outManifest) {
   http.end();
 
   if (got != static_cast<size_t>(contentLen)) {
+    Serial.printf("[ota] manifest fetch failed: connection closed after %u/%d bytes\n", static_cast<unsigned>(got),
+                 contentLen);
     delete[] buf;
     return Result::DOWNLOAD_INTERRUPTED;
   }
 
   OtaManifest::ParseResult pr = OtaManifest::parse(buf, got, outManifest);
   delete[] buf;
-  return (pr == OtaManifest::ParseResult::OK) ? Result::OK : Result::MANIFEST_INVALID;
+  if (pr != OtaManifest::ParseResult::OK) {
+    Serial.printf("[ota] manifest parse failed: %s\n", OtaManifest::resultToString(pr));
+    return Result::MANIFEST_INVALID;
+  }
+  Serial.printf("[ota] manifest OK: version=%s build=%u hardware=%s size=%u\n", outManifest->version,
+               static_cast<unsigned>(outManifest->build), outManifest->hardware,
+               static_cast<unsigned>(outManifest->size));
+  return Result::OK;
 }
 
 Result downloadAndInstall(const OtaManifest::Manifest& manifest, ProgressFn onProgress) {
   if (OtaConfig::isPlaceholderServer()) return Result::HTTPS_CONNECT_FAILED;
 
   const esp_partition_t* updatePartition = esp_ota_get_next_update_partition(nullptr);
-  if (updatePartition == nullptr) return Result::BOOT_PARTITION_FAILED;
-  if (manifest.size == 0 || manifest.size > updatePartition->size) return Result::IMAGE_TOO_LARGE;
+  if (updatePartition == nullptr) {
+    Serial.println("[ota] download aborted: no inactive OTA partition available");
+    return Result::BOOT_PARTITION_FAILED;
+  }
+  if (manifest.size == 0 || manifest.size > updatePartition->size) {
+    Serial.printf("[ota] download aborted: manifest size=%u exceeds inactive partition '%s' size=%u\n",
+                 static_cast<unsigned>(manifest.size), updatePartition->label,
+                 static_cast<unsigned>(updatePartition->size));
+    return Result::IMAGE_TOO_LARGE;
+  }
 
   WiFiClientSecure client;
   client.setCACert(kOtaRootCaPem);
@@ -129,10 +156,15 @@ Result downloadAndInstall(const OtaManifest::Manifest& manifest, ProgressFn onPr
 
   char url[300];
   snprintf(url, sizeof(url), "%s%s", OtaConfig::kBaseUrl, manifest.path);
-  if (!http.begin(client, url)) return Result::HTTPS_CONNECT_FAILED;
+  Serial.printf("[ota] downloading firmware: %s -> partition '%s'\n", url, updatePartition->label);
+  if (!http.begin(client, url)) {
+    Serial.println("[ota] download aborted: http.begin() failed (malformed URL or TLS setup failure)");
+    return Result::HTTPS_CONNECT_FAILED;
+  }
 
   int code = http.GET();
   if (code != 200) {
+    Serial.printf("[ota] download aborted: HTTP GET returned %d\n", code);
     http.end();
     return Result::HTTPS_CONNECT_FAILED;
   }
@@ -142,11 +174,14 @@ Result downloadAndInstall(const OtaManifest::Manifest& manifest, ProgressFn onPr
   // (Phase 5 section 56.3: chunked firmware responses must be rejected).
   int contentLen = http.getSize();
   if (contentLen <= 0 || static_cast<size_t>(contentLen) != manifest.size) {
+    Serial.printf("[ota] download aborted: Content-Length=%d does not match manifest size=%u\n", contentLen,
+                 static_cast<unsigned>(manifest.size));
     http.end();
     return Result::CONTENT_LENGTH_MISMATCH;
   }
 
   if (!Update.begin(manifest.size, U_FLASH)) {
+    Serial.printf("[ota] download aborted: Update.begin() failed, error=%s\n", Update.errorString());
     http.end();
     return Result::WRITE_FAILED;
   }
@@ -203,6 +238,8 @@ Result downloadAndInstall(const OtaManifest::Manifest& manifest, ProgressFn onPr
     mbedtls_sha256_update_ret(&sha, chunk, static_cast<size_t>(n));
     size_t w = Update.write(chunk, static_cast<size_t>(n));
     if (w != static_cast<size_t>(n)) {
+      Serial.printf("[ota] download aborted: Update.write() wrote %u/%u bytes, error=%s\n", static_cast<unsigned>(w),
+                   static_cast<unsigned>(n), Update.errorString());
       failResult = Result::WRITE_FAILED;
       break;
     }
@@ -228,11 +265,15 @@ Result downloadAndInstall(const OtaManifest::Manifest& manifest, ProgressFn onPr
   http.end();
 
   if (failResult != Result::OK) {
+    Serial.printf("[ota] download failed after %u/%u bytes: %s\n", static_cast<unsigned>(written),
+                 static_cast<unsigned>(manifest.size), resultToString(failResult));
     mbedtls_sha256_free(&sha);
     Update.abort();
     return failResult;
   }
   if (written != manifest.size) {
+    Serial.printf("[ota] download aborted: loop exited with %u/%u bytes written\n", static_cast<unsigned>(written),
+                 static_cast<unsigned>(manifest.size));
     mbedtls_sha256_free(&sha);
     Update.abort();
     return Result::CONTENT_LENGTH_MISMATCH;
@@ -247,6 +288,7 @@ Result downloadAndInstall(const OtaManifest::Manifest& manifest, ProgressFn onPr
   Serial.printf("[ota] calculated sha256=%s expected=%s\n", digestHex, manifest.sha256_hex);
 
   if (strcasecmp(digestHex, manifest.sha256_hex) != 0) {
+    Serial.println("[ota] download aborted: SHA-256 mismatch, image will not be activated");
     Update.abort();
     return Result::SHA256_MISMATCH;
   }
@@ -254,9 +296,11 @@ Result downloadAndInstall(const OtaManifest::Manifest& manifest, ProgressFn onPr
   // Update.end(true) performs the ESP32 image/header validation, then
   // esp_ota_set_boot_partition() on the inactive slot we just wrote.
   if (!Update.end(true)) {
+    Serial.printf("[ota] download aborted: Update.end() failed, error=%s\n", Update.errorString());
     return Result::IMAGE_FINALIZE_FAILED;
   }
 
+  Serial.printf("[ota] Update.end() succeeded; new boot partition selected\n");
   return Result::OK;
 }
 

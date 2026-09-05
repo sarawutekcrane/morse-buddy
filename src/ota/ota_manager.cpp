@@ -436,11 +436,17 @@ void beginInstallFlow() {
     return;
   }
 
+  const esp_partition_t* runningPartition = esp_ota_get_running_partition();
+  const esp_partition_t* targetPartition = esp_ota_get_next_update_partition(nullptr);
   Serial.printf(
-      "[ota] starting update: current=%s/%u available=%s/%u hardware=%s size=%u free_heap=%u battery=%u%%\n",
+      "[ota] starting update: current=%s/%u available=%s/%u hardware=%s manifest_size=%u running_partition=%s "
+      "target_partition=%s(%u) free_heap=%u battery=%u%%\n",
       FW_VERSION, static_cast<unsigned>(FW_BUILD_NUMBER), g_lastManifest.version,
       static_cast<unsigned>(g_lastManifest.build), g_lastManifest.hardware, static_cast<unsigned>(g_lastManifest.size),
-      static_cast<unsigned>(freeHeap), Power::getBatteryPercent());
+      runningPartition != nullptr ? runningPartition->label : "?",
+      targetPartition != nullptr ? targetPartition->label : "?",
+      targetPartition != nullptr ? static_cast<unsigned>(targetPartition->size) : 0, static_cast<unsigned>(freeHeap),
+      Power::getBatteryPercent());
 
   g_uiState = UiState::PREPARING;
   g_preparingDrawn = false;
