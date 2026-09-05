@@ -78,6 +78,8 @@ bool hasBadge(uint8_t mask) {
   return false;
 }
 
+bool g_raceInvitePending = false;
+
 void onSettingsChanged(const SettingsChangeInfo& info) {
   if (info.event != SET_GROUP_DELETED) return;
   bool changed = false;
@@ -149,6 +151,8 @@ uint16_t getUnreadCount(const char* group_code, const char* contact_key) {
 
 bool hasAnyUnreadText() { return hasBadge(BADGE_TEXT); }
 bool hasAnyUnreadEnigma() { return hasBadge(BADGE_ENIGMA); }
-bool hasAnyUnreadTrainingGame() { return hasBadge(BADGE_TRAINING_GAME); }
+bool hasAnyUnreadTrainingGame() { return hasBadge(BADGE_TRAINING_GAME) || g_raceInvitePending; }
+
+void setRaceInvitePending(bool pending) { g_raceInvitePending = pending; }
 
 }  // namespace Notifications

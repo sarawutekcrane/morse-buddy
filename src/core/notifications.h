@@ -33,4 +33,12 @@ bool hasAnyUnreadText();
 bool hasAnyUnreadEnigma();
 bool hasAnyUnreadTrainingGame();
 
+// Phase 4: a Race invitation is a bare PK_RACE_INVITE packet, not a
+// MessageStore record, so it cannot light BADGE_TRAINING_GAME through
+// onMessageArrived(). Menu::registerMainMenuBadge holds only one callback
+// per Main Menu item, and that slot is already this module's own
+// hasAnyUnreadTrainingGame, so Race Mode ORs into the same Main Menu badge
+// through this flag instead of registering a second, overwriting callback.
+void setRaceInvitePending(bool pending);
+
 }  // namespace Notifications
