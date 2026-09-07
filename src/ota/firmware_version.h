@@ -7,12 +7,12 @@
 #include <stdint.h>
 
 // Human-facing. Not used for update-order comparison.
-constexpr const char* FW_VERSION = "1.0.1";
+constexpr const char* FW_VERSION = "1.0.2";
 
 // Authoritative update-order value. Must be strictly greater on every
 // released firmware than on the one before it (Phase 5 section 8: never
 // use a timestamp alone as firmware identity).
-constexpr uint32_t FW_BUILD_NUMBER = 2;
+constexpr uint32_t FW_BUILD_NUMBER = 3;
 
 // Must match exactly (case-sensitive, full string compare) between the
 // manifest's hardware= field and this device before an OTA is accepted.
