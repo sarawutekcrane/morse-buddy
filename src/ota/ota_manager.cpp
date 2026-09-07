@@ -105,12 +105,35 @@ void nvsSetLastFailBuild(uint32_t v) { Storage::core().putUInt(kKeyLastFailBuild
 // signals section 34 asks for. "slots" is the WiFi-credential key any
 // device that could possibly have reached an OTA update at all must have
 // written at some point (OTA requires a working WiFi connection).
+// TEST ONLY — NEVER MERGE INTO PRODUCTION
+// Exists solely on the test/ota-rollback-health-fail branch to exercise
+// the real, unmodified automatic-rollback path in runPostOtaValidation()
+// below. This constant does not exist on any production branch/tag; it
+// is not remote-triggerable, not MQTT-triggerable, not web-triggerable,
+// and has no runtime/Settings-exposed toggle -- it is a branch-only
+// compile-time constant, checked in only here.
+#define OTA_TEST_FORCE_HEALTH_CHECK_FAIL 1
+
 bool runHealthCheck() {
   bool nvsOk = Storage::wifi().isKey("slots");
   bool fsOk = LittleFS.totalBytes() > 0;
   bool heapOk = ESP.getFreeHeap() > 10 * 1024;
   Serial.printf("[ota] health check: nvs=%d fs=%d heap=%d (%u bytes free)\n", nvsOk, fsOk, heapOk,
                static_cast<unsigned>(ESP.getFreeHeap()));
+
+#ifdef OTA_TEST_FORCE_HEALTH_CHECK_FAIL
+  // TEST ONLY — NEVER MERGE INTO PRODUCTION
+  // Deliberately ignores the real nvsOk/fsOk/heapOk result computed above
+  // (which is still logged normally) and forces failure instead, so that
+  // this function is reached and returns false only in the exact same
+  // circumstance the real check would have run in: a genuine PENDING_VERIFY
+  // boot with matching OTA metadata (see runPostOtaValidation()'s call
+  // site, unmodified on this branch). Every other boot path never calls
+  // runHealthCheck() at all, so ordinary boot behavior is unaffected.
+  Serial.println("[TEST] FORCED OTA HEALTH CHECK FAILURE");
+  return false;
+#endif
+
   return nvsOk && fsOk && heapOk;
 }
 
