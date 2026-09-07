@@ -143,6 +143,22 @@ bool decodeKeyConfig(const uint8_t* data, size_t len, EnigmaKeyConfig* outKey) {
   }
   if (outKey->rotor_count > EnigmaCrypto::kMaxRotors) return false;
   if (outKey->plugboard_pair_count > EnigmaCrypto::kMaxPlugboardPairs) return false;
+
+  // Defense against a malformed/hostile peer: rotor_type and plugboard_pairs
+  // bytes are used directly as array indices in EnigmaCrypto::run()'s cipher
+  // pipeline (kRotorWiring/kRotorNotch/kReflectorB lookups) and in the
+  // Reveal screen's kNames[] lookup, neither of which re-validates this key
+  // -- an out-of-range value here would otherwise be an out-of-bounds array
+  // access the moment this key is used, not caught anywhere else on the
+  // receive path.
+  for (uint8_t i = 0; i < outKey->rotor_count; i++) {
+    if (outKey->rotor_type[i] >= EnigmaCrypto::kRotorTypeCount) return false;
+  }
+  for (uint8_t i = 0; i < outKey->plugboard_pair_count; i++) {
+    char a = outKey->plugboard_pairs[i][0];
+    char b = outKey->plugboard_pairs[i][1];
+    if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') return false;
+  }
   return true;
 }
 

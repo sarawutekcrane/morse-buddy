@@ -681,8 +681,18 @@ void handleRaceSolvedPacket(const char* group_code, const char* topic, const uin
 void handleRaceResetPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
   (void)group_code;
   (void)topic;
-  (void)payload;
-  (void)payloadLen;
+  // publishReset() carries the sender's own g_inviteId as the entire
+  // payload; every other Race packet handler validates inviteId/roundId
+  // against our own room before acting (a stale/foreign event is otherwise
+  // ignored per Addendum "stale Race event"). This one didn't -- a RESET
+  // published by a completely different, unrelated room in the same group
+  // (e.g. its owner going offline) would wipe an uninvolved device's own
+  // active room. Reject anything that isn't for our current room.
+  if (payloadLen < kIdLen || g_phase == RoomPhase::NO_LOBBY) return;
+  char inviteId[kIdLen];
+  memcpy(inviteId, payload, kIdLen);
+  inviteId[kIdLen - 1] = '\0';
+  if (strcmp(inviteId, g_inviteId) != 0) return;
   applyReset();
 }
 

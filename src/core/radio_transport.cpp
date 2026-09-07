@@ -339,6 +339,18 @@ void handleRadioBusyPacket(const char* group_code, const char* topic, const uint
     // busy is denied.
     bool sameClaimant = g_receiverBusy.busy && strcmp(g_receiverBusy.claimerDeviceId, claimer) == 0;
     if (!g_receiverBusy.busy || sameClaimant) {
+      // A same-claimant re-claim with a DIFFERENT session_id means the
+      // caller's previous session was abandoned without a RELEASE (e.g. a
+      // WiFi drop mid-call) and they are now redialing. Our own callee-side
+      // g_call for that stale session would otherwise still be sitting in
+      // NEGOTIATING/UDP_DIRECT/MQTT_FALLBACK and reject the upcoming
+      // SESSION_START (session_id mismatch) until g_receiverBusy's TTL
+      // sweep eventually clears it -- tear it down proactively here, the
+      // same way an explicit RELEASE or that TTL sweep already would, so
+      // the fresh call is not silently blocked.
+      if (sameClaimant && strcmp(g_receiverBusy.sessionId, sessionId) != 0) {
+        releaseCalleeCallIfMatches(claimer, g_receiverBusy.sessionId);
+      }
       g_receiverBusy.busy = true;
       strncpy(g_receiverBusy.claimerDeviceId, claimer, sizeof(g_receiverBusy.claimerDeviceId) - 1);
       strncpy(g_receiverBusy.sessionId, sessionId, sizeof(g_receiverBusy.sessionId) - 1);

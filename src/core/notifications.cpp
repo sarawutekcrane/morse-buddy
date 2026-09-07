@@ -78,6 +78,23 @@ bool hasBadge(uint8_t mask) {
   return false;
 }
 
+// MessageStore::setOnEvictedCallback's own doc comment says this exists "so
+// Notifications can decrement its per-conversation summary" -- without
+// wiring it up here, an UNREAD record evicted by the 300-message FIFO cap or
+// global low-space cleanup left its summary's unread_count permanently
+// stuck (the evicted message can never again be reached by clearUnread(),
+// since it no longer exists), which could pin the Main Menu badge on
+// indefinitely. `flags` is the evicted record's own header flags, captured
+// before removal, so no re-read of the now-deleted file is needed.
+void onMessageEvicted(const MessageRef& ref, uint16_t flags) {
+  if (!(flags & MessageStore::FLAG_UNREAD)) return;
+  Summary* s = findSummary(ref.group_code, ref.contact_key);
+  if (s != nullptr && s->unread_count > 0) {
+    s->unread_count--;
+    saveSummaries();
+  }
+}
+
 bool g_raceInvitePending = false;
 
 void onSettingsChanged(const SettingsChangeInfo& info) {
@@ -95,6 +112,7 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
 void serviceInit() {
   loadSummaries();
   registerSettingsChangeHook(onSettingsChanged);
+  MessageStore::setOnEvictedCallback(onMessageEvicted);
   Menu::registerMainMenuBadge(MainMenuIndex::TEXT, hasAnyUnreadText);
   Menu::registerMainMenuBadge(MainMenuIndex::ENIGMA, hasAnyUnreadEnigma);
   Menu::registerMainMenuBadge(MainMenuIndex::TRAINING_GAME, hasAnyUnreadTrainingGame);

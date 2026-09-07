@@ -583,8 +583,14 @@ void startRevealFlow(const MessageRef& ref, const StoredMessageView& view) {
   g_revealRef = ref;
   char ciphertext[EnigmaCrypto::kMaxEscapedLen + 1];
   uint32_t fp, gen;
-  EnigmaKeys::decodeEnigmaPayload(view.typePayload, view.typePayloadLen, ciphertext, sizeof(ciphertext), &fp, &gen,
-                                  &g_revealedKey);
+  if (!EnigmaKeys::decodeEnigmaPayload(view.typePayload, view.typePayloadLen, ciphertext, sizeof(ciphertext), &fp,
+                                       &gen, &g_revealedKey)) {
+    // Malformed/corrupt payload: fail safe to an empty key (0 rotors, 0
+    // plugboard pairs) rather than leaving g_revealedKey holding whatever
+    // out-of-range bytes decodeKeyConfig() rejected -- screenReveal() would
+    // otherwise index kNames[] with an unvalidated rotor_type.
+    memset(&g_revealedKey, 0, sizeof(g_revealedKey));
+  }
 }
 
 void screenReveal() {
