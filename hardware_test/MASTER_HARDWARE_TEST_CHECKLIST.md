@@ -58,7 +58,7 @@ HW-E2E-###     Final end-to-end integration
 | Bench PSU (optional) | recommended | controlled power-loss tests (Section 30) without abusing a real battery |
 | WiFi access point with Internet access | 1 | MQTT to `broker.hivemq.com:1883`, OTA HTTPS to `sarawutekcrane.github.io` |
 | MQTT reachability | via the AP's Internet | `broker.hivemq.com:1883` is a **public, unencrypted (plain MQTT, not MQTTS)** broker — note for testers, not a defect to fix here |
-| A way to serve local files for OTA failure-fixture testing (Section 27) | recommended (e.g. a temporary local HTTPS server or a scratch path on the same GitHub Pages repo) | `ota_test_cases/` manifests need to be fetched by the device from *some* HTTPS origin with a valid cert chain — the device never trusts an unverified/self-signed server (`setCACert`, no `setInsecure()`) |
+| Write access to the live `morse-buddy-ota` GitHub Pages repo (Section 27) | **required** | **Corrected**: the production firmware has no configurable manifest URL — `OtaConfig::kBaseUrl` + `kManifestPath` are compile-time constants pointing only at `https://sarawutekcrane.github.io/morse-buddy-ota/manifest.txt`. There is no scratch-path or alternate-server option on the device. Every OTA failure-fixture test (Section 27) requires *temporarily replacing that exact live file* with one fixture at a time, then restoring the known-good manifest immediately after — see **OTA TEST MANIFEST SWAP PROCEDURE** before Section 27 |
 
 ### Minimum device count by feature
 
@@ -710,14 +710,136 @@ path=/morse-buddy-ota/releases/1.0.2/firmware-1.0.2-build3.bin
 
 ---
 
+## OTA TEST MANIFEST SWAP PROCEDURE (read before running Section 27)
+
+**Corrected in this revision.** An earlier version of this document
+stated that OTA failure fixtures could be tested via a separate
+"scratch manifest path," implying the device could be pointed at some
+alternate URL for testing. **That is incorrect and has been removed.**
+The production firmware has no manifest-selection mechanism: `Ota`'s
+`kBaseUrl`/`kManifestPath` (`src/ota/ota_config.h`) are compile-time
+constants, and `runCheckForUpdateBlocking()`/`fetchManifest()` always
+fetch exactly one URL:
+
+```
+https://sarawutekcrane.github.io/morse-buddy-ota/manifest.txt
+```
+
+There is no build flag, Settings screen, or Serial command that changes
+this. The **only** way to exercise a Section 27 fixture on real hardware
+is to temporarily overwrite that exact live file with the fixture's
+`manifest.txt`, run the one test it is for, and then restore the real
+manifest before doing anything else. This is a live, shared, public
+resource — every device configured to check for updates (test hardware
+or otherwise) will see whatever is published there for as long as it is
+live. Treat every fixture deployment as a small, deliberate outage
+window on production infrastructure, not a passive read.
+
+### 1. Pre-test verification
+
+1. `curl -s https://sarawutekcrane.github.io/morse-buddy-ota/manifest.txt`
+   and save the output to a local file (e.g. `known_good_manifest.txt`).
+   Do this **even if you believe you already know what is live** — this
+   is your only proof of the exact bytes to restore afterward.
+2. Confirm the saved manifest is well-formed (`MBOTA1` magic, all 6
+   mandatory fields, plausible `version=`/`build=`) and matches whichever
+   build is the current intended server baseline (Build 1 at the time of
+   this writing; see the note at the end of this procedure for later in
+   the sequence).
+3. Confirm you have exactly one fixture selected from `ota_test_cases/`
+   for this run — never queue multiple fixtures for one swap.
+
+### 2. Fixture deployment
+
+4. Copy the selected fixture's `ota_test_cases/<NN_name>/manifest.txt`
+   over the live file at `/morse-buddy-ota/manifest.txt` in the GitHub
+   Pages repo (commit + push, or the repo's normal publish path) —
+   nothing else in the repo changes. For fixtures that also need a real
+   firmware binary reachable (01, 02, 13, 14, 15 per Section 27's table),
+   confirm that binary is already hosted at the path the fixture's
+   manifest references **before** publishing the manifest — never publish
+   a manifest whose firmware isn't there yet (same ordering rule as
+   Section 23/25's real releases).
+5. Publish the change.
+
+### 3. Online verification
+
+6. Wait for GitHub Pages to redeploy (typically under a minute, but
+   confirm rather than assume).
+7. `curl -s https://sarawutekcrane.github.io/morse-buddy-ota/manifest.txt`
+   again and diff it byte-for-byte against the fixture file you intended
+   to deploy. **Do not proceed to the hardware test until this matches
+   exactly** — GitHub Pages caching can serve a stale file for a short
+   window after a push.
+
+### 4. Hardware test
+
+8. Run **exactly one** ESP32 hardware test (the single Section 27 row
+   this fixture exists for) against the now-live fixture manifest.
+9. Record the result immediately per `TEST_RESULT_TEMPLATE.md` — screen
+   text, Serial log lines, running build after, PASS/FAIL.
+
+### 5. Restore procedure
+
+10. Immediately after recording the result — before starting any other
+    task, before lunch, before anything — overwrite
+    `/morse-buddy-ota/manifest.txt` with the known-good manifest saved in
+    step 1 (or the file described below) and publish that.
+
+### 6. Post-restore verification
+
+11. `curl -s https://sarawutekcrane.github.io/morse-buddy-ota/manifest.txt`
+    one more time and confirm it byte-for-byte matches the known-good
+    manifest from step 1. Do not consider the swap cycle complete, and do
+    not start the next fixture, until this check passes.
+
+### 7. Emergency restore procedure
+
+If a test session is interrupted (crash, power loss, called away) while
+a fixture manifest is still live: treat restoring the known-good manifest
+as the single highest-priority action before anything else, including
+before writing up results. If the saved `known_good_manifest.txt` from
+step 1 is unavailable, use the Build 1 known-good manifest reproduced
+below rather than leaving a failure fixture live indefinitely.
+
+**NEVER leave a failure-test fixture as the live manifest after
+testing.** Every device that checks for updates while a fixture is live
+— including any hardware not currently part of your test session — will
+see it.
+
+### Current frozen Build 1 known-good restore manifest
+
+```
+MBOTA1
+version=1.0.0
+build=1
+hardware=MORSE_BUDDY_ESP32_114_V1
+size=1128816
+sha256=3901180d5fc4ce898ea47a1f774c11b03b8a78e39108e2ab2444ce4ce8fc761f
+path=/morse-buddy-ota/releases/1.0.0/firmware-1.0.0-build1.bin
+```
+
+**This is only correct while Build 1 is the intended server baseline.**
+Once Section 23 (Publish Build 2) has actually been executed and Build 2
+becomes the intended baseline, the restore manifest for every subsequent
+fixture-swap cycle must be Build 2's real manifest instead — and again
+Build 3's after Section 25. Always use step 1's freshly-`curl`'d copy of
+whatever is live *before* your first swap of that session as the
+authoritative restore target; the Build 1 text above is a documented
+fallback for the current baseline, not a permanent constant.
+
+---
+
 ## SECTION 27 — OTA Failure Fixtures (`ota_test_cases/01`–`17`)
 
-For every fixture: point the device's Check-for-Update at a server
-serving that exact `manifest.txt` (a scratch path, not the live
-`morse-buddy-ota` manifest — never modify the published manifest for
-these tests). All expected behavior below is exactly what
-`ota_test_cases/README.md` traced from source in the prior session —
-reproduced here as hardware test entries.
+For every fixture: follow the **OTA TEST MANIFEST SWAP PROCEDURE** above
+in full — verify and save the current live manifest, publish the one
+fixture, verify it online, run the single hardware test it exists for,
+record the result, then immediately restore and re-verify the known-good
+manifest before touching the next fixture. Never batch multiple fixtures
+into one live-manifest window. All expected behavior below is exactly
+what `ota_test_cases/README.md` traced from source in the prior session
+— reproduced here as hardware test entries.
 
 | Test ID | Fixture | Starting build | Server fixture needed | Expected parser result | Screen message | Serial | Firmware HTTP? | `Update.begin`? | Flash write? | Reboot? | Running build after |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -923,14 +1045,19 @@ few times as possible:
     scenario H for after Section 24)
 21. Build 1 no-update test (Section 22) — confirm this **before**
     touching the live manifest at all
-22. OTA failure fixtures that need no firmware replacement — i.e. every
-    row in Section 27 except 01/02/13/14/15 (Section 27, parser-only
-    subset)
+22. OTA failure fixtures that don't need a real firmware binary hosted —
+    i.e. every row in Section 27 except 01/02/13/14/15 (the parser-only
+    subset). Even though no `.bin` is needed for these, each one is still
+    a full **OTA TEST MANIFEST SWAP PROCEDURE** cycle against the one
+    real live manifest URL — save known-good, publish the one fixture,
+    verify online, run the one test, restore, verify restore — one
+    fixture at a time, never batched
 23. Publish Build 2 (Section 23 — first real write to the live OTA host)
 24. OTA Build 1→2 (Section 24), including memory scenario H now
 25. Build 2 persistence checks (Section 31, first half)
 26. Remaining Section 27 fixtures that need Build 2 actually hosted
-    (02, 13, 14)
+    (02, 13, 14) — same one-fixture-at-a-time swap procedure; the
+    restore target for these is now Build 2's real manifest, not Build 1's
 27. Manual rollback test (Section 29) — while still easy to get back to
     Build 2 if needed
 28. Automatic rollback (Section 28) — only if/when an induction method
@@ -939,7 +1066,8 @@ few times as possible:
     everything else about OTA is known-good
 30. Publish Build 3 (Section 25)
 31. OTA Build 2→3 (Section 26) — proves the other slot direction
-32. Section 27's remaining Build-3-dependent row (15)
+32. Section 27's remaining Build-3-dependent row (15) — same swap
+    procedure; the restore target is now Build 3's real manifest
 33. Repeated-operation/leak tests (Section 32)
 34. Final end-to-end integration (Section 33)
 
@@ -948,4 +1076,7 @@ test, does the Build-1 no-update check (step 21) before any manifest
 change, and defers both rollback categories (steps 27–28) and power-loss
 testing (step 29) until the "happy path" OTA is already proven — so a
 failure there is unambiguously about rollback/failure-recovery, not a
-basic OTA defect.
+basic OTA defect. Steps 22, 26, and 32 each touch the one live production
+manifest repeatedly — every single fixture within those steps is its own
+complete OTA TEST MANIFEST SWAP PROCEDURE cycle, restored before the next
+one begins.

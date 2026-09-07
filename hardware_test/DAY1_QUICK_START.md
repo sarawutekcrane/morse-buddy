@@ -90,7 +90,12 @@ master checklist's Section 35 recommended execution order.
 ## Do not on Day 1
 
 - Do not flash Build 2 or Build 3 directly.
-- Do not touch the OTA server or `manifest.txt`.
+- Do not touch the OTA server or `manifest.txt` on Day 1. When OTA failure
+  fixtures are tested later, the only real procedure is temporarily
+  replacing the one live manifest at `/morse-buddy-ota/manifest.txt` and
+  restoring it immediately after — see **OTA TEST MANIFEST SWAP
+  PROCEDURE** in `MASTER_HARDWARE_TEST_CHECKLIST.md` before Section 27.
+  There is no separate scratch server the device can be pointed at.
 - Do not attempt rollback or power-loss-during-OTA testing before the
   happy-path OTA flow (Sections 22–26) is proven on hardware.
 - Do not modify firmware source to work around a failure — record it as a

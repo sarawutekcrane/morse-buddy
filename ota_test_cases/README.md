@@ -1,9 +1,50 @@
 # Morse Buddy OTA Failure Test Fixtures
 
 Local-only manifest fixtures for testing the Phase 5 OTA client once ESP32
-hardware is available. **Nothing here is published.** These are inputs you
-point a test HTTP server (or a modified local copy of the real host layout)
-at — they are never uploaded to `morse-buddy-ota` / GitHub Pages.
+hardware is available. **Nothing here is published yet — these files sit
+in the repository only until a hardware test session actually needs one.**
+
+## Corrected: how these fixtures actually get tested on hardware
+
+An earlier version of this note said fixtures would be served from a
+separate "scratch" HTTP path or a modified local copy of the host layout.
+**That is incorrect and has been corrected.** The production firmware has
+no configurable manifest source — `OtaConfig::kBaseUrl` +
+`kManifestPath` (`src/ota/ota_config.h`) are compile-time constants, and
+the device only ever fetches:
+
+```
+https://sarawutekcrane.github.io/morse-buddy-ota/manifest.txt
+```
+
+There is no scratch-path, alternate-host, or Settings-selectable option.
+The only way to exercise one of these fixtures on real hardware is to
+**temporarily overwrite that exact live file** with the fixture's
+`manifest.txt`, run the one hardware test it exists for, and immediately
+restore the real (known-good) manifest before doing anything else. The
+full procedure — pre-test verification, fixture deployment, online
+verification via `curl`, the single hardware test, restore, post-restore
+verification, and an emergency-restore procedure — is documented in
+`hardware_test/MASTER_HARDWARE_TEST_CHECKLIST.md` under **OTA TEST
+MANIFEST SWAP PROCEDURE** (immediately before that document's Section
+27). Read it in full before deploying any fixture below. In short:
+
+1. Save the currently live manifest (`curl` it, don't assume).
+2. Publish exactly one fixture as the live manifest.
+3. Verify the live URL matches the fixture byte-for-byte.
+4. Run exactly the one ESP32 hardware test this fixture is for.
+5. Record the result.
+6. Immediately restore the known-good manifest and verify the restore
+   online.
+
+**NEVER leave a failure-test fixture as the live manifest after
+testing** — every device that checks for updates while a fixture is
+live will see it, not just your test hardware. The known-good manifest
+to restore is whichever build is the current intended server baseline
+(Build 1 at the time of this writing; Build 2 after Section 23 is
+executed; Build 3 after Section 25) — always confirmed via `curl`
+immediately before your first swap of a session, never assumed from
+memory.
 
 ## How the current source actually behaves (traced from `src/ota/*`, not assumed)
 
