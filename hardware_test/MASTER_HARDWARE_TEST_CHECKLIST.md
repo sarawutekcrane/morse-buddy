@@ -872,8 +872,13 @@ exercise them.
 
 ## SECTION 28 — Automatic Rollback
 
+**Corrected in this revision.** An earlier version of this section said
+no induction method existed and marked it TBD. **A dedicated induction
+method now exists** and is documented below — none of the `HW-RB-*`
+entries in this section are TBD any longer.
+
 Traced end-to-end from `ota_manager.cpp::runPostOtaValidation()`
-(audited this session):
+(audited in a prior session turn, unchanged since):
 
 - `esp_ota`'s `PENDING_VERIFY` state is checked independently every
   boot; combined with this device's own `otaPending`/`otaTgtBuild`
@@ -887,33 +892,180 @@ Traced end-to-end from `ota_manager.cpp::runPostOtaValidation()`
   `prevBuild`/`lastFailBuild`/`targetBuild` clears `otaPending`,
   **retains** `otaLastFail`, and takes no further rollback action.
 
-**Forcing a genuine health-check failure safely, without modifying
-firmware source or creating a new build, has no supported mechanism in
-the current source.** `runHealthCheck()` checks three real conditions
-(`Storage::wifi().isKey("slots")`, `LittleFS.totalBytes() > 0`,
-`ESP.getFreeHeap() > 10*1024`) — there is no compile-time or
-Settings-exposed way to deliberately fail one of these using only the
-already-frozen Build 1/2/3 binaries, and this plan is explicitly
-forbidden from creating a Build 4 or modifying source to add a test
-hook. Per your own instruction, this is marked:
+### Induction method: dedicated test firmware (Build 9001)
 
-**HW-RB-000 — Induction method: TBD.** Do not attempt an uncontrolled
-method (e.g. corrupting flash by hand, physically damaging the WiFi
-credential store) to force this. If automatic-rollback testing is
-required before a future build adds a deliberate test hook, that
-decision should be made explicitly, not worked around here.
+A separate, isolated Git branch — `test/ota-rollback-health-fail`,
+branched from the frozen `v1.0.0-build1` tag (commit
+`8236e98644075b1bd5ed329fc8eb7b916c4e9531`) — carries a **TEST ONLY,
+never-merge-into-production** firmware image built solely to exercise
+this section:
 
-Once an induction method exists (future decision), the following remain
-valid regardless of *how* failure is induced:
+| Field | Value |
+|---|---|
+| Version | `1.0.0-RBTEST` |
+| Build | `9001` |
+| Hardware | `MORSE_BUDDY_ESP32_114_V1` (unchanged) |
+| Firmware size | `1128800` bytes |
+| SHA-256 | `74825f657e4442add91bbf165d2ac567b1f11d11e9a850a57d1a9c989aef02bd` |
+| Server firmware path (once published) | `/morse-buddy-ota/test/rollback/firmware-rbtest-build9001.bin` |
+
+Build 9001 exists specifically so a persisted `otaLastFail=9001` can
+never be confused with, or affect, production Build 2 (`build=2`) or
+Build 3 (`build=3`) — see PASS criteria below.
+
+**What the test firmware actually changes**, confirmed by source diff
+against the frozen baseline (only 2 files, `firmware_version.h` and
+`ota_manager.cpp`, touched — `runPostOtaValidation()` itself,
+`verifyRollbackLater()`, the anti-loop metadata logic, `partitions.csv`,
+and NVS layout are all byte-for-byte unchanged from Build 1):
+
+- `runHealthCheck()` still computes and logs the real
+  `nvsOk`/`fsOk`/`heapOk` result exactly as production does, but under a
+  branch-only `OTA_TEST_FORCE_HEALTH_CHECK_FAIL` compile-time constant
+  (no runtime, remote, MQTT, or web trigger — it cannot be toggled from
+  a running device) it then unconditionally returns `false` and prints:
+  ```
+  [TEST] FORCED OTA HEALTH CHECK FAILURE
+  ```
+- This is only reached in the exact same circumstance the real check
+  would run in — a genuine `PENDING_VERIFY` boot with matching OTA
+  metadata — so ordinary boot behavior is unaffected on this test image,
+  and the test hook **never calls rollback directly**. The existing,
+  unmodified `runPostOtaValidation()` receives `healthy == false` from
+  this call exactly as it would from a real failure, and takes its own
+  normal production path from there: persists `otaLastFail = 9001`,
+  logs `[ota] post-update health check FAILED`, then calls the real
+  `esp_ota_mark_app_invalid_rollback_and_reboot()`.
+
+**This test firmware must never be flashed directly via USB as a
+substitute for Build 1**, and must never be merged into the production
+branch. It is reached only via a real OTA hop from a running Build 1
+device, exactly like any other release — see the sequence below.
+
+### Rollback test sequence (future hardware procedure)
+
+Prerequisites before starting: an ESP32 is running the frozen Build 1
+image (known healthy, per Section 22's no-update test having already
+passed), and the live manifest at `/morse-buddy-ota/manifest.txt` has
+been restored and verified as the Build 1 manifest per the **OTA TEST
+MANIFEST SWAP PROCEDURE** (before Section 27). This section reuses that
+same swap-and-restore discipline — Build 9001 is never left as the live
+manifest any longer than the single test requires.
+
+1. Upload the RBTEST binary to the server path above, then verify the
+   firmware URL returns HTTP 200 (same ordering rule as every other
+   release: firmware reachable before any manifest references it).
+2. Verify its `Content-Length` header equals **1128800** bytes.
+3. Download it back and independently recompute SHA-256; confirm it
+   equals `74825f657e4442add91bbf165d2ac567b1f11d11e9a850a57d1a9c989aef02bd`.
+4. Temporarily replace the root live manifest
+   (`/morse-buddy-ota/manifest.txt`) with the Build 9001 manifest:
+   ```
+   MBOTA1
+   version=1.0.0-RBTEST
+   build=9001
+   hardware=MORSE_BUDDY_ESP32_114_V1
+   size=1128800
+   sha256=74825f657e4442add91bbf165d2ac567b1f11d11e9a850a57d1a9c989aef02bd
+   path=/morse-buddy-ota/test/rollback/firmware-rbtest-build9001.bin
+   ```
+5. Verify the online manifest via `curl` byte-for-byte before touching
+   the device (same rule as the swap procedure — never assume, always
+   verify).
+6. On the ESP32 running Build 1, open Settings → System → Firmware
+   Update → Check for Update.
+7. Confirm Build 9001 (`1.0.0-RBTEST`) is offered as `New Firmware
+   Available`.
+8. Confirm the update ("Update").
+9. Confirm the firmware downloads and writes successfully (progress
+   shown, `Update.end()` succeeds — same happy-path mechanics as
+   Section 24, just with this manifest).
+10. Confirm the device reboots into Build 9001 in `PENDING_VERIFY`
+    state (same `esp_ota` state Section 24's Build 2 install reaches).
+11. Confirm Serial contains exactly:
+    ```
+    [TEST] FORCED OTA HEALTH CHECK FAILURE
+    ```
+12. Confirm the existing, unmodified `runPostOtaValidation()` reports
+    the health failure: Serial shows `[ota] post-update health check
+    FAILED` immediately after line 11's output.
+13. Confirm the bootloader/application rollback path returns the device
+    to Build 1: `esp_ota_mark_app_invalid_rollback_and_reboot()` fires,
+    device reboots, `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` (confirmed
+    real on this pinned toolchain) selects the previous slot.
+14. Confirm the running version/build is `1.0.0` / `Build 1` again on
+    the Firmware Update screen.
+15. Confirm `otaLastFail` (NVS `mb_core`/`otaLastFail`) now reads `9001`
+    — check via the same mechanism used for HW-OTA-12-006/HW-RB earlier
+    audits (a temporary Serial print or the Firmware Update screen's own
+    "previously failed" warning in step 17).
+16. Confirm the **next** normal reboot (plain power cycle, not another
+    OTA attempt) stays on Build 1 and does **not** bounce back to Build
+    9001 — repeat across ≥5 power cycles, watching for any
+    `ota_0`↔`ota_1` oscillation.
+17. While the server still advertises Build 9001 (manifest not yet
+    restored), open Check for Update again and confirm the
+    `UPDATE_AVAILABLE_PREV_FAILED` screen (`This firmware previously
+    failed` / `Retry Update` / `Cancel`, default `Cancel`) appears —
+    this is the same source path exercised by
+    `runCheckForUpdateBlocking()`'s `lastFail`/`g_lastManifest.build`
+    comparison used throughout Section 27.
+18. Immediately restore the intended known-good server manifest (Build
+    1's, per the OTA TEST MANIFEST SWAP PROCEDURE — **never leave Build
+    9001 live longer than this one test requires**).
+19. Verify the restored manifest online via `curl`, byte-for-byte,
+    before considering the test session's manifest swap complete.
+20. Confirm production Build 2 is not poisoned by the failed Build 9001:
+    with the live manifest now advertising a real Build 2 (whenever that
+    section of testing is reached), confirm Check for Update on a Build
+    1 device offers plain `UPDATE_AVAILABLE` for Build 2 (not the
+    `_PREV_FAILED` variant) — `otaLastFail=9001` only ever matches a
+    manifest whose `build==9001`, per `g_lastManifest.build == lastFail`
+    in `runCheckForUpdateBlocking()`, so an unrelated build number can
+    never trigger that warning by coincidence.
+
+### PASS criteria
+
+- **Automatic rollback occurred**: step 13's reboot lands back on Build
+  1 without any manual rollback action (`Update.rollBack()` from
+  Section 29 is never invoked in this sequence).
+- **Previous Build 1 remained bootable**: step 14 confirms the Firmware
+  Update screen reports `1.0.0` / `Build 1`, and the device is otherwise
+  fully usable (not stuck in a recovery/error state).
+- **No `ota_0`/`ota_1` oscillation**: step 16 holds across ≥5 power
+  cycles with no bounce back to Build 9001.
+- **`last_failed_ota_build` = 9001**: step 15's NVS read confirms this
+  exact value, distinct from any production build number.
+- **Production Build 2/3 remain eligible later**: step 20 confirms a
+  real Build 2 (or Build 3) offer is never suppressed or mis-flagged as
+  previously-failed because of the unrelated Build 9001 failure record.
+- **Persistent NVS/LittleFS data remain intact**: repeat the Section 31
+  persistence table (Settings, WiFi slots, Family Groups, Recent
+  contacts, Enigma keys, Notifications, Solo state, Text history,
+  pending Outbox message) across this entire sequence — the RBTEST
+  install and the subsequent rollback each only ever write to an OTA app
+  partition, never to `nvs`/`littlefs`, exactly like every other OTA
+  hop in this document.
 
 | Test ID | Procedure | Expected result | PASS criteria |
 |---|---|---|---|
-| HW-RB-001 | Induce failure on a Build N→N+1 OTA (method TBD) | `otaLastFail` persisted before rollback | Confirm via Serial before the forced reboot |
-| HW-RB-002 | Device reboots after `esp_ota_mark_app_invalid_rollback_and_reboot()` | Bootloader selects the previous slot (confirmed real: `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` on this exact pinned toolchain) | Device boots build N again |
-| HW-RB-003 | Recovery boot | `otaPending` cleared, `otaLastFail` retained, no further rollback | Confirm via Serial: `automatic rollback recovery succeeded` |
-| HW-RB-004 | Next normal reboot (power cycle) | Does not bounce back to the failed slot | Stays on build N indefinitely |
-| HW-RB-005 | Check for Update again, server still advertises the failed build N+1 | Screen shows `This firmware previously failed` / `Retry Update` / `Cancel`, default Cancel | Warning shown correctly |
-| HW-RB-006 | Confirm no `ota_0`↔`ota_1` oscillation across repeated boots | Running build stays N | No flip-flopping observed over ≥5 power cycles |
+| HW-RB-000 | Confirm starting condition: device on known-healthy Build 1, live manifest verified as Build 1 | Preconditions match Section 22/OTA TEST MANIFEST SWAP PROCEDURE state | Confirmed before proceeding to HW-RB-001 |
+| HW-RB-001 | Sequence steps 1–2: RBTEST firmware URL returns HTTP 200, `Content-Length` = 1128800 | Firmware reachable at the expected size before any manifest references it | Both checks pass |
+| HW-RB-002 | Sequence step 3: download RBTEST binary, recompute SHA-256 | Matches `74825f657e4442add91bbf165d2ac567b1f11d11e9a850a57d1a9c989aef02bd` | Exact match |
+| HW-RB-003 | Sequence steps 4–5: swap live manifest to Build 9001, verify online via `curl` | Manifest matches the fixture byte-for-byte | Confirmed before touching the device |
+| HW-RB-004 | Sequence steps 6–7: Check for Update on the Build 1 device | Build 9001 offered as `New Firmware Available` | Correct version/build shown |
+| HW-RB-005 | Sequence steps 8–9: confirm Update, observe download/write | `Update.end()` succeeds, no error screen | Progress completes normally |
+| HW-RB-006 | Sequence step 10: reboot | Device reboots into Build 9001, `esp_ota` reports `PENDING_VERIFY` | Confirmed via the same mechanism as HW-OTA-12-008 |
+| HW-RB-007 | Sequence step 11: inspect Serial immediately after reboot | Serial contains exactly `[TEST] FORCED OTA HEALTH CHECK FAILURE` | Line present, verbatim |
+| HW-RB-008 | Sequence step 12: confirm `otaLastFail` persisted before rollback | Serial shows `[ota] post-update health check FAILED`; NVS write happens before the rollback call (source-level fact, `nvsSetLastFailBuild()` precedes `esp_ota_mark_app_invalid_rollback_and_reboot()`) | Ordering confirmed via Serial sequence |
+| HW-RB-009 | Sequence step 13: device reboots after `esp_ota_mark_app_invalid_rollback_and_reboot()` | Bootloader selects the previous slot (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, confirmed real on this pinned toolchain) | Device boots Build 1 again |
+| HW-RB-010 | Sequence step 14: confirm running identity | Firmware Update screen shows `Current: v1.0.0` / `Build: 1` | Matches Build 1 exactly |
+| HW-RB-011 | Sequence step 15: read `otaLastFail` | NVS `mb_core`/`otaLastFail` = 9001 | Exact value confirmed |
+| HW-RB-012 | Sequence step 16: repeat power cycles ≥5× | Stays on Build 1 every time | No `ota_0`↔`ota_1` oscillation observed |
+| HW-RB-013 | Sequence step 17: Check for Update while server still advertises 9001 | `UPDATE_AVAILABLE_PREV_FAILED` screen: `This firmware previously failed` / `Retry Update` / `Cancel`, default `Cancel` | Warning shown correctly, default selection is Cancel |
+| HW-RB-014 | Sequence step 18: restore known-good manifest immediately | Live manifest matches the intended baseline again | Restore performed without delay |
+| HW-RB-015 | Sequence step 19: verify restored manifest via `curl` | Byte-for-byte match to the intended known-good manifest | Confirmed online before ending the test session |
+| HW-RB-016 | Sequence step 20: confirm Build 2/3 not poisoned | A later, real Build 2/3 offer shows plain `UPDATE_AVAILABLE`, never `_PREV_FAILED` | `otaLastFail=9001` never matches an unrelated build number |
 
 ---
 
@@ -1060,8 +1212,11 @@ few times as possible:
     restore target for these is now Build 2's real manifest, not Build 1's
 27. Manual rollback test (Section 29) — while still easy to get back to
     Build 2 if needed
-28. Automatic rollback (Section 28) — only if/when an induction method
-    is decided; otherwise skip with TBD noted
+28. Automatic rollback (Section 28) — using the `test/ota-rollback-health-fail`
+    (Build 9001) induction method now documented there; run this only
+    after Build 2 is confirmed working (step 24), since it needs a
+    known-healthy Build 1 device and a full manifest-swap/restore cycle
+    of its own, separate from any production release
 29. Power-loss tests (Section 30) — last among the risky tests, once
     everything else about OTA is known-good
 30. Publish Build 3 (Section 25)
