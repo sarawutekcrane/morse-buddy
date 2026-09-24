@@ -240,7 +240,12 @@ void ListMenu::tick(const char* title) {
 namespace {
 ConfirmPromptConfig g_confirmConfig;
 bool g_confirmYesSelected = true;
-bool g_confirmDirty = true;
+
+// Hardware Fix #3A: full draw only on first entry (startConfirmPrompt());
+// a Yes/No toggle redraws only the selector row below -- the prompt
+// text/title area is drawn once and never touched again.
+bool g_confirmNeedsFullRedraw = true;
+bool g_confirmLastYesSelected = true;
 }  // namespace
 
 namespace Menu {
@@ -248,7 +253,7 @@ namespace Menu {
 void startConfirmPrompt(const ConfirmPromptConfig& config) {
   g_confirmConfig = config;
   g_confirmYesSelected = config.defaultYes;
-  g_confirmDirty = true;
+  g_confirmNeedsFullRedraw = true;
 }
 
 void confirmPromptScreen() {
@@ -257,7 +262,6 @@ void confirmPromptScreen() {
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE) {
       g_confirmYesSelected = !g_confirmYesSelected;
-      g_confirmDirty = true;
     } else if (Input::isMenuConfirm(e)) {
       if (g_confirmYesSelected) {
         if (g_confirmConfig.onYes != nullptr) g_confirmConfig.onYes();
@@ -275,22 +279,38 @@ void confirmPromptScreen() {
 
   // This modal never clears/owns the status bar row itself, but it's still
   // visible underneath it, so keep it live every tick regardless of the
-  // content-area dirty gate below (Hardware Fix #1 correction).
+  // content-area gate below (Hardware Fix #1 correction).
   Display::drawStatusBar();
-  if (!g_confirmDirty) return;
-  g_confirmDirty = false;
+
+  bool firstDraw = g_confirmNeedsFullRedraw;
+  bool selectionChanged = !firstDraw && (g_confirmYesSelected != g_confirmLastYesSelected);
+  if (!firstDraw && !selectionChanged) return;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
   int16_t y = Display::kStatusBarHeight + 4;
-  Display::printLine(2, y, g_confirmConfig.line1);
-  y += lh;
-  if (g_confirmConfig.line2 != nullptr) {
-    Display::printLine(2, y, g_confirmConfig.line2);
+  int16_t selectorY = static_cast<int16_t>(y + lh + (g_confirmConfig.line2 != nullptr ? lh : 0) + 8);
+  const char* selectorText = g_confirmYesSelected ? "> Yes    No" : "  Yes  > No";
+
+  if (firstDraw) {
+    Display::clearContentArea();
+    Display::printLine(2, y, g_confirmConfig.line1);
     y += lh;
+    if (g_confirmConfig.line2 != nullptr) {
+      Display::printLine(2, y, g_confirmConfig.line2);
+      y += lh;
+    }
+    Display::printLine(2, selectorY, selectorText);
+    g_confirmNeedsFullRedraw = false;
+  } else {
+    // PRIMARY is a GFX custom font and never draws with an opaque
+    // background, so the row is explicitly erased before the toggled
+    // selector text is drawn.
+    Display::tft().fillRect(0, selectorY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    Display::printLine(2, selectorY, selectorText);
   }
-  Display::printLine(2, y + 8, g_confirmYesSelected ? "> Yes    No" : "  Yes  > No");
+
+  g_confirmLastYesSelected = g_confirmYesSelected;
 }
 
 }  // namespace Menu

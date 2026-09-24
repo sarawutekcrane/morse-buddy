@@ -234,6 +234,31 @@ struct NumberAdjustState {
 NumberAdjustState g_numAdjust;
 bool g_numAdjustDirty = true;
 
+// Hardware Fix #3A: same pattern as MixedTextEntry -- a full clear+redraw
+// only happens once, on entry; every later render diffs the value/warning
+// row text against what was last drawn and only fillRect+redraws the
+// row(s) that actually changed. Title is drawn once and never touched again.
+bool g_numAdjustNeedsFullRedraw = true;
+char g_lastNumAdjustValueLine[24] = {0};
+char g_lastNumAdjustWarnLine[40] = {0};
+
+void computeNumAdjustValueLine(char* out, size_t outCap) {
+  if (g_numAdjust.format != nullptr) {
+    g_numAdjust.format(g_numAdjust.value, out, outCap);
+  } else {
+    snprintf(out, outCap, "%d", g_numAdjust.value);
+  }
+}
+
+void computeNumAdjustWarnLine(char* out, size_t outCap) {
+  if (g_numAdjust.warnAt != kNoWarn && g_numAdjust.value >= g_numAdjust.warnAt) {
+    strncpy(out, g_numAdjust.warnText, outCap - 1);
+    out[outCap - 1] = '\0';
+  } else {
+    out[0] = '\0';
+  }
+}
+
 void numberAdjustTick() {
   Input::update();
   InputEvent e;
@@ -258,24 +283,37 @@ void numberAdjustTick() {
   g_numAdjustDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 4;
-  Display::printLine(2, y, g_numAdjust.title);
-  y += lh;
+  int16_t titleY = Display::kStatusBarHeight + 4;
+  int16_t valueY = static_cast<int16_t>(titleY + lh);
+  int16_t warnY = static_cast<int16_t>(valueY + lh);
 
-  char buf[24];
-  if (g_numAdjust.format != nullptr) {
-    g_numAdjust.format(g_numAdjust.value, buf, sizeof(buf));
+  char valueLine[24];
+  computeNumAdjustValueLine(valueLine, sizeof(valueLine));
+  char warnLine[40];
+  computeNumAdjustWarnLine(warnLine, sizeof(warnLine));
+
+  if (g_numAdjustNeedsFullRedraw) {
+    Display::clearContentArea();
+    Display::printLine(2, titleY, g_numAdjust.title);
+    Display::printLine(2, valueY, valueLine);
+    if (warnLine[0] != '\0') Display::printLine(2, warnY, warnLine);
+    g_numAdjustNeedsFullRedraw = false;
   } else {
-    snprintf(buf, sizeof(buf), "%d", g_numAdjust.value);
+    if (strcmp(valueLine, g_lastNumAdjustValueLine) != 0) {
+      Display::tft().fillRect(0, valueY, Display::kScreenWidth, lh, ST77XX_BLACK);
+      Display::printLine(2, valueY, valueLine);
+    }
+    if (strcmp(warnLine, g_lastNumAdjustWarnLine) != 0) {
+      Display::tft().fillRect(0, warnY, Display::kScreenWidth, lh, ST77XX_BLACK);
+      if (warnLine[0] != '\0') Display::printLine(2, warnY, warnLine);
+    }
   }
-  Display::printLine(2, y, buf);
-  y += lh;
 
-  if (g_numAdjust.warnAt != kNoWarn && g_numAdjust.value >= g_numAdjust.warnAt) {
-    Display::printLine(2, y, g_numAdjust.warnText);
-  }
+  strncpy(g_lastNumAdjustValueLine, valueLine, sizeof(g_lastNumAdjustValueLine) - 1);
+  g_lastNumAdjustValueLine[sizeof(g_lastNumAdjustValueLine) - 1] = '\0';
+  strncpy(g_lastNumAdjustWarnLine, warnLine, sizeof(g_lastNumAdjustWarnLine) - 1);
+  g_lastNumAdjustWarnLine[sizeof(g_lastNumAdjustWarnLine) - 1] = '\0';
 }
 
 void formatPercent(int16_t v, char* buf, size_t n) { snprintf(buf, n, "%d%%", v); }
@@ -300,6 +338,7 @@ void screenBrightnessAdjust() {
     g_numAdjust = {"Brightness", 0, 100, 5, static_cast<int16_t>(Settings::getBrightness()),
                    kNoWarn, nullptr, formatPercent, saveBrightness};
     g_numAdjustDirty = true;
+    g_numAdjustNeedsFullRedraw = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -309,6 +348,7 @@ void screenVolumeAdjust() {
     g_numAdjust = {"Speaker Volume", 0, 100, 5, static_cast<int16_t>(Settings::getSpeakerVolume()),
                    kNoWarn, nullptr, formatPercent, saveVolume};
     g_numAdjustDirty = true;
+    g_numAdjustNeedsFullRedraw = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -318,6 +358,7 @@ void screenWpmAdjust() {
     g_numAdjust = {"WPM", Morse::kMinWpm, Morse::kMaxWpm, 1, static_cast<int16_t>(Settings::getWpm()),
                    static_cast<int16_t>(Morse::kWpmWarnThreshold), "Warning: high speed", nullptr, saveWpm};
     g_numAdjustDirty = true;
+    g_numAdjustNeedsFullRedraw = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -327,6 +368,7 @@ void screenSleepTimeoutAdjust() {
     g_numAdjust = {"Sleep Timeout", 0, 30, 1, static_cast<int16_t>(Settings::getSleepTimeoutMinutes()),
                    kNoWarn, nullptr, formatSleepTimeout, saveSleepTimeout};
     g_numAdjustDirty = true;
+    g_numAdjustNeedsFullRedraw = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -452,7 +494,16 @@ constexpr uint8_t kMaxScanResults = 12;
 char g_scanSsids[kMaxScanResults][33];
 uint8_t g_scanCount = 0;
 uint8_t g_scanSelected = 0;
-bool g_scanDirty = true;
+
+// Hardware Fix #3A: same three-way redraw split as ListMenu (Hardware Fix
+// #2) -- full draw only on first entry, a viewport scroll redraws just the
+// row region, and a same-viewport selection move touches only the marker
+// cells of the old and new selected row. The marker is drawn independently
+// of the label at a fixed labelX for the same reason as ListMenu: PRIMARY
+// is a proportional GFX font, so "> "/"  " are not guaranteed equal width.
+bool g_scanNeedsFullRedraw = true;
+int16_t g_scanLastStartIdx = -1;
+uint8_t g_scanLastSelected = 0;
 
 void screenWifiScanResults() {
   if (Menu::consumeJustEntered()) {
@@ -470,19 +521,17 @@ void screenWifiScanResults() {
     }
     WiFi.scanDelete();
     g_scanSelected = 0;
-    g_scanDirty = true;
+    g_scanNeedsFullRedraw = true;
   }
 
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE && g_scanCount > 0) {
-      uint8_t prev = g_scanSelected;
       int16_t next = static_cast<int16_t>(g_scanSelected) + e.value;
       if (next < 0) next = static_cast<int16_t>(g_scanCount) - 1;
       if (next >= static_cast<int16_t>(g_scanCount)) next = 0;
       g_scanSelected = static_cast<uint8_t>(next);
-      if (g_scanSelected != prev) g_scanDirty = true;
     } else if (Input::isMenuConfirm(e) && g_scanCount > 0) {
       strncpy(g_chosenSsid, g_scanSsids[g_scanSelected], sizeof(g_chosenSsid) - 1);
       g_chosenSsid[sizeof(g_chosenSsid) - 1] = '\0';
@@ -493,19 +542,15 @@ void screenWifiScanResults() {
   }
 
   Display::drawStatusBar();
-  if (!g_scanDirty) return;
-  g_scanDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
-  Display::printLine(2, y, g_scanCount == 0 ? "No networks found" : "Select SSID:");
-  y += lh;
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t rowsTopY = static_cast<int16_t>(titleY + lh);
 
   // Viewport scroll (Hardware Fix #1): up to kMaxScanResults=12 results may
   // no longer all fit at the larger PRIMARY line height.
-  int16_t remaining = Display::kScreenHeight - y;
+  int16_t remaining = Display::kScreenHeight - rowsTopY;
   uint8_t visibleRows = (remaining > 0) ? static_cast<uint8_t>(remaining / lh) : 0;
   if (visibleRows == 0) visibleRows = 1;
   int16_t startIdx = 0;
@@ -516,12 +561,43 @@ void screenWifiScanResults() {
     if (startIdx < 0) startIdx = 0;
   }
 
-  for (uint8_t i = static_cast<uint8_t>(startIdx); i < g_scanCount && i < startIdx + visibleRows; i++) {
-    char line[40];
-    snprintf(line, sizeof(line), "%s%s", i == g_scanSelected ? "> " : "  ", g_scanSsids[i]);
-    Display::printLine(2, y, line);
-    y += lh;
+  bool firstDraw = g_scanNeedsFullRedraw;
+  bool scrolled = !firstDraw && (startIdx != g_scanLastStartIdx);
+  bool selectionOnlyChanged = !firstDraw && !scrolled && (g_scanSelected != g_scanLastSelected);
+
+  if (!firstDraw && !scrolled && !selectionOnlyChanged) return;
+
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+  if (firstDraw) {
+    Display::clearContentArea();
+    Display::printLine(2, titleY, g_scanCount == 0 ? "No networks found" : "Select SSID:");
+    for (uint8_t i = static_cast<uint8_t>(startIdx); i < g_scanCount && i < startIdx + visibleRows; i++) {
+      int16_t rowY = static_cast<int16_t>(rowsTopY + (i - startIdx) * lh);
+      if (i == g_scanSelected) Display::printLine(2, rowY, ">");
+      Display::printLine(labelX, rowY, g_scanSsids[i]);
+    }
+    g_scanNeedsFullRedraw = false;
+  } else if (scrolled) {
+    int16_t regionH = static_cast<int16_t>(Display::kScreenHeight - rowsTopY);
+    if (regionH < 0) regionH = 0;
+    Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
+    for (uint8_t i = static_cast<uint8_t>(startIdx); i < g_scanCount && i < startIdx + visibleRows; i++) {
+      int16_t rowY = static_cast<int16_t>(rowsTopY + (i - startIdx) * lh);
+      if (i == g_scanSelected) Display::printLine(2, rowY, ">");
+      Display::printLine(labelX, rowY, g_scanSsids[i]);
+    }
+  } else if (selectionOnlyChanged) {
+    int16_t oldY = static_cast<int16_t>(rowsTopY + (g_scanLastSelected - startIdx) * lh);
+    int16_t newY = static_cast<int16_t>(rowsTopY + (g_scanSelected - startIdx) * lh);
+    Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+    Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+    Display::printLine(2, newY, ">");
   }
+
+  g_scanLastStartIdx = startIdx;
+  g_scanLastSelected = g_scanSelected;
 }
 
 void screenWifiPasswordEntry() {

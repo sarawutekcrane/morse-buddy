@@ -58,6 +58,16 @@ MixedTextEntryResult g_result = MixedTextEntryResult::NONE;
 
 bool g_dirty = true;
 
+// Hardware Fix #3A: render() no longer clears/redraws the whole content
+// area on every dirty tick. g_needsFullRedraw gates the one-time
+// clear+title+input+control draw (start()); every other render() call
+// diffs the freshly-computed input/control row text against what was
+// last actually drawn and only fillRect+redraws the row(s) whose content
+// changed -- the title is never touched again after the first draw.
+bool g_needsFullRedraw = true;
+char g_lastInputLine[96] = {0};
+char g_lastControlLine[40] = {0};
+
 void appendConfirmedChar(char c) {
   if (g_length < g_config.maxLength) {
     g_buffer[g_length++] = c;
@@ -180,14 +190,11 @@ void handleConfirm(const InputEvent& e) {
   }
 }
 
-void render() {
-  Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
-  int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
-  Display::printLine(2, y, g_config.title);
-  y += lh;
-
+// Builds the input row's text (cursor/preview/morse suffix as
+// appropriate) with the same leading-clip-for-long-strings behavior as
+// before, into a caller-owned buffer so it can be diffed against what was
+// last drawn.
+void computeInputLine(char* out, size_t outCap) {
   char line[96];
   switch (g_state) {
     case State::EMPTY:
@@ -217,14 +224,62 @@ void render() {
   const char* visible = line;
   int16_t avail = Display::kScreenWidth - 2;
   while (visible[0] != '\0' && Display::textWidth(visible) > avail) visible++;
-  Display::printLine(2, y, visible);
-  y += lh;
+  strncpy(out, visible, outCap - 1);
+  out[outCap - 1] = '\0';
+}
 
+// Builds the control row's text: the validation error (EMPTY state only)
+// or the Save/Cancel toggle line (CONFIRM state only), empty otherwise.
+void computeControlLine(char* out, size_t outCap) {
   if (g_state == State::EMPTY && g_errorMessage != nullptr) {
-    Display::printLine(2, y + 8, g_errorMessage);
+    strncpy(out, g_errorMessage, outCap - 1);
+    out[outCap - 1] = '\0';
   } else if (g_state == State::CONFIRM) {
-    Display::printLine(2, y + 8, g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
+    snprintf(out, outCap, "%s", g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
+  } else {
+    out[0] = '\0';
   }
+}
+
+void render() {
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t lh = Display::lineHeight();
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t inputY = static_cast<int16_t>(titleY + lh);
+  int16_t controlY = static_cast<int16_t>(inputY + lh + 8);
+
+  char inputLine[96];
+  computeInputLine(inputLine, sizeof(inputLine));
+  char controlLine[40];
+  computeControlLine(controlLine, sizeof(controlLine));
+
+  if (g_needsFullRedraw) {
+    // First render after start(): everything is new -- title included.
+    Display::clearContentArea();
+    Display::printLine(2, titleY, g_config.title);
+    Display::printLine(2, inputY, inputLine);
+    if (controlLine[0] != '\0') Display::printLine(2, controlY, controlLine);
+    g_needsFullRedraw = false;
+  } else {
+    // Every later render: diff against what was last actually drawn and
+    // touch only the row(s) whose content changed. The title is never
+    // redrawn again after the first draw. PRIMARY is a GFX custom font
+    // and never draws with an opaque background, so each changed row is
+    // explicitly fillRect-erased before its replacement text is drawn.
+    if (strcmp(inputLine, g_lastInputLine) != 0) {
+      Display::tft().fillRect(0, inputY, Display::kScreenWidth, lh, ST77XX_BLACK);
+      Display::printLine(2, inputY, inputLine);
+    }
+    if (strcmp(controlLine, g_lastControlLine) != 0) {
+      Display::tft().fillRect(0, controlY, Display::kScreenWidth, lh, ST77XX_BLACK);
+      if (controlLine[0] != '\0') Display::printLine(2, controlY, controlLine);
+    }
+  }
+
+  strncpy(g_lastInputLine, inputLine, sizeof(g_lastInputLine) - 1);
+  g_lastInputLine[sizeof(g_lastInputLine) - 1] = '\0';
+  strncpy(g_lastControlLine, controlLine, sizeof(g_lastControlLine) - 1);
+  g_lastControlLine[sizeof(g_lastControlLine) - 1] = '\0';
 }
 
 }  // namespace
@@ -245,6 +300,9 @@ void start(const MixedTextEntryConfig& config, const char* initialValue) {
   g_finished = false;
   g_result = MixedTextEntryResult::NONE;
   g_dirty = true;
+  g_needsFullRedraw = true;
+  g_lastInputLine[0] = '\0';
+  g_lastControlLine[0] = '\0';
 }
 
 void tick() {
