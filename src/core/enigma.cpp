@@ -73,20 +73,22 @@ void decodeLocalPayload(const uint8_t* data, uint16_t len, uint8_t* outLock, cha
 // No Family Groups
 // =============================================================================
 void screenNoFamilyGroups() {
+  bool justEntered = Menu::consumeJustEntered();
+
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (Input::isBack(e)) Menu::goBack();
   }
+
   Display::drawStatusBar();
+  if (!justEntered) return;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(6, 60);
-  tft.print("No Family Groups");
-  tft.setCursor(6, 76);
-  tft.print("Add one in Settings");
+  int16_t lh = Display::lineHeight();
+  Display::printLine(6, 60, "No Family Groups");
+  Display::printLine(6, 60 + lh, "Add one in Settings");
 }
 
 // =============================================================================
@@ -488,10 +490,16 @@ void startReceiveKeyEditorFor(const MessageRef& ref) {
   enterStep(KeyEditStep::ROTOR_COUNT);
 }
 
+bool g_keyEditorDirty = true;
+
 void screenKeyEditor() {
+  if (Menu::consumeJustEntered()) g_keyEditorDirty = true;
+
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
       switch (g_editStep) {
         case KeyEditStep::ROTOR_COUNT:
@@ -527,12 +535,16 @@ void screenKeyEditor() {
     }
   }
 
+  if (hadEvent) g_keyEditorDirty = true;
+  if (!g_keyEditorDirty) return;
+  g_keyEditorDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(g_editingSender ? "Sender Key" : "Receive Key");
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  Display::printLine(2, y, g_editingSender ? "Sender Key" : "Receive Key");
+  y += lh;
 
   char line[40];
   switch (g_editStep) {
@@ -564,12 +576,11 @@ void screenKeyEditor() {
       snprintf(line, sizeof(line), "%s", g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
       break;
   }
-  tft.setCursor(2, Display::kStatusBarHeight + 20);
-  tft.print(line);
+  Display::printLine(2, y, line);
+  y += lh;
 
   if (g_editStep == KeyEditStep::CONFIRM && g_working.rotor_count == 0 && g_working.plugboard_pair_count == 0) {
-    tft.setCursor(2, Display::kStatusBarHeight + 40);
-    tft.print("Warning: plaintext passthrough");
+    Display::printLine(2, y, "Warning: plaintext passthrough");
   }
 }
 
@@ -593,7 +604,11 @@ void startRevealFlow(const MessageRef& ref, const StoredMessageView& view) {
   }
 }
 
+bool g_revealDirty = true;
+
 void screenReveal() {
+  if (Menu::consumeJustEntered()) g_revealDirty = true;
+
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
@@ -607,33 +622,40 @@ void screenReveal() {
     }
   }
 
+  if (!g_revealDirty) return;
+  g_revealDirty = false;
+
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print("Revealed Key");
+
+  // Title uses PRIMARY (Hardware Fix #1); the rotor-by-rotor detail list
+  // below stays at COMPACT -- up to kMaxRotors=4 entries plus 3 more lines
+  // (title/count/plugs+instruction) would overflow the 121px content area
+  // at PRIMARY's larger line height (re-verified per Fix #1 item 14: this
+  // is one of the explicitly higher-risk "icon/text density" screens).
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t primaryLh = Display::lineHeight();
+  Display::printLine(2, Display::kStatusBarHeight + 2, "Revealed Key");
+
+  Display::setFont(Display::Font::COMPACT);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2 + primaryLh;
 
   char line[48];
   snprintf(line, sizeof(line), "Rotors: %d", g_revealedKey.rotor_count);
-  tft.setCursor(2, Display::kStatusBarHeight + 16);
-  tft.print(line);
+  Display::printLine(2, y, line);
+  y += lh;
 
-  int16_t y = Display::kStatusBarHeight + 28;
   for (uint8_t i = 0; i < g_revealedKey.rotor_count; i++) {
     static const char* const kNames[] = {"I", "II", "III", "IV", "V"};
     snprintf(line, sizeof(line), "  %s @ %c", kNames[g_revealedKey.rotor_type[i]],
              static_cast<char>('A' + g_revealedKey.rotor_position[i]));
-    tft.setCursor(2, y);
-    tft.print(line);
-    y += 10;
+    Display::printLine(2, y, line);
+    y += lh;
   }
   snprintf(line, sizeof(line), "Plugs: %d", g_revealedKey.plugboard_pair_count);
-  tft.setCursor(2, y);
-  tft.print(line);
-  y += 10;
-  tft.setCursor(2, y);
-  tft.print("DOT: use as Receive Key");
+  Display::printLine(2, y, line);
+  y += lh;
+  Display::printLine(2, y, "DOT: use as Receive Key");
 }
 
 // =============================================================================
@@ -926,17 +948,22 @@ void handleHistoryFocusEvent(const InputEvent& e) {
   }
 }
 
+bool g_enigmaChatDirty = true;
+
 void screenEnigmaChat() {
   if (Menu::consumeJustEntered()) {
     clearDraft();
     g_historyCursor = kNoHistoryCursor;
     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
     markIndexDirty();
+    g_enigmaChatDirty = true;
   }
 
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
       refreshIndexIfNeeded();
       if (g_historyCursor == kNoHistoryCursor) {
@@ -956,34 +983,48 @@ void screenEnigmaChat() {
       handleComposeEvent(e);
     }
   }
+  if (hadEvent) g_enigmaChatDirty = true;
 
   if (g_historyCursor == kNoHistoryCursor && g_composePatternLen > 0) {
     if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeComposeChar();
+      g_enigmaChatDirty = true;
     }
   }
 
+  bool wasIndexDirty = g_indexDirty;
   refreshIndexIfNeeded();
+  if (wasIndexDirty) g_enigmaChatDirty = true;
 
   Display::drawStatusBar();
-  Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  if (!g_enigmaChatDirty) return;
+  g_enigmaChatDirty = false;
 
-  constexpr uint16_t kViewportLines = 4;
+  Display::setFont(Display::Font::PRIMARY);
+  Display::clearContentArea();
+  int16_t lh = Display::lineHeight();
+
+  // Reserve the last 2 rows for the (optional) compose-error line and the
+  // compose line itself, same fixed-slot layout as before, just computed
+  // from the real line height instead of a hardcoded 10px (Hardware Fix #1).
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t contentHeight = Display::kScreenHeight - contentTop;
+  uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
+  if (totalLines < 3) totalLines = 3;  // at least 1 history row + error row + compose row
+  uint16_t viewportLines = static_cast<uint16_t>(totalLines - 2);
+
   uint16_t startIdx = 0;
-  if (g_indexTotal > kViewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - kViewportLines);
+  if (g_indexTotal > viewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - viewportLines);
   if (g_historyCursor != kNoHistoryCursor) {
     if (g_historyCursor < startIdx) {
       startIdx = g_historyCursor;
-    } else if (g_historyCursor >= startIdx + kViewportLines) {
-      startIdx = static_cast<uint16_t>(g_historyCursor - kViewportLines + 1);
+    } else if (g_historyCursor >= startIdx + viewportLines) {
+      startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
     }
   }
 
-  int16_t y = Display::kStatusBarHeight + 2;
-  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + kViewportLines; i++) {
+  int16_t y = contentTop;
+  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
     const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
     if (entry == nullptr) continue;
     MessageRef ref = refForIndexEntry(*entry);
@@ -993,23 +1034,22 @@ void screenEnigmaChat() {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
       if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
     }
-    tft.setCursor(2, y);
-    tft.print(i == g_historyCursor ? "> " : "  ");
-    tft.print(lineBuf);
-    y += 10;
+    char line[56];
+    snprintf(line, sizeof(line), "%s%s", i == g_historyCursor ? "> " : "  ", lineBuf);
+    Display::printLine(2, y, line);
+    y += lh;
   }
 
-  y = Display::kStatusBarHeight + 2 + kViewportLines * 10 + 4;
+  y = contentTop + static_cast<int16_t>(viewportLines) * lh;
   if (g_composeError != nullptr) {
-    tft.setCursor(2, y);
-    tft.print(g_composeError);
-    y += 10;
+    Display::printLine(2, y, g_composeError);
   }
+  y += lh;
   char composeLine[64];
   buildComposeDisplay(composeLine, sizeof(composeLine));
-  tft.setCursor(2, y);
-  tft.print(g_historyCursor == kNoHistoryCursor ? "> " : "  ");
-  tft.print(composeLine);
+  char fullCompose[72];
+  snprintf(fullCompose, sizeof(fullCompose), "%s%s", g_historyCursor == kNoHistoryCursor ? "> " : "  ", composeLine);
+  Display::printLine(2, y, fullCompose);
 }
 
 // =============================================================================

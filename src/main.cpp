@@ -14,6 +14,50 @@
 #include "core/sleep.h"
 #include "core/storage_init.h"
 
+namespace {
+// Lightweight main-loop iteration timing instrumentation (Hardware
+// Validation Fix #1, evidence requirement: report a concrete before/after
+// loop-timing measurement, not just a subjective "feels better"). Adds one
+// micros() read and a running min/max/avg per iteration -- negligible
+// overhead -- and logs a summary over Serial roughly once a second. A
+// short/consistent avg with a low max is evidence the per-loop TFT
+// redraw work that used to run unconditionally (full clearContentArea() +
+// full-menu redraw + status bar redraw every tick, before this fix) is
+// gone; a long max spike would mean something is still blocking. Left in
+// for this hardware-validation build so real-hardware numbers can be
+// captured directly from the Serial monitor; safe to strip after retest.
+uint32_t g_loopLastMicros = 0;
+uint32_t g_loopMinUs = 0xFFFFFFFF;
+uint32_t g_loopMaxUs = 0;
+uint32_t g_loopSumUs = 0;
+uint32_t g_loopCount = 0;
+uint32_t g_loopWindowStartMs = 0;
+
+void tickLoopTimingInstrumentation() {
+  uint32_t nowUs = micros();
+  if (g_loopLastMicros != 0) {
+    uint32_t delta = nowUs - g_loopLastMicros;
+    if (delta < g_loopMinUs) g_loopMinUs = delta;
+    if (delta > g_loopMaxUs) g_loopMaxUs = delta;
+    g_loopSumUs += delta;
+    g_loopCount++;
+  }
+  g_loopLastMicros = nowUs;
+
+  uint32_t nowMs = millis();
+  if (nowMs - g_loopWindowStartMs >= 1000 && g_loopCount > 0) {
+    Serial.printf("[loop] iters=%u avg=%uus min=%uus max=%uus\n", static_cast<unsigned>(g_loopCount),
+                  static_cast<unsigned>(g_loopSumUs / g_loopCount), static_cast<unsigned>(g_loopMinUs),
+                  static_cast<unsigned>(g_loopMaxUs));
+    g_loopMinUs = 0xFFFFFFFF;
+    g_loopMaxUs = 0;
+    g_loopSumUs = 0;
+    g_loopCount = 0;
+    g_loopWindowStartMs = nowMs;
+  }
+}
+}  // namespace
+
 void setup() {
   Serial.begin(115200);
 
@@ -50,6 +94,7 @@ void setup() {
 }
 
 void loop() {
+  tickLoopTimingInstrumentation();
   tickRegisteredServices();
   Power::tick();
   Menu::tick();

@@ -184,12 +184,19 @@ void submitGuess() {
   NumberGuessing::resetDigitEntry(&g_digitEntry);
 }
 
+bool g_soloGuessDirty = true;
+
 void screenSoloGuess() {
-  if (Menu::consumeJustEntered()) NumberGuessing::resetDigitEntry(&g_digitEntry);
+  if (Menu::consumeJustEntered()) {
+    NumberGuessing::resetDigitEntry(&g_digitEntry);
+    g_soloGuessDirty = true;
+  }
 
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (e.type == InputEventType::ENCODER_SHORT) {
       if (g_digitEntry.count == 4) {
         submitGuess();
@@ -204,63 +211,78 @@ void screenSoloGuess() {
       NumberGuessing::handleDigitEntryEvent(&g_digitEntry, e);
     }
   }
+  if (hadEvent) g_soloGuessDirty = true;
+
+  uint8_t countBefore = g_digitEntry.count;
   NumberGuessing::tickDigitEntry(&g_digitEntry);
+  if (g_digitEntry.count != countBefore) g_soloGuessDirty = true;  // hold-to-delete fired
 
   Display::drawStatusBar();
+  if (!g_soloGuessDirty) return;
+  g_soloGuessDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
   char line[32];
   snprintf(line, sizeof(line), "Attempt %d", g_solo.totalAttempts + 1);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(line);
+  Display::printLine(2, y, line);
+  y += lh;
 
   char guessLine[16] = "____";
   for (uint8_t i = 0; i < g_digitEntry.count; i++) guessLine[i] = static_cast<char>('0' + g_digitEntry.digits[i]);
   if (g_digitEntry.count < 4) guessLine[g_digitEntry.count] = static_cast<char>('0' + g_digitEntry.previewDigit);
-  tft.setCursor(2, Display::kStatusBarHeight + 20);
-  tft.print("Guess: ");
-  tft.print(guessLine);
+  char full[24];
+  snprintf(full, sizeof(full), "Guess: %s", guessLine);
+  Display::printLine(2, y, full);
 }
+
+bool g_soloResultDirty = true;
 
 void screenSoloResult() {
   if (Menu::consumeJustEntered()) {
     g_resultScrollIndex = (g_solo.historyCount > 0) ? static_cast<uint16_t>(g_solo.historyCount - 1) : 0;
+    g_soloResultDirty = true;
   }
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE) {
+      uint16_t prev = g_resultScrollIndex;
       int32_t next = static_cast<int32_t>(g_resultScrollIndex) + e.value;
       if (next < 0) next = 0;
       if (next >= g_solo.historyCount) next = g_solo.historyCount > 0 ? g_solo.historyCount - 1 : 0;
       g_resultScrollIndex = static_cast<uint16_t>(next);
+      if (g_resultScrollIndex != prev) g_soloResultDirty = true;
     } else if (Input::isMenuConfirm(e) || Input::isBack(e)) {
       Menu::goBack();
     }
   }
 
   Display::drawStatusBar();
+  if (!g_soloResultDirty) return;
+  g_soloResultDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
   char line[32];
   snprintf(line, sizeof(line), "Total attempts: %d", g_solo.totalAttempts);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(line);
+  Display::printLine(2, y, line);
+  y += lh;
 
-  constexpr uint16_t kRows = 4;
-  uint16_t start = (g_resultScrollIndex >= kRows) ? static_cast<uint16_t>(g_resultScrollIndex - kRows + 1) : 0;
-  int16_t y = Display::kStatusBarHeight + 16;
-  for (uint16_t i = start; i < g_solo.historyCount && i < start + kRows; i++) {
+  int16_t remaining = Display::kScreenHeight - y;
+  uint16_t rows = (remaining > 0) ? static_cast<uint16_t>(remaining / lh) : 0;
+  if (rows == 0) rows = 1;
+  uint16_t start = (g_resultScrollIndex >= rows) ? static_cast<uint16_t>(g_resultScrollIndex - rows + 1) : 0;
+  for (uint16_t i = start; i < g_solo.historyCount && i < start + rows; i++) {
     const GuessEntry& g = g_solo.history[i];
     snprintf(line, sizeof(line), "%s%04d %dA%dB", i == g_resultScrollIndex ? "> " : "  ", g.guessValue, g.aCount,
              g.bCount);
-    tft.setCursor(2, y);
-    tft.print(line);
-    y += 10;
+    Display::printLine(2, y, line);
+    y += lh;
   }
 }
 

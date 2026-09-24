@@ -310,15 +310,22 @@ void handleChallengeEvent(const InputEvent& e) {
   // Encoder short: no effect on the Challenge cursor.
 }
 
+bool g_practiceDirty = true;
+bool g_practiceWasShowingResult = false;
+
 void screenPractice() {
   if (Menu::consumeJustEntered()) {
     g_streak = 0;
     startNewChallenge();
+    g_practiceDirty = true;
+    g_practiceWasShowingResult = false;
   }
 
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (Input::isBack(e)) {
       Menu::goBack();
       continue;
@@ -331,50 +338,61 @@ void screenPractice() {
       handleAnswerEvent(e);
     }
   }
+  if (hadEvent) g_practiceDirty = true;
 
   if (g_cursor == PracticeCursor::ANSWER && g_answerPatternLen > 0) {
     if (millis() - g_lastAnswerReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeAnswerChar();
+      g_practiceDirty = true;
     }
   }
 
+  // The result banner expires on a timer, not an input event, so its
+  // visibility transition needs its own dirty trigger (Hardware Fix #1).
+  bool showingResult = (g_resultText != nullptr && millis() < g_resultShownUntilMs);
+  if (showingResult != g_practiceWasShowingResult) g_practiceDirty = true;
+  g_practiceWasShowingResult = showingResult;
+
   Display::drawStatusBar();
+  if (!g_practiceDirty) return;
+  g_practiceDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
 
   char line[40];
   snprintf(line, sizeof(line), "Level %u  Streak %u", Settings::getPracticeLevel(), g_streak);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(line);
+  Display::printLine(2, y, line);
+  y += lh;
 
-  tft.setCursor(2, Display::kStatusBarHeight + 16);
-  tft.print(g_cursor == PracticeCursor::CHALLENGE ? "> " : "  ");
+  char challengeLine[168];
   if (g_revealHeld) {
-    tft.print(g_challengeText);
+    snprintf(challengeLine, sizeof(challengeLine), "%s%s", g_cursor == PracticeCursor::CHALLENGE ? "> " : "  ",
+             g_challengeText);
   } else {
     char raw[160];
     buildRawMorse(g_challengeText, raw, sizeof(raw));
-    tft.print(raw);
+    snprintf(challengeLine, sizeof(challengeLine), "%s%s", g_cursor == PracticeCursor::CHALLENGE ? "> " : "  ", raw);
   }
+  Display::printLine(2, y, challengeLine);
+  y += lh;
 
-  tft.setCursor(2, Display::kStatusBarHeight + 30);
-  tft.print(g_cursor == PracticeCursor::ANSWER ? "> " : "  ");
-  char answerLine[40];
-  snprintf(answerLine, sizeof(answerLine), "%s%s%s", g_answerText, (g_answerPatternLen > 0 ? " " : ""),
-           g_answerPattern);
-  tft.print(answerLine);
+  char answerLine[48];
+  snprintf(answerLine, sizeof(answerLine), "%s%s%s%s", g_cursor == PracticeCursor::ANSWER ? "> " : "  ",
+           g_answerText, (g_answerPatternLen > 0 ? " " : ""), g_answerPattern);
+  Display::printLine(2, y, answerLine);
+  y += lh;
 
-  if (g_resultText != nullptr && millis() < g_resultShownUntilMs) {
-    tft.setCursor(2, Display::kStatusBarHeight + 44);
-    tft.print(g_resultText);
+  if (showingResult) {
+    Display::printLine(2, y, g_resultText);
   }
+  y += lh;
 
   char hiLine[24];
   snprintf(hiLine, sizeof(hiLine), "High: %u", g_highScore[Settings::getPracticeLevel() - 1]);
-  tft.setCursor(2, Display::kStatusBarHeight + 58);
-  tft.print(hiLine);
+  Display::printLine(2, y, hiLine);
 }
 
 // Storage::init() runs from setup() after every global constructor has

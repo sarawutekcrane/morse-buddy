@@ -279,41 +279,122 @@ uint8_t g_promptSelected = 1;  // 0 = optionA, 1 = optionB (default Cancel/Back)
 bool g_checkingDrawn = false;
 bool g_preparingDrawn = false;
 
-void drawLine(int16_t y, const char* text) {
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setCursor(2, y);
-  tft.print(text);
-}
+// ---- Dirty-tracked draw helpers (Hardware Fix #1) --------------------------
+// These helpers are the choke points every static/prompt/progress OTA
+// screen draws through, so gating redraws here (by comparing the actual
+// text/selection/percent content against what was last drawn) covers every
+// case in the switch below without needing a separate dirty flag per
+// UiState. A content-match alone is not sufficient, though: drawMessage(),
+// drawTwoOptionPrompt() and otaProgressCallback() all share the same
+// content area, and the UiState machine can hop between them (e.g.
+// CHECKING's "Checking..." message, then SERVER_ERROR's prompt with the
+// exact same error text as some earlier, unrelated visit). If drawer B
+// finds its own cached text unchanged from the *last time B itself drew*,
+// that does NOT mean the screen currently shows B's text -- drawer A may
+// have painted over it since. g_lastContentDrawer tracks which of these
+// actually owns the pixels right now, so a switch between drawers always
+// forces a redraw regardless of text equality.
+enum class OtaContentDrawer : uint8_t { NONE, MESSAGE, PROMPT, PROGRESS, MAIN };
+OtaContentDrawer g_lastContentDrawer = OtaContentDrawer::NONE;
+char g_lastExtraLine[48] = {0};
+bool g_promptHasExtraLast = false;
+char g_lastLine1[48] = {0};
+char g_lastLine2[48] = {0};
+bool g_promptHasLine2Last = false;
+char g_lastLabelA[24] = {0};
+char g_lastLabelB[24] = {0};
+uint8_t g_lastSelected = 0xFF;
 
 void drawTwoOptionPrompt(const char* line1, const char* line2, const char* labelA, const char* labelB,
-                         uint8_t selected) {
+                         uint8_t selected, const char* extraLine = nullptr) {
+  bool line2Present = (line2 != nullptr);
+  bool extraPresent = (extraLine != nullptr);
+  bool changed = (g_lastContentDrawer != OtaContentDrawer::PROMPT) || selected != g_lastSelected ||
+                 extraPresent != g_promptHasExtraLast ||
+                 (extraPresent && strcmp(extraLine, g_lastExtraLine) != 0) || strcmp(line1, g_lastLine1) != 0 ||
+                 (line2Present != g_promptHasLine2Last) || (line2Present && strcmp(line2, g_lastLine2) != 0) ||
+                 strcmp(labelA, g_lastLabelA) != 0 || strcmp(labelB, g_lastLabelB) != 0;
+  if (!changed) return;
+
+  g_lastContentDrawer = OtaContentDrawer::PROMPT;
+  g_lastSelected = selected;
+  g_promptHasExtraLast = extraPresent;
+  if (extraPresent) {
+    strncpy(g_lastExtraLine, extraLine, sizeof(g_lastExtraLine) - 1);
+    g_lastExtraLine[sizeof(g_lastExtraLine) - 1] = '\0';
+  }
+  strncpy(g_lastLine1, line1, sizeof(g_lastLine1) - 1);
+  g_lastLine1[sizeof(g_lastLine1) - 1] = '\0';
+  g_promptHasLine2Last = line2Present;
+  if (line2Present) {
+    strncpy(g_lastLine2, line2, sizeof(g_lastLine2) - 1);
+    g_lastLine2[sizeof(g_lastLine2) - 1] = '\0';
+  }
+  strncpy(g_lastLabelA, labelA, sizeof(g_lastLabelA) - 1);
+  g_lastLabelA[sizeof(g_lastLabelA) - 1] = '\0';
+  strncpy(g_lastLabelB, labelB, sizeof(g_lastLabelB) - 1);
+  g_lastLabelB[sizeof(g_lastLabelB) - 1] = '\0';
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  drawLine(Display::kStatusBarHeight + 4, line1);
-  if (line2 != nullptr) drawLine(Display::kStatusBarHeight + 16, line2);
-  tft.setCursor(2, Display::kStatusBarHeight + 40);
-  tft.print(selected == 0 ? "> " : "  ");
-  tft.print(labelA);
-  tft.setCursor(2, Display::kStatusBarHeight + 52);
-  tft.print(selected == 1 ? "> " : "  ");
-  tft.print(labelB);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  if (extraPresent) {
+    Display::printLine(2, y, extraLine);
+    y += lh;
+  }
+  Display::printLine(2, y, line1);
+  y += lh;
+  if (line2Present) {
+    Display::printLine(2, y, line2);
+    y += lh;
+  }
+  y += 2;
+  char opt[40];
+  snprintf(opt, sizeof(opt), "%s%s", selected == 0 ? "> " : "  ", labelA);
+  Display::printLine(2, y, opt);
+  y += lh;
+  snprintf(opt, sizeof(opt), "%s%s", selected == 1 ? "> " : "  ", labelB);
+  Display::printLine(2, y, opt);
 }
 
+char g_lastMsgLine1[48] = {0};
+char g_lastMsgLine2[48] = {0};
+bool g_msgHasLine2Last = false;
+
 void drawMessage(const char* line1, const char* line2) {
+  bool line2Present = (line2 != nullptr);
+  bool changed = (g_lastContentDrawer != OtaContentDrawer::MESSAGE) || strcmp(line1, g_lastMsgLine1) != 0 ||
+                 (line2Present != g_msgHasLine2Last) || (line2Present && strcmp(line2, g_lastMsgLine2) != 0);
+  if (!changed) return;
+
+  g_lastContentDrawer = OtaContentDrawer::MESSAGE;
+  strncpy(g_lastMsgLine1, line1, sizeof(g_lastMsgLine1) - 1);
+  g_lastMsgLine1[sizeof(g_lastMsgLine1) - 1] = '\0';
+  g_msgHasLine2Last = line2Present;
+  if (line2Present) {
+    strncpy(g_lastMsgLine2, line2, sizeof(g_lastMsgLine2) - 1);
+    g_lastMsgLine2[sizeof(g_lastMsgLine2) - 1] = '\0';
+  }
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  drawLine(Display::kStatusBarHeight + 4, line1);
-  if (line2 != nullptr) drawLine(Display::kStatusBarHeight + 16, line2);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 4;
+  Display::printLine(2, y, line1);
+  if (line2Present) {
+    y += lh;
+    Display::printLine(2, y, line2);
+  }
 }
+
+bool g_mainDirty = true;
 
 void resetToMain() {
   g_uiState = UiState::MAIN;
   g_mainCanRollback = Update.canRollBack();
   g_mainSelected = 0;
+  g_mainDirty = true;
 }
 
 // ---- Check for Update ------------------------------------------------------
@@ -357,16 +438,34 @@ void runCheckForUpdateBlocking() {
 }
 
 // ---- Install flow -----------------------------------------------------------
+// Progress-driven, not idle-looped: chunks arrive at network speed, and the
+// percent-unchanged guard below (Hardware Fix #1) skips the redraw when
+// consecutive chunks round to the same percentage, without ever freezing
+// the visible progress (task requirement: dynamic screens may refresh at a
+// bounded rate or on data change, never freeze).
+uint8_t g_lastProgressPercent = 0xFF;
+
 void otaProgressCallback(size_t written, size_t expected) {
   uint8_t percent = expected > 0 ? static_cast<uint8_t>((written * 100) / expected) : 0;
+  // Must also redraw on a drawer switch even when the percent coincidentally
+  // matches the last value THIS function drew (e.g. a retried download that
+  // again starts/fails at the same percent as last time) -- otherwise the
+  // screen could be left showing whatever drawMessage()'s "Preparing
+  // Update..." last painted instead of the progress bar (same
+  // cross-drawer staleness class as drawMessage()/drawTwoOptionPrompt()).
+  if (g_lastContentDrawer == OtaContentDrawer::PROGRESS && percent == g_lastProgressPercent) return;
+  g_lastContentDrawer = OtaContentDrawer::PROGRESS;
+  g_lastProgressPercent = percent;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  drawLine(Display::kStatusBarHeight + 4, "Updating Firmware");
-  tft.setCursor(2, Display::kStatusBarHeight + 24);
-  tft.print(percent);
-  tft.print("%");
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 4;
+  Display::printLine(2, y, "Updating Firmware");
+  y += lh + 6;
+  char line[8];
+  snprintf(line, sizeof(line), "%u%%", percent);
+  Display::printLine(2, y, line);
 }
 
 // Deliberately blocking (see runDownloadAndInstallBlocking()'s comment):
@@ -565,7 +664,9 @@ void screenFirmwareUpdate() {
       uint8_t itemCount = g_mainCanRollback ? 2 : 1;
       while (Input::popEvent(e)) {
         if (e.type == InputEventType::ENCODER_ROTATE && itemCount > 1) {
+          uint8_t prev = g_mainSelected;
           g_mainSelected = static_cast<uint8_t>((g_mainSelected + 1) % itemCount);
+          if (g_mainSelected != prev) g_mainDirty = true;
         } else if (Input::isMenuConfirm(e)) {
           if (g_mainSelected == 0) {
             selectRetryCheck();
@@ -579,23 +680,30 @@ void screenFirmwareUpdate() {
         }
       }
       Display::drawStatusBar();
+      if (!g_mainDirty && g_lastContentDrawer == OtaContentDrawer::MAIN) return;
+      g_mainDirty = false;
+      g_lastContentDrawer = OtaContentDrawer::MAIN;
+
+      Display::setFont(Display::Font::PRIMARY);
       Display::clearContentArea();
-      Adafruit_ST7789& tft = Display::tft();
-      tft.setTextSize(1);
-      tft.setTextColor(ST77XX_WHITE);
-      drawLine(Display::kStatusBarHeight + 2, "Firmware Update");
+      int16_t lh = Display::lineHeight();
+      int16_t y = Display::kStatusBarHeight + 2;
+      Display::printLine(2, y, "Firmware Update");
+      y += lh;
       char line[32];
       snprintf(line, sizeof(line), "Current: v%s", FW_VERSION);
-      drawLine(Display::kStatusBarHeight + 16, line);
+      Display::printLine(2, y, line);
+      y += lh;
       snprintf(line, sizeof(line), "Build: %u", static_cast<unsigned>(FW_BUILD_NUMBER));
-      drawLine(Display::kStatusBarHeight + 28, line);
-      tft.setCursor(2, Display::kStatusBarHeight + 44);
-      tft.print(g_mainSelected == 0 ? "> " : "  ");
-      tft.print("Check for Update");
+      Display::printLine(2, y, line);
+      y += lh;
+      char item[32];
+      snprintf(item, sizeof(item), "%sCheck for Update", g_mainSelected == 0 ? "> " : "  ");
+      Display::printLine(2, y, item);
+      y += lh;
       if (g_mainCanRollback) {
-        tft.setCursor(2, Display::kStatusBarHeight + 56);
-        tft.print(g_mainSelected == 1 ? "> " : "  ");
-        tft.print("Rollback to Previous");
+        snprintf(item, sizeof(item), "%sRollback to Previous", g_mainSelected == 1 ? "> " : "  ");
+        Display::printLine(2, y, item);
       }
       return;
     }
@@ -633,19 +741,7 @@ void screenFirmwareUpdate() {
       snprintf(line2, sizeof(line2), "New: v%s", g_lastManifest.version);
       const char* labelA = (g_uiState == UiState::UPDATE_AVAILABLE_PREV_FAILED) ? "Retry Update" : "Update";
       if (g_uiState == UiState::UPDATE_AVAILABLE_PREV_FAILED) {
-        Display::clearContentArea();
-        Adafruit_ST7789& tft = Display::tft();
-        tft.setTextSize(1);
-        tft.setTextColor(ST77XX_WHITE);
-        drawLine(Display::kStatusBarHeight + 2, "This firmware previously failed");
-        drawLine(Display::kStatusBarHeight + 16, line1);
-        drawLine(Display::kStatusBarHeight + 28, line2);
-        tft.setCursor(2, Display::kStatusBarHeight + 44);
-        tft.print(g_promptSelected == 0 ? "> " : "  ");
-        tft.print(labelA);
-        tft.setCursor(2, Display::kStatusBarHeight + 56);
-        tft.print(g_promptSelected == 1 ? "> " : "  ");
-        tft.print("Cancel");
+        drawTwoOptionPrompt(line1, line2, labelA, "Cancel", g_promptSelected, "This firmware previously failed");
         tickTwoOption(selectUpdateConfirmed, selectBackToMain);
       } else {
         drawTwoOptionPrompt(line1, line2, labelA, "Cancel", g_promptSelected);

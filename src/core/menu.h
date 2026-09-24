@@ -34,11 +34,22 @@ using BadgeFn = bool (*)();
 // Reusable wrapping list widget (Addendum: "all menu/list encoder
 // navigation wraps"). DOT/DASH confirms the highlighted item by pushing
 // its onSelect screen; Encoder long goes back.
+//
+// Hardware Fix #1: redraws only when something visible actually changed
+// (configure() called, selection moved, or a badge flipped) instead of
+// every tick, and scrolls a viewport window when there are more items than
+// fit the content area at the larger PRIMARY font -- the selected item is
+// always kept inside the visible window.
 class ListMenu {
  public:
   // badges, when given, must point to an array the same length as items
   // (entries may be nullptr for "no badge"); the array must outlive this
-  // ListMenu instance (a static/global array, as with items).
+  // ListMenu instance (a static/global array, as with items). Badge-change
+  // dirty-tracking only applies up to kBadgeCacheCap items; beyond that,
+  // badges are treated as always-possibly-changed (correct, just not
+  // optimized -- no caller currently passes more than a handful).
+  static constexpr uint8_t kBadgeCacheCap = 8;
+
   void configure(const SettingItem* items, uint8_t count, const BadgeFn* badges = nullptr);
   void tick(const char* title);
   uint8_t selectedIndex() const { return selected_; }
@@ -48,6 +59,8 @@ class ListMenu {
   const BadgeFn* badges_ = nullptr;
   uint8_t count_ = 0;
   uint8_t selected_ = 0;
+  bool dirty_ = true;
+  bool lastBadge_[kBadgeCacheCap] = {};
 };
 
 namespace Menu {

@@ -56,6 +56,8 @@ const char* g_errorMessage = nullptr;
 bool g_finished = false;
 MixedTextEntryResult g_result = MixedTextEntryResult::NONE;
 
+bool g_dirty = true;
+
 void appendConfirmedChar(char c) {
   if (g_length < g_config.maxLength) {
     g_buffer[g_length++] = c;
@@ -179,41 +181,49 @@ void handleConfirm(const InputEvent& e) {
 }
 
 void render() {
-  Adafruit_ST7789& tft = Display::tft();
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  Display::printLine(2, y, g_config.title);
+  y += lh;
 
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(g_config.title);
-
-  tft.setCursor(2, Display::kStatusBarHeight + 16);
-  tft.print(g_buffer);
-
+  char line[96];
   switch (g_state) {
     case State::EMPTY:
-      tft.print('_');
-      if (g_errorMessage != nullptr) {
-        tft.setCursor(2, Display::kStatusBarHeight + 40);
-        tft.print(g_errorMessage);
-      }
+      snprintf(line, sizeof(line), "%s_", g_buffer);
       break;
     case State::PREVIEW: {
       char c = charsetAt(g_config.charset, g_previewIndex);
-      tft.print('[');
-      tft.print(c);
-      tft.print(']');
+      snprintf(line, sizeof(line), "%s[%c]", g_buffer, c);
       break;
     }
     case State::MORSE:
-      tft.print('[');
-      tft.print(g_morsePattern);
-      tft.print(']');
+      snprintf(line, sizeof(line), "%s[%s]", g_buffer, g_morsePattern);
       break;
     case State::CONFIRM:
-      tft.setCursor(2, Display::kStatusBarHeight + 40);
-      tft.print(g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
+      // No cursor/preview suffix while confirming -- matches original
+      // behavior of showing the plain buffer value being saved.
+      snprintf(line, sizeof(line), "%s", g_buffer);
       break;
+  }
+
+  // Keep the actively-edited tail (cursor/preview) visible rather than
+  // clipping it off-screen: a WiFi Password (up to 64 chars) or Group Code
+  // (up to 32) can now exceed the PRIMARY font's visible width, where at
+  // the old compact font they usually still fit (Hardware Fix #1). Drop
+  // leading characters, not trailing ones, so the part the user is
+  // actively typing (or about to save) stays on screen.
+  const char* visible = line;
+  int16_t avail = Display::kScreenWidth - 2;
+  while (visible[0] != '\0' && Display::textWidth(visible) > avail) visible++;
+  Display::printLine(2, y, visible);
+  y += lh;
+
+  if (g_state == State::EMPTY && g_errorMessage != nullptr) {
+    Display::printLine(2, y + 8, g_errorMessage);
+  } else if (g_state == State::CONFIRM) {
+    Display::printLine(2, y + 8, g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
   }
 }
 
@@ -234,12 +244,15 @@ void start(const MixedTextEntryConfig& config, const char* initialValue) {
   g_errorMessage = nullptr;
   g_finished = false;
   g_result = MixedTextEntryResult::NONE;
+  g_dirty = true;
 }
 
 void tick() {
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     switch (g_state) {
       case State::EMPTY:
         handleEmpty(e);
@@ -255,14 +268,21 @@ void tick() {
         break;
     }
   }
+  // Every popped event here changes visible state (preview index, pattern,
+  // buffer, or the Save/Cancel toggle) or is about to leave this screen
+  // entirely, so a coarse "any event -> dirty" is correct, not just cheap.
+  if (hadEvent) g_dirty = true;
 
   if (g_state == State::MORSE && g_morsePatternLen > 0) {
     uint32_t now = millis();
     if (now - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeMorseChar();
+      g_dirty = true;
     }
   }
 
+  if (!g_dirty) return;
+  g_dirty = false;
   render();
 }
 

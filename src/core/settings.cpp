@@ -232,6 +232,7 @@ struct NumberAdjustState {
   void (*onSave)(int16_t);
 };
 NumberAdjustState g_numAdjust;
+bool g_numAdjustDirty = true;
 
 void numberAdjustTick() {
   Input::update();
@@ -241,6 +242,7 @@ void numberAdjustTick() {
       int32_t nv = static_cast<int32_t>(g_numAdjust.value) + static_cast<int32_t>(e.value) * g_numAdjust.step;
       if (nv < g_numAdjust.minV) nv = g_numAdjust.minV;
       if (nv > g_numAdjust.maxV) nv = g_numAdjust.maxV;
+      if (static_cast<int16_t>(nv) != g_numAdjust.value) g_numAdjustDirty = true;
       g_numAdjust.value = static_cast<int16_t>(nv);
     } else if (Input::isMenuConfirm(e)) {
       if (g_numAdjust.onSave != nullptr) g_numAdjust.onSave(g_numAdjust.value);
@@ -252,12 +254,15 @@ void numberAdjustTick() {
     }
   }
 
+  if (!g_numAdjustDirty) return;
+  g_numAdjustDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(2, Display::kStatusBarHeight + 4);
-  tft.print(g_numAdjust.title);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 4;
+  Display::printLine(2, y, g_numAdjust.title);
+  y += lh;
 
   char buf[24];
   if (g_numAdjust.format != nullptr) {
@@ -265,12 +270,11 @@ void numberAdjustTick() {
   } else {
     snprintf(buf, sizeof(buf), "%d", g_numAdjust.value);
   }
-  tft.setCursor(2, Display::kStatusBarHeight + 22);
-  tft.print(buf);
+  Display::printLine(2, y, buf);
+  y += lh;
 
   if (g_numAdjust.warnAt != kNoWarn && g_numAdjust.value >= g_numAdjust.warnAt) {
-    tft.setCursor(2, Display::kStatusBarHeight + 40);
-    tft.print(g_numAdjust.warnText);
+    Display::printLine(2, y, g_numAdjust.warnText);
   }
 }
 
@@ -295,6 +299,7 @@ void screenBrightnessAdjust() {
   if (Menu::consumeJustEntered()) {
     g_numAdjust = {"Brightness", 0, 100, 5, static_cast<int16_t>(Settings::getBrightness()),
                    kNoWarn, nullptr, formatPercent, saveBrightness};
+    g_numAdjustDirty = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -303,6 +308,7 @@ void screenVolumeAdjust() {
   if (Menu::consumeJustEntered()) {
     g_numAdjust = {"Speaker Volume", 0, 100, 5, static_cast<int16_t>(Settings::getSpeakerVolume()),
                    kNoWarn, nullptr, formatPercent, saveVolume};
+    g_numAdjustDirty = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -311,6 +317,7 @@ void screenWpmAdjust() {
   if (Menu::consumeJustEntered()) {
     g_numAdjust = {"WPM", Morse::kMinWpm, Morse::kMaxWpm, 1, static_cast<int16_t>(Settings::getWpm()),
                    static_cast<int16_t>(Morse::kWpmWarnThreshold), "Warning: high speed", nullptr, saveWpm};
+    g_numAdjustDirty = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -319,6 +326,7 @@ void screenSleepTimeoutAdjust() {
   if (Menu::consumeJustEntered()) {
     g_numAdjust = {"Sleep Timeout", 0, 30, 1, static_cast<int16_t>(Settings::getSleepTimeoutMinutes()),
                    kNoWarn, nullptr, formatSleepTimeout, saveSleepTimeout};
+    g_numAdjustDirty = true;
   }
   Display::drawStatusBar();
   numberAdjustTick();
@@ -444,10 +452,14 @@ constexpr uint8_t kMaxScanResults = 12;
 char g_scanSsids[kMaxScanResults][33];
 uint8_t g_scanCount = 0;
 uint8_t g_scanSelected = 0;
+bool g_scanDirty = true;
 
 void screenWifiScanResults() {
   if (Menu::consumeJustEntered()) {
     g_scanCount = 0;
+    // WiFi.scanNetworks() is a blocking call (several seconds) -- pre-
+    // existing behavior, out of scope for Hardware Fix #1's redraw/encoder
+    // work, which only touches per-tick rendering. Noted in the fix report.
     int n = WiFi.scanNetworks();
     for (int i = 0; i < n && g_scanCount < kMaxScanResults; i++) {
       String ssid = WiFi.SSID(i);
@@ -458,16 +470,19 @@ void screenWifiScanResults() {
     }
     WiFi.scanDelete();
     g_scanSelected = 0;
+    g_scanDirty = true;
   }
 
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE && g_scanCount > 0) {
+      uint8_t prev = g_scanSelected;
       int16_t next = static_cast<int16_t>(g_scanSelected) + e.value;
       if (next < 0) next = static_cast<int16_t>(g_scanCount) - 1;
       if (next >= static_cast<int16_t>(g_scanCount)) next = 0;
       g_scanSelected = static_cast<uint8_t>(next);
+      if (g_scanSelected != prev) g_scanDirty = true;
     } else if (Input::isMenuConfirm(e) && g_scanCount > 0) {
       strncpy(g_chosenSsid, g_scanSsids[g_scanSelected], sizeof(g_chosenSsid) - 1);
       g_chosenSsid[sizeof(g_chosenSsid) - 1] = '\0';
@@ -477,18 +492,34 @@ void screenWifiScanResults() {
     }
   }
 
+  if (!g_scanDirty) return;
+  g_scanDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(g_scanCount == 0 ? "No networks found" : "Select SSID:");
-  int16_t y = Display::kStatusBarHeight + 14;
-  for (uint8_t i = 0; i < g_scanCount; i++) {
-    tft.setCursor(2, y);
-    tft.print(i == g_scanSelected ? "> " : "  ");
-    tft.print(g_scanSsids[i]);
-    y += 10;
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  Display::printLine(2, y, g_scanCount == 0 ? "No networks found" : "Select SSID:");
+  y += lh;
+
+  // Viewport scroll (Hardware Fix #1): up to kMaxScanResults=12 results may
+  // no longer all fit at the larger PRIMARY line height.
+  int16_t remaining = Display::kScreenHeight - y;
+  uint8_t visibleRows = (remaining > 0) ? static_cast<uint8_t>(remaining / lh) : 0;
+  if (visibleRows == 0) visibleRows = 1;
+  int16_t startIdx = 0;
+  if (g_scanCount > visibleRows) {
+    if (g_scanSelected >= visibleRows) startIdx = static_cast<int16_t>(g_scanSelected) - visibleRows + 1;
+    int16_t maxStart = static_cast<int16_t>(g_scanCount) - static_cast<int16_t>(visibleRows);
+    if (startIdx > maxStart) startIdx = maxStart;
+    if (startIdx < 0) startIdx = 0;
+  }
+
+  for (uint8_t i = static_cast<uint8_t>(startIdx); i < g_scanCount && i < startIdx + visibleRows; i++) {
+    char line[40];
+    snprintf(line, sizeof(line), "%s%s", i == g_scanSelected ? "> " : "  ", g_scanSsids[i]);
+    Display::printLine(2, y, line);
+    y += lh;
   }
 }
 
@@ -516,6 +547,7 @@ enum class WifiTestState : uint8_t { CONNECTING, DONE };
 WifiTestState g_wifiTestState = WifiTestState::DONE;
 uint32_t g_wifiTestStartMs = 0;
 bool g_wifiTestSuccess = false;
+bool g_wifiTestDirty = true;
 
 void screenWifiTestConnection() {
   if (Menu::consumeJustEntered()) {
@@ -528,6 +560,7 @@ void screenWifiTestConnection() {
       g_wifiTestState = WifiTestState::DONE;
       g_wifiTestSuccess = false;
     }
+    g_wifiTestDirty = true;
   }
 
   Input::update();
@@ -543,20 +576,25 @@ void screenWifiTestConnection() {
     if (WiFi.status() == WL_CONNECTED) {
       g_wifiTestState = WifiTestState::DONE;
       g_wifiTestSuccess = true;
+      g_wifiTestDirty = true;
     } else if (millis() - g_wifiTestStartMs >= 15000) {
       g_wifiTestState = WifiTestState::DONE;
       g_wifiTestSuccess = false;
+      g_wifiTestDirty = true;
     }
   }
 
+  if (!g_wifiTestDirty) return;
+  g_wifiTestDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(2, Display::kStatusBarHeight + 20);
-  tft.print(g_wifiTestState == WifiTestState::CONNECTING ? "Connecting..." : (g_wifiTestSuccess ? "Connected!" : "Failed"));
-  tft.setCursor(2, Display::kStatusBarHeight + 40);
-  tft.print("DOT to return");
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 20;
+  Display::printLine(2, y, g_wifiTestState == WifiTestState::CONNECTING ? "Connecting..."
+                                                                        : (g_wifiTestSuccess ? "Connected!" : "Failed"));
+  y += lh;
+  Display::printLine(2, y, "DOT to return");
 }
 
 // ---- Family Groups ------------------------------------------------------------

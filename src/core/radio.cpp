@@ -49,21 +49,28 @@ void serviceInit() {
 // Friend's, minus "recent offline" (you can't call someone who isn't
 // online) and with Everyone unconditionally included either way.
 // =============================================================================
+bool g_radioNoGroupsDirty = true;
+
 void screenNoFamilyGroups() {
+  bool justEntered = Menu::consumeJustEntered();
+  if (justEntered) g_radioNoGroupsDirty = true;
+
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (Input::isBack(e)) Menu::goBack();
   }
   Display::drawStatusBar();
+  if (!g_radioNoGroupsDirty) return;
+  g_radioNoGroupsDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(6, 60);
-  tft.print("No Family Groups");
-  tft.setCursor(6, 76);
-  tft.print("Add one in Settings");
+  int16_t lh = Display::lineHeight();
+  int16_t y = 60;
+  Display::printLine(6, y, "No Family Groups");
+  y += lh;
+  Display::printLine(6, y, "Add one in Settings");
 }
 
 SettingItem g_groupSelectItems[Settings::kMaxGroups];
@@ -176,6 +183,9 @@ void leaveTalk() {
   }
 }
 
+bool g_talkDirty = true;
+const char* g_talkLastStatus = nullptr;
+
 void screenTalk() {
   bool isEveryone = strcmp(g_selectedContactKey, MessageStore::kEveryone) == 0;
 
@@ -185,6 +195,8 @@ void screenTalk() {
       Presence::setOwnRadioAvailable(true);
       Presence::republishOwnPresenceAllGroups();
     }
+    g_talkDirty = true;
+    g_talkLastStatus = nullptr;
   }
 
   Input::update();
@@ -213,13 +225,14 @@ void screenTalk() {
   }
 
   Display::drawStatusBar();
-  Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(isEveryone ? "Everyone" : g_selectedContactKey);
 
+  // Call state (Claiming/Connecting/Talking/BUSY) transitions asynchronously
+  // as the negotiation state machine progresses, not just on local input, so
+  // detect changes by comparing the resolved status string each tick rather
+  // than only on popped events (Hardware Fix #1). All branches return string
+  // literals, so pointer comparison correctly detects a change. This is also
+  // the "Channel-Busy" status screen flagged for extra review alongside the
+  // larger PRIMARY font (item 14).
   const char* status = "Ready";
   if (isEveryone) {
     if (RadioTransport::isBroadcasting()) status = "Talking...";
@@ -244,8 +257,18 @@ void screenTalk() {
         break;
     }
   }
-  tft.setCursor(2, Display::kStatusBarHeight + 20);
-  tft.print(status);
+
+  if (!g_talkDirty && status == g_talkLastStatus) return;
+  g_talkDirty = false;
+  g_talkLastStatus = status;
+
+  Display::setFont(Display::Font::PRIMARY);
+  Display::clearContentArea();
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  Display::printLine(2, y, isEveryone ? "Everyone" : g_selectedContactKey);
+  y += lh;
+  Display::printLine(2, y, status);
 }
 
 // =============================================================================

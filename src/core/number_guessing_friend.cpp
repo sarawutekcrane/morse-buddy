@@ -385,20 +385,22 @@ void handleGameResultChunkPacket(const char* group_code, const char* topic, cons
 // to its own file; there is no shared list-building utility to reuse).
 // =============================================================================
 void screenNoFamilyGroups() {
+  bool justEntered = Menu::consumeJustEntered();
+
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (Input::isBack(e)) Menu::goBack();
   }
+
   Display::drawStatusBar();
+  if (!justEntered) return;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(6, 60);
-  tft.print("No Family Groups");
-  tft.setCursor(6, 76);
-  tft.print("Add one in Settings");
+  int16_t lh = Display::lineHeight();
+  Display::printLine(6, 60, "No Family Groups");
+  Display::printLine(6, 60 + lh, "Add one in Settings");
 }
 
 SettingItem g_groupSelectItems[Settings::kMaxGroups];
@@ -569,16 +571,21 @@ void handleFriendChatEvent(const InputEvent& e) {
   }
 }
 
+bool g_friendChatDirty = true;
+
 void screenFriendChat() {
   if (Menu::consumeJustEntered()) {
     g_historyCursor = kNoHistoryCursor;
     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
     markIndexDirty();
+    g_friendChatDirty = true;
   }
 
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
       refreshIndexIfNeeded();
       if (g_historyCursor == kNoHistoryCursor) {
@@ -596,28 +603,38 @@ void screenFriendChat() {
       handleFriendChatEvent(e);
     }
   }
+  if (hadEvent) g_friendChatDirty = true;
 
+  bool wasIndexDirty = g_indexDirty;
   refreshIndexIfNeeded();
+  if (wasIndexDirty) g_friendChatDirty = true;
 
   Display::drawStatusBar();
-  Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  if (!g_friendChatDirty) return;
+  g_friendChatDirty = false;
 
-  constexpr uint16_t kViewportLines = 4;
+  Display::setFont(Display::Font::PRIMARY);
+  Display::clearContentArea();
+  int16_t lh = Display::lineHeight();
+
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t contentHeight = Display::kScreenHeight - contentTop;
+  uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
+  if (totalLines < 2) totalLines = 2;
+  uint16_t viewportLines = static_cast<uint16_t>(totalLines - 1);
+
   uint16_t startIdx = 0;
-  if (g_indexTotal > kViewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - kViewportLines);
+  if (g_indexTotal > viewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - viewportLines);
   if (g_historyCursor != kNoHistoryCursor) {
     if (g_historyCursor < startIdx) {
       startIdx = g_historyCursor;
-    } else if (g_historyCursor >= startIdx + kViewportLines) {
-      startIdx = static_cast<uint16_t>(g_historyCursor - kViewportLines + 1);
+    } else if (g_historyCursor >= startIdx + viewportLines) {
+      startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
     }
   }
 
-  int16_t y = Display::kStatusBarHeight + 2;
-  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + kViewportLines; i++) {
+  int16_t y = contentTop;
+  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
     const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
     if (entry == nullptr) continue;
     MessageRef ref = refForIndexEntry(*entry);
@@ -627,16 +644,15 @@ void screenFriendChat() {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
       if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
     }
-    tft.setCursor(2, y);
-    tft.print(i == g_historyCursor ? "> " : "  ");
-    tft.print(lineBuf);
-    y += 10;
+    char line[56];
+    snprintf(line, sizeof(line), "%s%s", i == g_historyCursor ? "> " : "  ", lineBuf);
+    Display::printLine(2, y, line);
+    y += lh;
   }
 
-  y = Display::kStatusBarHeight + 2 + kViewportLines * 10 + 4;
-  tft.setCursor(2, y);
-  tft.print(g_historyCursor == kNoHistoryCursor ? "> " : "  ");
-  tft.print("(Short: new challenge)");
+  char full[40];
+  snprintf(full, sizeof(full), "%s(Short: new challenge)", g_historyCursor == kNoHistoryCursor ? "> " : "  ");
+  Display::printLine(2, y, full);
 }
 
 // =============================================================================
@@ -754,10 +770,16 @@ void submitAnswerGuess() {
   g_answerPhase = AnswerPhase::SHOWING_RESULT;
 }
 
+bool g_answerDirty = true;
+
 void screenAnswer() {
+  if (Menu::consumeJustEntered()) g_answerDirty = true;
+
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (Input::isBack(e)) {
       Menu::goBack();
       continue;
@@ -781,32 +803,40 @@ void screenAnswer() {
       NumberGuessing::handleDigitEntryEvent(&g_digitEntry, e);
     }
   }
-  if (g_answerPhase == AnswerPhase::ENTERING) NumberGuessing::tickDigitEntry(&g_digitEntry);
+  if (hadEvent) g_answerDirty = true;
+
+  if (g_answerPhase == AnswerPhase::ENTERING) {
+    uint8_t countBefore = g_digitEntry.count;
+    NumberGuessing::tickDigitEntry(&g_digitEntry);
+    if (g_digitEntry.count != countBefore) g_answerDirty = true;
+  }
 
   Display::drawStatusBar();
+  if (!g_answerDirty) return;
+  g_answerDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
   char line[32];
 
   if (g_answerPhase == AnswerPhase::SHOWING_RESULT) {
     snprintf(line, sizeof(line), "%04u -> %uA%uB", g_pendingGuessValue, g_pendingResult.a, g_pendingResult.b);
-    tft.setCursor(2, Display::kStatusBarHeight + 2);
-    tft.print(line);
-    tft.setCursor(2, Display::kStatusBarHeight + 20);
-    tft.print("Short: continue");
+    Display::printLine(2, y, line);
+    y += lh;
+    Display::printLine(2, y, "Short: continue");
   } else {
     snprintf(line, sizeof(line), "Attempt %d", g_activeGame.totalAttempts + 1);
-    tft.setCursor(2, Display::kStatusBarHeight + 2);
-    tft.print(line);
+    Display::printLine(2, y, line);
+    y += lh;
 
     char guessLine[16] = "____";
     for (uint8_t i = 0; i < g_digitEntry.count; i++) guessLine[i] = static_cast<char>('0' + g_digitEntry.digits[i]);
     if (g_digitEntry.count < 4) guessLine[g_digitEntry.count] = static_cast<char>('0' + g_digitEntry.previewDigit);
-    tft.setCursor(2, Display::kStatusBarHeight + 20);
-    tft.print("ANSWER: ");
-    tft.print(guessLine);
+    char full[24];
+    snprintf(full, sizeof(full), "ANSWER: %s", guessLine);
+    Display::printLine(2, y, full);
   }
 }
 
@@ -818,43 +848,51 @@ uint16_t g_friendResultScroll = 0;
 
 void startResultView(const FriendGameState& s) { g_viewState = s; }
 
+bool g_friendResultDirty = true;
+
 void screenFriendResult() {
   if (Menu::consumeJustEntered()) {
     g_friendResultScroll = (g_viewState.historyCount > 0) ? static_cast<uint16_t>(g_viewState.historyCount - 1) : 0;
+    g_friendResultDirty = true;
   }
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE) {
+      uint16_t prev = g_friendResultScroll;
       int32_t next = static_cast<int32_t>(g_friendResultScroll) + e.value;
       if (next < 0) next = 0;
       if (next >= g_viewState.historyCount) next = g_viewState.historyCount > 0 ? g_viewState.historyCount - 1 : 0;
       g_friendResultScroll = static_cast<uint16_t>(next);
+      if (g_friendResultScroll != prev) g_friendResultDirty = true;
     } else if (Input::isMenuConfirm(e) || Input::isBack(e)) {
       Menu::goBack();
     }
   }
 
   Display::drawStatusBar();
+  if (!g_friendResultDirty) return;
+  g_friendResultDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
   char line[32];
   snprintf(line, sizeof(line), "Total attempts: %d", g_viewState.totalAttempts);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print(line);
+  Display::printLine(2, y, line);
+  y += lh;
 
-  constexpr uint16_t kRows = 4;
-  uint16_t start = (g_friendResultScroll >= kRows) ? static_cast<uint16_t>(g_friendResultScroll - kRows + 1) : 0;
-  int16_t y = Display::kStatusBarHeight + 16;
-  for (uint16_t i = start; i < g_viewState.historyCount && i < start + kRows; i++) {
+  int16_t remaining = Display::kScreenHeight - y;
+  uint16_t rows = (remaining > 0) ? static_cast<uint16_t>(remaining / lh) : 0;
+  if (rows == 0) rows = 1;
+  uint16_t start = (g_friendResultScroll >= rows) ? static_cast<uint16_t>(g_friendResultScroll - rows + 1) : 0;
+  for (uint16_t i = start; i < g_viewState.historyCount && i < start + rows; i++) {
     const FriendEntry& g = g_viewState.history[chronologicalIndex(g_viewState, static_cast<uint8_t>(i))];
     snprintf(line, sizeof(line), "%s%04d %dA%dB", i == g_friendResultScroll ? "> " : "  ", g.guessValue, g.aCount,
              g.bCount);
-    tft.setCursor(2, y);
-    tft.print(line);
-    y += 10;
+    Display::printLine(2, y, line);
+    y += lh;
   }
 }
 
@@ -946,12 +984,19 @@ void finishChallengeCreation(const uint8_t secret[4]) {
   Menu::pushScreen(screenQuickSwitch);
 }
 
+bool g_manualEntryDirty = true;
+
 void screenManualEntry() {
-  if (Menu::consumeJustEntered()) NumberGuessing::resetDigitEntry(&g_digitEntry);
+  if (Menu::consumeJustEntered()) {
+    NumberGuessing::resetDigitEntry(&g_digitEntry);
+    g_manualEntryDirty = true;
+  }
 
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (Input::isBack(e)) {
       Menu::goBack();
       continue;
@@ -967,29 +1012,41 @@ void screenManualEntry() {
       NumberGuessing::handleDigitEntryEvent(&g_digitEntry, e);
     }
   }
+  if (hadEvent) g_manualEntryDirty = true;
+
+  uint8_t countBefore = g_digitEntry.count;
   NumberGuessing::tickDigitEntry(&g_digitEntry);
+  if (g_digitEntry.count != countBefore) g_manualEntryDirty = true;  // hold-to-delete fired
 
   Display::drawStatusBar();
+  if (!g_manualEntryDirty) return;
+  g_manualEntryDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
   char guessLine[16] = "____";
   for (uint8_t i = 0; i < g_digitEntry.count; i++) guessLine[i] = static_cast<char>('0' + g_digitEntry.digits[i]);
   if (g_digitEntry.count < 4) guessLine[g_digitEntry.count] = static_cast<char>('0' + g_digitEntry.previewDigit);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print("Set secret: ");
-  tft.print(guessLine);
+  char line[32];
+  snprintf(line, sizeof(line), "Set secret: %s", guessLine);
+  Display::printLine(2, y, line);
+  y += lh;
   if (g_digitEntry.count == 4) {
-    tft.setCursor(2, Display::kStatusBarHeight + 20);
-    tft.print("DOT: send");
+    Display::printLine(2, y, "DOT: send");
   }
 }
 
 constexpr uint32_t kDotConfirmMs = 500;  // same short/hold boundary as digit entry (Addendum 9.5)
 
+bool g_randomConfirmDirty = true;
+
 void screenRandomConfirm() {
-  if (Menu::consumeJustEntered()) generateRandomFriendSecret(g_pendingRandomSecret);
+  if (Menu::consumeJustEntered()) {
+    generateRandomFriendSecret(g_pendingRandomSecret);
+    g_randomConfirmDirty = true;
+  }
 
   Input::update();
   InputEvent e;
@@ -1005,14 +1062,16 @@ void screenRandomConfirm() {
   }
 
   Display::drawStatusBar();
+  if (!g_randomConfirmDirty) return;
+  g_randomConfirmDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(2, Display::kStatusBarHeight + 2);
-  tft.print("Random secret ready");
-  tft.setCursor(2, Display::kStatusBarHeight + 20);
-  tft.print("DOT: send");
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  Display::printLine(2, y, "Random secret ready");
+  y += lh;
+  Display::printLine(2, y, "DOT: send");
 }
 
 void quickSwitchText() {

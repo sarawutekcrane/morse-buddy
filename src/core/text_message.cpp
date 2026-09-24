@@ -104,20 +104,25 @@ void refreshIndexIfNeeded() {
 // No Family Groups
 // =============================================================================
 void screenNoFamilyGroups() {
+  // Captured before Input::isBack() can call Menu::goBack() and reassign
+  // the flag to whichever screen becomes newly on top (established pattern
+  // -- see comingSoonScreen in menu.cpp).
+  bool justEntered = Menu::consumeJustEntered();
+
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (Input::isBack(e)) Menu::goBack();
   }
+
   Display::drawStatusBar();
+  if (!justEntered) return;
+
+  Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(6, 60);
-  tft.print("No Family Groups");
-  tft.setCursor(6, 76);
-  tft.print("Add one in Settings");
+  int16_t lh = Display::lineHeight();
+  Display::printLine(6, 60, "No Family Groups");
+  Display::printLine(6, 60 + lh, "Add one in Settings");
 }
 
 // =============================================================================
@@ -417,6 +422,8 @@ void handleHistoryFocusEvent(const InputEvent& e) {
   }
 }
 
+bool g_chatRenderDirty = true;
+
 void screenChat() {
   if (Menu::consumeJustEntered()) {
     clearDraft();
@@ -427,11 +434,14 @@ void screenChat() {
     g_chatOpenContact[sizeof(g_chatOpenContact) - 1] = '\0';
     g_chatIsOpen = true;
     markIndexDirty();
+    g_chatRenderDirty = true;
   }
 
   Input::update();
   InputEvent e;
+  bool hadEvent = false;
   while (Input::popEvent(e)) {
+    hadEvent = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
       refreshIndexIfNeeded();
       if (g_historyCursor == kNoHistoryCursor) {
@@ -451,34 +461,49 @@ void screenChat() {
       handleComposeEvent(e);
     }
   }
+  if (hadEvent) g_chatRenderDirty = true;
 
   if (g_historyCursor == kNoHistoryCursor && g_composePatternLen > 0) {
     if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeComposeChar();
+      g_chatRenderDirty = true;
     }
   }
 
+  bool wasIndexDirty = g_indexDirty;
   refreshIndexIfNeeded();
+  if (wasIndexDirty) g_chatRenderDirty = true;  // index actually reloaded: content may have changed
 
   Display::drawStatusBar();
-  Display::clearContentArea();
-  Adafruit_ST7789& tft = Display::tft();
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE);
+  if (!g_chatRenderDirty) return;
+  g_chatRenderDirty = false;
 
-  constexpr uint16_t kViewportLines = 4;
+  Display::setFont(Display::Font::PRIMARY);
+  Display::clearContentArea();
+  int16_t lh = Display::lineHeight();
+
+  // As many history rows as fit, with the last row always reserved for the
+  // compose line -- mirrors the original fixed-4-row layout, just computed
+  // from the active font's real line height instead of a hardcoded 10px
+  // (Hardware Fix #1: PRIMARY's larger line height means fewer rows fit).
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t contentHeight = Display::kScreenHeight - contentTop;
+  uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
+  if (totalLines < 2) totalLines = 2;
+  uint16_t viewportLines = static_cast<uint16_t>(totalLines - 1);
+
   uint16_t startIdx = 0;
-  if (g_indexTotal > kViewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - kViewportLines);
+  if (g_indexTotal > viewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - viewportLines);
   if (g_historyCursor != kNoHistoryCursor) {
     if (g_historyCursor < startIdx) {
       startIdx = g_historyCursor;
-    } else if (g_historyCursor >= startIdx + kViewportLines) {
-      startIdx = static_cast<uint16_t>(g_historyCursor - kViewportLines + 1);
+    } else if (g_historyCursor >= startIdx + viewportLines) {
+      startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
     }
   }
 
-  int16_t y = Display::kStatusBarHeight + 2;
-  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + kViewportLines; i++) {
+  int16_t y = contentTop;
+  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
     const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
     if (entry == nullptr) continue;
     MessageRef ref = refForIndexEntry(*entry);
@@ -488,18 +513,17 @@ void screenChat() {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
       if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
     }
-    tft.setCursor(2, y);
-    tft.print(i == g_historyCursor ? "> " : "  ");
-    tft.print(lineBuf);
-    y += 10;
+    char line[56];
+    snprintf(line, sizeof(line), "%s%s", i == g_historyCursor ? "> " : "  ", lineBuf);
+    Display::printLine(2, y, line);
+    y += lh;
   }
 
-  y = Display::kStatusBarHeight + 2 + kViewportLines * 10 + 4;
   char composeLine[64];
   buildComposeDisplay(composeLine, sizeof(composeLine));
-  tft.setCursor(2, y);
-  tft.print(g_historyCursor == kNoHistoryCursor ? "> " : "  ");
-  tft.print(composeLine);
+  char fullCompose[72];
+  snprintf(fullCompose, sizeof(fullCompose), "%s%s", g_historyCursor == kNoHistoryCursor ? "> " : "  ", composeLine);
+  Display::printLine(2, y, fullCompose);
 }
 
 // =============================================================================
