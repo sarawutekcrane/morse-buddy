@@ -44,18 +44,28 @@ bool encodeChar(char c, char* outPattern, uint8_t outPatternSize);
 bool isDeletePattern(const char* pattern);
 
 // =============================================================================
-// Natural-text word-gap helper (Hardware Fix #4 issue 3).
+// Natural-text word-gap helper (Hardware Fix #4 issue 3; revised in
+// Hardware Fix #4.1 to a DEFERRED word-boundary model).
 //
 // Every natural-sentence Morse compose path (Text Message, Enigma, Morse
 // Practice answer) already finalizes a letter itself once letterGapMs() (3
 // dit) of silence has passed. This helper covers the separate step on top
-// of that: once a letter has been finalized, a word space is due after a
-// further wordGapMs() (7 dit) of silence measured from the release of the
-// symbol that completed that letter -- NOT from when finalize happened --
-// unless a new symbol starts first. A small shared struct + three
-// functions so this 3-caller timing rule isn't reimplemented three times
-// with subtly different edge cases; callers still own their own millis()
-// and letter-finalize logic (no Input/timing responsibility moves here).
+// of that: once a letter has been finalized, the pause since the symbol
+// that completed it MIGHT turn out to be a word gap (>= wordGapMs(), 7
+// dit) -- but that can only be known for certain once the user actually
+// starts a NEXT symbol, since the same pause also covers "done composing,
+// about to press Send/Submit". If a space were inserted purely because
+// time passed, an idle pause before Send/Submit would wrongly leave a
+// trailing space in the stored/sent text (and, for Morse Practice, could
+// turn a correct answer into a strcmp() mismatch).
+//
+// So nothing is ever mutated while idle. The pending state is only ever
+// resolved -- to either exactly one space or nothing -- at the moment the
+// NEXT symbol begins (DOT_PRESS_START), before that symbol is accepted.
+// A small shared struct + three functions so this 3-caller timing rule
+// isn't reimplemented three times with subtly different edge cases;
+// callers still own their own millis() and letter-finalize logic (no
+// Input/timing responsibility moves here).
 // =============================================================================
 struct WordGapState {
   bool pending = false;
@@ -64,21 +74,28 @@ struct WordGapState {
 
 // Call right after finalizing a letter (pattern length back to 0), passing
 // the millis() timestamp at which the symbol that completed it was
-// released.
+// released. Does not itself mutate compose text or commit to a space --
+// see consumeWordBoundaryOnSymbolStart().
 void armWordGap(WordGapState* state, uint32_t symbolReleaseMs);
 
-// Cancels a pending word gap immediately. Call this on every
-// DOT_PRESS_START (not DOT_RELEASE) so a user starting the next letter's
-// first symbol can never have their hold time itself cross the 7-dit
-// threshold and wrongly insert a space mid-press. Also call on any reset
-// point (send, clear draft, screen entry, challenge reset, etc.) so no
-// stale pending state survives into an unrelated composition.
+// Discards a pending word boundary WITHOUT consuming it as a space. Call
+// on any reset point that isn't "the user started composing the next
+// letter" -- send, clear draft, delete/reset gesture, screen entry, new
+// challenge/compose session, etc. -- so no stale pending state survives
+// into an unrelated composition.
 void cancelWordGap(WordGapState* state);
 
-// Call once per tick while composing. Returns true exactly once when
-// wordGapMs(wpm) has elapsed since lastSymbolReleaseMs, and clears
-// `pending` itself -- the caller does not need to call cancelWordGap()
-// after acting on a true result.
-bool wordGapDue(WordGapState* state, uint8_t wpm, uint32_t nowMs);
+// Call exactly once, on every DOT_PRESS_START, BEFORE the new symbol is
+// accepted into the pattern buffer. Returns true -- meaning "insert
+// exactly one space now, then compose this symbol as the start of the
+// next word" -- only if a word boundary was pending AND at least
+// wordGapMs(wpm) had elapsed (at this moment) since the release of the
+// letter-completing symbol. Either way, the pending state is consumed:
+// a pending boundary that turns out to be too short (still the same
+// word) is silently cancelled and this returns false. If nothing was
+// pending, always returns false. A word space is therefore committed
+// only immediately before a real next symbol -- never merely because
+// time passed while idle (Hardware Fix #4.1).
+bool consumeWordBoundaryOnSymbolStart(WordGapState* state, uint8_t wpm, uint32_t nowMs);
 
 }  // namespace Morse

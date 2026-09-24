@@ -887,16 +887,22 @@ void clearDraft() {
   Morse::cancelWordGap(&g_composeWordGap);
 }
 
-// Appends exactly one ASCII space to the compose draft if a natural word
-// gap (7 dit of silence since the last Morse symbol) has elapsed since the
-// last letter finalized (Hardware Fix #4 issue 3). The space becomes part
-// of g_composeText here, i.e. before EnigmaCrypto::normalizeAndEscape()
-// ever sees it at send time -- normalizeAndEscape()/reverseEscape() already
-// round-trip a space through the escaped ciphertext alphabet unchanged, so
-// no crypto changes are needed for "HELLO WORLD" to decrypt back to
-// "HELLO WORLD".
-bool appendWordSpaceIfDue() {
-  if (!Morse::wordGapDue(&g_composeWordGap, Settings::getWpm(), millis())) return false;
+// Called on every DOT_PRESS_START, before the new symbol is accepted into
+// the pattern buffer (Hardware Fix #4.1: deferred word-boundary model). A
+// word space is committed here -- and only here -- because a pause after
+// the last letter is genuinely ambiguous until a next symbol actually
+// begins: the same pause also covers "done composing, about to press
+// Send", and inserting a space purely because time passed would wrongly
+// leave a trailing space in that case (which Enigma would then encode as
+// escaped content, e.g. XQ, before decryption ever restores it). The
+// space becomes part of g_composeText here, i.e. before
+// EnigmaCrypto::normalizeAndEscape() ever sees it at send time --
+// normalizeAndEscape()/reverseEscape() already round-trip a space through
+// the escaped ciphertext alphabet unchanged, so no crypto changes are
+// needed for "HELLO WORLD" to decrypt back to "HELLO WORLD". Returns true
+// if compose text changed so the caller can mark dirty.
+bool tryAppendWordSpaceOnSymbolStart() {
+  if (!Morse::consumeWordBoundaryOnSymbolStart(&g_composeWordGap, Settings::getWpm(), millis())) return false;
   if (g_composeLen == 0) return false;
   if (g_composeText[g_composeLen - 1] == ' ') return false;
   if (g_composeLen >= EnigmaCrypto::kMaxEscapedLen) return false;
@@ -1069,11 +1075,12 @@ void buildComposePrefixSuffix(char* prefix, size_t prefixSize, char* suffix, siz
 
 void handleComposeEvent(const InputEvent& e) {
   if (e.type == InputEventType::DOT_PRESS_START) {
-    // A new symbol starting cancels any pending word gap immediately --
-    // waiting for DOT_RELEASE would let a held first DASH of the next
-    // letter cross the 7-dit threshold mid-press and wrongly insert a
-    // space (Hardware Fix #4 issue 3, critical input detail).
-    Morse::cancelWordGap(&g_composeWordGap);
+    // Resolve any pending word boundary now, before this symbol is
+    // accepted -- a space is inserted only if the pause was actually
+    // >= 7 dit at this exact moment, never merely because time passed
+    // while idle (Hardware Fix #4.1). Redraw is already guaranteed by the
+    // caller's "any popped event marks dirty" rule.
+    tryAppendWordSpaceOnSymbolStart();
   } else if (e.type == InputEventType::DOT_RELEASE) {
     g_composeError = nullptr;
     if (e.durationMs >= Morse::kSpecialCommandMs) {
@@ -1188,13 +1195,13 @@ void screenEnigmaChat() {
   }
   if (hadEvent) g_enigmaChatDirty = true;
 
-  if (g_historyCursor == kNoHistoryCursor) {
-    if (g_composePatternLen > 0) {
-      if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
-        finalizeComposeChar();
-        g_enigmaChatDirty = true;
-      }
-    } else if (appendWordSpaceIfDue()) {
+  // Word-boundary resolution is no longer a per-tick check (Hardware Fix
+  // #4.1): it only happens at the next DOT_PRESS_START, in
+  // handleComposeEvent() above, so idling past 7 dit before pressing Send
+  // never mutates compose text on its own.
+  if (g_historyCursor == kNoHistoryCursor && g_composePatternLen > 0) {
+    if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
+      finalizeComposeChar();
       g_enigmaChatDirty = true;
     }
   }

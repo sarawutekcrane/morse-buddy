@@ -58,6 +58,22 @@ class ListMenu {
   // optimized -- no caller currently passes more than a handful).
   static constexpr uint8_t kBadgeCacheCap = 8;
 
+  // PUSH_SCREEN (default): DOT/DASH confirm pushes items_[selected_].onSelect
+  // as a new screen, same as ever -- every existing navigation menu keeps
+  // this behavior unchanged.
+  // IN_PLACE (Hardware Fix #4.1): DOT/DASH confirm instead calls
+  // items_[selected_].onSelect() directly, as a plain function call, with
+  // no screen push and no navigation-stack change. For a persisted
+  // setting picker (Typing Display, Mute Radio Outside, Audio Preview,
+  // Reveal Answer, Select Level) this lets confirming a choice update the
+  // saved value and its "*" badge in place, on the same screen, with no
+  // clearContentArea()/full redraw and no re-entry through configure() --
+  // eliminating the confirm-time flicker a push+goBack()+re-enter cycle
+  // caused even though it was visually the same picker screen throughout.
+  // An IN_PLACE onSelect must NOT call Menu::goBack() or push a screen;
+  // it should only save/apply the value and fire any required hook.
+  enum class SelectionMode : uint8_t { PUSH_SCREEN, IN_PLACE };
+
   // initialSelected: the cursor's starting row. Callers rendering a
   // persisted enum/bool picker pass the index matching the currently saved
   // value, so the picker opens on the active choice instead of always
@@ -65,7 +81,7 @@ class ListMenu {
   // existing non-persisted-picker callers are unaffected. Out-of-range
   // values are clamped to 0.
   void configure(const SettingItem* items, uint8_t count, const BadgeFn* badges = nullptr,
-                 uint8_t initialSelected = 0);
+                 uint8_t initialSelected = 0, SelectionMode selectionMode = SelectionMode::PUSH_SCREEN);
   void tick(const char* title);
   uint8_t selectedIndex() const { return selected_; }
 
@@ -74,6 +90,7 @@ class ListMenu {
   const BadgeFn* badges_ = nullptr;
   uint8_t count_ = 0;
   uint8_t selected_ = 0;
+  SelectionMode selectionMode_ = SelectionMode::PUSH_SCREEN;
   bool needsFullRedraw_ = true;
   int16_t lastDrawnStartIdx_ = -1;  // -1: nothing drawn yet (forces firstDraw's own path anyway)
   uint8_t lastDrawnSelected_ = 0;

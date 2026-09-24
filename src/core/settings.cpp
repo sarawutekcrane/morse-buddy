@@ -389,12 +389,16 @@ void screenSleepTimeoutAdjust() {
 // independent of the "> " navigation cursor, so the user can tell what's
 // active even while browsing other choices. Reuses ListMenu's existing
 // per-item BadgeFn mechanism (already used for Main Menu unread badges) --
-// each badge fn below just reports "is this the currently saved value",
-// so ListMenu's existing marker-only-on-cursor-move / badge-diffed-region
-// redraw logic (Hardware Fix #2/#3) applies unchanged.
-void typingTrampolineMorse() { Settings::setTypingDisplay(Settings::TypingDisplay::MORSE_ONLY); Menu::goBack(); }
-void typingTrampolineLetters() { Settings::setTypingDisplay(Settings::TypingDisplay::LETTERS_ONLY); Menu::goBack(); }
-void typingTrampolineMixed() { Settings::setTypingDisplay(Settings::TypingDisplay::MIXED); Menu::goBack(); }
+// each badge fn below just reports "is this the currently saved value".
+//
+// Hardware Fix #4.1: confirmed in ListMenu::SelectionMode::IN_PLACE, so
+// these callbacks save the value and stay on this same picker screen --
+// no Menu::goBack(), no re-entry through screenTypingDisplayPicker()'s
+// configure() call, no clearContentArea(). ListMenu's badge-cell-only
+// redraw then updates just the "*" in place.
+void typingTrampolineMorse() { Settings::setTypingDisplay(Settings::TypingDisplay::MORSE_ONLY); }
+void typingTrampolineLetters() { Settings::setTypingDisplay(Settings::TypingDisplay::LETTERS_ONLY); }
+void typingTrampolineMixed() { Settings::setTypingDisplay(Settings::TypingDisplay::MIXED); }
 const SettingItem kTypingDisplayItems[] = {
     {"Morse Only", typingTrampolineMorse},
     {"Letters Only", typingTrampolineLetters},
@@ -408,7 +412,8 @@ ListMenu g_typingDisplayListMenu;
 void screenTypingDisplayPicker() {
   if (Menu::consumeJustEntered()) {
     g_typingDisplayListMenu.configure(kTypingDisplayItems, 3, kTypingDisplayBadges,
-                                       static_cast<uint8_t>(Settings::getTypingDisplay()));
+                                       static_cast<uint8_t>(Settings::getTypingDisplay()),
+                                       ListMenu::SelectionMode::IN_PLACE);
   }
   Display::drawStatusBar();
   g_typingDisplayListMenu.tick("Typing Display");
@@ -418,13 +423,11 @@ void muteRadioTrampolineOff() {
   Settings::setMuteRadioOutsideRadio(false);
   SettingsChangeInfo info{SET_MUTE_RADIO_CHANGED, 0, {0}};
   fireSettingsChangeHooks(info);
-  Menu::goBack();
 }
 void muteRadioTrampolineOn() {
   Settings::setMuteRadioOutsideRadio(true);
   SettingsChangeInfo info{SET_MUTE_RADIO_CHANGED, 0, {0}};
   fireSettingsChangeHooks(info);
-  Menu::goBack();
 }
 const SettingItem kMuteRadioItems[] = {{"Off", muteRadioTrampolineOff}, {"On", muteRadioTrampolineOn}};
 bool muteRadioBadgeOff() { return !Settings::getMuteRadioOutsideRadio(); }
@@ -434,7 +437,7 @@ ListMenu g_muteRadioListMenu;
 void screenMuteRadioPicker() {
   if (Menu::consumeJustEntered()) {
     g_muteRadioListMenu.configure(kMuteRadioItems, 2, kMuteRadioBadges,
-                                   Settings::getMuteRadioOutsideRadio() ? 1 : 0);
+                                   Settings::getMuteRadioOutsideRadio() ? 1 : 0, ListMenu::SelectionMode::IN_PLACE);
   }
   Display::drawStatusBar();
   g_muteRadioListMenu.tick("Mute Radio Outside");
@@ -874,9 +877,9 @@ void screenNumberGuessing() {
   g_numberGuessingListMenu.tick("Number Guessing");
 }
 
-void levelTrampoline1() { Settings::setPracticeLevel(1); Menu::goBack(); }
-void levelTrampoline2() { Settings::setPracticeLevel(2); Menu::goBack(); }
-void levelTrampoline3() { Settings::setPracticeLevel(3); Menu::goBack(); }
+void levelTrampoline1() { Settings::setPracticeLevel(1); }
+void levelTrampoline2() { Settings::setPracticeLevel(2); }
+void levelTrampoline3() { Settings::setPracticeLevel(3); }
 const SettingItem kLevelItems[] = {
     {"Level 1", levelTrampoline1},
     {"Level 2", levelTrampoline2},
@@ -891,7 +894,7 @@ void screenMorsePracticeLevelPicker() {
   if (Menu::consumeJustEntered()) {
     uint8_t level = Settings::getPracticeLevel();
     uint8_t initial = (level >= 1 && level <= 3) ? static_cast<uint8_t>(level - 1) : 0;
-    g_levelListMenu.configure(kLevelItems, 3, kLevelBadges, initial);
+    g_levelListMenu.configure(kLevelItems, 3, kLevelBadges, initial, ListMenu::SelectionMode::IN_PLACE);
   }
   Display::drawStatusBar();
   g_levelListMenu.tick("Select Level");
