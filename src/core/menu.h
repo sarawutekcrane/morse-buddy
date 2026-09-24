@@ -40,6 +40,14 @@ using BadgeFn = bool (*)();
 // every tick, and scrolls a viewport window when there are more items than
 // fit the content area at the larger PRIMARY font -- the selected item is
 // always kept inside the visible window.
+//
+// Hardware Fix #2: a plain selection move within the same viewport (the
+// overwhelmingly common case) no longer clears/redraws the title or any
+// row label -- only the "> " marker glyph moves from the old selected row
+// to the new one. A full clear+redraw only happens on the first draw after
+// configure(); a viewport scroll or a badge change redraws just the list
+// row region (never the title or status bar). See ListMenu::tick()'s
+// implementation comment for the exact three-way redraw split.
 class ListMenu {
  public:
   // badges, when given, must point to an array the same length as items
@@ -59,7 +67,9 @@ class ListMenu {
   const BadgeFn* badges_ = nullptr;
   uint8_t count_ = 0;
   uint8_t selected_ = 0;
-  bool dirty_ = true;
+  bool needsFullRedraw_ = true;
+  int16_t lastDrawnStartIdx_ = -1;  // -1: nothing drawn yet (forces firstDraw's own path anyway)
+  uint8_t lastDrawnSelected_ = 0;
   bool lastBadge_[kBadgeCacheCap] = {};
 };
 

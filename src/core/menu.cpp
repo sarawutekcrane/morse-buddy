@@ -108,7 +108,7 @@ void ListMenu::configure(const SettingItem* items, uint8_t count, const BadgeFn*
   badges_ = badges;
   count_ = count;
   selected_ = 0;
-  dirty_ = true;
+  needsFullRedraw_ = true;
   for (auto& b : lastBadge_) b = false;
 }
 
@@ -117,12 +117,10 @@ void ListMenu::tick(const char* title) {
   InputEvent e;
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE && count_ > 0) {
-      uint8_t prev = selected_;
       int16_t next = static_cast<int16_t>(selected_) + e.value;
       if (next < 0) next = static_cast<int16_t>(count_) - 1;
       if (next >= static_cast<int16_t>(count_)) next = 0;
       selected_ = static_cast<uint8_t>(next);
-      if (selected_ != prev) dirty_ = true;
     } else if (Input::isMenuConfirm(e) && count_ > 0) {
       ScreenHandlerFn fn = items_[selected_].onSelect;
       if (fn != nullptr) Menu::pushScreen(fn);
@@ -131,13 +129,13 @@ void ListMenu::tick(const char* title) {
     }
   }
 
-  // Badges are polled every tick regardless of dirty_ (they're arbitrary
-  // caller-provided bool fns, e.g. unread-message checks, and must stay
-  // live) but only trigger a redraw when a value actually flips, per
-  // Hardware Fix #1. Beyond kBadgeCacheCap items the per-item cache can't
-  // be used safely, so those lists are conservatively always redrawn when
-  // badges_ is set (correct, just not optimized -- no current caller
-  // exceeds the cap).
+  // Badges are polled every tick regardless of redraw state (they're
+  // arbitrary caller-provided bool fns, e.g. unread-message checks, and
+  // must stay live) but only trigger a redraw when a value actually flips,
+  // per Hardware Fix #1. Beyond kBadgeCacheCap items the per-item cache
+  // can't be used safely, so those lists are conservatively always
+  // redrawn when badges_ is set (correct, just not optimized -- no
+  // current caller exceeds the cap).
   bool canTrackBadges = (badges_ != nullptr) && (count_ <= kBadgeCacheCap);
   bool badgesChanged = (badges_ != nullptr) && !canTrackBadges;
   bool badgeNow[kBadgeCacheCap];
@@ -148,28 +146,16 @@ void ListMenu::tick(const char* title) {
     }
   }
 
-  if (!dirty_ && !badgesChanged) return;
-
-  if (canTrackBadges) {
-    for (uint8_t i = 0; i < count_; i++) lastBadge_[i] = badgeNow[i];
-  }
-  dirty_ = false;
-
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-
-  int16_t y = Display::kStatusBarHeight + 2;
-  if (title != nullptr) {
-    Display::printLine(2, y, title);
-    y += lh;
-  }
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t rowsTopY = static_cast<int16_t>(titleY + (title != nullptr ? lh : 0));
 
   // Viewport scroll: show as many rows as fit below the title, keeping
   // `selected_` inside the visible window at all times (Hardware Fix #1 --
   // required now that PRIMARY's larger line height means fewer rows fit
   // than the old compact font, e.g. up to 41-item Recipient lists).
-  int16_t remaining = Display::kScreenHeight - y;
+  int16_t remaining = Display::kScreenHeight - rowsTopY;
   uint8_t visibleRows = (remaining > 0) ? static_cast<uint8_t>(remaining / lh) : 0;
   if (visibleRows == 0) visibleRows = 1;  // always show at least the selected row
 
@@ -181,13 +167,74 @@ void ListMenu::tick(const char* title) {
     if (startIdx < 0) startIdx = 0;
   }
 
-  for (uint8_t i = static_cast<uint8_t>(startIdx); i < count_ && i < startIdx + visibleRows; i++) {
-    bool badge = (badges_ != nullptr && badges_[i] != nullptr && badges_[i]());
-    char line[56];
-    snprintf(line, sizeof(line), "%s%s%s", i == selected_ ? "> " : "  ", items_[i].label, badge ? " *" : "");
-    Display::printLine(2, y, line);
-    y += lh;
+  // Hardware Fix #2: three-way redraw split, cheapest first.
+  //   1. firstDraw (configure() just ran): the only path that clears the
+  //      whole content area and (re)draws the title -- everything is new.
+  //   2. scrolled (viewport start index moved) or a badge flipped: every
+  //      visible row's logical content may have changed, so redraw the
+  //      list ROW REGION only (never the title, never the status bar).
+  //   3. selectionOnlyChanged (same viewport, no badge change -- the
+  //      overwhelmingly common "one detent" case): move only the "> "
+  //      marker glyph between the old and new selected row. No label,
+  //      title, or background repaint at all. This is what eliminates the
+  //      ~41ms cursor-move redraw burst measured on real hardware.
+  bool firstDraw = needsFullRedraw_;
+  bool scrolled = !firstDraw && (startIdx != lastDrawnStartIdx_);
+  bool selectionOnlyChanged = !firstDraw && !scrolled && (selected_ != lastDrawnSelected_);
+
+  if (!firstDraw && !scrolled && !badgesChanged && !selectionOnlyChanged) return;
+
+  if (canTrackBadges) {
+    for (uint8_t i = 0; i < count_; i++) lastBadge_[i] = badgeNow[i];
   }
+
+  // Marker column: reserved width is measured from the marker glyph
+  // itself (not assumed), and the label always starts at the same fixed X
+  // regardless of whether a marker is drawn there -- PRIMARY is a
+  // proportional GFX font, so "> " and "  " are not guaranteed equal
+  // width, and concatenating them into one string (the pre-Fix-#2
+  // approach) both prevented a marker-only update and risked the label
+  // shifting a pixel or two depending on which was drawn.
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+  if (firstDraw) {
+    Display::clearContentArea();
+    if (title != nullptr) Display::printLine(2, titleY, title);
+    for (uint8_t i = static_cast<uint8_t>(startIdx); i < count_ && i < startIdx + visibleRows; i++) {
+      int16_t rowY = static_cast<int16_t>(rowsTopY + (i - startIdx) * lh);
+      if (i == selected_) Display::printLine(2, rowY, ">");
+      bool badge = (badges_ != nullptr && badges_[i] != nullptr && badges_[i]());
+      char label[56];
+      snprintf(label, sizeof(label), "%s%s", items_[i].label, badge ? " *" : "");
+      Display::printLine(labelX, rowY, label);
+    }
+    needsFullRedraw_ = false;
+  } else if (scrolled || badgesChanged) {
+    int16_t regionH = static_cast<int16_t>(Display::kScreenHeight - rowsTopY);
+    if (regionH < 0) regionH = 0;
+    Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
+    for (uint8_t i = static_cast<uint8_t>(startIdx); i < count_ && i < startIdx + visibleRows; i++) {
+      int16_t rowY = static_cast<int16_t>(rowsTopY + (i - startIdx) * lh);
+      if (i == selected_) Display::printLine(2, rowY, ">");
+      bool badge = (badges_ != nullptr && badges_[i] != nullptr && badges_[i]());
+      char label[56];
+      snprintf(label, sizeof(label), "%s%s", items_[i].label, badge ? " *" : "");
+      Display::printLine(labelX, rowY, label);
+    }
+  } else {
+    // selectionOnlyChanged: erase each cell explicitly before drawing --
+    // PRIMARY (a GFX custom font) never draws with an opaque background,
+    // so a stale ">" would otherwise remain visible under new content.
+    int16_t oldY = static_cast<int16_t>(rowsTopY + (lastDrawnSelected_ - startIdx) * lh);
+    int16_t newY = static_cast<int16_t>(rowsTopY + (selected_ - startIdx) * lh);
+    Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+    Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+    Display::printLine(2, newY, ">");
+  }
+
+  lastDrawnStartIdx_ = startIdx;
+  lastDrawnSelected_ = selected_;
 }
 
 namespace {
