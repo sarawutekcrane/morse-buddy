@@ -536,6 +536,7 @@ void screenKeyEditor() {
   }
 
   if (hadEvent) g_keyEditorDirty = true;
+  Display::drawStatusBar();
   if (!g_keyEditorDirty) return;
   g_keyEditorDirty = false;
 
@@ -622,6 +623,7 @@ void screenReveal() {
     }
   }
 
+  Display::drawStatusBar();
   if (!g_revealDirty) return;
   g_revealDirty = false;
 

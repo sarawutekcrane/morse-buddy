@@ -226,6 +226,10 @@ void confirmPromptScreen() {
     }
   }
 
+  // This modal never clears/owns the status bar row itself, but it's still
+  // visible underneath it, so keep it live every tick regardless of the
+  // content-area dirty gate below (Hardware Fix #1 correction).
+  Display::drawStatusBar();
   if (!g_confirmDirty) return;
   g_confirmDirty = false;
 
@@ -261,9 +265,13 @@ void comingSoonScreen() {
     }
   }
 
+  // Called unconditionally, before the content-area gate below, so
+  // connectivity/battery stay fresh for as long as the user remains on
+  // this screen (Hardware Fix #1 correction) -- drawStatusBar() is
+  // internally dirty-gated, so this is safe/cheap every tick.
+  Display::drawStatusBar();
   if (!justEntered) return;
 
-  Display::drawStatusBar();
   Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
   Display::printLine(60, 60, "Coming Soon");

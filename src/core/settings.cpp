@@ -492,6 +492,7 @@ void screenWifiScanResults() {
     }
   }
 
+  Display::drawStatusBar();
   if (!g_scanDirty) return;
   g_scanDirty = false;
 
@@ -584,6 +585,7 @@ void screenWifiTestConnection() {
     }
   }
 
+  Display::drawStatusBar();
   if (!g_wifiTestDirty) return;
   g_wifiTestDirty = false;
 

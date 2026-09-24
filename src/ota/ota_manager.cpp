@@ -657,6 +657,14 @@ Registrar g_registrar;
 void screenFirmwareUpdate() {
   if (Menu::consumeJustEntered()) resetToMain();
 
+  // Every UiState below reserves the status bar area (clearContentArea()
+  // never touches it), so it must be refreshed every tick regardless of
+  // which state is active -- otherwise connectivity/battery can go stale
+  // while the user is anywhere in this flow, not just on MAIN. drawStatusBar()
+  // is internally dirty-gated (Hardware Fix #1), so this is safe/cheap to
+  // call unconditionally here rather than duplicating it into every case.
+  Display::drawStatusBar();
+
   switch (g_uiState) {
     case UiState::MAIN: {
       Input::update();
@@ -679,7 +687,6 @@ void screenFirmwareUpdate() {
           return;
         }
       }
-      Display::drawStatusBar();
       if (!g_mainDirty && g_lastContentDrawer == OtaContentDrawer::MAIN) return;
       g_mainDirty = false;
       g_lastContentDrawer = OtaContentDrawer::MAIN;

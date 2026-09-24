@@ -281,6 +281,14 @@ void tick() {
     }
   }
 
+  // Every screen that delegates to this shared widget (My Name, WiFi
+  // Password, Group Name, Group Code, ...) still shows the standard status
+  // bar, but none of them call Display::drawStatusBar() themselves -- this
+  // is the single choke point they all go through, so it belongs here
+  // (Hardware Fix #1 correction). drawStatusBar() is internally dirty-gated,
+  // so calling it unconditionally every tick is safe/cheap.
+  Display::drawStatusBar();
+
   if (!g_dirty) return;
   g_dirty = false;
   render();

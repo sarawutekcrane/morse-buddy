@@ -79,13 +79,16 @@ void init() {
   // the GPIO map exactly, so no custom SPIClass/pin remap is needed.
   g_tft.init(135, 240);
   // Native panel is 135x240 portrait; rotation 1 produces 240x135 landscape.
-  // CONFIRMED on real ideaspark ESP32 1.14" hardware (hardware validation
-  // Fix #1): image orientation, edges, and content all render correctly at
-  // rotation 1 with no colstart/rowstart correction needed -- the only
-  // defect hardware testing found was continuous full-screen redraw
-  // (flicker/tear), fixed below and in menu.cpp/display's dirty-tracking,
-  // not a geometry/offset problem. Do not add a colstart/rowstart override
-  // without a new, separately-reported hardware symptom.
+  // Real hardware testing (ideaspark ESP32 1.14" board, hardware validation
+  // Fix #1) reported a readable, correctly-oriented landscape UI at
+  // rotation 1 -- not a rotated/mirrored image -- with the actual reported
+  // defect being continuous flicker/scrolling/tearing, fixed below and in
+  // menu.cpp/display's dirty-tracking. That is gross orientation only: a
+  // pixel-level colstart/rowstart check (whether edge rows/columns are
+  // clipped or shifted a few pixels) has NOT been explicitly tested and
+  // must not be reported as confirmed until a hardware retest specifically
+  // checks screen edges. Add a colstart/rowstart override only if such a
+  // retest reports a concrete edge/offset symptom.
   g_tft.setRotation(1);
   g_tft.fillScreen(ST77XX_BLACK);
 
