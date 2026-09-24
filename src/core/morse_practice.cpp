@@ -225,6 +225,15 @@ char g_answerPattern[Morse::kMaxPatternLength + 1];
 uint8_t g_answerPatternLen = 0;
 uint32_t g_lastAnswerReleaseMs = 0;
 Morse::WordGapState g_answerWordGap;
+// True while the pattern currently being keyed (g_answerPattern) is known
+// to start a new word -- captured once, at that pattern's FIRST symbol
+// (see captureAnswerWordBoundaryOnSymbolStart()), and left untouched by
+// symbol 2/3/... of the same pattern. Only consumed -- as an actual ASCII
+// space, committed immediately before the decoded character -- by
+// finalizeAnswerChar()'s NORMAL letter finalization; a delete prosign or
+// a special-command clear discard it without ever writing a space
+// (Hardware Fix #4.2).
+bool g_answerPatternStartsNewWord = false;
 
 const char* g_resultText = nullptr;
 uint32_t g_resultShownUntilMs = 0;
@@ -234,24 +243,25 @@ void resetAnswerCompose() {
   g_answerText[0] = '\0';
   g_answerPatternLen = 0;
   g_answerPattern[0] = '\0';
+  g_answerPatternStartsNewWord = false;
   Morse::cancelWordGap(&g_answerWordGap);
 }
 
 // Called on every DOT_PRESS_START, before the new symbol is accepted into
-// the pattern buffer (Hardware Fix #4.1: deferred word-boundary model).
-// Level 3 sentences need real spaces (e.g. "THE SUN IS HOT", not
-// "THESUNISHOT"), but a space must only ever be committed right before a
-// real next symbol -- never merely because the user paused before
-// pressing Submit, which would otherwise turn a correct "CAT" answer into
-// "CAT " and fail submitAnswer()'s exact strcmp().
-bool tryAppendAnswerWordSpaceOnSymbolStart() {
-  if (!Morse::consumeWordBoundaryOnSymbolStart(&g_answerWordGap, Settings::getWpm(), millis())) return false;
-  if (g_answerLen == 0) return false;
-  if (g_answerText[g_answerLen - 1] == ' ') return false;
-  if (g_answerLen >= sizeof(g_answerText) - 1) return false;
-  g_answerText[g_answerLen++] = ' ';
-  g_answerText[g_answerLen] = '\0';
-  return true;
+// the pattern buffer (Hardware Fix #4.2). Only captures whether the
+// pattern now starting is a new word -- and only at that pattern's FIRST
+// symbol (g_answerPatternLen == 0); symbol 2/3/... of a multi-symbol
+// character (e.g. W = .--) must never re-resolve or overwrite this flag.
+// Never mutates the answer draft itself -- see finalizeAnswerChar(). Level
+// 3 sentences need real spaces (e.g. "THE SUN IS HOT", not "THESUNISHOT"),
+// but a space must only ever be committed at normal letter finalization --
+// never merely because the user paused before Submit (which would
+// otherwise turn a correct "CAT" answer into "CAT " and fail
+// submitAnswer()'s exact strcmp()), and never for a delete prosign.
+void captureAnswerWordBoundaryOnSymbolStart() {
+  if (g_answerPatternLen != 0) return;
+  g_answerPatternStartsNewWord =
+      Morse::consumeWordBoundaryOnSymbolStart(&g_answerWordGap, Settings::getWpm(), millis());
 }
 
 void startNewChallenge() {
@@ -266,10 +276,22 @@ void startNewChallenge() {
 
 void finalizeAnswerChar() {
   char c = Morse::decodePattern(g_answerPattern);
-  if (g_answerLen < sizeof(g_answerText) - 1) {
+  // NORMAL character finalization is the only place a word separator is
+  // ever actually committed (Hardware Fix #4.2) -- and only as one atomic
+  // write together with the character it separates, so a boundary is
+  // never left as a trailing space with no room for the letter that was
+  // supposed to follow it.
+  bool needsSpace = g_answerPatternStartsNewWord && g_answerLen > 0 && g_answerText[g_answerLen - 1] != ' ';
+  size_t needed = needsSpace ? 2 : 1;
+  if (g_answerLen + needed <= sizeof(g_answerText) - 1) {
+    if (needsSpace) g_answerText[g_answerLen++] = ' ';
+    g_answerText[g_answerLen++] = c;
+    g_answerText[g_answerLen] = '\0';
+  } else if (g_answerLen < sizeof(g_answerText) - 1) {
     g_answerText[g_answerLen++] = c;
     g_answerText[g_answerLen] = '\0';
   }
+  g_answerPatternStartsNewWord = false;
   g_answerPatternLen = 0;
   g_answerPattern[0] = '\0';
   Morse::armWordGap(&g_answerWordGap, g_lastAnswerReleaseMs);
@@ -312,12 +334,12 @@ void submitAnswer() {
 
 void handleAnswerEvent(const InputEvent& e) {
   if (e.type == InputEventType::DOT_PRESS_START) {
-    // Resolve any pending word boundary now, before this symbol is
-    // accepted -- a space is inserted only if the pause was actually
-    // >= 7 dit at this exact moment, never merely because time passed
-    // while idle (Hardware Fix #4.1). Redraw is already guaranteed by the
-    // caller's "any popped event marks dirty" rule.
-    tryAppendAnswerWordSpaceOnSymbolStart();
+    // Only captures whether this new pattern starts a new word (Hardware
+    // Fix #4.2) -- never mutates the answer draft itself. The space (if
+    // any) is committed later, only at NORMAL letter finalization; a
+    // delete prosign discards the captured flag below instead of
+    // consuming it as a space.
+    captureAnswerWordBoundaryOnSymbolStart();
   } else if (e.type == InputEventType::DOT_RELEASE) {
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       resetAnswerCompose();
@@ -330,6 +352,11 @@ void handleAnswerEvent(const InputEvent& e) {
     }
     g_lastAnswerReleaseMs = millis();
     if (Morse::isDeletePattern(g_answerPattern)) {
+      // A delete prosign never commits a word separator -- it must remove
+      // the previous REAL confirmed character, not an auto-inserted space
+      // that was never actually written to the answer draft (Hardware Fix
+      // #4.2).
+      g_answerPatternStartsNewWord = false;
       if (g_answerLen > 0) {
         g_answerLen--;
         g_answerText[g_answerLen] = '\0';

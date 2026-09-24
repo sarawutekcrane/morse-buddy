@@ -875,6 +875,20 @@ void refreshIndexIfNeeded() {
   g_indexDirty = false;
 }
 
+// True while the pattern currently being keyed (g_composePattern) is known
+// to start a new word -- captured once, at that pattern's FIRST symbol
+// (see captureWordBoundaryOnSymbolStart()), and left untouched by symbol
+// 2/3/... of the same pattern. Only consumed -- as an actual ASCII space,
+// committed immediately before the decoded character, before
+// EnigmaCrypto::normalizeAndEscape() ever sees it at send time -- by
+// finalizeComposeChar()'s NORMAL letter finalization; a delete prosign or
+// a special-command clear discard it without ever writing a space
+// (Hardware Fix #4.2). normalizeAndEscape()/reverseEscape() already
+// round-trip a space through the escaped ciphertext alphabet unchanged,
+// so no crypto changes are needed for "HELLO WORLD" to decrypt back to
+// "HELLO WORLD".
+bool g_currentPatternStartsNewWord = false;
+
 void resetComposePattern() {
   g_composePatternLen = 0;
   g_composePattern[0] = '\0';
@@ -884,31 +898,20 @@ void clearDraft() {
   g_composeText[0] = '\0';
   resetComposePattern();
   g_composeError = nullptr;
+  g_currentPatternStartsNewWord = false;
   Morse::cancelWordGap(&g_composeWordGap);
 }
 
 // Called on every DOT_PRESS_START, before the new symbol is accepted into
-// the pattern buffer (Hardware Fix #4.1: deferred word-boundary model). A
-// word space is committed here -- and only here -- because a pause after
-// the last letter is genuinely ambiguous until a next symbol actually
-// begins: the same pause also covers "done composing, about to press
-// Send", and inserting a space purely because time passed would wrongly
-// leave a trailing space in that case (which Enigma would then encode as
-// escaped content, e.g. XQ, before decryption ever restores it). The
-// space becomes part of g_composeText here, i.e. before
-// EnigmaCrypto::normalizeAndEscape() ever sees it at send time --
-// normalizeAndEscape()/reverseEscape() already round-trip a space through
-// the escaped ciphertext alphabet unchanged, so no crypto changes are
-// needed for "HELLO WORLD" to decrypt back to "HELLO WORLD". Returns true
-// if compose text changed so the caller can mark dirty.
-bool tryAppendWordSpaceOnSymbolStart() {
-  if (!Morse::consumeWordBoundaryOnSymbolStart(&g_composeWordGap, Settings::getWpm(), millis())) return false;
-  if (g_composeLen == 0) return false;
-  if (g_composeText[g_composeLen - 1] == ' ') return false;
-  if (g_composeLen >= EnigmaCrypto::kMaxEscapedLen) return false;
-  g_composeText[g_composeLen++] = ' ';
-  g_composeText[g_composeLen] = '\0';
-  return true;
+// the pattern buffer (Hardware Fix #4.2). Only captures whether the
+// pattern now starting is a new word -- and only at that pattern's FIRST
+// symbol (g_composePatternLen == 0); symbol 2/3/... of a multi-symbol
+// character (e.g. W = .--) must never re-resolve or overwrite this flag.
+// Never mutates compose text itself -- see finalizeComposeChar().
+void captureWordBoundaryOnSymbolStart() {
+  if (g_composePatternLen != 0) return;
+  g_currentPatternStartsNewWord =
+      Morse::consumeWordBoundaryOnSymbolStart(&g_composeWordGap, Settings::getWpm(), millis());
 }
 
 MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
@@ -1017,10 +1020,22 @@ void sendEnigmaMessage() {
 
 void finalizeComposeChar() {
   char c = Morse::decodePattern(g_composePattern);
-  if (g_composeLen < EnigmaCrypto::kMaxEscapedLen) {
+  // NORMAL character finalization is the only place a word separator is
+  // ever actually committed (Hardware Fix #4.2) -- and only as one atomic
+  // write together with the character it separates, so a boundary is
+  // never left as a trailing space with no room for the letter that was
+  // supposed to follow it.
+  bool needsSpace = g_currentPatternStartsNewWord && g_composeLen > 0 && g_composeText[g_composeLen - 1] != ' ';
+  size_t needed = needsSpace ? 2 : 1;
+  if (g_composeLen + needed <= EnigmaCrypto::kMaxEscapedLen) {
+    if (needsSpace) g_composeText[g_composeLen++] = ' ';
+    g_composeText[g_composeLen++] = c;
+    g_composeText[g_composeLen] = '\0';
+  } else if (g_composeLen < EnigmaCrypto::kMaxEscapedLen) {
     g_composeText[g_composeLen++] = c;
     g_composeText[g_composeLen] = '\0';
   }
+  g_currentPatternStartsNewWord = false;
   resetComposePattern();
   Morse::armWordGap(&g_composeWordGap, g_lastMorseReleaseMs);
 }
@@ -1075,12 +1090,12 @@ void buildComposePrefixSuffix(char* prefix, size_t prefixSize, char* suffix, siz
 
 void handleComposeEvent(const InputEvent& e) {
   if (e.type == InputEventType::DOT_PRESS_START) {
-    // Resolve any pending word boundary now, before this symbol is
-    // accepted -- a space is inserted only if the pause was actually
-    // >= 7 dit at this exact moment, never merely because time passed
-    // while idle (Hardware Fix #4.1). Redraw is already guaranteed by the
-    // caller's "any popped event marks dirty" rule.
-    tryAppendWordSpaceOnSymbolStart();
+    // Only captures whether this new pattern starts a new word (Hardware
+    // Fix #4.2) -- never mutates compose text itself. The space (if any)
+    // is committed later, only at NORMAL letter finalization; a delete
+    // prosign discards the captured flag below instead of consuming it as
+    // a space.
+    captureWordBoundaryOnSymbolStart();
   } else if (e.type == InputEventType::DOT_RELEASE) {
     g_composeError = nullptr;
     if (e.durationMs >= Morse::kSpecialCommandMs) {
@@ -1094,6 +1109,11 @@ void handleComposeEvent(const InputEvent& e) {
     }
     g_lastMorseReleaseMs = millis();
     if (Morse::isDeletePattern(g_composePattern)) {
+      // A delete prosign never commits a word separator -- it must remove
+      // the previous REAL confirmed character, not an auto-inserted space
+      // that was never actually written to compose text (Hardware Fix
+      // #4.2).
+      g_currentPatternStartsNewWord = false;
       if (g_composeLen > 0) {
         g_composeLen--;
         g_composeText[g_composeLen] = '\0';
