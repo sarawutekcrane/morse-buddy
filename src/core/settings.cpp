@@ -301,7 +301,16 @@ void numberAdjustTick() {
     g_numAdjustNeedsFullRedraw = false;
   } else {
     if (strcmp(valueLine, g_lastNumAdjustValueLine) != 0) {
-      Display::tft().fillRect(0, valueY, Display::kScreenWidth, lh, ST77XX_BLACK);
+      // Erase only the old/new value glyph bounds (Hardware Fix #3), not
+      // the full row width -- the value always starts at the same fixed
+      // X, so this never needs the "same layout" full-row fallback that
+      // MixedTextEntry's clipped-tail case does.
+      int16_t oldW = Display::textWidth(g_lastNumAdjustValueLine);
+      int16_t newW = Display::textWidth(valueLine);
+      int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+      if (eraseW > maxW) eraseW = maxW;
+      Display::tft().fillRect(2, valueY, eraseW, lh, ST77XX_BLACK);
       Display::printLine(2, valueY, valueLine);
     }
     if (strcmp(warnLine, g_lastNumAdjustWarnLine) != 0) {

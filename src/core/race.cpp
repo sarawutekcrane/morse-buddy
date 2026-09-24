@@ -356,11 +356,16 @@ void enterGuessScreen() {
 }
 
 bool g_raceGuessDirty = true;
+bool g_raceGuessNeedsFullRedraw = true;
+bool g_raceGuessLastShowingResult = false;
+NumberGuessing::DigitRowRenderState g_raceGuessRowState;
 
 void screenRaceGuess() {
   if (Menu::consumeJustEntered()) {
     NumberGuessing::resetDigitEntry(&g_digitEntry);
     g_raceGuessDirty = true;
+    g_raceGuessNeedsFullRedraw = true;
+    NumberGuessing::resetDigitRowRenderState(&g_raceGuessRowState);
   }
 
   if (g_pendingExternalSolve) {
@@ -417,20 +422,32 @@ void screenRaceGuess() {
   g_raceGuessDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t y = Display::kStatusBarHeight + 2;
 
-  if (g_guessResultText != nullptr) {
-    Display::printLine(2, y, g_guessResultText);
-    return;
+  // Showing the transient "Solved by X" outcome is a genuine content-type
+  // change from the guess-entry row, so it forces a full redraw same as
+  // first entry (Global Invariant 12's spirit); it is otherwise static
+  // while shown, so no further per-tick diffing is needed there.
+  bool showingResult = (g_guessResultText != nullptr);
+  bool phaseChanged = (showingResult != g_raceGuessLastShowingResult);
+  bool forceFull = g_raceGuessNeedsFullRedraw || phaseChanged;
+
+  if (showingResult) {
+    if (forceFull) {
+      Display::clearContentArea();
+      Display::printLine(2, y, g_guessResultText);
+      g_raceGuessNeedsFullRedraw = false;
+    }
+  } else {
+    if (forceFull) {
+      Display::clearContentArea();
+      NumberGuessing::resetDigitRowRenderState(&g_raceGuessRowState);
+      g_raceGuessNeedsFullRedraw = false;
+    }
+    NumberGuessing::renderDigitRow(&g_raceGuessRowState, 2, y, "Guess: ", g_digitEntry);
   }
 
-  char guessLine[16] = "____";
-  for (uint8_t i = 0; i < g_digitEntry.count; i++) guessLine[i] = static_cast<char>('0' + g_digitEntry.digits[i]);
-  if (g_digitEntry.count < 4) guessLine[g_digitEntry.count] = static_cast<char>('0' + g_digitEntry.previewDigit);
-  char line[24];
-  snprintf(line, sizeof(line), "Guess: %s", guessLine);
-  Display::printLine(2, y, line);
+  g_raceGuessLastShowingResult = showingResult;
 }
 
 // =============================================================================
@@ -482,11 +499,19 @@ void leaveRaceMode() {
   applyReset();
 }
 
-bool g_raceRoomDirty = true;
-RoomPhase g_raceRoomLastPhase = static_cast<RoomPhase>(0xFF);
-bool g_raceRoomLastJoined = false;
-char g_raceRoomLastOwner[kDeviceIdLen] = {0};
-uint16_t g_raceRoomLastScore = 0xFFFF;
+// Hardware Fix #3: this screen is driven by async network/presence events
+// (owner takeover, participants joining, score changes from remote
+// solves) as much as local input. Rather than one combined "anything
+// changed" snapshot that redraws the whole content area, each row (title,
+// action label, score, and each participant slot) is diffed and
+// redrawn independently -- a score change no longer repaints the
+// participant list, an online-count change no longer repaints the score,
+// and a single participant's name change no longer repaints its
+// neighbors (this is the Race Mode Room participant-list screen flagged
+// for extra overlap/clipping review under the larger PRIMARY font).
+bool g_raceRoomNeedsFullRedraw = true;
+char g_raceRoomLastActionLabel[24] = {0};
+char g_raceRoomLastScoreLine[16] = {0};
 uint8_t g_raceRoomLastOnlineCount = 0xFF;
 char g_raceRoomLastOnlineNames[4][17] = {{0}};
 
@@ -495,7 +520,7 @@ void screenRaceRoom() {
     g_isRoomScreenActive = true;
     RadioTransport::setUiContext(RadioTransport::UiContext::RACE_ROOM);
     setRoomAvailability(true);
-    g_raceRoomDirty = true;
+    g_raceRoomNeedsFullRedraw = true;
   }
 
   checkOwnerOnline();
@@ -524,46 +549,19 @@ void screenRaceRoom() {
 
   Display::drawStatusBar();
 
-  // This screen is driven by async network/presence events (owner takeover,
-  // participants joining, score changes from remote solves) as much as by
-  // local input, so dirty-tracking here compares a value snapshot every
-  // tick rather than only reacting to popped input events (Hardware Fix #1;
-  // this is the Race Mode Room participant-list screen flagged for extra
-  // overlap/clipping review under the larger PRIMARY font).
-  uint16_t score = getScore(Identity::deviceId());
-  Presence::OnlineContact online[6];
-  uint8_t n = Presence::getOnlineContacts(g_groupCode, online, 6);
-  uint8_t shown = (n < 4) ? n : 4;
-
-  bool changed = g_raceRoomDirty || (g_phase != g_raceRoomLastPhase) || (g_haveJoined != g_raceRoomLastJoined) ||
-                 (strcmp(g_ownerDeviceId, g_raceRoomLastOwner) != 0) || (score != g_raceRoomLastScore) ||
-                 (shown != g_raceRoomLastOnlineCount);
-  if (!changed) {
-    for (uint8_t i = 0; i < shown; i++) {
-      if (strcmp(online[i].display_name, g_raceRoomLastOnlineNames[i]) != 0) {
-        changed = true;
-        break;
-      }
-    }
-  }
-  if (!changed) return;
-
-  g_raceRoomDirty = false;
-  g_raceRoomLastPhase = g_phase;
-  g_raceRoomLastJoined = g_haveJoined;
-  strncpy(g_raceRoomLastOwner, g_ownerDeviceId, sizeof(g_raceRoomLastOwner) - 1);
-  g_raceRoomLastOwner[sizeof(g_raceRoomLastOwner) - 1] = '\0';
-  g_raceRoomLastScore = score;
-  g_raceRoomLastOnlineCount = shown;
-  for (uint8_t i = 0; i < shown; i++) {
-    strncpy(g_raceRoomLastOnlineNames[i], online[i].display_name, sizeof(g_raceRoomLastOnlineNames[i]) - 1);
-    g_raceRoomLastOnlineNames[i][sizeof(g_raceRoomLastOnlineNames[i]) - 1] = '\0';
-  }
-
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t actionY = static_cast<int16_t>(titleY + lh);
+  int16_t scoreY = static_cast<int16_t>(actionY + lh);
+  int16_t rowsTopY = static_cast<int16_t>(scoreY + lh);
+
+  bool firstDraw = g_raceRoomNeedsFullRedraw;
+  if (firstDraw) {
+    Display::clearContentArea();
+    Display::printLine(2, titleY, "Race Room");
+    g_raceRoomNeedsFullRedraw = false;
+  }
 
   const char* actionLabel;
   if (g_phase == RoomPhase::NO_LOBBY) {
@@ -575,25 +573,71 @@ void screenRaceRoom() {
   } else {
     actionLabel = g_haveJoined ? "Short: Continue" : "Short: Join";
   }
-  Display::printLine(2, y, "Race Room");
-  y += lh;
-  Display::printLine(2, y, actionLabel);
-  y += lh;
+  if (firstDraw || strcmp(actionLabel, g_raceRoomLastActionLabel) != 0) {
+    int16_t oldW = Display::textWidth(g_raceRoomLastActionLabel);
+    int16_t newW = Display::textWidth(actionLabel);
+    int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+    if (eraseW > maxW) eraseW = maxW;
+    if (!firstDraw) Display::tft().fillRect(2, actionY, eraseW, lh, ST77XX_BLACK);
+    Display::printLine(2, actionY, actionLabel);
+    strncpy(g_raceRoomLastActionLabel, actionLabel, sizeof(g_raceRoomLastActionLabel) - 1);
+    g_raceRoomLastActionLabel[sizeof(g_raceRoomLastActionLabel) - 1] = '\0';
+  }
 
-  char line[40];
-  snprintf(line, sizeof(line), "Score: %u", score);
-  Display::printLine(2, y, line);
-  y += lh;
+  uint16_t score = getScore(Identity::deviceId());
+  char scoreLine[16];
+  snprintf(scoreLine, sizeof(scoreLine), "Score: %u", score);
+  if (firstDraw || strcmp(scoreLine, g_raceRoomLastScoreLine) != 0) {
+    int16_t oldW = Display::textWidth(g_raceRoomLastScoreLine);
+    int16_t newW = Display::textWidth(scoreLine);
+    int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+    if (eraseW > maxW) eraseW = maxW;
+    if (!firstDraw) Display::tft().fillRect(2, scoreY, eraseW, lh, ST77XX_BLACK);
+    Display::printLine(2, scoreY, scoreLine);
+    strncpy(g_raceRoomLastScoreLine, scoreLine, sizeof(g_raceRoomLastScoreLine) - 1);
+    g_raceRoomLastScoreLine[sizeof(g_raceRoomLastScoreLine) - 1] = '\0';
+  }
 
   // Dynamic viewport: at the larger PRIMARY line height fewer rows fit than
   // the old fixed 4-row/10px layout assumed, so size the participant list
   // to whatever vertical space is actually left instead of hardcoding a
   // row count (avoids off-screen/overlapping names, item 14).
-  int16_t remaining = Display::kScreenHeight - y;
+  Presence::OnlineContact online[6];
+  uint8_t n = Presence::getOnlineContacts(g_groupCode, online, 6);
+  uint8_t shown = (n < 4) ? n : 4;
+  int16_t remaining = Display::kScreenHeight - rowsTopY;
   uint16_t rows = (remaining > 0) ? static_cast<uint16_t>(remaining / lh) : 0;
-  for (uint8_t i = 0; i < shown && i < rows; i++) {
-    Display::printLine(2, y, online[i].display_name);
-    y += lh;
+  uint8_t visibleCount = static_cast<uint8_t>((shown < rows) ? shown : rows);
+
+  if (firstDraw || visibleCount != g_raceRoomLastOnlineCount) {
+    // The set of visible participant slots itself changed (someone
+    // joined/left, or first draw): a genuine layout change, so the
+    // participant region is redrawn in full -- still never the title,
+    // action, or score rows above it.
+    if (!firstDraw) {
+      int16_t regionH = static_cast<int16_t>(Display::kScreenHeight - rowsTopY);
+      if (regionH < 0) regionH = 0;
+      Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
+    }
+    for (uint8_t i = 0; i < visibleCount; i++) {
+      Display::printLine(2, static_cast<int16_t>(rowsTopY + i * lh), online[i].display_name);
+      strncpy(g_raceRoomLastOnlineNames[i], online[i].display_name, sizeof(g_raceRoomLastOnlineNames[i]) - 1);
+      g_raceRoomLastOnlineNames[i][sizeof(g_raceRoomLastOnlineNames[i]) - 1] = '\0';
+    }
+    g_raceRoomLastOnlineCount = visibleCount;
+  } else {
+    // Same visible slot count: diff each row independently so one
+    // participant's name change never repaints the others.
+    for (uint8_t i = 0; i < visibleCount; i++) {
+      if (strcmp(online[i].display_name, g_raceRoomLastOnlineNames[i]) == 0) continue;
+      int16_t rowY = static_cast<int16_t>(rowsTopY + i * lh);
+      Display::tft().fillRect(0, rowY, Display::kScreenWidth, lh, ST77XX_BLACK);
+      Display::printLine(2, rowY, online[i].display_name);
+      strncpy(g_raceRoomLastOnlineNames[i], online[i].display_name, sizeof(g_raceRoomLastOnlineNames[i]) - 1);
+      g_raceRoomLastOnlineNames[i][sizeof(g_raceRoomLastOnlineNames[i]) - 1] = '\0';
+    }
   }
 }
 

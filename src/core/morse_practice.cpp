@@ -313,12 +313,24 @@ void handleChallengeEvent(const InputEvent& e) {
 bool g_practiceDirty = true;
 bool g_practiceWasShowingResult = false;
 
+// Hardware Fix #3: each row (title/streak, challenge, answer, result
+// banner, high score) is diffed and redrawn independently, so typing a
+// Morse answer -- the most frequent interaction on this screen -- never
+// repaints the stable challenge/title/high-score rows, only its own row.
+bool g_practiceNeedsFullRedraw = true;
+char g_lastPracticeTitleLine[40] = {0};
+char g_lastPracticeChallengeLine[168] = {0};
+char g_lastPracticeAnswerLine[48] = {0};
+char g_lastPracticeResultLine[40] = {0};
+char g_lastPracticeHiLine[24] = {0};
+
 void screenPractice() {
   if (Menu::consumeJustEntered()) {
     g_streak = 0;
     startNewChallenge();
     g_practiceDirty = true;
     g_practiceWasShowingResult = false;
+    g_practiceNeedsFullRedraw = true;
   }
 
   Input::update();
@@ -358,14 +370,21 @@ void screenPractice() {
   g_practiceDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t challengeY = static_cast<int16_t>(titleY + lh);
+  int16_t answerY = static_cast<int16_t>(challengeY + lh);
+  int16_t resultY = static_cast<int16_t>(answerY + lh);
+  int16_t hiY = static_cast<int16_t>(resultY + lh);
 
-  char line[40];
-  snprintf(line, sizeof(line), "Level %u  Streak %u", Settings::getPracticeLevel(), g_streak);
-  Display::printLine(2, y, line);
-  y += lh;
+  bool firstDraw = g_practiceNeedsFullRedraw;
+  if (firstDraw) {
+    Display::clearContentArea();
+    g_practiceNeedsFullRedraw = false;
+  }
+
+  char titleLine[40];
+  snprintf(titleLine, sizeof(titleLine), "Level %u  Streak %u", Settings::getPracticeLevel(), g_streak);
 
   char challengeLine[168];
   if (g_revealHeld) {
@@ -376,23 +395,52 @@ void screenPractice() {
     buildRawMorse(g_challengeText, raw, sizeof(raw));
     snprintf(challengeLine, sizeof(challengeLine), "%s%s", g_cursor == PracticeCursor::CHALLENGE ? "> " : "  ", raw);
   }
-  Display::printLine(2, y, challengeLine);
-  y += lh;
 
   char answerLine[48];
   snprintf(answerLine, sizeof(answerLine), "%s%s%s%s", g_cursor == PracticeCursor::ANSWER ? "> " : "  ",
            g_answerText, (g_answerPatternLen > 0 ? " " : ""), g_answerPattern);
-  Display::printLine(2, y, answerLine);
-  y += lh;
 
+  char resultLine[40];
   if (showingResult) {
-    Display::printLine(2, y, g_resultText);
+    snprintf(resultLine, sizeof(resultLine), "%s", g_resultText);
+  } else {
+    resultLine[0] = '\0';
   }
-  y += lh;
 
   char hiLine[24];
   snprintf(hiLine, sizeof(hiLine), "High: %u", g_highScore[Settings::getPracticeLevel() - 1]);
-  Display::printLine(2, y, hiLine);
+
+  // Each row is diffed and redrawn independently -- typing a Morse answer
+  // (the most frequent interaction here) never repaints the stable
+  // title/challenge/high-score rows, only its own row (Hardware Fix #3).
+  struct RowUpdate {
+    int16_t y;
+    char* lastBuf;
+    size_t lastBufCap;
+    const char* newText;
+  };
+  RowUpdate rows[] = {
+      {titleY, g_lastPracticeTitleLine, sizeof(g_lastPracticeTitleLine), titleLine},
+      {challengeY, g_lastPracticeChallengeLine, sizeof(g_lastPracticeChallengeLine), challengeLine},
+      {answerY, g_lastPracticeAnswerLine, sizeof(g_lastPracticeAnswerLine), answerLine},
+      {resultY, g_lastPracticeResultLine, sizeof(g_lastPracticeResultLine), resultLine},
+      {hiY, g_lastPracticeHiLine, sizeof(g_lastPracticeHiLine), hiLine},
+  };
+  for (const RowUpdate& row : rows) {
+    if (firstDraw) {
+      if (row.newText[0] != '\0') Display::printLine(2, row.y, row.newText);
+    } else if (strcmp(row.newText, row.lastBuf) != 0) {
+      int16_t oldW = Display::textWidth(row.lastBuf);
+      int16_t newW = Display::textWidth(row.newText);
+      int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+      if (eraseW > maxW) eraseW = maxW;
+      Display::tft().fillRect(2, row.y, eraseW, lh, ST77XX_BLACK);
+      if (row.newText[0] != '\0') Display::printLine(2, row.y, row.newText);
+    }
+    strncpy(row.lastBuf, row.newText, row.lastBufCap - 1);
+    row.lastBuf[row.lastBufCap - 1] = '\0';
+  }
 }
 
 // Storage::init() runs from setup() after every global constructor has

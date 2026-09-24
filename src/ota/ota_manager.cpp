@@ -272,6 +272,7 @@ char g_errorMsg[48] = {0};
 bool g_failedWasWifiLoss = false;
 
 uint8_t g_mainSelected = 0;
+uint8_t g_mainLastSelected = 0xFF;
 bool g_mainCanRollback = false;
 
 uint8_t g_promptSelected = 1;  // 0 = optionA, 1 = optionB (default Cancel/Back)
@@ -309,12 +310,49 @@ void drawTwoOptionPrompt(const char* line1, const char* line2, const char* label
                          uint8_t selected, const char* extraLine = nullptr) {
   bool line2Present = (line2 != nullptr);
   bool extraPresent = (extraLine != nullptr);
-  bool changed = (g_lastContentDrawer != OtaContentDrawer::PROMPT) || selected != g_lastSelected ||
-                 extraPresent != g_promptHasExtraLast ||
-                 (extraPresent && strcmp(extraLine, g_lastExtraLine) != 0) || strcmp(line1, g_lastLine1) != 0 ||
-                 (line2Present != g_promptHasLine2Last) || (line2Present && strcmp(line2, g_lastLine2) != 0) ||
-                 strcmp(labelA, g_lastLabelA) != 0 || strcmp(labelB, g_lastLabelB) != 0;
-  if (!changed) return;
+  // Text and selection are tracked as separate triggers (Hardware Fix #3):
+  // a pure Yes/No (or Save/Cancel, Retry/Back, ...) toggle no longer
+  // redraws the question/explanation text, and only moves the "> "
+  // marker between the two option rows -- it never repaints label text.
+  bool textChanged = (g_lastContentDrawer != OtaContentDrawer::PROMPT) || extraPresent != g_promptHasExtraLast ||
+                      (extraPresent && strcmp(extraLine, g_lastExtraLine) != 0) || strcmp(line1, g_lastLine1) != 0 ||
+                      (line2Present != g_promptHasLine2Last) || (line2Present && strcmp(line2, g_lastLine2) != 0) ||
+                      strcmp(labelA, g_lastLabelA) != 0 || strcmp(labelB, g_lastLabelB) != 0;
+  bool selectionChanged = !textChanged && (selected != g_lastSelected);
+  if (!textChanged && !selectionChanged) return;
+
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  int16_t extraY = y;
+  if (extraPresent) y = static_cast<int16_t>(y + lh);
+  int16_t line1Y = y;
+  y = static_cast<int16_t>(y + lh);
+  int16_t line2Y = y;
+  if (line2Present) y = static_cast<int16_t>(y + lh);
+  y = static_cast<int16_t>(y + 2);
+  int16_t optAY = y;
+  int16_t optBY = static_cast<int16_t>(y + lh);
+
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+  if (textChanged) {
+    Display::clearContentArea();
+    if (extraPresent) Display::printLine(2, extraY, extraLine);
+    Display::printLine(2, line1Y, line1);
+    if (line2Present) Display::printLine(2, line2Y, line2);
+    if (selected == 0) Display::printLine(2, optAY, ">");
+    Display::printLine(labelX, optAY, labelA);
+    if (selected == 1) Display::printLine(2, optBY, ">");
+    Display::printLine(labelX, optBY, labelB);
+  } else {
+    int16_t oldY = (g_lastSelected == 0) ? optAY : optBY;
+    int16_t newY = (selected == 0) ? optAY : optBY;
+    Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+    Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+    Display::printLine(2, newY, ">");
+  }
 
   g_lastContentDrawer = OtaContentDrawer::PROMPT;
   g_lastSelected = selected;
@@ -334,28 +372,6 @@ void drawTwoOptionPrompt(const char* line1, const char* line2, const char* label
   g_lastLabelA[sizeof(g_lastLabelA) - 1] = '\0';
   strncpy(g_lastLabelB, labelB, sizeof(g_lastLabelB) - 1);
   g_lastLabelB[sizeof(g_lastLabelB) - 1] = '\0';
-
-  Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
-  int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
-  if (extraPresent) {
-    Display::printLine(2, y, extraLine);
-    y += lh;
-  }
-  Display::printLine(2, y, line1);
-  y += lh;
-  if (line2Present) {
-    Display::printLine(2, y, line2);
-    y += lh;
-  }
-  y += 2;
-  char opt[40];
-  snprintf(opt, sizeof(opt), "%s%s", selected == 0 ? "> " : "  ", labelA);
-  Display::printLine(2, y, opt);
-  y += lh;
-  snprintf(opt, sizeof(opt), "%s%s", selected == 1 ? "> " : "  ", labelB);
-  Display::printLine(2, y, opt);
 }
 
 char g_lastMsgLine1[48] = {0};
@@ -453,19 +469,39 @@ void otaProgressCallback(size_t written, size_t expected) {
   // screen could be left showing whatever drawMessage()'s "Preparing
   // Update..." last painted instead of the progress bar (same
   // cross-drawer staleness class as drawMessage()/drawTwoOptionPrompt()).
-  if (g_lastContentDrawer == OtaContentDrawer::PROGRESS && percent == g_lastProgressPercent) return;
-  g_lastContentDrawer = OtaContentDrawer::PROGRESS;
-  g_lastProgressPercent = percent;
+  bool wasAlreadyProgress = (g_lastContentDrawer == OtaContentDrawer::PROGRESS);
+  if (wasAlreadyProgress && percent == g_lastProgressPercent) return;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 4;
-  Display::printLine(2, y, "Updating Firmware");
-  y += lh + 6;
+  int16_t titleY = Display::kStatusBarHeight + 4;
+  int16_t percentY = static_cast<int16_t>(titleY + lh + 6);
+
   char line[8];
   snprintf(line, sizeof(line), "%u%%", percent);
-  Display::printLine(2, y, line);
+
+  if (!wasAlreadyProgress) {
+    // Entering the progress screen fresh (first chunk of this download,
+    // or a different drawer owned the screen last): draw "Updating
+    // Firmware" once. Hardware Fix #3: every later call for this same
+    // download only updates the percentage region below it -- the old
+    // pattern cleared and redrew both on every single percent tick.
+    Display::clearContentArea();
+    Display::printLine(2, titleY, "Updating Firmware");
+  } else {
+    char oldLine[8];
+    snprintf(oldLine, sizeof(oldLine), "%u%%", g_lastProgressPercent);
+    int16_t oldW = Display::textWidth(oldLine);
+    int16_t newW = Display::textWidth(line);
+    int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+    if (eraseW > maxW) eraseW = maxW;
+    Display::tft().fillRect(2, percentY, eraseW, lh, ST77XX_BLACK);
+  }
+  Display::printLine(2, percentY, line);
+
+  g_lastContentDrawer = OtaContentDrawer::PROGRESS;
+  g_lastProgressPercent = percent;
 }
 
 // Deliberately blocking (see runDownloadAndInstallBlocking()'s comment):
@@ -689,29 +725,43 @@ void screenFirmwareUpdate() {
       }
       if (!g_mainDirty && g_lastContentDrawer == OtaContentDrawer::MAIN) return;
       g_mainDirty = false;
+      // A different drawer owned the screen last (or this is the very
+      // first draw): everything is new. Otherwise this can only be a
+      // selection move within MAIN (nothing else sets g_mainDirty here),
+      // so only the "> " marker needs to move (Hardware Fix #3).
+      bool firstDraw = (g_lastContentDrawer != OtaContentDrawer::MAIN);
       g_lastContentDrawer = OtaContentDrawer::MAIN;
 
       Display::setFont(Display::Font::PRIMARY);
-      Display::clearContentArea();
       int16_t lh = Display::lineHeight();
-      int16_t y = Display::kStatusBarHeight + 2;
-      Display::printLine(2, y, "Firmware Update");
-      y += lh;
-      char line[32];
-      snprintf(line, sizeof(line), "Current: v%s", FW_VERSION);
-      Display::printLine(2, y, line);
-      y += lh;
-      snprintf(line, sizeof(line), "Build: %u", static_cast<unsigned>(FW_BUILD_NUMBER));
-      Display::printLine(2, y, line);
-      y += lh;
-      char item[32];
-      snprintf(item, sizeof(item), "%sCheck for Update", g_mainSelected == 0 ? "> " : "  ");
-      Display::printLine(2, y, item);
-      y += lh;
-      if (g_mainCanRollback) {
-        snprintf(item, sizeof(item), "%sRollback to Previous", g_mainSelected == 1 ? "> " : "  ");
-        Display::printLine(2, y, item);
+      int16_t titleY = Display::kStatusBarHeight + 2;
+      int16_t item0Y = static_cast<int16_t>(titleY + 3 * lh);
+      int16_t item1Y = static_cast<int16_t>(item0Y + lh);
+      int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+      int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+      if (firstDraw) {
+        Display::clearContentArea();
+        Display::printLine(2, titleY, "Firmware Update");
+        char line[32];
+        snprintf(line, sizeof(line), "Current: v%s", FW_VERSION);
+        Display::printLine(2, static_cast<int16_t>(titleY + lh), line);
+        snprintf(line, sizeof(line), "Build: %u", static_cast<unsigned>(FW_BUILD_NUMBER));
+        Display::printLine(2, static_cast<int16_t>(titleY + 2 * lh), line);
+        if (g_mainSelected == 0) Display::printLine(2, item0Y, ">");
+        Display::printLine(labelX, item0Y, "Check for Update");
+        if (g_mainCanRollback) {
+          if (g_mainSelected == 1) Display::printLine(2, item1Y, ">");
+          Display::printLine(labelX, item1Y, "Rollback to Previous");
+        }
+      } else {
+        int16_t oldY = (g_mainLastSelected == 0) ? item0Y : item1Y;
+        int16_t newY = (g_mainSelected == 0) ? item0Y : item1Y;
+        Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+        Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+        Display::printLine(2, newY, ">");
       }
+      g_mainLastSelected = g_mainSelected;
       return;
     }
 

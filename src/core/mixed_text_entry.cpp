@@ -58,14 +58,22 @@ MixedTextEntryResult g_result = MixedTextEntryResult::NONE;
 
 bool g_dirty = true;
 
-// Hardware Fix #3A: render() no longer clears/redraws the whole content
-// area on every dirty tick. g_needsFullRedraw gates the one-time
-// clear+title+input+control draw (start()); every other render() call
-// diffs the freshly-computed input/control row text against what was
-// last actually drawn and only fillRect+redraws the row(s) whose content
-// changed -- the title is never touched again after the first draw.
+// Hardware Fix #3A/#3: render() no longer clears/redraws the whole content
+// area on every dirty tick, and (Fix #3) the input row itself is split
+// into a stable confirmed PREFIX (g_buffer) and a dynamic SUFFIX
+// (cursor/preview/morse marker) so a plain preview-character change
+// (e.g. ABCDEF[G] -> ABCDEF[H]) redraws only the suffix cell -- the
+// confirmed "ABCDEF" is never touched. g_needsFullRedraw gates the
+// one-time clear+title+input+control draw (start()). If the row's
+// leading-clip window is active (long strings), a full input-row redraw
+// is used instead, because the visible coordinate mapping can shift
+// (Global Invariant 12) -- prefix/suffix X positions are only stable
+// when nothing is clipped.
 bool g_needsFullRedraw = true;
-char g_lastInputLine[96] = {0};
+char g_lastPrefix[65] = {0};
+char g_lastSuffix[24] = {0};
+bool g_lastNeededClip = false;
+char g_lastClippedLine[96] = {0};
 char g_lastControlLine[40] = {0};
 
 void appendConfirmedChar(char c) {
@@ -190,42 +198,30 @@ void handleConfirm(const InputEvent& e) {
   }
 }
 
-// Builds the input row's text (cursor/preview/morse suffix as
-// appropriate) with the same leading-clip-for-long-strings behavior as
-// before, into a caller-owned buffer so it can be diffed against what was
-// last drawn.
-void computeInputLine(char* out, size_t outCap) {
-  char line[96];
+// Splits the input row into its stable confirmed prefix (the buffer, as
+// typed so far) and its dynamic suffix (cursor/preview/morse marker).
+// CONFIRM state shows the plain buffer with no suffix at all -- matches
+// original behavior of showing the plain value being saved.
+void computeParts(char* prefixOut, size_t prefixCap, char* suffixOut, size_t suffixCap) {
+  strncpy(prefixOut, g_buffer, prefixCap - 1);
+  prefixOut[prefixCap - 1] = '\0';
+
   switch (g_state) {
     case State::EMPTY:
-      snprintf(line, sizeof(line), "%s_", g_buffer);
+      snprintf(suffixOut, suffixCap, "_");
       break;
     case State::PREVIEW: {
       char c = charsetAt(g_config.charset, g_previewIndex);
-      snprintf(line, sizeof(line), "%s[%c]", g_buffer, c);
+      snprintf(suffixOut, suffixCap, "[%c]", c);
       break;
     }
     case State::MORSE:
-      snprintf(line, sizeof(line), "%s[%s]", g_buffer, g_morsePattern);
+      snprintf(suffixOut, suffixCap, "[%s]", g_morsePattern);
       break;
     case State::CONFIRM:
-      // No cursor/preview suffix while confirming -- matches original
-      // behavior of showing the plain buffer value being saved.
-      snprintf(line, sizeof(line), "%s", g_buffer);
+      suffixOut[0] = '\0';
       break;
   }
-
-  // Keep the actively-edited tail (cursor/preview) visible rather than
-  // clipping it off-screen: a WiFi Password (up to 64 chars) or Group Code
-  // (up to 32) can now exceed the PRIMARY font's visible width, where at
-  // the old compact font they usually still fit (Hardware Fix #1). Drop
-  // leading characters, not trailing ones, so the part the user is
-  // actively typing (or about to save) stays on screen.
-  const char* visible = line;
-  int16_t avail = Display::kScreenWidth - 2;
-  while (visible[0] != '\0' && Display::textWidth(visible) > avail) visible++;
-  strncpy(out, visible, outCap - 1);
-  out[outCap - 1] = '\0';
 }
 
 // Builds the control row's text: the validation error (EMPTY state only)
@@ -248,36 +244,99 @@ void render() {
   int16_t inputY = static_cast<int16_t>(titleY + lh);
   int16_t controlY = static_cast<int16_t>(inputY + lh + 8);
 
-  char inputLine[96];
-  computeInputLine(inputLine, sizeof(inputLine));
+  char prefix[65];
+  char suffix[24];
+  computeParts(prefix, sizeof(prefix), suffix, sizeof(suffix));
+
+  char combined[96];
+  snprintf(combined, sizeof(combined), "%s%s", prefix, suffix);
+  int16_t avail = static_cast<int16_t>(Display::kScreenWidth - 2);
+  bool needsClip = Display::textWidth(combined) > avail;
+
+  // Keep the actively-edited tail visible rather than clipping it
+  // off-screen: a WiFi Password (up to 64 chars) or Group Code (up to 32)
+  // can exceed the PRIMARY font's visible width. Drop leading characters,
+  // not trailing ones, so the part the user is actively typing (or about
+  // to save) stays on screen (Hardware Fix #1). When clipping isn't
+  // needed, clippedLine is just the unclipped combined string.
+  char clippedLine[96];
+  if (needsClip) {
+    const char* visible = combined;
+    while (visible[0] != '\0' && Display::textWidth(visible) > avail) visible++;
+    strncpy(clippedLine, visible, sizeof(clippedLine) - 1);
+  } else {
+    strncpy(clippedLine, combined, sizeof(clippedLine) - 1);
+  }
+  clippedLine[sizeof(clippedLine) - 1] = '\0';
+
   char controlLine[40];
   computeControlLine(controlLine, sizeof(controlLine));
+
+  int16_t prefixW = Display::textWidth(prefix);
+  int16_t suffixX = static_cast<int16_t>(2 + prefixW);
 
   if (g_needsFullRedraw) {
     // First render after start(): everything is new -- title included.
     Display::clearContentArea();
     Display::printLine(2, titleY, g_config.title);
-    Display::printLine(2, inputY, inputLine);
-    if (controlLine[0] != '\0') Display::printLine(2, controlY, controlLine);
+    if (needsClip) {
+      Display::printLine(2, inputY, clippedLine);
+    } else {
+      Display::printLine(2, inputY, prefix);
+      if (suffix[0] != '\0') Display::printLine(suffixX, inputY, suffix);
+    }
+    // Control row is handled uniformly by the unconditional diff below
+    // (g_lastControlLine starts empty, so a non-empty controlLine here
+    // will correctly be drawn there without a redundant double-draw).
     g_needsFullRedraw = false;
-  } else {
-    // Every later render: diff against what was last actually drawn and
-    // touch only the row(s) whose content changed. The title is never
-    // redrawn again after the first draw. PRIMARY is a GFX custom font
-    // and never draws with an opaque background, so each changed row is
-    // explicitly fillRect-erased before its replacement text is drawn.
-    if (strcmp(inputLine, g_lastInputLine) != 0) {
+  } else if (needsClip || g_lastNeededClip) {
+    // The leading-clip window is active now, or was active last render:
+    // the visible coordinate mapping may have shifted (Global Invariant
+    // 12), so fall back to a full input-row redraw rather than risk a
+    // partial update landing at the wrong X. Still only touches the input
+    // row, never the title.
+    if (strcmp(clippedLine, g_lastClippedLine) != 0) {
       Display::tft().fillRect(0, inputY, Display::kScreenWidth, lh, ST77XX_BLACK);
-      Display::printLine(2, inputY, inputLine);
+      Display::printLine(2, inputY, clippedLine);
     }
-    if (strcmp(controlLine, g_lastControlLine) != 0) {
-      Display::tft().fillRect(0, controlY, Display::kScreenWidth, lh, ST77XX_BLACK);
-      if (controlLine[0] != '\0') Display::printLine(2, controlY, controlLine);
-    }
+  } else if (strcmp(prefix, g_lastPrefix) != 0) {
+    // The confirmed prefix itself changed (append/delete/Morse-finalize):
+    // not the common "same layout" case, so redraw the whole row -- still
+    // far lighter than a full-screen or even full-content-area clear.
+    Display::tft().fillRect(0, inputY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    Display::printLine(2, inputY, prefix);
+    if (suffix[0] != '\0') Display::printLine(suffixX, inputY, suffix);
+  } else if (strcmp(suffix, g_lastSuffix) != 0) {
+    // The hot path this fix targets: only the dynamic suffix
+    // (cursor/preview/morse marker) changed, e.g. ABCDEF[G] -> ABCDEF[H].
+    // The confirmed prefix is provably unchanged and at the same X, so it
+    // is never touched -- only the suffix's own cell (sized to cover both
+    // its old and new glyph extents) is erased and redrawn.
+    int16_t oldSuffixW = Display::textWidth(g_lastSuffix);
+    int16_t newSuffixW = Display::textWidth(suffix);
+    int16_t eraseW = static_cast<int16_t>((oldSuffixW > newSuffixW ? oldSuffixW : newSuffixW) + 4);
+    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - suffixX);
+    if (eraseW > maxW) eraseW = maxW;
+    if (eraseW < 0) eraseW = 0;
+    Display::tft().fillRect(suffixX, inputY, eraseW, lh, ST77XX_BLACK);
+    if (suffix[0] != '\0') Display::printLine(suffixX, inputY, suffix);
   }
 
-  strncpy(g_lastInputLine, inputLine, sizeof(g_lastInputLine) - 1);
-  g_lastInputLine[sizeof(g_lastInputLine) - 1] = '\0';
+  if (strcmp(controlLine, g_lastControlLine) != 0) {
+    // PRIMARY is a GFX custom font and never draws with an opaque
+    // background, so the row is explicitly erased before its replacement
+    // is drawn.
+    Display::tft().fillRect(0, controlY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    if (controlLine[0] != '\0') Display::printLine(2, controlY, controlLine);
+  }
+
+  g_lastNeededClip = needsClip;
+  strncpy(g_lastClippedLine, clippedLine, sizeof(g_lastClippedLine) - 1);
+  g_lastClippedLine[sizeof(g_lastClippedLine) - 1] = '\0';
+  strncpy(g_lastPrefix, prefix, sizeof(g_lastPrefix) - 1);
+  g_lastPrefix[sizeof(g_lastPrefix) - 1] = '\0';
+  strncpy(g_lastSuffix, suffix, sizeof(g_lastSuffix) - 1);
+  g_lastSuffix[sizeof(g_lastSuffix) - 1] = '\0';
   strncpy(g_lastControlLine, controlLine, sizeof(g_lastControlLine) - 1);
   g_lastControlLine[sizeof(g_lastControlLine) - 1] = '\0';
 }
@@ -301,7 +360,10 @@ void start(const MixedTextEntryConfig& config, const char* initialValue) {
   g_result = MixedTextEntryResult::NONE;
   g_dirty = true;
   g_needsFullRedraw = true;
-  g_lastInputLine[0] = '\0';
+  g_lastPrefix[0] = '\0';
+  g_lastSuffix[0] = '\0';
+  g_lastNeededClip = false;
+  g_lastClippedLine[0] = '\0';
   g_lastControlLine[0] = '\0';
 }
 

@@ -184,6 +184,7 @@ void leaveTalk() {
 }
 
 bool g_talkDirty = true;
+bool g_talkNeedsFullRedraw = true;
 const char* g_talkLastStatus = nullptr;
 
 void screenTalk() {
@@ -196,6 +197,7 @@ void screenTalk() {
       Presence::republishOwnPresenceAllGroups();
     }
     g_talkDirty = true;
+    g_talkNeedsFullRedraw = true;
     g_talkLastStatus = nullptr;
   }
 
@@ -260,15 +262,30 @@ void screenTalk() {
 
   if (!g_talkDirty && status == g_talkLastStatus) return;
   g_talkDirty = false;
-  g_talkLastStatus = status;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
-  Display::printLine(2, y, isEveryone ? "Everyone" : g_selectedContactKey);
-  y += lh;
-  Display::printLine(2, y, status);
+  int16_t nameY = Display::kStatusBarHeight + 2;
+  int16_t statusY = static_cast<int16_t>(nameY + lh);
+
+  // Static recipient/contact name stays untouched when only the call
+  // status (Ready/Claiming/Talking/BUSY/relay-direct) changes -- only the
+  // status row is erased and redrawn (Hardware Fix #3; this is also the
+  // "Channel-Busy" status screen flagged for extra review, item 14).
+  if (g_talkNeedsFullRedraw) {
+    Display::clearContentArea();
+    Display::printLine(2, nameY, isEveryone ? "Everyone" : g_selectedContactKey);
+    g_talkNeedsFullRedraw = false;
+  } else {
+    int16_t oldW = (g_talkLastStatus != nullptr) ? Display::textWidth(g_talkLastStatus) : 0;
+    int16_t newW = Display::textWidth(status);
+    int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+    if (eraseW > maxW) eraseW = maxW;
+    Display::tft().fillRect(2, statusY, eraseW, lh, ST77XX_BLACK);
+  }
+  Display::printLine(2, statusY, status);
+  g_talkLastStatus = status;
 }
 
 // =============================================================================

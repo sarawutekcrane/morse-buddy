@@ -424,6 +424,18 @@ void handleHistoryFocusEvent(const InputEvent& e) {
 
 bool g_chatRenderDirty = true;
 
+// Hardware Fix #3: same three-way redraw split as ListMenu, plus a
+// separate wasIndexDirty-driven "content changed" trigger (an actual
+// new/changed message must redraw the history row region even without a
+// scroll), and the compose row diffed completely independently. Stored
+// message history is never touched by a plain cursor move or by compose
+// activity (Morse pattern growth, typed characters) -- only by a genuine
+// content or viewport change.
+bool g_chatNeedsFullRedraw = true;
+int16_t g_chatLastStartIdx = -1;
+uint16_t g_chatLastCursor = kNoHistoryCursor;
+char g_chatLastComposeLine[72] = {0};
+
 void screenChat() {
   if (Menu::consumeJustEntered()) {
     clearDraft();
@@ -435,6 +447,7 @@ void screenChat() {
     g_chatIsOpen = true;
     markIndexDirty();
     g_chatRenderDirty = true;
+    g_chatNeedsFullRedraw = true;
   }
 
   Input::update();
@@ -479,7 +492,6 @@ void screenChat() {
   g_chatRenderDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
 
   // As many history rows as fit, with the last row always reserved for the
@@ -501,29 +513,69 @@ void screenChat() {
       startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
     }
   }
+  int16_t composeY = static_cast<int16_t>(contentTop + viewportLines * lh);
 
-  int16_t y = contentTop;
-  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
-    const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
-    if (entry == nullptr) continue;
-    MessageRef ref = refForIndexEntry(*entry);
-    StoredMessageView view;
-    char lineBuf[48] = "?";
-    if (MessageStore::loadMessage(ref, &view)) {
-      RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-      if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+  bool firstDraw = g_chatNeedsFullRedraw;
+  bool contentChanged = !firstDraw && wasIndexDirty;
+  bool scrolled = !firstDraw && !contentChanged && (static_cast<int16_t>(startIdx) != g_chatLastStartIdx);
+  bool selectionOnlyChanged = !firstDraw && !contentChanged && !scrolled && (g_historyCursor != g_chatLastCursor);
+
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+  if (firstDraw || contentChanged || scrolled) {
+    if (firstDraw) {
+      Display::clearContentArea();
+    } else {
+      int16_t regionH = static_cast<int16_t>(composeY - contentTop);
+      if (regionH < 0) regionH = 0;
+      Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
-    char line[56];
-    snprintf(line, sizeof(line), "%s%s", i == g_historyCursor ? "> " : "  ", lineBuf);
-    Display::printLine(2, y, line);
-    y += lh;
+    int16_t y = contentTop;
+    for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
+      const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
+      if (entry == nullptr) continue;
+      MessageRef ref = refForIndexEntry(*entry);
+      StoredMessageView view;
+      char lineBuf[48] = "?";
+      if (MessageStore::loadMessage(ref, &view)) {
+        RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
+        if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+      }
+      if (i == g_historyCursor) Display::printLine(2, y, ">");
+      Display::printLine(labelX, y, lineBuf);
+      y += lh;
+    }
+    g_chatNeedsFullRedraw = false;
+  } else if (selectionOnlyChanged) {
+    if (g_chatLastCursor != kNoHistoryCursor) {
+      int16_t oldY = static_cast<int16_t>(contentTop + (g_chatLastCursor - startIdx) * lh);
+      Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+    }
+    if (g_historyCursor != kNoHistoryCursor) {
+      int16_t newY = static_cast<int16_t>(contentTop + (g_historyCursor - startIdx) * lh);
+      Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+      Display::printLine(2, newY, ">");
+    }
   }
 
+  // Compose row is diffed completely independently of the history rows
+  // above it -- Morse pattern growth, typed characters, and the cursor-
+  // focus prefix flip never repaint stored message history (Hardware Fix
+  // #3, Section F).
   char composeLine[64];
   buildComposeDisplay(composeLine, sizeof(composeLine));
   char fullCompose[72];
   snprintf(fullCompose, sizeof(fullCompose), "%s%s", g_historyCursor == kNoHistoryCursor ? "> " : "  ", composeLine);
-  Display::printLine(2, y, fullCompose);
+  if (firstDraw || strcmp(fullCompose, g_chatLastComposeLine) != 0) {
+    if (!firstDraw) Display::tft().fillRect(0, composeY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    Display::printLine(2, composeY, fullCompose);
+    strncpy(g_chatLastComposeLine, fullCompose, sizeof(g_chatLastComposeLine) - 1);
+    g_chatLastComposeLine[sizeof(g_chatLastComposeLine) - 1] = '\0';
+  }
+
+  g_chatLastStartIdx = static_cast<int16_t>(startIdx);
+  g_chatLastCursor = g_historyCursor;
 }
 
 // =============================================================================

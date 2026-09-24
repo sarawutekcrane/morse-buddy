@@ -491,9 +491,15 @@ void startReceiveKeyEditorFor(const MessageRef& ref) {
 }
 
 bool g_keyEditorDirty = true;
+bool g_keyEditorNeedsFullRedraw = true;
+char g_lastKeyEditorLine[40] = {0};
+char g_lastKeyEditorWarnLine[40] = {0};
 
 void screenKeyEditor() {
-  if (Menu::consumeJustEntered()) g_keyEditorDirty = true;
+  if (Menu::consumeJustEntered()) {
+    g_keyEditorDirty = true;
+    g_keyEditorNeedsFullRedraw = true;
+  }
 
   Input::update();
   InputEvent e;
@@ -541,11 +547,17 @@ void screenKeyEditor() {
   g_keyEditorDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
-  Display::printLine(2, y, g_editingSender ? "Sender Key" : "Receive Key");
-  y += lh;
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t valueY = static_cast<int16_t>(titleY + lh);
+  int16_t warnY = static_cast<int16_t>(valueY + lh);
+
+  bool firstDraw = g_keyEditorNeedsFullRedraw;
+  if (firstDraw) {
+    Display::clearContentArea();
+    Display::printLine(2, titleY, g_editingSender ? "Sender Key" : "Receive Key");
+    g_keyEditorNeedsFullRedraw = false;
+  }
 
   char line[40];
   switch (g_editStep) {
@@ -577,11 +589,35 @@ void screenKeyEditor() {
       snprintf(line, sizeof(line), "%s", g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
       break;
   }
-  Display::printLine(2, y, line);
-  y += lh;
+  // Value and warning rows are diffed independently, so changing the
+  // picker value never repaints the static title above it (Hardware Fix
+  // #3, Section G). Erasing only the old/new glyph bounds (not the full
+  // row width) keeps this cheap even for the frequent rotate case.
+  if (firstDraw || strcmp(line, g_lastKeyEditorLine) != 0) {
+    if (!firstDraw) {
+      int16_t oldW = Display::textWidth(g_lastKeyEditorLine);
+      int16_t newW = Display::textWidth(line);
+      int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+      if (eraseW > maxW) eraseW = maxW;
+      Display::tft().fillRect(2, valueY, eraseW, lh, ST77XX_BLACK);
+    }
+    Display::printLine(2, valueY, line);
+    strncpy(g_lastKeyEditorLine, line, sizeof(g_lastKeyEditorLine) - 1);
+    g_lastKeyEditorLine[sizeof(g_lastKeyEditorLine) - 1] = '\0';
+  }
 
+  char warnLine[40];
   if (g_editStep == KeyEditStep::CONFIRM && g_working.rotor_count == 0 && g_working.plugboard_pair_count == 0) {
-    Display::printLine(2, y, "Warning: plaintext passthrough");
+    snprintf(warnLine, sizeof(warnLine), "Warning: plaintext passthrough");
+  } else {
+    warnLine[0] = '\0';
+  }
+  if (firstDraw || strcmp(warnLine, g_lastKeyEditorWarnLine) != 0) {
+    if (!firstDraw) Display::tft().fillRect(0, warnY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    if (warnLine[0] != '\0') Display::printLine(2, warnY, warnLine);
+    strncpy(g_lastKeyEditorWarnLine, warnLine, sizeof(g_lastKeyEditorWarnLine) - 1);
+    g_lastKeyEditorWarnLine[sizeof(g_lastKeyEditorWarnLine) - 1] = '\0';
   }
 }
 
@@ -952,6 +988,17 @@ void handleHistoryFocusEvent(const InputEvent& e) {
 
 bool g_enigmaChatDirty = true;
 
+// Hardware Fix #3: same three-way redraw split as ListMenu, plus separate
+// wasIndexDirty-driven "content changed" and independently-diffed error
+// and compose rows. Stored message history is never touched by a plain
+// cursor move or by compose activity, only by a genuine content or
+// viewport change.
+bool g_enigmaChatNeedsFullRedraw = true;
+int16_t g_enigmaChatLastStartIdx = -1;
+uint16_t g_enigmaChatLastCursor = kNoHistoryCursor;
+char g_enigmaChatLastErrorLine[40] = {0};
+char g_enigmaChatLastComposeLine[72] = {0};
+
 void screenEnigmaChat() {
   if (Menu::consumeJustEntered()) {
     clearDraft();
@@ -959,6 +1006,7 @@ void screenEnigmaChat() {
     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
     markIndexDirty();
     g_enigmaChatDirty = true;
+    g_enigmaChatNeedsFullRedraw = true;
   }
 
   Input::update();
@@ -1003,7 +1051,6 @@ void screenEnigmaChat() {
   g_enigmaChatDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
 
   // Reserve the last 2 rows for the (optional) compose-error line and the
@@ -1024,34 +1071,82 @@ void screenEnigmaChat() {
       startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
     }
   }
+  int16_t errorY = static_cast<int16_t>(contentTop + viewportLines * lh);
+  int16_t composeY = static_cast<int16_t>(errorY + lh);
 
-  int16_t y = contentTop;
-  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
-    const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
-    if (entry == nullptr) continue;
-    MessageRef ref = refForIndexEntry(*entry);
-    StoredMessageView view;
-    char lineBuf[48] = "?";
-    if (MessageStore::loadMessage(ref, &view)) {
-      RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-      if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+  bool firstDraw = g_enigmaChatNeedsFullRedraw;
+  bool contentChanged = !firstDraw && wasIndexDirty;
+  bool scrolled = !firstDraw && !contentChanged && (static_cast<int16_t>(startIdx) != g_enigmaChatLastStartIdx);
+  bool selectionOnlyChanged =
+      !firstDraw && !contentChanged && !scrolled && (g_historyCursor != g_enigmaChatLastCursor);
+
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+  if (firstDraw || contentChanged || scrolled) {
+    if (firstDraw) {
+      Display::clearContentArea();
+    } else {
+      int16_t regionH = static_cast<int16_t>(errorY - contentTop);
+      if (regionH < 0) regionH = 0;
+      Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
-    char line[56];
-    snprintf(line, sizeof(line), "%s%s", i == g_historyCursor ? "> " : "  ", lineBuf);
-    Display::printLine(2, y, line);
-    y += lh;
+    int16_t y = contentTop;
+    for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
+      const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
+      if (entry == nullptr) continue;
+      MessageRef ref = refForIndexEntry(*entry);
+      StoredMessageView view;
+      char lineBuf[48] = "?";
+      if (MessageStore::loadMessage(ref, &view)) {
+        RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
+        if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+      }
+      if (i == g_historyCursor) Display::printLine(2, y, ">");
+      Display::printLine(labelX, y, lineBuf);
+      y += lh;
+    }
+    g_enigmaChatNeedsFullRedraw = false;
+  } else if (selectionOnlyChanged) {
+    if (g_enigmaChatLastCursor != kNoHistoryCursor) {
+      int16_t oldY = static_cast<int16_t>(contentTop + (g_enigmaChatLastCursor - startIdx) * lh);
+      Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+    }
+    if (g_historyCursor != kNoHistoryCursor) {
+      int16_t newY = static_cast<int16_t>(contentTop + (g_historyCursor - startIdx) * lh);
+      Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+      Display::printLine(2, newY, ">");
+    }
   }
 
-  y = contentTop + static_cast<int16_t>(viewportLines) * lh;
+  // Error and compose rows are diffed completely independently of the
+  // history rows above them (Hardware Fix #3, Section F/G).
+  char errorLine[40];
   if (g_composeError != nullptr) {
-    Display::printLine(2, y, g_composeError);
+    snprintf(errorLine, sizeof(errorLine), "%s", g_composeError);
+  } else {
+    errorLine[0] = '\0';
   }
-  y += lh;
+  if (firstDraw || strcmp(errorLine, g_enigmaChatLastErrorLine) != 0) {
+    if (!firstDraw) Display::tft().fillRect(0, errorY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    if (errorLine[0] != '\0') Display::printLine(2, errorY, errorLine);
+    strncpy(g_enigmaChatLastErrorLine, errorLine, sizeof(g_enigmaChatLastErrorLine) - 1);
+    g_enigmaChatLastErrorLine[sizeof(g_enigmaChatLastErrorLine) - 1] = '\0';
+  }
+
   char composeLine[64];
   buildComposeDisplay(composeLine, sizeof(composeLine));
   char fullCompose[72];
   snprintf(fullCompose, sizeof(fullCompose), "%s%s", g_historyCursor == kNoHistoryCursor ? "> " : "  ", composeLine);
-  Display::printLine(2, y, fullCompose);
+  if (firstDraw || strcmp(fullCompose, g_enigmaChatLastComposeLine) != 0) {
+    if (!firstDraw) Display::tft().fillRect(0, composeY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    Display::printLine(2, composeY, fullCompose);
+    strncpy(g_enigmaChatLastComposeLine, fullCompose, sizeof(g_enigmaChatLastComposeLine) - 1);
+    g_enigmaChatLastComposeLine[sizeof(g_enigmaChatLastComposeLine) - 1] = '\0';
+  }
+
+  g_enigmaChatLastStartIdx = static_cast<int16_t>(startIdx);
+  g_enigmaChatLastCursor = g_historyCursor;
 }
 
 // =============================================================================

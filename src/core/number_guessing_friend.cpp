@@ -571,7 +571,17 @@ void handleFriendChatEvent(const InputEvent& e) {
   }
 }
 
+// Hardware Fix #3: same three-way redraw split as ListMenu, plus a
+// separate wasIndexDirty-driven "content changed" trigger (a genuinely
+// new/changed message must redraw the row region even without a
+// scroll) -- stored message history is never touched by a plain cursor
+// move or by the hint row's own cursor-prefix flip, only by an actual
+// content or viewport change.
 bool g_friendChatDirty = true;
+bool g_friendChatNeedsFullRedraw = true;
+int16_t g_friendChatLastStartIdx = -1;
+uint16_t g_friendChatLastCursor = kNoHistoryCursor;
+bool g_friendChatLastHintNoCursor = true;
 
 void screenFriendChat() {
   if (Menu::consumeJustEntered()) {
@@ -579,6 +589,7 @@ void screenFriendChat() {
     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
     markIndexDirty();
     g_friendChatDirty = true;
+    g_friendChatNeedsFullRedraw = true;
   }
 
   Input::update();
@@ -614,7 +625,6 @@ void screenFriendChat() {
   g_friendChatDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
 
   int16_t contentTop = Display::kStatusBarHeight + 2;
@@ -632,27 +642,64 @@ void screenFriendChat() {
       startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
     }
   }
+  int16_t hintY = static_cast<int16_t>(contentTop + viewportLines * lh);
 
-  int16_t y = contentTop;
-  for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
-    const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
-    if (entry == nullptr) continue;
-    MessageRef ref = refForIndexEntry(*entry);
-    StoredMessageView view;
-    char lineBuf[48] = "?";
-    if (MessageStore::loadMessage(ref, &view)) {
-      RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-      if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+  bool firstDraw = g_friendChatNeedsFullRedraw;
+  bool contentChanged = !firstDraw && wasIndexDirty;
+  bool scrolled = !firstDraw && !contentChanged && (static_cast<int16_t>(startIdx) != g_friendChatLastStartIdx);
+  bool selectionOnlyChanged =
+      !firstDraw && !contentChanged && !scrolled && (g_historyCursor != g_friendChatLastCursor);
+
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+  if (firstDraw || contentChanged || scrolled) {
+    if (firstDraw) {
+      Display::clearContentArea();
+    } else {
+      int16_t regionH = static_cast<int16_t>(hintY - contentTop);
+      if (regionH < 0) regionH = 0;
+      Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
-    char line[56];
-    snprintf(line, sizeof(line), "%s%s", i == g_historyCursor ? "> " : "  ", lineBuf);
-    Display::printLine(2, y, line);
-    y += lh;
+    int16_t y = contentTop;
+    for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
+      const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
+      if (entry == nullptr) continue;
+      MessageRef ref = refForIndexEntry(*entry);
+      StoredMessageView view;
+      char lineBuf[48] = "?";
+      if (MessageStore::loadMessage(ref, &view)) {
+        RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
+        if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+      }
+      if (i == g_historyCursor) Display::printLine(2, y, ">");
+      Display::printLine(labelX, y, lineBuf);
+      y += lh;
+    }
+    g_friendChatNeedsFullRedraw = false;
+  } else if (selectionOnlyChanged) {
+    if (g_friendChatLastCursor != kNoHistoryCursor) {
+      int16_t oldY = static_cast<int16_t>(contentTop + (g_friendChatLastCursor - startIdx) * lh);
+      Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+    }
+    if (g_historyCursor != kNoHistoryCursor) {
+      int16_t newY = static_cast<int16_t>(contentTop + (g_historyCursor - startIdx) * lh);
+      Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+      Display::printLine(2, newY, ">");
+    }
   }
 
-  char full[40];
-  snprintf(full, sizeof(full), "%s(Short: new challenge)", g_historyCursor == kNoHistoryCursor ? "> " : "  ");
-  Display::printLine(2, y, full);
+  bool hintNoCursor = (g_historyCursor == kNoHistoryCursor);
+  if (firstDraw || contentChanged || scrolled || hintNoCursor != g_friendChatLastHintNoCursor) {
+    Display::tft().fillRect(0, hintY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    char full[40];
+    snprintf(full, sizeof(full), "%s(Short: new challenge)", hintNoCursor ? "> " : "  ");
+    Display::printLine(2, hintY, full);
+    g_friendChatLastHintNoCursor = hintNoCursor;
+  }
+
+  g_friendChatLastStartIdx = static_cast<int16_t>(startIdx);
+  g_friendChatLastCursor = g_historyCursor;
 }
 
 // =============================================================================
@@ -771,9 +818,17 @@ void submitAnswerGuess() {
 }
 
 bool g_answerDirty = true;
+bool g_answerNeedsFullRedraw = true;
+AnswerPhase g_answerLastDrawnPhase = AnswerPhase::ENTERING;
+char g_lastAnswerAttemptLine[32] = {0};
+NumberGuessing::DigitRowRenderState g_answerRowState;
 
 void screenAnswer() {
-  if (Menu::consumeJustEntered()) g_answerDirty = true;
+  if (Menu::consumeJustEntered()) {
+    g_answerDirty = true;
+    g_answerNeedsFullRedraw = true;
+    NumberGuessing::resetDigitRowRenderState(&g_answerRowState);
+  }
 
   Input::update();
   InputEvent e;
@@ -816,28 +871,48 @@ void screenAnswer() {
   g_answerDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
   int16_t y = Display::kStatusBarHeight + 2;
-  char line[32];
+
+  // A phase transition (ENTERING <-> SHOWING_RESULT) is a genuine content
+  // replacement -- the whole row layout changes -- so it forces a full
+  // redraw same as first entry (Global Invariant 12's spirit). Within a
+  // phase, only what actually changed is touched.
+  bool phaseChanged = (g_answerPhase != g_answerLastDrawnPhase);
+  bool forceFull = g_answerNeedsFullRedraw || phaseChanged;
 
   if (g_answerPhase == AnswerPhase::SHOWING_RESULT) {
-    snprintf(line, sizeof(line), "%04u -> %uA%uB", g_pendingGuessValue, g_pendingResult.a, g_pendingResult.b);
-    Display::printLine(2, y, line);
-    y += lh;
-    Display::printLine(2, y, "Short: continue");
+    if (forceFull) {
+      Display::clearContentArea();
+      char line[32];
+      snprintf(line, sizeof(line), "%04u -> %uA%uB", g_pendingGuessValue, g_pendingResult.a, g_pendingResult.b);
+      Display::printLine(2, y, line);
+      y += lh;
+      Display::printLine(2, y, "Short: continue");
+      g_answerNeedsFullRedraw = false;
+    }
+    // Nothing dynamic while showing the result: no further per-tick
+    // diffing needed until the phase changes again.
   } else {
-    snprintf(line, sizeof(line), "Attempt %d", g_activeGame.totalAttempts + 1);
-    Display::printLine(2, y, line);
+    char attemptLine[32];
+    snprintf(attemptLine, sizeof(attemptLine), "Attempt %d", g_activeGame.totalAttempts + 1);
+    if (forceFull) {
+      Display::clearContentArea();
+      Display::printLine(2, y, attemptLine);
+      NumberGuessing::resetDigitRowRenderState(&g_answerRowState);
+      g_answerNeedsFullRedraw = false;
+    } else if (strcmp(attemptLine, g_lastAnswerAttemptLine) != 0) {
+      Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+      Display::printLine(2, y, attemptLine);
+    }
+    strncpy(g_lastAnswerAttemptLine, attemptLine, sizeof(g_lastAnswerAttemptLine) - 1);
+    g_lastAnswerAttemptLine[sizeof(g_lastAnswerAttemptLine) - 1] = '\0';
     y += lh;
 
-    char guessLine[16] = "____";
-    for (uint8_t i = 0; i < g_digitEntry.count; i++) guessLine[i] = static_cast<char>('0' + g_digitEntry.digits[i]);
-    if (g_digitEntry.count < 4) guessLine[g_digitEntry.count] = static_cast<char>('0' + g_digitEntry.previewDigit);
-    char full[24];
-    snprintf(full, sizeof(full), "ANSWER: %s", guessLine);
-    Display::printLine(2, y, full);
+    NumberGuessing::renderDigitRow(&g_answerRowState, 2, y, "ANSWER: ", g_digitEntry);
   }
+
+  g_answerLastDrawnPhase = g_answerPhase;
 }
 
 // =============================================================================
@@ -848,52 +923,90 @@ uint16_t g_friendResultScroll = 0;
 
 void startResultView(const FriendGameState& s) { g_viewState = s; }
 
-bool g_friendResultDirty = true;
+// Hardware Fix #3: same three-way redraw split as ListMenu -- full draw
+// only on first entry, a viewport scroll redraws just the row region, and
+// a same-viewport cursor move touches only the marker cells of the old
+// and new selected row. History entries are immutable once recorded (this
+// is a view-only screen), so labels never need their own diff.
+bool g_friendResultNeedsFullRedraw = true;
+int16_t g_friendResultLastStart = -1;
+uint16_t g_friendResultLastSelected = 0;
 
 void screenFriendResult() {
   if (Menu::consumeJustEntered()) {
     g_friendResultScroll = (g_viewState.historyCount > 0) ? static_cast<uint16_t>(g_viewState.historyCount - 1) : 0;
-    g_friendResultDirty = true;
+    g_friendResultNeedsFullRedraw = true;
   }
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE) {
-      uint16_t prev = g_friendResultScroll;
       int32_t next = static_cast<int32_t>(g_friendResultScroll) + e.value;
       if (next < 0) next = 0;
       if (next >= g_viewState.historyCount) next = g_viewState.historyCount > 0 ? g_viewState.historyCount - 1 : 0;
       g_friendResultScroll = static_cast<uint16_t>(next);
-      if (g_friendResultScroll != prev) g_friendResultDirty = true;
     } else if (Input::isMenuConfirm(e) || Input::isBack(e)) {
       Menu::goBack();
     }
   }
 
   Display::drawStatusBar();
-  if (!g_friendResultDirty) return;
-  g_friendResultDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
-  char line[32];
-  snprintf(line, sizeof(line), "Total attempts: %d", g_viewState.totalAttempts);
-  Display::printLine(2, y, line);
-  y += lh;
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t rowsTopY = static_cast<int16_t>(titleY + lh);
 
-  int16_t remaining = Display::kScreenHeight - y;
+  int16_t remaining = Display::kScreenHeight - rowsTopY;
   uint16_t rows = (remaining > 0) ? static_cast<uint16_t>(remaining / lh) : 0;
   if (rows == 0) rows = 1;
-  uint16_t start = (g_friendResultScroll >= rows) ? static_cast<uint16_t>(g_friendResultScroll - rows + 1) : 0;
-  for (uint16_t i = start; i < g_viewState.historyCount && i < start + rows; i++) {
-    const FriendEntry& g = g_viewState.history[chronologicalIndex(g_viewState, static_cast<uint8_t>(i))];
-    snprintf(line, sizeof(line), "%s%04d %dA%dB", i == g_friendResultScroll ? "> " : "  ", g.guessValue, g.aCount,
-             g.bCount);
-    Display::printLine(2, y, line);
-    y += lh;
+  int16_t start = 0;
+  if (g_friendResultScroll >= rows) start = static_cast<int16_t>(g_friendResultScroll - rows + 1);
+
+  bool firstDraw = g_friendResultNeedsFullRedraw;
+  bool scrolled = !firstDraw && (start != g_friendResultLastStart);
+  bool selectionOnlyChanged = !firstDraw && !scrolled && (g_friendResultScroll != g_friendResultLastSelected);
+  if (!firstDraw && !scrolled && !selectionOnlyChanged) return;
+
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+
+  if (firstDraw) {
+    Display::clearContentArea();
+    char titleLine[32];
+    snprintf(titleLine, sizeof(titleLine), "Total attempts: %d", g_viewState.totalAttempts);
+    Display::printLine(2, titleY, titleLine);
+    for (uint16_t i = static_cast<uint16_t>(start); i < g_viewState.historyCount && i < start + rows; i++) {
+      int16_t rowY = static_cast<int16_t>(rowsTopY + (i - start) * lh);
+      const FriendEntry& g = g_viewState.history[chronologicalIndex(g_viewState, static_cast<uint8_t>(i))];
+      if (i == g_friendResultScroll) Display::printLine(2, rowY, ">");
+      char line[24];
+      snprintf(line, sizeof(line), "%04d %dA%dB", g.guessValue, g.aCount, g.bCount);
+      Display::printLine(labelX, rowY, line);
+    }
+    g_friendResultNeedsFullRedraw = false;
+  } else if (scrolled) {
+    int16_t regionH = static_cast<int16_t>(Display::kScreenHeight - rowsTopY);
+    if (regionH < 0) regionH = 0;
+    Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
+    for (uint16_t i = static_cast<uint16_t>(start); i < g_viewState.historyCount && i < start + rows; i++) {
+      int16_t rowY = static_cast<int16_t>(rowsTopY + (i - start) * lh);
+      const FriendEntry& g = g_viewState.history[chronologicalIndex(g_viewState, static_cast<uint8_t>(i))];
+      if (i == g_friendResultScroll) Display::printLine(2, rowY, ">");
+      char line[24];
+      snprintf(line, sizeof(line), "%04d %dA%dB", g.guessValue, g.aCount, g.bCount);
+      Display::printLine(labelX, rowY, line);
+    }
+  } else if (selectionOnlyChanged) {
+    int16_t oldY = static_cast<int16_t>(rowsTopY + (g_friendResultLastSelected - start) * lh);
+    int16_t newY = static_cast<int16_t>(rowsTopY + (g_friendResultScroll - start) * lh);
+    Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+    Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
+    Display::printLine(2, newY, ">");
   }
+
+  g_friendResultLastStart = start;
+  g_friendResultLastSelected = g_friendResultScroll;
 }
 
 // =============================================================================
@@ -985,11 +1098,16 @@ void finishChallengeCreation(const uint8_t secret[4]) {
 }
 
 bool g_manualEntryDirty = true;
+bool g_manualEntryNeedsFullRedraw = true;
+bool g_manualEntryLastHintShown = false;
+NumberGuessing::DigitRowRenderState g_manualEntryRowState;
 
 void screenManualEntry() {
   if (Menu::consumeJustEntered()) {
     NumberGuessing::resetDigitEntry(&g_digitEntry);
     g_manualEntryDirty = true;
+    g_manualEntryNeedsFullRedraw = true;
+    NumberGuessing::resetDigitRowRenderState(&g_manualEntryRowState);
   }
 
   Input::update();
@@ -1023,18 +1141,21 @@ void screenManualEntry() {
   g_manualEntryDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  Display::clearContentArea();
   int16_t lh = Display::lineHeight();
   int16_t y = Display::kStatusBarHeight + 2;
-  char guessLine[16] = "____";
-  for (uint8_t i = 0; i < g_digitEntry.count; i++) guessLine[i] = static_cast<char>('0' + g_digitEntry.digits[i]);
-  if (g_digitEntry.count < 4) guessLine[g_digitEntry.count] = static_cast<char>('0' + g_digitEntry.previewDigit);
-  char line[32];
-  snprintf(line, sizeof(line), "Set secret: %s", guessLine);
-  Display::printLine(2, y, line);
+
+  if (g_manualEntryNeedsFullRedraw) {
+    Display::clearContentArea();
+    g_manualEntryNeedsFullRedraw = false;
+  }
+  NumberGuessing::renderDigitRow(&g_manualEntryRowState, 2, y, "Set secret: ", g_digitEntry);
   y += lh;
-  if (g_digitEntry.count == 4) {
-    Display::printLine(2, y, "DOT: send");
+
+  bool hintShown = (g_digitEntry.count == 4);
+  if (hintShown != g_manualEntryLastHintShown) {
+    Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+    if (hintShown) Display::printLine(2, y, "DOT: send");
+    g_manualEntryLastHintShown = hintShown;
   }
 }
 
