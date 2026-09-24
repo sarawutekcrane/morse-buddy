@@ -51,17 +51,18 @@ struct MessageTypeEntry {
   uint8_t type;
   RenderFn renderFn;
   MessageEventFn eventFn;
+  MessageIconFn iconFn;
 };
 MessageTypeEntry g_messageTypes[kMaxMessageTypes];
 }  // namespace
 
-bool registerMessageType(uint8_t type, RenderFn renderFn, MessageEventFn eventFn) {
+bool registerMessageType(uint8_t type, RenderFn renderFn, MessageEventFn eventFn, MessageIconFn iconFn) {
   for (uint8_t i = 0; i < kMaxMessageTypes; i++) {
     if (g_messageTypes[i].used && g_messageTypes[i].type == type) return false;  // already registered
   }
   for (uint8_t i = 0; i < kMaxMessageTypes; i++) {
     if (!g_messageTypes[i].used) {
-      g_messageTypes[i] = {true, type, renderFn, eventFn};
+      g_messageTypes[i] = {true, type, renderFn, eventFn, iconFn};
       return true;
     }
   }
@@ -78,6 +79,13 @@ RenderFn getMessageRenderFn(uint8_t type) {
 MessageEventFn getMessageEventFn(uint8_t type) {
   for (uint8_t i = 0; i < kMaxMessageTypes; i++) {
     if (g_messageTypes[i].used && g_messageTypes[i].type == type) return g_messageTypes[i].eventFn;
+  }
+  return nullptr;
+}
+
+MessageIconFn getMessageIconFn(uint8_t type) {
+  for (uint8_t i = 0; i < kMaxMessageTypes; i++) {
+    if (g_messageTypes[i].used && g_messageTypes[i].type == type) return g_messageTypes[i].iconFn;
   }
   return nullptr;
 }

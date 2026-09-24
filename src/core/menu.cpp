@@ -103,11 +103,12 @@ bool consumeJustEntered() {
 
 }  // namespace Menu
 
-void ListMenu::configure(const SettingItem* items, uint8_t count, const BadgeFn* badges) {
+void ListMenu::configure(const SettingItem* items, uint8_t count, const BadgeFn* badges,
+                          uint8_t initialSelected) {
   items_ = items;
   badges_ = badges;
   count_ = count;
-  selected_ = 0;
+  selected_ = (count > 0 && initialSelected < count) ? initialSelected : 0;
   needsFullRedraw_ = true;
   for (auto& b : lastBadge_) b = false;
 }

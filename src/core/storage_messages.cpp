@@ -637,4 +637,9 @@ bool isDuplicateAndRecord(const char* group_code, const char* contact_key, const
   return false;
 }
 
+void buildSenderPrefix(const PacketCodec::MessageEnvelope& env, char* out, size_t outSize) {
+  const char* name = (env.sender_name_cache[0] != '\0') ? env.sender_name_cache : env.sender_device_id;
+  snprintf(out, outSize, "%s: ", name);
+}
+
 }  // namespace MessageStore

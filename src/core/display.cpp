@@ -181,4 +181,22 @@ void printLine(int16_t x, int16_t topY, const char* text) {
   g_tft.print(buf);
 }
 
+void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565) {
+  // Drawn with TFT primitives (never a font glyph) inside a fixed
+  // kLockIconCellWidth x kLockIconCellHeight cell, so text after it always
+  // starts at the same X regardless of open/closed state (Hardware Fix #4
+  // issue 5). Body is a small filled rounded rect; the shackle is an
+  // outlined rounded rect whose bottom is hidden behind the body, leaving
+  // just its top arch visible above the body -- closed sits centered,
+  // open is shifted left and clear of the body to read as "unlatched".
+  constexpr int16_t kBodyW = 8, kBodyH = 6;
+  constexpr int16_t kShackleW = 6, kShackleH = 7;
+  int16_t bodyX = static_cast<int16_t>(x + 2);
+  int16_t bodyY = static_cast<int16_t>(y + 5);
+  int16_t shackleX = static_cast<int16_t>(open ? x : x + 3);
+  int16_t shackleY = y;
+  g_tft.drawRoundRect(shackleX, shackleY, kShackleW, kShackleH, 2, color565);
+  g_tft.fillRoundRect(bodyX, bodyY, kBodyW, kBodyH, 1, color565);
+}
+
 }  // namespace Display

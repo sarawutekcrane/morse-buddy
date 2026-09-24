@@ -77,11 +77,19 @@ enum MessageEventType : uint8_t {
 using RenderFn = void (*)(const StoredMessageView& msg, char* outBuffer, size_t outBufferSize);
 using MessageEventFn = void (*)(const MessageRef& ref, MessageEventType eventType);
 
+// Hardware Fix #4 issue 5: optional per-type status icon drawn in a fixed
+// cell before the sender name (currently only Enigma's lock state uses
+// this). NONE means "no icon for this row" -- a type that registers no
+// iconFn (Text, Game) always gets NONE, so its rows have no icon cell.
+enum class MessageIconKind : uint8_t { NONE, LOCK_CLOSED_RED, LOCK_CLOSED_YELLOW, LOCK_OPEN_GREEN };
+using MessageIconFn = MessageIconKind (*)(const StoredMessageView& msg);
+
 static const uint8_t kMaxMessageTypes = 8;
 
-bool registerMessageType(uint8_t type, RenderFn renderFn, MessageEventFn eventFn);
+bool registerMessageType(uint8_t type, RenderFn renderFn, MessageEventFn eventFn, MessageIconFn iconFn = nullptr);
 RenderFn getMessageRenderFn(uint8_t type);
 MessageEventFn getMessageEventFn(uint8_t type);
+MessageIconFn getMessageIconFn(uint8_t type);
 
 // =============================================================================
 // 3.4 Empty compose-line hook

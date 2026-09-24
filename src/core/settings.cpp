@@ -384,6 +384,14 @@ void screenSleepTimeoutAdjust() {
 }
 
 // ---- Typing Display / Mute Radio pickers -----------------------------------
+// Hardware Fix #4 issue 1: a persisted picker must open on the currently
+// saved value (not always item 0) and mark that value with a "*" badge
+// independent of the "> " navigation cursor, so the user can tell what's
+// active even while browsing other choices. Reuses ListMenu's existing
+// per-item BadgeFn mechanism (already used for Main Menu unread badges) --
+// each badge fn below just reports "is this the currently saved value",
+// so ListMenu's existing marker-only-on-cursor-move / badge-diffed-region
+// redraw logic (Hardware Fix #2/#3) applies unchanged.
 void typingTrampolineMorse() { Settings::setTypingDisplay(Settings::TypingDisplay::MORSE_ONLY); Menu::goBack(); }
 void typingTrampolineLetters() { Settings::setTypingDisplay(Settings::TypingDisplay::LETTERS_ONLY); Menu::goBack(); }
 void typingTrampolineMixed() { Settings::setTypingDisplay(Settings::TypingDisplay::MIXED); Menu::goBack(); }
@@ -392,9 +400,16 @@ const SettingItem kTypingDisplayItems[] = {
     {"Letters Only", typingTrampolineLetters},
     {"Mixed", typingTrampolineMixed},
 };
+bool typingBadgeMorseOnly() { return Settings::getTypingDisplay() == Settings::TypingDisplay::MORSE_ONLY; }
+bool typingBadgeLettersOnly() { return Settings::getTypingDisplay() == Settings::TypingDisplay::LETTERS_ONLY; }
+bool typingBadgeMixed() { return Settings::getTypingDisplay() == Settings::TypingDisplay::MIXED; }
+const BadgeFn kTypingDisplayBadges[] = {typingBadgeMorseOnly, typingBadgeLettersOnly, typingBadgeMixed};
 ListMenu g_typingDisplayListMenu;
 void screenTypingDisplayPicker() {
-  if (Menu::consumeJustEntered()) g_typingDisplayListMenu.configure(kTypingDisplayItems, 3);
+  if (Menu::consumeJustEntered()) {
+    g_typingDisplayListMenu.configure(kTypingDisplayItems, 3, kTypingDisplayBadges,
+                                       static_cast<uint8_t>(Settings::getTypingDisplay()));
+  }
   Display::drawStatusBar();
   g_typingDisplayListMenu.tick("Typing Display");
 }
@@ -412,9 +427,15 @@ void muteRadioTrampolineOn() {
   Menu::goBack();
 }
 const SettingItem kMuteRadioItems[] = {{"Off", muteRadioTrampolineOff}, {"On", muteRadioTrampolineOn}};
+bool muteRadioBadgeOff() { return !Settings::getMuteRadioOutsideRadio(); }
+bool muteRadioBadgeOn() { return Settings::getMuteRadioOutsideRadio(); }
+const BadgeFn kMuteRadioBadges[] = {muteRadioBadgeOff, muteRadioBadgeOn};
 ListMenu g_muteRadioListMenu;
 void screenMuteRadioPicker() {
-  if (Menu::consumeJustEntered()) g_muteRadioListMenu.configure(kMuteRadioItems, 2);
+  if (Menu::consumeJustEntered()) {
+    g_muteRadioListMenu.configure(kMuteRadioItems, 2, kMuteRadioBadges,
+                                   Settings::getMuteRadioOutsideRadio() ? 1 : 0);
+  }
   Display::drawStatusBar();
   g_muteRadioListMenu.tick("Mute Radio Outside");
 }
@@ -861,9 +882,17 @@ const SettingItem kLevelItems[] = {
     {"Level 2", levelTrampoline2},
     {"Level 3", levelTrampoline3},
 };
+bool levelBadge1() { return Settings::getPracticeLevel() == 1; }
+bool levelBadge2() { return Settings::getPracticeLevel() == 2; }
+bool levelBadge3() { return Settings::getPracticeLevel() == 3; }
+const BadgeFn kLevelBadges[] = {levelBadge1, levelBadge2, levelBadge3};
 ListMenu g_levelListMenu;
 void screenMorsePracticeLevelPicker() {
-  if (Menu::consumeJustEntered()) g_levelListMenu.configure(kLevelItems, 3);
+  if (Menu::consumeJustEntered()) {
+    uint8_t level = Settings::getPracticeLevel();
+    uint8_t initial = (level >= 1 && level <= 3) ? static_cast<uint8_t>(level - 1) : 0;
+    g_levelListMenu.configure(kLevelItems, 3, kLevelBadges, initial);
+  }
   Display::drawStatusBar();
   g_levelListMenu.tick("Select Level");
 }

@@ -72,4 +72,15 @@ void printLine(int16_t x, int16_t topY, const char* text);
 // screens that need to right-align or fit-check before drawing.
 int16_t textWidth(const char* text);
 
+// Fixed-size (kLockIconCellWidth x kLockIconCellHeight) status icon: a tiny
+// padlock drawn with TFT primitives, not a font glyph (the installed GFX
+// font cannot be assumed to have a Unicode lock glyph -- Hardware Fix #4
+// issue 5). `open`: true draws an open-shackle lock, false a closed one --
+// shape and color both carry the status, never color alone. Callers erase
+// the icon's own cell (kLockIconCellWidth wide) before redrawing, same as
+// any other partial-redraw region; this never touches pixels outside it.
+constexpr int16_t kLockIconCellWidth = 12;
+constexpr int16_t kLockIconCellHeight = 12;
+void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
+
 }  // namespace Display

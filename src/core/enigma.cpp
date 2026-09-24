@@ -326,8 +326,16 @@ int16_t nextValidLetter(int16_t current, int8_t direction, int16_t extraExclude)
   return current;
 }
 
+// Hardware Fix #4 issue 6: every step/slot transition goes through this one
+// function (including re-entering the SAME step for the next rotor/pair
+// slot, e.g. ROTOR_TYPE -> ROTOR_TYPE for rotor 2), so it is the single
+// correct place to flag "the value row's label genuinely changed, a full
+// row redraw is acceptable" -- consumed once by the next render.
+bool g_keyEditStepEntered = true;
+
 void enterStep(KeyEditStep step) {
   g_editStep = step;
+  g_keyEditStepEntered = true;
   switch (step) {
     case KeyEditStep::ROTOR_COUNT:
       g_pickerIndex = g_working.rotor_count;
@@ -492,8 +500,18 @@ void startReceiveKeyEditorFor(const MessageRef& ref) {
 
 bool g_keyEditorDirty = true;
 bool g_keyEditorNeedsFullRedraw = true;
-char g_lastKeyEditorLine[40] = {0};
 char g_lastKeyEditorWarnLine[40] = {0};
+
+// Value-row tracking (Hardware Fix #4 issue 6). LABEL_VALUE steps (Rotor
+// Count/Plugboard Pairs/Rotor Type/Rotor Position/Pair Letter 1/Pair
+// Letter 2) diff a stable label against a separately-drawn dynamic value;
+// TOGGLE_TWO steps (Method Choice, Confirm) diff a marker moving between
+// two fixed, never-repainted labels -- same pattern as MixedTextEntry's
+// CONFIRM selector and Menu's Yes/No prompt.
+enum class KeyEditRowKind : uint8_t { LABEL_VALUE, TOGGLE_TWO };
+char g_lastKeyEditLabel[32] = {0};
+char g_lastKeyEditValue[8] = {0};
+bool g_lastKeyEditToggleASelected = true;
 
 void screenKeyEditor() {
   if (Menu::consumeJustEntered()) {
@@ -559,52 +577,126 @@ void screenKeyEditor() {
     g_keyEditorNeedsFullRedraw = false;
   }
 
-  char line[40];
+  // Value row (Hardware Fix #4 issue 6): LABEL_VALUE steps keep a stable
+  // label separate from a dynamic value so rotating never repaints the
+  // label; TOGGLE_TWO steps (Method Choice, Confirm) keep two fixed
+  // labels with only a "> " marker moving between them. A step or
+  // rotor/pair slot change (g_keyEditStepEntered, set by enterStep())
+  // allows a full value-row redraw since the label genuinely changed --
+  // still never a full content-area clear outside first entry.
+  KeyEditRowKind kind;
+  char label[32] = {0};
+  char value[8] = {0};
+  const char* toggleLabelA = nullptr;
+  const char* toggleLabelB = nullptr;
+  bool toggleASelected = false;
   switch (g_editStep) {
     case KeyEditStep::ROTOR_COUNT:
-      snprintf(line, sizeof(line), "Rotor Count: %d", g_pickerIndex);
+      kind = KeyEditRowKind::LABEL_VALUE;
+      snprintf(label, sizeof(label), "Rotor Count: ");
+      snprintf(value, sizeof(value), "%d", g_pickerIndex);
       break;
     case KeyEditStep::PLUGBOARD_COUNT:
-      snprintf(line, sizeof(line), "Plugboard Pairs: %d", g_pickerIndex);
+      kind = KeyEditRowKind::LABEL_VALUE;
+      snprintf(label, sizeof(label), "Plugboard Pairs: ");
+      snprintf(value, sizeof(value), "%d", g_pickerIndex);
       break;
     case KeyEditStep::METHOD_CHOICE:
-      snprintf(line, sizeof(line), "%s", g_pickerIndex == 0 ? "> Manual Setup" : "> Randomize All");
+      kind = KeyEditRowKind::TOGGLE_TWO;
+      toggleLabelA = "Manual Setup";
+      toggleLabelB = "Randomize All";
+      toggleASelected = (g_pickerIndex == 0);
       break;
     case KeyEditStep::ROTOR_TYPE: {
       static const char* const kRotorNames[] = {"I", "II", "III", "IV", "V"};
-      snprintf(line, sizeof(line), "Rotor %d Type: %s", g_editRotorSlot + 1, kRotorNames[g_pickerIndex]);
+      kind = KeyEditRowKind::LABEL_VALUE;
+      snprintf(label, sizeof(label), "Rotor %d Type: ", g_editRotorSlot + 1);
+      snprintf(value, sizeof(value), "%s", kRotorNames[g_pickerIndex]);
       break;
     }
     case KeyEditStep::ROTOR_POSITION:
-      snprintf(line, sizeof(line), "Rotor %d Pos: %c", g_editRotorSlot + 1, static_cast<char>('A' + g_pickerIndex));
+      kind = KeyEditRowKind::LABEL_VALUE;
+      snprintf(label, sizeof(label), "Rotor %d Pos: ", g_editRotorSlot + 1);
+      snprintf(value, sizeof(value), "%c", static_cast<char>('A' + g_pickerIndex));
       break;
     case KeyEditStep::PLUG_LETTER1:
-      snprintf(line, sizeof(line), "Pair %d Letter 1: %c", g_editPairSlot + 1, static_cast<char>('A' + g_pickerIndex));
+      kind = KeyEditRowKind::LABEL_VALUE;
+      snprintf(label, sizeof(label), "Pair %d Letter 1: ", g_editPairSlot + 1);
+      snprintf(value, sizeof(value), "%c", static_cast<char>('A' + g_pickerIndex));
       break;
     case KeyEditStep::PLUG_LETTER2:
-      snprintf(line, sizeof(line), "Pair %d Letter 2: %c%c", g_editPairSlot + 1, g_editFirstLetter,
-               static_cast<char>('A' + g_pickerIndex));
+      kind = KeyEditRowKind::LABEL_VALUE;
+      // Stable portion includes the already-confirmed first pair letter.
+      snprintf(label, sizeof(label), "Pair %d Letter 2: %c", g_editPairSlot + 1, g_editFirstLetter);
+      snprintf(value, sizeof(value), "%c", static_cast<char>('A' + g_pickerIndex));
       break;
     case KeyEditStep::CONFIRM:
-      snprintf(line, sizeof(line), "%s", g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
+      kind = KeyEditRowKind::TOGGLE_TWO;
+      toggleLabelA = "Save";
+      toggleLabelB = "Cancel";
+      toggleASelected = g_confirmSaveSelected;
       break;
   }
-  // Value and warning rows are diffed independently, so changing the
-  // picker value never repaints the static title above it (Hardware Fix
-  // #3, Section G). Erasing only the old/new glyph bounds (not the full
-  // row width) keeps this cheap even for the frequent rotate case.
-  if (firstDraw || strcmp(line, g_lastKeyEditorLine) != 0) {
-    if (!firstDraw) {
-      int16_t oldW = Display::textWidth(g_lastKeyEditorLine);
-      int16_t newW = Display::textWidth(line);
+
+  bool stepChanged = firstDraw || g_keyEditStepEntered;
+  g_keyEditStepEntered = false;
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+
+  if (kind == KeyEditRowKind::LABEL_VALUE) {
+    int16_t valueX = static_cast<int16_t>(2 + Display::textWidth(label));
+    if (stepChanged) {
+      if (!firstDraw) {
+        int16_t eraseW = static_cast<int16_t>(Display::kScreenWidth - 2);
+        Display::tft().fillRect(2, valueY, eraseW, lh, ST77XX_BLACK);
+      }
+      Display::printLine(2, valueY, label);
+      Display::printLine(valueX, valueY, value);
+    } else if (strcmp(value, g_lastKeyEditValue) != 0) {
+      // The hot path: only the rotated value changed. The label is
+      // provably unchanged (same step, same slot), so it is never
+      // touched -- only the value's own glyph-bounds cell is erased.
+      int16_t oldW = Display::textWidth(g_lastKeyEditValue);
+      int16_t newW = Display::textWidth(value);
       int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
-      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - valueX);
       if (eraseW > maxW) eraseW = maxW;
-      Display::tft().fillRect(2, valueY, eraseW, lh, ST77XX_BLACK);
+      if (eraseW < 0) eraseW = 0;
+      Display::tft().fillRect(valueX, valueY, eraseW, lh, ST77XX_BLACK);
+      Display::printLine(valueX, valueY, value);
     }
-    Display::printLine(2, valueY, line);
-    strncpy(g_lastKeyEditorLine, line, sizeof(g_lastKeyEditorLine) - 1);
-    g_lastKeyEditorLine[sizeof(g_lastKeyEditorLine) - 1] = '\0';
+    strncpy(g_lastKeyEditLabel, label, sizeof(g_lastKeyEditLabel) - 1);
+    g_lastKeyEditLabel[sizeof(g_lastKeyEditLabel) - 1] = '\0';
+    strncpy(g_lastKeyEditValue, value, sizeof(g_lastKeyEditValue) - 1);
+    g_lastKeyEditValue[sizeof(g_lastKeyEditValue) - 1] = '\0';
+  } else {
+    // TOGGLE_TWO: both labels are fixed text -- only the "> " marker
+    // between them ever moves on a plain toggle (same pattern as
+    // MixedTextEntry's CONFIRM selector and Menu's Yes/No prompt).
+    int16_t aMarkerX = 2;
+    int16_t aLabelX = static_cast<int16_t>(aMarkerX + markerW);
+    int16_t aLabelW = Display::textWidth(toggleLabelA);
+    int16_t gapW = Display::textWidth("    ");
+    int16_t bMarkerX = static_cast<int16_t>(aLabelX + aLabelW + gapW);
+    int16_t bLabelX = static_cast<int16_t>(bMarkerX + markerW);
+    if (stepChanged) {
+      if (!firstDraw) {
+        int16_t eraseW = static_cast<int16_t>(Display::kScreenWidth - 2);
+        Display::tft().fillRect(2, valueY, eraseW, lh, ST77XX_BLACK);
+      }
+      if (toggleASelected) Display::printLine(aMarkerX, valueY, ">");
+      Display::printLine(aLabelX, valueY, toggleLabelA);
+      if (!toggleASelected) Display::printLine(bMarkerX, valueY, ">");
+      Display::printLine(bLabelX, valueY, toggleLabelB);
+    } else if (toggleASelected != g_lastKeyEditToggleASelected) {
+      int16_t oldMarkerX = g_lastKeyEditToggleASelected ? aMarkerX : bMarkerX;
+      int16_t newMarkerX = toggleASelected ? aMarkerX : bMarkerX;
+      Display::tft().fillRect(oldMarkerX, valueY, markerW, lh, ST77XX_BLACK);
+      Display::tft().fillRect(newMarkerX, valueY, markerW, lh, ST77XX_BLACK);
+      Display::printLine(newMarkerX, valueY, ">");
+    }
+    g_lastKeyEditToggleASelected = toggleASelected;
+    g_lastKeyEditLabel[0] = '\0';
+    g_lastKeyEditValue[0] = '\0';
   }
 
   char warnLine[40];
@@ -770,6 +862,7 @@ uint8_t g_composeLen = 0;
 char g_composePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_composePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
+Morse::WordGapState g_composeWordGap;
 const char* g_composeError = nullptr;
 
 bool g_indexDirty = true;
@@ -791,6 +884,25 @@ void clearDraft() {
   g_composeText[0] = '\0';
   resetComposePattern();
   g_composeError = nullptr;
+  Morse::cancelWordGap(&g_composeWordGap);
+}
+
+// Appends exactly one ASCII space to the compose draft if a natural word
+// gap (7 dit of silence since the last Morse symbol) has elapsed since the
+// last letter finalized (Hardware Fix #4 issue 3). The space becomes part
+// of g_composeText here, i.e. before EnigmaCrypto::normalizeAndEscape()
+// ever sees it at send time -- normalizeAndEscape()/reverseEscape() already
+// round-trip a space through the escaped ciphertext alphabet unchanged, so
+// no crypto changes are needed for "HELLO WORLD" to decrypt back to
+// "HELLO WORLD".
+bool appendWordSpaceIfDue() {
+  if (!Morse::wordGapDue(&g_composeWordGap, Settings::getWpm(), millis())) return false;
+  if (g_composeLen == 0) return false;
+  if (g_composeText[g_composeLen - 1] == ' ') return false;
+  if (g_composeLen >= EnigmaCrypto::kMaxEscapedLen) return false;
+  g_composeText[g_composeLen++] = ' ';
+  g_composeText[g_composeLen] = '\0';
+  return true;
 }
 
 MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
@@ -801,6 +913,26 @@ MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
   ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
   ref.sequence = entry.sequence;
   return ref;
+}
+
+// Draws a history row's optional per-type status icon (currently only
+// Enigma's own lock state) in its fixed kLockIconCellWidth cell before the
+// sender name -- shape AND color both carry the state, replacing the old
+// user-visible [B]/[W]/[U] text tokens (Hardware Fix #4 issue 5).
+void drawRowIcon(int16_t x, int16_t y, MessageIconKind icon) {
+  switch (icon) {
+    case MessageIconKind::LOCK_CLOSED_RED:
+      Display::drawLockIcon(x, y, false, ST77XX_RED);
+      break;
+    case MessageIconKind::LOCK_CLOSED_YELLOW:
+      Display::drawLockIcon(x, y, false, ST77XX_YELLOW);
+      break;
+    case MessageIconKind::LOCK_OPEN_GREEN:
+      Display::drawLockIcon(x, y, true, ST77XX_GREEN);
+      break;
+    case MessageIconKind::NONE:
+      break;
+  }
 }
 
 void sendEnigmaMessage() {
@@ -884,6 +1016,7 @@ void finalizeComposeChar() {
     g_composeText[g_composeLen] = '\0';
   }
   resetComposePattern();
+  Morse::armWordGap(&g_composeWordGap, g_lastMorseReleaseMs);
 }
 
 void buildCanonicalRawMorse(const char* text, char* out, size_t outSize) {
@@ -935,7 +1068,13 @@ void buildComposePrefixSuffix(char* prefix, size_t prefixSize, char* suffix, siz
 }
 
 void handleComposeEvent(const InputEvent& e) {
-  if (e.type == InputEventType::DOT_RELEASE) {
+  if (e.type == InputEventType::DOT_PRESS_START) {
+    // A new symbol starting cancels any pending word gap immediately --
+    // waiting for DOT_RELEASE would let a held first DASH of the next
+    // letter cross the 7-dit threshold mid-press and wrongly insert a
+    // space (Hardware Fix #4 issue 3, critical input detail).
+    Morse::cancelWordGap(&g_composeWordGap);
+  } else if (e.type == InputEventType::DOT_RELEASE) {
     g_composeError = nullptr;
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       clearDraft();
@@ -953,6 +1092,7 @@ void handleComposeEvent(const InputEvent& e) {
         g_composeText[g_composeLen] = '\0';
       }
       resetComposePattern();
+      Morse::cancelWordGap(&g_composeWordGap);
     }
   } else if (e.type == InputEventType::ENCODER_SHORT) {
     if (g_composeLen > 0) {
@@ -1048,9 +1188,13 @@ void screenEnigmaChat() {
   }
   if (hadEvent) g_enigmaChatDirty = true;
 
-  if (g_historyCursor == kNoHistoryCursor && g_composePatternLen > 0) {
-    if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
-      finalizeComposeChar();
+  if (g_historyCursor == kNoHistoryCursor) {
+    if (g_composePatternLen > 0) {
+      if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
+        finalizeComposeChar();
+        g_enigmaChatDirty = true;
+      }
+    } else if (appendWordSpaceIfDue()) {
       g_enigmaChatDirty = true;
     }
   }
@@ -1111,12 +1255,23 @@ void screenEnigmaChat() {
       MessageRef ref = refForIndexEntry(*entry);
       StoredMessageView view;
       char lineBuf[48] = "?";
+      char senderPrefix[24] = {0};
+      MessageIconKind icon = MessageIconKind::NONE;
       if (MessageStore::loadMessage(ref, &view)) {
         RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
         if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+        MessageStore::buildSenderPrefix(view.envelope, senderPrefix, sizeof(senderPrefix));
+        MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
+        if (iconFn != nullptr) icon = iconFn(view);
       }
       if (i == g_historyCursor) Display::printLine(2, y, ">");
-      Display::printLine(labelX, y, lineBuf);
+      // Icon cell reserved on every row so sender names stay X-aligned in
+      // a thread that mixes Enigma rows (icon) with Text/Game rows (none)
+      // (Hardware Fix #4 issues 2/5).
+      drawRowIcon(labelX, y, icon);
+      int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+      Display::printLine(textX, y, senderPrefix);
+      Display::printLine(static_cast<int16_t>(textX + Display::textWidth(senderPrefix)), y, lineBuf);
       y += lh;
     }
     g_enigmaChatNeedsFullRedraw = false;
@@ -1228,8 +1383,25 @@ void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t o
     return;
   }
 
-  const char* icon = (lockState == LOCK_UNLOCKED) ? "[U]" : (lockState == LOCK_WHITE) ? "[W]" : "[B]";
-  snprintf(outBuffer, outBufferSize, "%s %s", icon, ciphertext);
+  // Hardware Fix #4 issue 5: no user-visible [B]/[W]/[U] text tokens -- the
+  // lock state is conveyed by drawRowIcon()'s icon+color instead. An
+  // unlocked message's plaintext is already known locally, so it is shown
+  // directly (not hidden behind the hold gesture); BLACK/WHITE keep
+  // showing ciphertext by default, unchanged from before.
+  if (lockState == LOCK_UNLOCKED) {
+    snprintf(outBuffer, outBufferSize, "%s", cachedText);
+    return;
+  }
+  snprintf(outBuffer, outBufferSize, "%s", ciphertext);
+}
+
+MessageIconKind enigmaMessageIcon(const StoredMessageView& msg) {
+  uint8_t lockState;
+  char cachedText[251];
+  decodeLocalPayload(msg.localPayload, msg.localPayloadLen, &lockState, cachedText, sizeof(cachedText));
+  if (lockState == LOCK_UNLOCKED) return MessageIconKind::LOCK_OPEN_GREEN;
+  if (lockState == LOCK_WHITE) return MessageIconKind::LOCK_CLOSED_YELLOW;
+  return MessageIconKind::LOCK_CLOSED_RED;  // LOCK_BLACK
 }
 
 void onEnigmaMessageEvent(const MessageRef& ref, MessageEventType eventType) {
@@ -1320,7 +1492,7 @@ struct Registrar {
     svc.tick = nullptr;
     registerAppService(svc);
     registerModeHandler(Modes::ENIGMA, screenEnigmaEntry);
-    registerMessageType(PacketCodec::MSG_TYPE_ENIGMA, renderEnigmaMessage, onEnigmaMessageEvent);
+    registerMessageType(PacketCodec::MSG_TYPE_ENIGMA, renderEnigmaMessage, onEnigmaMessageEvent, enigmaMessageIcon);
     TextMessage::registerIncomingMessageHandler(PacketCodec::MSG_TYPE_ENIGMA, handleEnigmaArrival);
   }
 };

@@ -261,6 +261,7 @@ uint8_t g_composeLen = 0;
 char g_composePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_composePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
+Morse::WordGapState g_composeWordGap;
 
 void resetComposePattern() {
   g_composePatternLen = 0;
@@ -271,6 +272,23 @@ void clearDraft() {
   g_composeLen = 0;
   g_composeText[0] = '\0';
   resetComposePattern();
+  Morse::cancelWordGap(&g_composeWordGap);
+}
+
+// Appends exactly one ASCII space to the compose draft if a natural word
+// gap (7 dit of silence since the last Morse symbol) has elapsed since the
+// last letter finalized -- Hardware Fix #4 issue 3. Guards mirror the
+// spec literally even though pending is only ever armed right after a
+// real (non-space) letter appends, so these can never actually trigger in
+// practice; they cost nothing and make the invariant explicit.
+bool appendWordSpaceIfDue() {
+  if (!Morse::wordGapDue(&g_composeWordGap, Settings::getWpm(), millis())) return false;
+  if (g_composeLen == 0) return false;
+  if (g_composeText[g_composeLen - 1] == ' ') return false;
+  if (g_composeLen >= PacketCodec::kMaxDecodedTextLen) return false;
+  g_composeText[g_composeLen++] = ' ';
+  g_composeText[g_composeLen] = '\0';
+  return true;
 }
 
 MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
@@ -281,6 +299,28 @@ MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
   ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
   ref.sequence = entry.sequence;
   return ref;
+}
+
+// Draws a history row's optional per-type status icon (currently only
+// Enigma's lock state) in its fixed kLockIconCellWidth cell before the
+// sender name -- shape AND color both carry the state (Hardware Fix #4
+// issue 5); a message viewed from a different type's own Unified Thread
+// screen still shows its correct icon since this maps the same
+// MessageIconKind the owning type registered.
+void drawRowIcon(int16_t x, int16_t y, MessageIconKind icon) {
+  switch (icon) {
+    case MessageIconKind::LOCK_CLOSED_RED:
+      Display::drawLockIcon(x, y, false, ST77XX_RED);
+      break;
+    case MessageIconKind::LOCK_CLOSED_YELLOW:
+      Display::drawLockIcon(x, y, false, ST77XX_YELLOW);
+      break;
+    case MessageIconKind::LOCK_OPEN_GREEN:
+      Display::drawLockIcon(x, y, true, ST77XX_GREEN);
+      break;
+    case MessageIconKind::NONE:
+      break;
+  }
 }
 
 void sendComposedMessage() {
@@ -337,6 +377,9 @@ void finalizeComposeChar() {
     g_composeText[g_composeLen] = '\0';
   }
   resetComposePattern();
+  // Word-gap timer starts from the release of the symbol that just
+  // completed this letter (g_lastMorseReleaseMs), not from now.
+  Morse::armWordGap(&g_composeWordGap, g_lastMorseReleaseMs);
 }
 
 // Splits the compose line into a "prefix" (derived solely from confirmed
@@ -364,7 +407,13 @@ void buildComposePrefixSuffix(char* prefix, size_t prefixSize, char* suffix, siz
 }
 
 void handleComposeEvent(const InputEvent& e) {
-  if (e.type == InputEventType::DOT_RELEASE) {
+  if (e.type == InputEventType::DOT_PRESS_START) {
+    // A new symbol starting cancels any pending word gap immediately --
+    // waiting for DOT_RELEASE would let a held first DASH of the next
+    // letter cross the 7-dit threshold mid-press and wrongly insert a
+    // space (Hardware Fix #4 issue 3, critical input detail).
+    Morse::cancelWordGap(&g_composeWordGap);
+  } else if (e.type == InputEventType::DOT_RELEASE) {
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       clearDraft();  // DOT/DASH >=2000ms on compose: clear full draft
       return;
@@ -382,6 +431,7 @@ void handleComposeEvent(const InputEvent& e) {
         g_composeText[g_composeLen] = '\0';
       }
       resetComposePattern();
+      Morse::cancelWordGap(&g_composeWordGap);
     }
   } else if (e.type == InputEventType::ENCODER_SHORT) {
     if (g_composeLen > 0) {
@@ -488,9 +538,13 @@ void screenChat() {
   }
   if (hadEvent) g_chatRenderDirty = true;
 
-  if (g_historyCursor == kNoHistoryCursor && g_composePatternLen > 0) {
-    if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
-      finalizeComposeChar();
+  if (g_historyCursor == kNoHistoryCursor) {
+    if (g_composePatternLen > 0) {
+      if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
+        finalizeComposeChar();
+        g_chatRenderDirty = true;
+      }
+    } else if (appendWordSpaceIfDue()) {
       g_chatRenderDirty = true;
     }
   }
@@ -550,12 +604,24 @@ void screenChat() {
       MessageRef ref = refForIndexEntry(*entry);
       StoredMessageView view;
       char lineBuf[48] = "?";
+      char senderPrefix[24] = {0};
+      MessageIconKind icon = MessageIconKind::NONE;
       if (MessageStore::loadMessage(ref, &view)) {
         RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
         if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+        MessageStore::buildSenderPrefix(view.envelope, senderPrefix, sizeof(senderPrefix));
+        MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
+        if (iconFn != nullptr) icon = iconFn(view);
       }
       if (i == g_historyCursor) Display::printLine(2, y, ">");
-      Display::printLine(labelX, y, lineBuf);
+      // The icon cell is reserved on every row (whether or not that row's
+      // type actually has an icon) so sender names stay X-aligned even in
+      // a thread that mixes Enigma rows (icon) with Text/Game rows (none)
+      // -- consistent with Enigma's own "same X regardless of state" rule.
+      drawRowIcon(labelX, y, icon);
+      int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+      Display::printLine(textX, y, senderPrefix);
+      Display::printLine(static_cast<int16_t>(textX + Display::textWidth(senderPrefix)), y, lineBuf);
       y += lh;
     }
     g_chatNeedsFullRedraw = false;
@@ -692,6 +758,16 @@ void handleIncomingMessagePacket(const char* group_code, const char* topic, cons
   const uint8_t* typePayload = nullptr;
   uint16_t typePayloadLen = 0;
   if (!PacketCodec::decodeMessageEnvelope(payload, payloadLen, &env, &typePayload, &typePayloadLen)) return;
+
+  // Hardware Fix #4 issue 4: the MQTT broker can echo our own broadcast
+  // back to us; our outgoing copy is already stored locally (Direction::
+  // SENT, correct lock state for Enigma), so accepting this envelope too
+  // would create a duplicate, wrongly-stateful RECEIVED record for the
+  // same message. Rejected centrally here -- before the dedup ring or any
+  // per-type handler (Text/Enigma/Game all funnel through this one
+  // PK_MESSAGE dispatcher) -- so every message type is protected by one
+  // shared check instead of a separate filter per type.
+  if (strcmp(env.sender_device_id, Identity::deviceId()) == 0) return;
 
   bool isBroadcast = (strcmp(topic, "broadcast") == 0);
   const char* contact_key = isBroadcast ? MessageStore::kEveryone : env.sender_device_id;

@@ -39,4 +39,12 @@ struct RecentContact {
 // Returns up to `capacity` Recent Contacts for group_code, most-recently-seen first.
 uint8_t getRecentContacts(const char* group_code, RecentContact* outArr, uint8_t capacity);
 
+// Resolves a device_id to a human-friendly display name for UI use only
+// (Hardware Fix #4 issue 10, e.g. Race participant rows): self resolves to
+// Settings::getMyName(), otherwise the current online display name, then
+// the cached Recent Contacts name, then the raw device_id itself as a
+// last-resort fallback. Read-only -- never creates or mutates presence or
+// Recent Contacts state, and does not alter any network/state semantics.
+void resolveDisplayName(const char* group_code, const char* device_id, char* out, size_t outSize);
+
 }  // namespace Presence

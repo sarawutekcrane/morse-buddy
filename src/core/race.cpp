@@ -563,16 +563,36 @@ void screenRaceRoom() {
     g_raceRoomNeedsFullRedraw = false;
   }
 
-  const char* actionLabel;
+  // Hardware Fix #4 issue 9: a ">" marker (not the word "Short:") shows
+  // when ENCODER_SHORT currently does something local; the one non-action
+  // state ("Waiting for start...") gets no marker at all, so it reads as
+  // unmistakably passive. Every actionText here is a categorically
+  // different single-line status (never a same-label toggle where only a
+  // marker should move), so diffing the combined marker+text line as one
+  // string is the right redraw granularity, not the class of bug Hardware
+  // Fix #3 fixed elsewhere.
+  const char* actionText;
+  bool hasAction;
   if (g_phase == RoomPhase::NO_LOBBY) {
-    actionLabel = "Short: Invite to Play";
+    actionText = "Invite to Play";
+    hasAction = true;
   } else if (g_phase == RoomPhase::LOBBY_WAITING) {
-    actionLabel = (strcmp(g_ownerDeviceId, Identity::deviceId()) == 0)
-                      ? "Short: Start Round"
-                      : (g_haveJoined ? "Waiting for start..." : "Short: Join");
+    if (strcmp(g_ownerDeviceId, Identity::deviceId()) == 0) {
+      actionText = "Start Round";
+      hasAction = true;
+    } else if (g_haveJoined) {
+      actionText = "Waiting for start...";
+      hasAction = false;
+    } else {
+      actionText = "Join";
+      hasAction = true;
+    }
   } else {
-    actionLabel = g_haveJoined ? "Short: Continue" : "Short: Join";
+    actionText = g_haveJoined ? "Continue" : "Join";
+    hasAction = true;
   }
+  char actionLabel[32];
+  snprintf(actionLabel, sizeof(actionLabel), "%s%s", hasAction ? "> " : "", actionText);
   if (firstDraw || strcmp(actionLabel, g_raceRoomLastActionLabel) != 0) {
     int16_t oldW = Display::textWidth(g_raceRoomLastActionLabel);
     int16_t newW = Display::textWidth(actionLabel);
@@ -600,13 +620,32 @@ void screenRaceRoom() {
     g_raceRoomLastScoreLine[sizeof(g_raceRoomLastScoreLine) - 1] = '\0';
   }
 
-  // Dynamic viewport: at the larger PRIMARY line height fewer rows fit than
-  // the old fixed 4-row/10px layout assumed, so size the participant list
-  // to whatever vertical space is actually left instead of hardcoding a
-  // row count (avoids off-screen/overlapping names, item 14).
-  Presence::OnlineContact online[6];
-  uint8_t n = Presence::getOnlineContacts(g_groupCode, online, 6);
-  uint8_t shown = (n < 4) ? n : 4;
+  // Hardware Fix #4 issue 10: race membership comes from g_participants,
+  // the authoritative Race-protocol join list (populated by
+  // publishInvite()/publishJoin()/handleRaceJoinPacket(), and always
+  // includes self once invited/joined) -- never from generic group-online
+  // contacts, which exclude self entirely and would also show group
+  // members who are online but never joined this race. Presence is used
+  // only to resolve a joined device_id into a nicer display name; it never
+  // decides who counts as a participant.
+  //
+  // Dynamic viewport: at the larger PRIMARY line height fewer rows fit
+  // than the old fixed 4-row/10px layout assumed, so size the participant
+  // list to whatever vertical space is actually left instead of
+  // hardcoding a row count (avoids off-screen/overlapping names, item 14).
+  uint8_t shown = (g_participantCount < 4) ? g_participantCount : 4;
+  char shownNames[4][17];
+  for (uint8_t i = 0; i < shown; i++) {
+    Presence::resolveDisplayName(g_groupCode, g_participants[i], shownNames[i], sizeof(shownNames[i]));
+    if (strcmp(g_participants[i], Identity::deviceId()) == 0) {
+      // Mark self compactly; Display::printLine() safely truncates if the
+      // combined text would otherwise overflow the row.
+      char withYou[24];
+      snprintf(withYou, sizeof(withYou), "%s (You)", shownNames[i]);
+      strncpy(shownNames[i], withYou, sizeof(shownNames[i]) - 1);
+      shownNames[i][sizeof(shownNames[i]) - 1] = '\0';
+    }
+  }
   int16_t remaining = Display::kScreenHeight - rowsTopY;
   uint16_t rows = (remaining > 0) ? static_cast<uint16_t>(remaining / lh) : 0;
   uint8_t visibleCount = static_cast<uint8_t>((shown < rows) ? shown : rows);
@@ -622,8 +661,8 @@ void screenRaceRoom() {
       Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
     for (uint8_t i = 0; i < visibleCount; i++) {
-      Display::printLine(2, static_cast<int16_t>(rowsTopY + i * lh), online[i].display_name);
-      strncpy(g_raceRoomLastOnlineNames[i], online[i].display_name, sizeof(g_raceRoomLastOnlineNames[i]) - 1);
+      Display::printLine(2, static_cast<int16_t>(rowsTopY + i * lh), shownNames[i]);
+      strncpy(g_raceRoomLastOnlineNames[i], shownNames[i], sizeof(g_raceRoomLastOnlineNames[i]) - 1);
       g_raceRoomLastOnlineNames[i][sizeof(g_raceRoomLastOnlineNames[i]) - 1] = '\0';
     }
     g_raceRoomLastOnlineCount = visibleCount;
@@ -631,11 +670,11 @@ void screenRaceRoom() {
     // Same visible slot count: diff each row independently so one
     // participant's name change never repaints the others.
     for (uint8_t i = 0; i < visibleCount; i++) {
-      if (strcmp(online[i].display_name, g_raceRoomLastOnlineNames[i]) == 0) continue;
+      if (strcmp(shownNames[i], g_raceRoomLastOnlineNames[i]) == 0) continue;
       int16_t rowY = static_cast<int16_t>(rowsTopY + i * lh);
       Display::tft().fillRect(0, rowY, Display::kScreenWidth, lh, ST77XX_BLACK);
-      Display::printLine(2, rowY, online[i].display_name);
-      strncpy(g_raceRoomLastOnlineNames[i], online[i].display_name, sizeof(g_raceRoomLastOnlineNames[i]) - 1);
+      Display::printLine(2, rowY, shownNames[i]);
+      strncpy(g_raceRoomLastOnlineNames[i], shownNames[i], sizeof(g_raceRoomLastOnlineNames[i]) - 1);
       g_raceRoomLastOnlineNames[i][sizeof(g_raceRoomLastOnlineNames[i]) - 1] = '\0';
     }
   }

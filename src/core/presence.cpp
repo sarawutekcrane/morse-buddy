@@ -352,4 +352,36 @@ uint8_t getRecentContacts(const char* group_code, RecentContact* outArr, uint8_t
   return n;
 }
 
+void resolveDisplayName(const char* group_code, const char* device_id, char* out, size_t outSize) {
+  if (strcmp(device_id, Identity::deviceId()) == 0) {
+    strncpy(out, Settings::getMyName(), outSize - 1);
+    out[outSize - 1] = '\0';
+    return;
+  }
+
+  GroupPresenceTable* t = findTable(group_code);
+  if (t != nullptr) {
+    OnlineEntry* e = findOnlineEntry(t, device_id);
+    if (e != nullptr && e->display_name[0] != '\0') {
+      strncpy(out, e->display_name, outSize - 1);
+      out[outSize - 1] = '\0';
+      return;
+    }
+  }
+
+  RecentContactsForGroup* rt = findRecentTable(group_code);
+  if (rt != nullptr) {
+    for (auto& c : rt->contacts) {
+      if (c.used && strcmp(c.device_id, device_id) == 0 && c.last_known_name[0] != '\0') {
+        strncpy(out, c.last_known_name, outSize - 1);
+        out[outSize - 1] = '\0';
+        return;
+      }
+    }
+  }
+
+  strncpy(out, device_id, outSize - 1);
+  out[outSize - 1] = '\0';
+}
+
 }  // namespace Presence

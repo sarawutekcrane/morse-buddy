@@ -539,6 +539,26 @@ MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
   return ref;
 }
 
+// Draws a history row's optional per-type status icon (currently only
+// Enigma's lock state) in its fixed kLockIconCellWidth cell before the
+// sender name -- shape AND color both carry the state (Hardware Fix #4
+// issue 5).
+void drawRowIcon(int16_t x, int16_t y, MessageIconKind icon) {
+  switch (icon) {
+    case MessageIconKind::LOCK_CLOSED_RED:
+      Display::drawLockIcon(x, y, false, ST77XX_RED);
+      break;
+    case MessageIconKind::LOCK_CLOSED_YELLOW:
+      Display::drawLockIcon(x, y, false, ST77XX_YELLOW);
+      break;
+    case MessageIconKind::LOCK_OPEN_GREEN:
+      Display::drawLockIcon(x, y, true, ST77XX_GREEN);
+      break;
+    case MessageIconKind::NONE:
+      break;
+  }
+}
+
 void dispatchHistoryMessageEvent(const MessageStore::ConversationIndexEntry& entry, MessageEventType eventType) {
   MessageRef ref = refForIndexEntry(entry);
   StoredMessageView view;
@@ -669,12 +689,22 @@ void screenFriendChat() {
       MessageRef ref = refForIndexEntry(*entry);
       StoredMessageView view;
       char lineBuf[48] = "?";
+      char senderPrefix[24] = {0};
+      MessageIconKind icon = MessageIconKind::NONE;
       if (MessageStore::loadMessage(ref, &view)) {
         RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
         if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
+        MessageStore::buildSenderPrefix(view.envelope, senderPrefix, sizeof(senderPrefix));
+        MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
+        if (iconFn != nullptr) icon = iconFn(view);
       }
       if (i == g_historyCursor) Display::printLine(2, y, ">");
-      Display::printLine(labelX, y, lineBuf);
+      // Icon cell reserved on every row so sender names stay X-aligned in
+      // a thread that mixes Enigma rows (icon) with Text/Game rows (none).
+      drawRowIcon(labelX, y, icon);
+      int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+      Display::printLine(textX, y, senderPrefix);
+      Display::printLine(static_cast<int16_t>(textX + Display::textWidth(senderPrefix)), y, lineBuf);
       y += lh;
     }
     g_friendChatNeedsFullRedraw = false;

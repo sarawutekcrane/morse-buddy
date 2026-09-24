@@ -129,4 +129,13 @@ bool evictOldest(const char* group_code, const char* contact_key);
 // caller when this returns true.
 bool isDuplicateAndRecord(const char* group_code, const char* contact_key, const char* message_id);
 
+// Builds "<name>: " from an envelope's sender_name_cache, falling back to
+// sender_device_id when the cache is empty (Hardware Fix #4 issue 2). One
+// shared helper so every unified-thread renderer (Text/Enigma/Game) shows
+// sender identity the same way regardless of which message type a row
+// belongs to; outSize must be large enough for a reasonable name plus
+// ": ", longer names are safely truncated (never overflowed) same as any
+// other Display::printLine() call.
+void buildSenderPrefix(const PacketCodec::MessageEnvelope& env, char* out, size_t outSize);
+
 }  // namespace MessageStore

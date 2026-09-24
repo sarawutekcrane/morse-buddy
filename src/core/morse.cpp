@@ -76,4 +76,18 @@ bool isDeletePattern(const char* pattern) {
   return true;
 }
 
+void armWordGap(WordGapState* state, uint32_t symbolReleaseMs) {
+  state->pending = true;
+  state->lastSymbolReleaseMs = symbolReleaseMs;
+}
+
+void cancelWordGap(WordGapState* state) { state->pending = false; }
+
+bool wordGapDue(WordGapState* state, uint8_t wpm, uint32_t nowMs) {
+  if (!state->pending) return false;
+  if (nowMs - state->lastSymbolReleaseMs < wordGapMs(wpm)) return false;
+  state->pending = false;
+  return true;
+}
+
 }  // namespace Morse

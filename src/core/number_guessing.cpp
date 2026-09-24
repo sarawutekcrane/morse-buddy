@@ -99,99 +99,60 @@ void tickDigitEntry(DigitEntryState* state) {
 }
 
 void resetDigitRowRenderState(DigitRowRenderState* rs) {
-  rs->lastPrefix[0] = '\0';
-  rs->lastActive[0] = '\0';
-  rs->lastTail[0] = '\0';
-  rs->lastTailX = 0;
+  for (auto& c : rs->lastCell) c = 0;
   rs->neverDrawn = true;
+}
+
+// Widest glyph any cell can ever show (0-9 or the '_' placeholder) plus
+// padding -- the single source of truth for the fixed cell pitch, so no
+// cell's X ever depends on another cell's actual content width (Hardware
+// Fix #4 issue 7).
+int16_t digitCellWidth() {
+  int16_t maxW = Display::textWidth("_");
+  char buf[2] = {0, 0};
+  for (char c = '0'; c <= '9'; c++) {
+    buf[0] = c;
+    int16_t w = Display::textWidth(buf);
+    if (w > maxW) maxW = w;
+  }
+  return static_cast<int16_t>(maxW + 6);
 }
 
 void renderDigitRow(DigitRowRenderState* rs, int16_t x, int16_t y, const char* labelPrefix,
                     const DigitEntryState& state) {
-  char prefix[24];
-  size_t labelLen = strlen(labelPrefix);
-  if (labelLen > sizeof(prefix) - 1) labelLen = sizeof(prefix) - 1;
-  memcpy(prefix, labelPrefix, labelLen);
-  size_t pos = labelLen;
-  for (uint8_t i = 0; i < state.count && pos < sizeof(prefix) - 1; i++) {
-    prefix[pos++] = static_cast<char>('0' + state.digits[i]);
-  }
-  prefix[pos] = '\0';
-
-  char active[2] = {0, 0};
-  if (state.count < NumberGuessing::kSecretDigits) {
-    active[0] = static_cast<char>('0' + state.previewDigit);
-    active[1] = '\0';
-  }
-
-  char tail[8];
-  uint8_t tailLen =
-      (state.count < NumberGuessing::kSecretDigits) ? static_cast<uint8_t>(NumberGuessing::kSecretDigits - 1 - state.count) : 0;
-  if (tailLen > sizeof(tail) - 1) tailLen = sizeof(tail) - 1;
-  for (uint8_t i = 0; i < tailLen; i++) tail[i] = '_';
-  tail[tailLen] = '\0';
-
-  int16_t lh = Display::lineHeight();
-  int16_t prefixW = Display::textWidth(prefix);
-  int16_t activeX = static_cast<int16_t>(x + prefixW);
-  int16_t activeW = Display::textWidth(active);
-  int16_t tailX = static_cast<int16_t>(activeX + activeW);
-
-  if (rs->neverDrawn) {
-    Display::printLine(x, y, prefix);
-    if (active[0] != '\0') Display::printLine(activeX, y, active);
-    if (tail[0] != '\0') Display::printLine(tailX, y, tail);
-    rs->neverDrawn = false;
-  } else if (strcmp(prefix, rs->lastPrefix) != 0) {
-    // Confirmed digit count/content changed -- prefix, active position,
-    // and tail all shift, so redraw the whole row from x onward. Still a
-    // single short row, never a full-screen or full-content-area clear.
-    int16_t eraseW = static_cast<int16_t>(Display::kScreenWidth - x);
-    Display::tft().fillRect(x, y, eraseW, lh, ST77XX_BLACK);
-    Display::printLine(x, y, prefix);
-    if (active[0] != '\0') Display::printLine(activeX, y, active);
-    if (tail[0] != '\0') Display::printLine(tailX, y, tail);
-  } else if (strcmp(active, rs->lastActive) != 0) {
-    // The hot path: only the previewed (not yet confirmed) digit changed
-    // via ENCODER_ROTATE, e.g. 12_ _ -> 123_'s digit preview stepping.
-    // Confirmed digits are never touched. PRIMARY is a proportional font,
-    // so digits are NOT guaranteed equal width -- if the new preview
-    // glyph's width differs from the old one, tailX (computed from
-    // activeW) shifts too, and the already-drawn underscore tail would be
-    // left stale (a fragment not erased, or a gap) unless it is erased and
-    // redrawn together with the active digit (Hardware Fix #3 corrective
-    // bug fix). If tailX is unchanged, only the active cell needs touching.
-    if (tailX != rs->lastTailX) {
-      int16_t oldTailW = Display::textWidth(rs->lastTail);
-      int16_t regionEnd = static_cast<int16_t>(tailX + Display::textWidth(tail));
-      int16_t oldRegionEnd = static_cast<int16_t>(rs->lastTailX + oldTailW);
-      if (oldRegionEnd > regionEnd) regionEnd = oldRegionEnd;
-      int16_t eraseW = static_cast<int16_t>(regionEnd - activeX + 2);
-      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - activeX);
-      if (eraseW > maxW) eraseW = maxW;
-      if (eraseW < 0) eraseW = 0;
-      Display::tft().fillRect(activeX, y, eraseW, lh, ST77XX_BLACK);
-      if (active[0] != '\0') Display::printLine(activeX, y, active);
-      if (tail[0] != '\0') Display::printLine(tailX, y, tail);
+  char cells[NumberGuessing::kSecretDigits];
+  for (uint8_t i = 0; i < NumberGuessing::kSecretDigits; i++) {
+    if (i < state.count) {
+      cells[i] = static_cast<char>('0' + state.digits[i]);
+    } else if (i == state.count) {
+      cells[i] = static_cast<char>('0' + state.previewDigit);
     } else {
-      int16_t oldActiveW = Display::textWidth(rs->lastActive);
-      int16_t eraseW = static_cast<int16_t>((oldActiveW > activeW ? oldActiveW : activeW) + 2);
-      Display::tft().fillRect(activeX, y, eraseW, lh, ST77XX_BLACK);
-      if (active[0] != '\0') Display::printLine(activeX, y, active);
+      cells[i] = '_';
     }
   }
-  // No separate tail-only branch: tailLen is always 3-count, the same
-  // count that gates the prefix-changed branch above, so the tail's
-  // *content* can only change together with the prefix -- its X position
-  // can still shift on an active-only change, handled above.
 
-  strncpy(rs->lastPrefix, prefix, sizeof(rs->lastPrefix) - 1);
-  rs->lastPrefix[sizeof(rs->lastPrefix) - 1] = '\0';
-  strncpy(rs->lastActive, active, sizeof(rs->lastActive) - 1);
-  rs->lastActive[sizeof(rs->lastActive) - 1] = '\0';
-  strncpy(rs->lastTail, tail, sizeof(rs->lastTail) - 1);
-  rs->lastTail[sizeof(rs->lastTail) - 1] = '\0';
-  rs->lastTailX = tailX;
+  int16_t lh = Display::lineHeight();
+  int16_t cellW = digitCellWidth();
+  int16_t digitsX = static_cast<int16_t>(x + Display::textWidth(labelPrefix) + 4);
+
+  bool firstDraw = rs->neverDrawn;
+  if (firstDraw) {
+    Display::printLine(x, y, labelPrefix);
+    rs->neverDrawn = false;
+  }
+
+  // Each of the kSecretDigits fixed cells is diffed and redrawn completely
+  // independently -- a preview rotation, a digit confirming, or a delete
+  // only ever touches the specific cell(s) whose content actually changed,
+  // never a cell before or after it (the hot path this renderer targets).
+  for (uint8_t i = 0; i < NumberGuessing::kSecretDigits; i++) {
+    if (!firstDraw && cells[i] == rs->lastCell[i]) continue;
+    int16_t cellX = static_cast<int16_t>(digitsX + i * cellW);
+    if (!firstDraw) Display::tft().fillRect(cellX, y, cellW, lh, ST77XX_BLACK);
+    char buf[2] = {cells[i], '\0'};
+    Display::printLine(cellX, y, buf);
+    rs->lastCell[i] = cells[i];
+  }
 }
 
 }  // namespace NumberGuessing
@@ -283,6 +244,7 @@ void submitGuess() {
 bool g_soloGuessDirty = true;
 bool g_soloGuessNeedsFullRedraw = true;
 char g_lastSoloAttemptLine[32] = {0};
+char g_lastSoloClueLine[24] = {0};
 NumberGuessing::DigitRowRenderState g_soloGuessRowState;
 
 void screenSoloGuess() {
@@ -329,7 +291,8 @@ void screenSoloGuess() {
   char attemptLine[32];
   snprintf(attemptLine, sizeof(attemptLine), "Attempt %d", g_solo.totalAttempts + 1);
 
-  if (g_soloGuessNeedsFullRedraw) {
+  bool firstDraw = g_soloGuessNeedsFullRedraw;
+  if (firstDraw) {
     Display::clearContentArea();
     Display::printLine(2, y, attemptLine);
     g_soloGuessNeedsFullRedraw = false;
@@ -342,6 +305,28 @@ void screenSoloGuess() {
   y += lh;
 
   NumberGuessing::renderDigitRow(&g_soloGuessRowState, 2, y, "Guess: ", g_digitEntry);
+  y += lh;
+
+  // Hardware Fix #4 issue 8: persistent immediate clue after an incorrect
+  // guess, reusing submitGuess()'s already-computed A/B result (the most
+  // recent history entry) rather than duplicating the evaluate() logic.
+  // Digits = A+B (total correct digits regardless of position), Pos = A
+  // (correct digits in the correct position). Stays visible until the
+  // next guess replaces it, or a new puzzle clears history (historyCount
+  // back to 0 makes the clue disappear with it -- no separate reset
+  // needed). Diffed independently so it never repaints the Guess row.
+  char clueLine[24] = {0};
+  if (g_solo.historyCount > 0) {
+    const GuessEntry& last = g_solo.history[g_solo.historyCount - 1];
+    uint8_t digitsCorrect = static_cast<uint8_t>(last.aCount + last.bCount);
+    snprintf(clueLine, sizeof(clueLine), "Digits: %u  Pos: %u", digitsCorrect, last.aCount);
+  }
+  if (firstDraw || strcmp(clueLine, g_lastSoloClueLine) != 0) {
+    if (!firstDraw) Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+    if (clueLine[0] != '\0') Display::printLine(2, y, clueLine);
+    strncpy(g_lastSoloClueLine, clueLine, sizeof(g_lastSoloClueLine) - 1);
+    g_lastSoloClueLine[sizeof(g_lastSoloClueLine) - 1] = '\0';
+  }
 }
 
 // Hardware Fix #3: same three-way redraw split as ListMenu -- full draw

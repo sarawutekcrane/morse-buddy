@@ -58,7 +58,14 @@ class ListMenu {
   // optimized -- no caller currently passes more than a handful).
   static constexpr uint8_t kBadgeCacheCap = 8;
 
-  void configure(const SettingItem* items, uint8_t count, const BadgeFn* badges = nullptr);
+  // initialSelected: the cursor's starting row. Callers rendering a
+  // persisted enum/bool picker pass the index matching the currently saved
+  // value, so the picker opens on the active choice instead of always
+  // snapping back to item 0 (Hardware Fix #4 issue 1). Defaults to 0 so
+  // existing non-persisted-picker callers are unaffected. Out-of-range
+  // values are clamped to 0.
+  void configure(const SettingItem* items, uint8_t count, const BadgeFn* badges = nullptr,
+                 uint8_t initialSelected = 0);
   void tick(const char* title);
   uint8_t selectedIndex() const { return selected_; }
 

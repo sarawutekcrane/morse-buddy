@@ -36,30 +36,20 @@ void resetDigitEntry(DigitEntryState* state);
 void handleDigitEntryEvent(DigitEntryState* state, const InputEvent& e);
 void tickDigitEntry(DigitEntryState* state);  // call every frame to catch the 500ms hold-delete edge
 
-// Hardware Fix #3: shared partial-redraw renderer for a digit-entry row
-// ("<label><confirmed digits><active preview digit><underscores>", e.g.
-// "Guess: 12_ _"). Every caller (Play Solo, Play with Friend's answer/
-// manual-secret-entry, Race's guess screen) previously rebuilt this whole
-// 4-digit string into one snprintf and redrew it as a single line on every
-// encoder rotate, which visibly re-flickers the confirmed digits even
-// though only the active (not-yet-confirmed) digit actually changes. This
-// renderer instead diffs the confirmed-digit prefix, the single active
-// digit, and the trailing underscore tail independently, so a plain
-// preview-digit rotation (12_ _ -> 123_'s middle step, e.g. previewing 2
-// then 3 before confirming) only erases/redraws that one glyph cell.
+// Hardware Fix #4 issue 7: shared partial-redraw renderer for a digit-entry
+// row ("<label><4 fixed digit cells>", e.g. "Guess: 12_ _"), used by every
+// caller with a DigitEntryState (Play Solo, Play with Friend's answer/
+// manual-secret-entry, Race's guess screen). Earlier revisions accumulated
+// each cell's X from the previous cells' actual rendered width, which is
+// unsafe on PRIMARY's proportional font -- a digit whose glyph happens to
+// be narrower/wider than another could visibly shift every cell after it.
+// This renderer instead reserves kSecretDigits FIXED-X cells sized from the
+// single widest glyph any cell can ever show (0-9 or the '_' placeholder)
+// plus padding, so no cell's position ever depends on another cell's
+// content. Each cell (confirmed digit / active preview digit / not-yet-
+// reached placeholder) is diffed and redrawn completely independently.
 struct DigitRowRenderState {
-  // 24 bytes safely covers the longest caller label ("Set secret: ", 12
-  // chars) plus all kSecretDigits confirmed digits plus a null terminator
-  // (17 bytes needed) with headroom for future labels -- a tighter
-  // constant previously truncated "Set secret: 1234" to "Set secret: 123"
-  // (Hardware Fix #3 corrective item 6).
-  char lastPrefix[24] = {0};
-  char lastActive[2] = {0};
-  char lastTail[8] = {0};
-  // Tracks the X the tail was actually last drawn at (not just the last
-  // active glyph, since PRIMARY is a proportional font and an active-digit
-  // width change shifts where the tail must start).
-  int16_t lastTailX = 0;
+  char lastCell[kSecretDigits] = {0, 0, 0, 0};
   bool neverDrawn = true;
 };
 

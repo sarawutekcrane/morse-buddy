@@ -65,9 +65,17 @@ void audioPreviewOn() {
   Menu::goBack();
 }
 const SettingItem kAudioPreviewItems[] = {{"Off", audioPreviewOff}, {"On", audioPreviewOn}};
+// Hardware Fix #4 issue 1: the picker opens on the saved value and marks it
+// with a "*" badge (ListMenu's existing per-item BadgeFn mechanism) so the
+// active setting is visible independent of the "> " cursor.
+bool audioPreviewBadgeOff() { return !g_audioPreview; }
+bool audioPreviewBadgeOn() { return g_audioPreview; }
+const BadgeFn kAudioPreviewBadges[] = {audioPreviewBadgeOff, audioPreviewBadgeOn};
 ListMenu g_audioPreviewListMenu;
 void screenAudioPreviewPicker() {
-  if (Menu::consumeJustEntered()) g_audioPreviewListMenu.configure(kAudioPreviewItems, 2);
+  if (Menu::consumeJustEntered()) {
+    g_audioPreviewListMenu.configure(kAudioPreviewItems, 2, kAudioPreviewBadges, g_audioPreview ? 1 : 0);
+  }
   Display::drawStatusBar();
   g_audioPreviewListMenu.tick("Audio Preview");
 }
@@ -83,9 +91,14 @@ void revealAnswerOn() {
   Menu::goBack();
 }
 const SettingItem kRevealAnswerItems[] = {{"Off", revealAnswerOff}, {"On", revealAnswerOn}};
+bool revealAnswerBadgeOff() { return !g_revealAnswer; }
+bool revealAnswerBadgeOn() { return g_revealAnswer; }
+const BadgeFn kRevealAnswerBadges[] = {revealAnswerBadgeOff, revealAnswerBadgeOn};
 ListMenu g_revealAnswerListMenu;
 void screenRevealAnswerPicker() {
-  if (Menu::consumeJustEntered()) g_revealAnswerListMenu.configure(kRevealAnswerItems, 2);
+  if (Menu::consumeJustEntered()) {
+    g_revealAnswerListMenu.configure(kRevealAnswerItems, 2, kRevealAnswerBadges, g_revealAnswer ? 1 : 0);
+  }
   Display::drawStatusBar();
   g_revealAnswerListMenu.tick("Reveal Answer");
 }
@@ -209,6 +222,7 @@ uint8_t g_answerLen = 0;
 char g_answerPattern[Morse::kMaxPatternLength + 1];
 uint8_t g_answerPatternLen = 0;
 uint32_t g_lastAnswerReleaseMs = 0;
+Morse::WordGapState g_answerWordGap;
 
 const char* g_resultText = nullptr;
 uint32_t g_resultShownUntilMs = 0;
@@ -218,6 +232,21 @@ void resetAnswerCompose() {
   g_answerText[0] = '\0';
   g_answerPatternLen = 0;
   g_answerPattern[0] = '\0';
+  Morse::cancelWordGap(&g_answerWordGap);
+}
+
+// Appends exactly one ASCII space to the answer draft if a natural word gap
+// (7 dit of silence since the last Morse symbol) has elapsed since the
+// last letter finalized -- Hardware Fix #4 issues 3/13 (Level 3 sentences
+// need real spaces, e.g. "THE SUN IS HOT" not "THESUNISHOT").
+bool appendAnswerWordSpaceIfDue() {
+  if (!Morse::wordGapDue(&g_answerWordGap, Settings::getWpm(), millis())) return false;
+  if (g_answerLen == 0) return false;
+  if (g_answerText[g_answerLen - 1] == ' ') return false;
+  if (g_answerLen >= sizeof(g_answerText) - 1) return false;
+  g_answerText[g_answerLen++] = ' ';
+  g_answerText[g_answerLen] = '\0';
+  return true;
 }
 
 void startNewChallenge() {
@@ -238,6 +267,7 @@ void finalizeAnswerChar() {
   }
   g_answerPatternLen = 0;
   g_answerPattern[0] = '\0';
+  Morse::armWordGap(&g_answerWordGap, g_lastAnswerReleaseMs);
 }
 
 void submitAnswer() {
@@ -276,7 +306,13 @@ void submitAnswer() {
 }
 
 void handleAnswerEvent(const InputEvent& e) {
-  if (e.type == InputEventType::DOT_RELEASE) {
+  if (e.type == InputEventType::DOT_PRESS_START) {
+    // A new symbol starting cancels any pending word gap immediately --
+    // waiting for DOT_RELEASE would let a held first DASH of the next
+    // letter cross the 7-dit threshold mid-press and wrongly insert a
+    // space (Hardware Fix #4 issue 3, critical input detail).
+    Morse::cancelWordGap(&g_answerWordGap);
+  } else if (e.type == InputEventType::DOT_RELEASE) {
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       resetAnswerCompose();
       return;
@@ -294,6 +330,7 @@ void handleAnswerEvent(const InputEvent& e) {
       }
       g_answerPatternLen = 0;
       g_answerPattern[0] = '\0';
+      Morse::cancelWordGap(&g_answerWordGap);
     }
   } else if (e.type == InputEventType::ENCODER_SHORT) {
     submitAnswer();
@@ -355,9 +392,13 @@ void screenPractice() {
   }
   if (hadEvent) g_practiceDirty = true;
 
-  if (g_cursor == PracticeCursor::ANSWER && g_answerPatternLen > 0) {
-    if (millis() - g_lastAnswerReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
-      finalizeAnswerChar();
+  if (g_cursor == PracticeCursor::ANSWER) {
+    if (g_answerPatternLen > 0) {
+      if (millis() - g_lastAnswerReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
+        finalizeAnswerChar();
+        g_practiceDirty = true;
+      }
+    } else if (appendAnswerWordSpaceIfDue()) {
       g_practiceDirty = true;
     }
   }
