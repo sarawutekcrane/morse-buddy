@@ -582,6 +582,7 @@ bool g_friendChatNeedsFullRedraw = true;
 int16_t g_friendChatLastStartIdx = -1;
 uint16_t g_friendChatLastCursor = kNoHistoryCursor;
 bool g_friendChatLastHintNoCursor = true;
+char g_friendChatLastHintText[40] = {0};
 
 void screenFriendChat() {
   if (Menu::consumeJustEntered()) {
@@ -689,14 +690,24 @@ void screenFriendChat() {
     }
   }
 
-  bool hintNoCursor = (g_historyCursor == kNoHistoryCursor);
-  if (firstDraw || contentChanged || scrolled || hintNoCursor != g_friendChatLastHintNoCursor) {
-    Display::tft().fillRect(0, hintY, Display::kScreenWidth, lh, ST77XX_BLACK);
-    char full[40];
-    snprintf(full, sizeof(full), "%s(Short: new challenge)", hintNoCursor ? "> " : "  ");
-    Display::printLine(2, hintY, full);
-    g_friendChatLastHintNoCursor = hintNoCursor;
+  // Hint row: fixed label X, stable label text, marker-only redraw on
+  // focus change -- a plain cursor move onto/off the compose slot never
+  // repaints "(Short: new challenge)" (corrective item 5).
+  const char* hintText = "(Short: new challenge)";
+  bool hintFocused = (g_historyCursor == kNoHistoryCursor);
+  bool hintTextChanged = strcmp(hintText, g_friendChatLastHintText) != 0;
+  bool hintFocusChanged = hintFocused != g_friendChatLastHintNoCursor;
+  if (firstDraw || hintTextChanged) {
+    if (!firstDraw) Display::tft().fillRect(0, hintY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    Display::printLine(labelX, hintY, hintText);
+    if (hintFocused) Display::printLine(2, hintY, ">");
+    strncpy(g_friendChatLastHintText, hintText, sizeof(g_friendChatLastHintText) - 1);
+    g_friendChatLastHintText[sizeof(g_friendChatLastHintText) - 1] = '\0';
+  } else if (hintFocusChanged) {
+    Display::tft().fillRect(2, hintY, markerW, lh, ST77XX_BLACK);
+    if (hintFocused) Display::printLine(2, hintY, ">");
   }
+  g_friendChatLastHintNoCursor = hintFocused;
 
   g_friendChatLastStartIdx = static_cast<int16_t>(startIdx);
   g_friendChatLastCursor = g_historyCursor;

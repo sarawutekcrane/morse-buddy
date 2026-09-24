@@ -48,9 +48,18 @@ void tickDigitEntry(DigitEntryState* state);  // call every frame to catch the 5
 // preview-digit rotation (12_ _ -> 123_'s middle step, e.g. previewing 2
 // then 3 before confirming) only erases/redraws that one glyph cell.
 struct DigitRowRenderState {
-  char lastPrefix[16] = {0};
+  // 24 bytes safely covers the longest caller label ("Set secret: ", 12
+  // chars) plus all kSecretDigits confirmed digits plus a null terminator
+  // (17 bytes needed) with headroom for future labels -- a tighter
+  // constant previously truncated "Set secret: 1234" to "Set secret: 123"
+  // (Hardware Fix #3 corrective item 6).
+  char lastPrefix[24] = {0};
   char lastActive[2] = {0};
   char lastTail[8] = {0};
+  // Tracks the X the tail was actually last drawn at (not just the last
+  // active glyph, since PRIMARY is a proportional font and an active-digit
+  // width change shifts where the tail must start).
+  int16_t lastTailX = 0;
   bool neverDrawn = true;
 };
 

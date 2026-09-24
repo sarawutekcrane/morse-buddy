@@ -290,7 +290,17 @@ void confirmPromptScreen() {
   int16_t lh = Display::lineHeight();
   int16_t y = Display::kStatusBarHeight + 4;
   int16_t selectorY = static_cast<int16_t>(y + lh + (g_confirmConfig.line2 != nullptr ? lh : 0) + 8);
-  const char* selectorText = g_confirmYesSelected ? "> Yes    No" : "  Yes  > No";
+
+  // Yes/No labels are fixed text -- only the "> " marker between them ever
+  // moves, so a plain toggle never touches label pixels (same class fix as
+  // MixedTextEntry's CONFIRM selector; Hardware Fix #3 corrective re-scan).
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t yesMarkerX = 2;
+  int16_t yesLabelX = static_cast<int16_t>(yesMarkerX + markerW);
+  int16_t yesLabelW = Display::textWidth("Yes");
+  int16_t gapW = Display::textWidth("    ");
+  int16_t noMarkerX = static_cast<int16_t>(yesLabelX + yesLabelW + gapW);
+  int16_t noLabelX = static_cast<int16_t>(noMarkerX + markerW);
 
   if (firstDraw) {
     Display::clearContentArea();
@@ -300,14 +310,20 @@ void confirmPromptScreen() {
       Display::printLine(2, y, g_confirmConfig.line2);
       y += lh;
     }
-    Display::printLine(2, selectorY, selectorText);
+    if (g_confirmYesSelected) Display::printLine(yesMarkerX, selectorY, ">");
+    Display::printLine(yesLabelX, selectorY, "Yes");
+    if (!g_confirmYesSelected) Display::printLine(noMarkerX, selectorY, ">");
+    Display::printLine(noLabelX, selectorY, "No");
     g_confirmNeedsFullRedraw = false;
   } else {
     // PRIMARY is a GFX custom font and never draws with an opaque
-    // background, so the row is explicitly erased before the toggled
-    // selector text is drawn.
-    Display::tft().fillRect(0, selectorY, Display::kScreenWidth, lh, ST77XX_BLACK);
-    Display::printLine(2, selectorY, selectorText);
+    // background, so each marker cell is explicitly erased before the
+    // replacement is drawn -- the labels themselves are never touched.
+    int16_t oldMarkerX = g_confirmLastYesSelected ? yesMarkerX : noMarkerX;
+    int16_t newMarkerX = g_confirmYesSelected ? yesMarkerX : noMarkerX;
+    Display::tft().fillRect(oldMarkerX, selectorY, markerW, lh, ST77XX_BLACK);
+    Display::tft().fillRect(newMarkerX, selectorY, markerW, lh, ST77XX_BLACK);
+    Display::printLine(newMarkerX, selectorY, ">");
   }
 
   g_confirmLastYesSelected = g_confirmYesSelected;

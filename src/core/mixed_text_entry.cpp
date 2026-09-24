@@ -12,6 +12,14 @@ namespace {
 
 enum class State : uint8_t { EMPTY, PREVIEW, MORSE, CONFIRM };
 
+// The control row shows one of three things: nothing, a validation error
+// (EMPTY state), or the Save/Cancel selector (CONFIRM state). Save/Cancel
+// is tracked as its own kind (rather than folded into a single string)
+// because its two labels are fixed text -- only the "> " marker between
+// them ever moves -- so a plain toggle never needs to touch label pixels
+// (Hardware Fix #3 corrective).
+enum class ControlKind : uint8_t { NONE, ERROR, CONFIRM };
+
 const char kGeneralNameChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,-_!?@#";
 const char kGroupCodeChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -74,7 +82,9 @@ char g_lastPrefix[65] = {0};
 char g_lastSuffix[24] = {0};
 bool g_lastNeededClip = false;
 char g_lastClippedLine[96] = {0};
-char g_lastControlLine[40] = {0};
+ControlKind g_lastControlKind = ControlKind::NONE;
+char g_lastErrorText[40] = {0};
+bool g_lastConfirmSaveSelected = true;
 
 void appendConfirmedChar(char c) {
   if (g_length < g_config.maxLength) {
@@ -224,17 +234,10 @@ void computeParts(char* prefixOut, size_t prefixCap, char* suffixOut, size_t suf
   }
 }
 
-// Builds the control row's text: the validation error (EMPTY state only)
-// or the Save/Cancel toggle line (CONFIRM state only), empty otherwise.
-void computeControlLine(char* out, size_t outCap) {
-  if (g_state == State::EMPTY && g_errorMessage != nullptr) {
-    strncpy(out, g_errorMessage, outCap - 1);
-    out[outCap - 1] = '\0';
-  } else if (g_state == State::CONFIRM) {
-    snprintf(out, outCap, "%s", g_confirmSaveSelected ? "> Save    Cancel" : "  Save  > Cancel");
-  } else {
-    out[0] = '\0';
-  }
+ControlKind computeControlKind() {
+  if (g_state == State::EMPTY && g_errorMessage != nullptr) return ControlKind::ERROR;
+  if (g_state == State::CONFIRM) return ControlKind::CONFIRM;
+  return ControlKind::NONE;
 }
 
 void render() {
@@ -269,8 +272,8 @@ void render() {
   }
   clippedLine[sizeof(clippedLine) - 1] = '\0';
 
-  char controlLine[40];
-  computeControlLine(controlLine, sizeof(controlLine));
+  ControlKind controlKind = computeControlKind();
+  bool firstDraw = g_needsFullRedraw;
 
   int16_t prefixW = Display::textWidth(prefix);
   int16_t suffixX = static_cast<int16_t>(2 + prefixW);
@@ -285,9 +288,8 @@ void render() {
       Display::printLine(2, inputY, prefix);
       if (suffix[0] != '\0') Display::printLine(suffixX, inputY, suffix);
     }
-    // Control row is handled uniformly by the unconditional diff below
-    // (g_lastControlLine starts empty, so a non-empty controlLine here
-    // will correctly be drawn there without a redundant double-draw).
+    // Control row is handled uniformly by the block below (g_lastControlKind
+    // starts at NONE, so a real kind here is correctly treated as new).
     g_needsFullRedraw = false;
   } else if (needsClip || g_lastNeededClip) {
     // The leading-clip window is active now, or was active last render:
@@ -322,13 +324,52 @@ void render() {
     if (suffix[0] != '\0') Display::printLine(suffixX, inputY, suffix);
   }
 
-  if (strcmp(controlLine, g_lastControlLine) != 0) {
+  // Control row (Hardware Fix #3 corrective): a kind change (including
+  // first draw, since g_lastControlKind starts at NONE) or an error-text
+  // change redraws the whole row; a plain Save/Cancel toggle within the
+  // same CONFIRM kind only moves the "> " marker between the two fixed
+  // label positions -- "Save" and "Cancel" are never repainted.
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t saveMarkerX = 2;
+  int16_t saveLabelX = static_cast<int16_t>(saveMarkerX + markerW);
+  int16_t saveLabelW = Display::textWidth("Save");
+  int16_t gapW = Display::textWidth("    ");
+  int16_t cancelMarkerX = static_cast<int16_t>(saveLabelX + saveLabelW + gapW);
+  int16_t cancelLabelX = static_cast<int16_t>(cancelMarkerX + markerW);
+
+  bool kindChanged = (controlKind != g_lastControlKind);
+  bool errorTextChanged =
+      (controlKind == ControlKind::ERROR) && (g_errorMessage != nullptr) && strcmp(g_errorMessage, g_lastErrorText) != 0;
+
+  if (kindChanged || errorTextChanged) {
     // PRIMARY is a GFX custom font and never draws with an opaque
     // background, so the row is explicitly erased before its replacement
     // is drawn.
-    Display::tft().fillRect(0, controlY, Display::kScreenWidth, lh, ST77XX_BLACK);
-    if (controlLine[0] != '\0') Display::printLine(2, controlY, controlLine);
+    if (!firstDraw) Display::tft().fillRect(0, controlY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    if (controlKind == ControlKind::ERROR) {
+      Display::printLine(2, controlY, g_errorMessage);
+    } else if (controlKind == ControlKind::CONFIRM) {
+      if (g_confirmSaveSelected) Display::printLine(saveMarkerX, controlY, ">");
+      Display::printLine(saveLabelX, controlY, "Save");
+      if (!g_confirmSaveSelected) Display::printLine(cancelMarkerX, controlY, ">");
+      Display::printLine(cancelLabelX, controlY, "Cancel");
+    }
+  } else if (controlKind == ControlKind::CONFIRM && g_confirmSaveSelected != g_lastConfirmSaveSelected) {
+    int16_t oldMarkerX = g_lastConfirmSaveSelected ? saveMarkerX : cancelMarkerX;
+    int16_t newMarkerX = g_confirmSaveSelected ? saveMarkerX : cancelMarkerX;
+    Display::tft().fillRect(oldMarkerX, controlY, markerW, lh, ST77XX_BLACK);
+    Display::tft().fillRect(newMarkerX, controlY, markerW, lh, ST77XX_BLACK);
+    Display::printLine(newMarkerX, controlY, ">");
   }
+
+  g_lastControlKind = controlKind;
+  if (controlKind == ControlKind::ERROR && g_errorMessage != nullptr) {
+    strncpy(g_lastErrorText, g_errorMessage, sizeof(g_lastErrorText) - 1);
+    g_lastErrorText[sizeof(g_lastErrorText) - 1] = '\0';
+  } else {
+    g_lastErrorText[0] = '\0';
+  }
+  if (controlKind == ControlKind::CONFIRM) g_lastConfirmSaveSelected = g_confirmSaveSelected;
 
   g_lastNeededClip = needsClip;
   strncpy(g_lastClippedLine, clippedLine, sizeof(g_lastClippedLine) - 1);
@@ -337,8 +378,6 @@ void render() {
   g_lastPrefix[sizeof(g_lastPrefix) - 1] = '\0';
   strncpy(g_lastSuffix, suffix, sizeof(g_lastSuffix) - 1);
   g_lastSuffix[sizeof(g_lastSuffix) - 1] = '\0';
-  strncpy(g_lastControlLine, controlLine, sizeof(g_lastControlLine) - 1);
-  g_lastControlLine[sizeof(g_lastControlLine) - 1] = '\0';
 }
 
 }  // namespace
@@ -364,7 +403,9 @@ void start(const MixedTextEntryConfig& config, const char* initialValue) {
   g_lastSuffix[0] = '\0';
   g_lastNeededClip = false;
   g_lastClippedLine[0] = '\0';
-  g_lastControlLine[0] = '\0';
+  g_lastControlKind = ControlKind::NONE;
+  g_lastErrorText[0] = '\0';
+  g_lastConfirmSaveSelected = true;
 }
 
 void tick() {

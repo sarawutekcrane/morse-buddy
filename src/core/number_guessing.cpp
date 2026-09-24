@@ -102,12 +102,13 @@ void resetDigitRowRenderState(DigitRowRenderState* rs) {
   rs->lastPrefix[0] = '\0';
   rs->lastActive[0] = '\0';
   rs->lastTail[0] = '\0';
+  rs->lastTailX = 0;
   rs->neverDrawn = true;
 }
 
 void renderDigitRow(DigitRowRenderState* rs, int16_t x, int16_t y, const char* labelPrefix,
                     const DigitEntryState& state) {
-  char prefix[16];
+  char prefix[24];
   size_t labelLen = strlen(labelPrefix);
   if (labelLen > sizeof(prefix) - 1) labelLen = sizeof(prefix) - 1;
   memcpy(prefix, labelPrefix, labelLen);
@@ -153,15 +154,36 @@ void renderDigitRow(DigitRowRenderState* rs, int16_t x, int16_t y, const char* l
   } else if (strcmp(active, rs->lastActive) != 0) {
     // The hot path: only the previewed (not yet confirmed) digit changed
     // via ENCODER_ROTATE, e.g. 12_ _ -> 123_'s digit preview stepping.
-    // Confirmed digits and the trailing underscores are never touched.
-    int16_t oldActiveW = Display::textWidth(rs->lastActive);
-    int16_t eraseW = static_cast<int16_t>((oldActiveW > activeW ? oldActiveW : activeW) + 2);
-    Display::tft().fillRect(activeX, y, eraseW, lh, ST77XX_BLACK);
-    if (active[0] != '\0') Display::printLine(activeX, y, active);
+    // Confirmed digits are never touched. PRIMARY is a proportional font,
+    // so digits are NOT guaranteed equal width -- if the new preview
+    // glyph's width differs from the old one, tailX (computed from
+    // activeW) shifts too, and the already-drawn underscore tail would be
+    // left stale (a fragment not erased, or a gap) unless it is erased and
+    // redrawn together with the active digit (Hardware Fix #3 corrective
+    // bug fix). If tailX is unchanged, only the active cell needs touching.
+    if (tailX != rs->lastTailX) {
+      int16_t oldTailW = Display::textWidth(rs->lastTail);
+      int16_t regionEnd = static_cast<int16_t>(tailX + Display::textWidth(tail));
+      int16_t oldRegionEnd = static_cast<int16_t>(rs->lastTailX + oldTailW);
+      if (oldRegionEnd > regionEnd) regionEnd = oldRegionEnd;
+      int16_t eraseW = static_cast<int16_t>(regionEnd - activeX + 2);
+      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - activeX);
+      if (eraseW > maxW) eraseW = maxW;
+      if (eraseW < 0) eraseW = 0;
+      Display::tft().fillRect(activeX, y, eraseW, lh, ST77XX_BLACK);
+      if (active[0] != '\0') Display::printLine(activeX, y, active);
+      if (tail[0] != '\0') Display::printLine(tailX, y, tail);
+    } else {
+      int16_t oldActiveW = Display::textWidth(rs->lastActive);
+      int16_t eraseW = static_cast<int16_t>((oldActiveW > activeW ? oldActiveW : activeW) + 2);
+      Display::tft().fillRect(activeX, y, eraseW, lh, ST77XX_BLACK);
+      if (active[0] != '\0') Display::printLine(activeX, y, active);
+    }
   }
   // No separate tail-only branch: tailLen is always 3-count, the same
-  // count that gates the prefix-changed branch above, so the tail can
-  // only change together with the prefix.
+  // count that gates the prefix-changed branch above, so the tail's
+  // *content* can only change together with the prefix -- its X position
+  // can still shift on an active-only change, handled above.
 
   strncpy(rs->lastPrefix, prefix, sizeof(rs->lastPrefix) - 1);
   rs->lastPrefix[sizeof(rs->lastPrefix) - 1] = '\0';
@@ -169,6 +191,7 @@ void renderDigitRow(DigitRowRenderState* rs, int16_t x, int16_t y, const char* l
   rs->lastActive[sizeof(rs->lastActive) - 1] = '\0';
   strncpy(rs->lastTail, tail, sizeof(rs->lastTail) - 1);
   rs->lastTail[sizeof(rs->lastTail) - 1] = '\0';
+  rs->lastTailX = tailX;
 }
 
 }  // namespace NumberGuessing

@@ -339,17 +339,27 @@ void finalizeComposeChar() {
   resetComposePattern();
 }
 
-void buildComposeDisplay(char* out, size_t outSize) {
+// Splits the compose line into a "prefix" (derived solely from confirmed
+// g_composeText, so it is provably unchanged while a Morse pattern is being
+// keyed in) and a "suffix" (the in-progress g_composePattern, the only part
+// that changes on every dot/dash). In LETTERS_ONLY mode the pattern isn't
+// shown at all, so the suffix is always empty. Callers use this split to
+// avoid repainting confirmed compose text on every symbol (Hardware Fix #3
+// corrective item 2).
+void buildComposePrefixSuffix(char* prefix, size_t prefixSize, char* suffix, size_t suffixSize) {
   Settings::TypingDisplay mode = Settings::getTypingDisplay();
   if (mode == Settings::TypingDisplay::LETTERS_ONLY) {
-    strncpy(out, g_composeText, outSize - 1);
-    out[outSize - 1] = '\0';
+    strncpy(prefix, g_composeText, prefixSize - 1);
+    prefix[prefixSize - 1] = '\0';
+    suffix[0] = '\0';
   } else if (mode == Settings::TypingDisplay::MIXED) {
-    snprintf(out, outSize, "%s%s%s", g_composeText, (g_composePatternLen > 0 ? " " : ""), g_composePattern);
+    strncpy(prefix, g_composeText, prefixSize - 1);
+    prefix[prefixSize - 1] = '\0';
+    snprintf(suffix, suffixSize, "%s%s", (g_composePatternLen > 0 ? " " : ""), g_composePattern);
   } else {
-    char raw[64];
-    buildCanonicalRawMorse(g_composeText, raw, sizeof(raw));
-    snprintf(out, outSize, "%s%s", raw, g_composePattern);
+    buildCanonicalRawMorse(g_composeText, prefix, prefixSize);
+    strncpy(suffix, g_composePattern, suffixSize - 1);
+    suffix[suffixSize - 1] = '\0';
   }
 }
 
@@ -434,7 +444,9 @@ bool g_chatRenderDirty = true;
 bool g_chatNeedsFullRedraw = true;
 int16_t g_chatLastStartIdx = -1;
 uint16_t g_chatLastCursor = kNoHistoryCursor;
-char g_chatLastComposeLine[72] = {0};
+char g_chatLastComposePrefix[64] = {0};
+char g_chatLastComposeSuffix[Morse::kMaxPatternLength + 2] = {0};
+bool g_chatLastComposeFocused = true;
 
 void screenChat() {
   if (Menu::consumeJustEntered()) {
@@ -561,18 +573,56 @@ void screenChat() {
 
   // Compose row is diffed completely independently of the history rows
   // above it -- Morse pattern growth, typed characters, and the cursor-
-  // focus prefix flip never repaint stored message history (Hardware Fix
-  // #3, Section F).
-  char composeLine[64];
-  buildComposeDisplay(composeLine, sizeof(composeLine));
-  char fullCompose[72];
-  snprintf(fullCompose, sizeof(fullCompose), "%s%s", g_historyCursor == kNoHistoryCursor ? "> " : "  ", composeLine);
-  if (firstDraw || strcmp(fullCompose, g_chatLastComposeLine) != 0) {
+  // focus marker flip never repaint stored message history (Hardware Fix
+  // #3, Section F). The row is further split into a fixed-width focus
+  // marker, a stable confirmed-text prefix, and a dynamic Morse-pattern
+  // suffix, so an in-progress dot/dash never repaints already-confirmed
+  // compose text (corrective item 2).
+  char composePrefix[64];
+  char composeSuffix[Morse::kMaxPatternLength + 2];
+  buildComposePrefixSuffix(composePrefix, sizeof(composePrefix), composeSuffix, sizeof(composeSuffix));
+  bool composeFocused = (g_historyCursor == kNoHistoryCursor);
+
+  int16_t composeMarkerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t composePrefixX = static_cast<int16_t>(2 + composeMarkerW);
+  int16_t composePrefixW = Display::textWidth(composePrefix);
+  int16_t composeSuffixX = static_cast<int16_t>(composePrefixX + composePrefixW);
+
+  bool composeFocusChanged = (composeFocused != g_chatLastComposeFocused);
+  bool composePrefixChanged = strcmp(composePrefix, g_chatLastComposePrefix) != 0;
+  bool composeSuffixChanged = strcmp(composeSuffix, g_chatLastComposeSuffix) != 0;
+
+  if (firstDraw || composePrefixChanged) {
+    // The confirmed prefix changed (or this is the first draw): layout may
+    // have shifted, so redraw marker + prefix + suffix together -- still
+    // only the compose row, never history.
     if (!firstDraw) Display::tft().fillRect(0, composeY, Display::kScreenWidth, lh, ST77XX_BLACK);
-    Display::printLine(2, composeY, fullCompose);
-    strncpy(g_chatLastComposeLine, fullCompose, sizeof(g_chatLastComposeLine) - 1);
-    g_chatLastComposeLine[sizeof(g_chatLastComposeLine) - 1] = '\0';
+    Display::printLine(2, composeY, composeFocused ? ">" : " ");
+    Display::printLine(composePrefixX, composeY, composePrefix);
+    if (composeSuffix[0] != '\0') Display::printLine(composeSuffixX, composeY, composeSuffix);
+  } else if (composeFocusChanged) {
+    // Marker only -- confirmed prefix and suffix are untouched.
+    Display::tft().fillRect(2, composeY, composeMarkerW, lh, ST77XX_BLACK);
+    Display::printLine(2, composeY, composeFocused ? ">" : " ");
+  } else if (composeSuffixChanged) {
+    // The hot path this fix targets: only the Morse-pattern suffix changed.
+    // The confirmed prefix is provably unchanged and at the same X, so it
+    // is never touched -- only the suffix's own cell is erased/redrawn.
+    int16_t oldSuffixW = Display::textWidth(g_chatLastComposeSuffix);
+    int16_t newSuffixW = Display::textWidth(composeSuffix);
+    int16_t eraseW = static_cast<int16_t>((oldSuffixW > newSuffixW ? oldSuffixW : newSuffixW) + 4);
+    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - composeSuffixX);
+    if (eraseW > maxW) eraseW = maxW;
+    if (eraseW < 0) eraseW = 0;
+    Display::tft().fillRect(composeSuffixX, composeY, eraseW, lh, ST77XX_BLACK);
+    if (composeSuffix[0] != '\0') Display::printLine(composeSuffixX, composeY, composeSuffix);
   }
+
+  strncpy(g_chatLastComposePrefix, composePrefix, sizeof(g_chatLastComposePrefix) - 1);
+  g_chatLastComposePrefix[sizeof(g_chatLastComposePrefix) - 1] = '\0';
+  strncpy(g_chatLastComposeSuffix, composeSuffix, sizeof(g_chatLastComposeSuffix) - 1);
+  g_chatLastComposeSuffix[sizeof(g_chatLastComposeSuffix) - 1] = '\0';
+  g_chatLastComposeFocused = composeFocused;
 
   g_chatLastStartIdx = static_cast<int16_t>(startIdx);
   g_chatLastCursor = g_historyCursor;
