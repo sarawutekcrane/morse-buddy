@@ -388,19 +388,66 @@ void handleChallengeEvent(const InputEvent& e) {
 bool g_practiceDirty = true;
 bool g_practiceWasShowingResult = false;
 
-// Hardware Fix #3: each row (title/streak, challenge, answer, result
-// banner, high score) is diffed and redrawn independently, so typing a
-// Morse answer -- the most frequent interaction on this screen -- never
-// repaints the stable challenge/title/high-score rows, only its own row.
+// Hardware Fix #4.4 issue E: Level 3 challenges rendered as RAW Morse (the
+// default Typing Display view) can be far wider than one physical row --
+// "THE SUN IS HOT" alone expands to dozens of dot/dash/slash characters --
+// and "Wrong: <challenge>" can do the same. Challenge, Answer, and Result
+// are each word-wrapped by real pixel width into as many rows as they
+// actually need (Display::wrapText(), Hardware Fix #4.4 issue A's fixed
+// primitive), bounded by small per-section caps so the fixed Title/High
+// Score rows and the other sections always keep some room on this
+// otherwise very tight 135px-tall screen. Answer is prioritized for
+// space (it's the row the user is actively keying), then Challenge, then
+// the transient Result banner -- if a pathological case still doesn't
+// fit, the LAST wrapped rows of Answer are kept visible (so the caret
+// stays visible) and the FIRST wrapped rows of Challenge/Result are shown.
+constexpr uint8_t kMaxChallengeRows = 4;
+constexpr uint8_t kMaxAnswerRows = 3;
+constexpr uint8_t kMaxResultRows = 3;
+
+// Wraps `text` into at most `maxRows` rows (each already clipped to what
+// Display::printLine() can draw in full -- see wrapText()'s own
+// kPrintLineMaxChars guarantee), copying each row directly into
+// outRows[i]. Returns the row count produced (always >= 1, even for an
+// empty string, so a focused-but-empty section still has a row to put
+// the ">" marker on).
+uint8_t wrapIntoRows(const char* text, int16_t maxWidthPx, char outRows[][64], uint8_t maxRows) {
+  uint16_t starts[8];
+  uint16_t lens[8];
+  uint8_t cap = (maxRows < 8) ? maxRows : 8;
+  uint8_t n = Display::wrapText(text, maxWidthPx, starts, lens, cap);
+  if (n == 0) {
+    outRows[0][0] = '\0';
+    return 1;
+  }
+  for (uint8_t i = 0; i < n; i++) {
+    size_t l = lens[i];
+    if (l >= 64) l = 63;
+    memcpy(outRows[i], text + starts[i], l);
+    outRows[i][l] = '\0';
+  }
+  return n;
+}
+
+// Hardware Fix #3's per-row independent diffing is preserved and extended:
+// any change to how many rows Challenge/Answer/Result actually need
+// (g_lastChallengeRowCount et al.) shifts every row below it, so that
+// triggers one full mid-screen repaint (rare -- only on a new challenge,
+// a reveal toggle, or an answer/result that crosses a wrap boundary);
+// otherwise each row's own text is diffed independently, so typing a
+// Morse answer still normally repaints only the one row it changed.
 bool g_practiceNeedsFullRedraw = true;
 char g_lastPracticeTitleLine[40] = {0};
-char g_lastPracticeChallengeContent[160] = {0};
-bool g_lastPracticeChallengeMarker = false;
-char g_lastPracticeAnswerPrefix[24] = {0};
-char g_lastPracticeAnswerSuffix[Morse::kMaxPatternLength + 2] = {0};
-bool g_lastPracticeAnswerMarker = false;
-char g_lastPracticeResultLine[40] = {0};
 char g_lastPracticeHiLine[24] = {0};
+constexpr uint8_t kNoRowCount = 0xFF;
+uint8_t g_lastChallengeRowCount = kNoRowCount;
+uint8_t g_lastAnswerRowCount = kNoRowCount;
+uint8_t g_lastResultRowCount = kNoRowCount;
+char g_lastChallengeRowText[kMaxChallengeRows][64] = {{0}};
+char g_lastAnswerRowText[kMaxAnswerRows][64] = {{0}};
+char g_lastResultRowText[kMaxResultRows][64] = {{0}};
+bool g_lastPracticeChallengeMarker = false;
+bool g_lastPracticeAnswerMarker = false;
 
 void screenPractice() {
   if (Menu::consumeJustEntered()) {
@@ -453,17 +500,14 @@ void screenPractice() {
 
   Display::setFont(Display::Font::PRIMARY);
   int16_t lh = Display::lineHeight();
-  int16_t titleY = Display::kStatusBarHeight + 2;
-  int16_t challengeY = static_cast<int16_t>(titleY + lh);
-  int16_t answerY = static_cast<int16_t>(challengeY + lh);
-  int16_t resultY = static_cast<int16_t>(answerY + lh);
-  int16_t hiY = static_cast<int16_t>(resultY + lh);
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t contentHeight = Display::kScreenHeight - contentTop;
+  uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
+  if (totalLines < 5) totalLines = 5;  // title + >=1 challenge + >=1 answer + >=0 result + high score
 
-  bool firstDraw = g_practiceNeedsFullRedraw;
-  if (firstDraw) {
-    Display::clearContentArea();
-    g_practiceNeedsFullRedraw = false;
-  }
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t contentX = static_cast<int16_t>(2 + markerW);
+  int16_t rowWidth = static_cast<int16_t>(Display::kScreenWidth - contentX);
 
   char titleLine[40];
   snprintf(titleLine, sizeof(titleLine), "Level %u  Streak %u", Settings::getPracticeLevel(), g_streak);
@@ -481,17 +525,31 @@ void screenPractice() {
   }
   bool challengeMarker = (g_cursor == PracticeCursor::CHALLENGE);
 
-  // Answer content is further split into a stable confirmed-answer prefix
-  // and a dynamic Morse-pattern suffix, so an in-progress dot/dash never
-  // repaints already-confirmed answer letters.
-  char answerPrefix[24];
-  strncpy(answerPrefix, g_answerText, sizeof(answerPrefix) - 1);
-  answerPrefix[sizeof(answerPrefix) - 1] = '\0';
-  char answerSuffix[Morse::kMaxPatternLength + 2];
-  snprintf(answerSuffix, sizeof(answerSuffix), "%s%s", (g_answerPatternLen > 0 ? " " : ""), g_answerPattern);
+  // Answer's confirmed text and its in-progress Morse suffix are combined
+  // into one string here (Hardware Fix #4.4 issue E) -- unlike Enigma/Text
+  // compose, g_answerText is always short enough (Level 3's longest
+  // sentence is well under 24 chars) that re-wrapping the whole thing on
+  // every symbol is cheap, so no separate confirmed/tail split is needed
+  // to keep the hot path partial: per-row text diffing below already
+  // limits the actual repaint to whichever row changed.
+  char answerFull[64];
+  {
+    size_t plen = strlen(g_answerText);
+    if (plen >= sizeof(answerFull)) plen = sizeof(answerFull) - 1;
+    memcpy(answerFull, g_answerText, plen);
+    answerFull[plen] = '\0';
+    if (g_answerPatternLen > 0) {
+      char suffix[Morse::kMaxPatternLength + 2];
+      snprintf(suffix, sizeof(suffix), " %s", g_answerPattern);
+      size_t suffixLen = strlen(suffix);
+      if (plen + suffixLen >= sizeof(answerFull)) suffixLen = sizeof(answerFull) - 1 - plen;
+      memcpy(answerFull + plen, suffix, suffixLen);
+      answerFull[plen + suffixLen] = '\0';
+    }
+  }
   bool answerMarker = (g_cursor == PracticeCursor::ANSWER);
 
-  char resultLine[40];
+  char resultLine[64];
   if (showingResult) {
     snprintf(resultLine, sizeof(resultLine), "%s", g_resultText);
   } else {
@@ -501,96 +559,153 @@ void screenPractice() {
   char hiLine[24];
   snprintf(hiLine, sizeof(hiLine), "High: %u", g_highScore[Settings::getPracticeLevel() - 1]);
 
-  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-  int16_t contentX = static_cast<int16_t>(2 + markerW);
+  char challengeRowsFull[kMaxChallengeRows][64];
+  uint8_t challengeRowCountFull = wrapIntoRows(challengeContent, rowWidth, challengeRowsFull, kMaxChallengeRows);
+  char answerRowsFull[kMaxAnswerRows][64];
+  uint8_t answerRowCountFull = wrapIntoRows(answerFull, rowWidth, answerRowsFull, kMaxAnswerRows);
+  char resultRowsFull[kMaxResultRows][64];
+  uint8_t resultRowCountFull = showingResult ? wrapIntoRows(resultLine, rowWidth, resultRowsFull, kMaxResultRows) : 0;
 
-  // Challenge row: marker and content diffed independently.
-  bool challengeContentChanged = strcmp(challengeContent, g_lastPracticeChallengeContent) != 0;
-  bool challengeMarkerChanged = challengeMarker != g_lastPracticeChallengeMarker;
-  if (firstDraw || challengeContentChanged) {
-    if (!firstDraw) {
-      int16_t oldW = Display::textWidth(g_lastPracticeChallengeContent);
-      int16_t newW = Display::textWidth(challengeContent);
-      int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
-      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - contentX);
-      if (eraseW > maxW) eraseW = maxW;
-      if (eraseW < 0) eraseW = 0;
-      Display::tft().fillRect(contentX, challengeY, eraseW, lh, ST77XX_BLACK);
+  // Fits Challenge/Answer/Result into whatever's left after Title and High
+  // Score's fixed single rows, prioritizing Answer (the row actively being
+  // keyed -- "answer entry must keep the currently typed end visible"),
+  // then Challenge, then the transient Result banner. On this 135px-tall
+  // screen these three will usually all fit fully (Level 1/2 challenges
+  // and any Letters-Only view never wrap at all); only a Level 3 sentence
+  // shown as RAW Morse can be wide enough to need this budget to matter.
+  int32_t budget = static_cast<int32_t>(totalLines) - 2;
+  if (budget < 0) budget = 0;
+  uint8_t answerShown = static_cast<uint8_t>((answerRowCountFull < budget) ? answerRowCountFull : budget);
+  budget -= answerShown;
+  uint8_t challengeShown = static_cast<uint8_t>((challengeRowCountFull < budget) ? challengeRowCountFull : budget);
+  budget -= challengeShown;
+  uint8_t resultShown = static_cast<uint8_t>((resultRowCountFull < budget) ? resultRowCountFull : budget);
+  budget -= resultShown;
+
+  // If Answer or Result had to be clamped, keep their LAST rows visible
+  // (the active caret for Answer; the tail for Result) rather than losing
+  // the most current text; Challenge keeps its FIRST rows (natural
+  // top-down reading order) if it has to be clamped.
+  uint8_t answerStart = static_cast<uint8_t>(answerRowCountFull - answerShown);
+  uint8_t resultStart = static_cast<uint8_t>(resultRowCountFull - resultShown);
+
+  int16_t titleY = contentTop;
+  int16_t challengeY = static_cast<int16_t>(titleY + lh);
+  int16_t answerY = static_cast<int16_t>(challengeY + challengeShown * lh);
+  int16_t resultY = static_cast<int16_t>(answerY + answerShown * lh);
+  int16_t hiY = static_cast<int16_t>(resultY + resultShown * lh);
+
+  bool firstDraw = g_practiceNeedsFullRedraw;
+  // Any change to how many rows Challenge/Answer/Result actually need
+  // shifts every row below it, so that forces one full mid-screen repaint
+  // (Hardware Fix #4.4 issue E) -- rare: only a new challenge, a reveal
+  // toggle, or text crossing a wrap boundary triggers it.
+  bool layoutChanged = firstDraw || challengeShown != g_lastChallengeRowCount ||
+                       answerShown != g_lastAnswerRowCount || resultShown != g_lastResultRowCount;
+
+  if (layoutChanged) {
+    Display::clearContentArea();
+    if (titleLine[0] != '\0') Display::printLine(2, titleY, titleLine);
+    for (uint8_t i = 0; i < challengeShown; i++) {
+      int16_t y = static_cast<int16_t>(challengeY + i * lh);
+      if (i == 0 && challengeMarker) Display::printLine(2, y, ">");
+      Display::printLine(contentX, y, challengeRowsFull[i]);
     }
-    if (challengeContent[0] != '\0') Display::printLine(contentX, challengeY, challengeContent);
-  }
-  if (firstDraw || challengeMarkerChanged) {
-    if (!firstDraw) Display::tft().fillRect(2, challengeY, markerW, lh, ST77XX_BLACK);
-    if (challengeMarker) Display::printLine(2, challengeY, ">");
-  }
-  strncpy(g_lastPracticeChallengeContent, challengeContent, sizeof(g_lastPracticeChallengeContent) - 1);
-  g_lastPracticeChallengeContent[sizeof(g_lastPracticeChallengeContent) - 1] = '\0';
-  g_lastPracticeChallengeMarker = challengeMarker;
-
-  // Answer row: marker, stable confirmed-answer prefix, and dynamic
-  // Morse-pattern suffix all diffed independently.
-  bool answerPrefixChanged = strcmp(answerPrefix, g_lastPracticeAnswerPrefix) != 0;
-  bool answerSuffixChanged = strcmp(answerSuffix, g_lastPracticeAnswerSuffix) != 0;
-  bool answerMarkerChanged = answerMarker != g_lastPracticeAnswerMarker;
-  int16_t answerPrefixW = Display::textWidth(answerPrefix);
-  int16_t answerSuffixX = static_cast<int16_t>(contentX + answerPrefixW);
-  if (firstDraw || answerPrefixChanged) {
-    if (!firstDraw) {
-      int16_t eraseW = static_cast<int16_t>(Display::kScreenWidth - contentX);
-      if (eraseW < 0) eraseW = 0;
-      Display::tft().fillRect(contentX, answerY, eraseW, lh, ST77XX_BLACK);
+    for (uint8_t i = 0; i < answerShown; i++) {
+      int16_t y = static_cast<int16_t>(answerY + i * lh);
+      if (i == 0 && answerMarker) Display::printLine(2, y, ">");
+      Display::printLine(contentX, y, answerRowsFull[answerStart + i]);
     }
-    if (answerPrefix[0] != '\0') Display::printLine(contentX, answerY, answerPrefix);
-    if (answerSuffix[0] != '\0') Display::printLine(answerSuffixX, answerY, answerSuffix);
-  } else if (answerSuffixChanged) {
-    int16_t oldW = Display::textWidth(g_lastPracticeAnswerSuffix);
-    int16_t newW = Display::textWidth(answerSuffix);
-    int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
-    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - answerSuffixX);
-    if (eraseW > maxW) eraseW = maxW;
-    if (eraseW < 0) eraseW = 0;
-    Display::tft().fillRect(answerSuffixX, answerY, eraseW, lh, ST77XX_BLACK);
-    if (answerSuffix[0] != '\0') Display::printLine(answerSuffixX, answerY, answerSuffix);
-  }
-  if (firstDraw || answerMarkerChanged) {
-    if (!firstDraw) Display::tft().fillRect(2, answerY, markerW, lh, ST77XX_BLACK);
-    if (answerMarker) Display::printLine(2, answerY, ">");
-  }
-  strncpy(g_lastPracticeAnswerPrefix, answerPrefix, sizeof(g_lastPracticeAnswerPrefix) - 1);
-  g_lastPracticeAnswerPrefix[sizeof(g_lastPracticeAnswerPrefix) - 1] = '\0';
-  strncpy(g_lastPracticeAnswerSuffix, answerSuffix, sizeof(g_lastPracticeAnswerSuffix) - 1);
-  g_lastPracticeAnswerSuffix[sizeof(g_lastPracticeAnswerSuffix) - 1] = '\0';
-  g_lastPracticeAnswerMarker = answerMarker;
-
-  // Title/result/high-score rows are unaffected by cursor moves or answer
-  // typing, so they keep the original independent-diff RowUpdate pattern
-  // (Hardware Fix #3).
-  struct RowUpdate {
-    int16_t y;
-    char* lastBuf;
-    size_t lastBufCap;
-    const char* newText;
-  };
-  RowUpdate rows[] = {
-      {titleY, g_lastPracticeTitleLine, sizeof(g_lastPracticeTitleLine), titleLine},
-      {resultY, g_lastPracticeResultLine, sizeof(g_lastPracticeResultLine), resultLine},
-      {hiY, g_lastPracticeHiLine, sizeof(g_lastPracticeHiLine), hiLine},
-  };
-  for (const RowUpdate& row : rows) {
-    if (firstDraw) {
-      if (row.newText[0] != '\0') Display::printLine(2, row.y, row.newText);
-    } else if (strcmp(row.newText, row.lastBuf) != 0) {
-      int16_t oldW = Display::textWidth(row.lastBuf);
-      int16_t newW = Display::textWidth(row.newText);
+    for (uint8_t i = 0; i < resultShown; i++) {
+      int16_t y = static_cast<int16_t>(resultY + i * lh);
+      Display::printLine(2, y, resultRowsFull[resultStart + i]);
+    }
+    if (hiLine[0] != '\0') Display::printLine(2, hiY, hiLine);
+    g_practiceNeedsFullRedraw = false;
+  } else {
+    if (strcmp(titleLine, g_lastPracticeTitleLine) != 0) {
+      int16_t oldW = Display::textWidth(g_lastPracticeTitleLine);
+      int16_t newW = Display::textWidth(titleLine);
       int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
       int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
       if (eraseW > maxW) eraseW = maxW;
-      Display::tft().fillRect(2, row.y, eraseW, lh, ST77XX_BLACK);
-      if (row.newText[0] != '\0') Display::printLine(2, row.y, row.newText);
+      Display::tft().fillRect(2, titleY, eraseW, lh, ST77XX_BLACK);
+      if (titleLine[0] != '\0') Display::printLine(2, titleY, titleLine);
     }
-    strncpy(row.lastBuf, row.newText, row.lastBufCap - 1);
-    row.lastBuf[row.lastBufCap - 1] = '\0';
+    // Stable layout: each row's own text is diffed independently, so
+    // typing a Morse answer symbol -- or Level 1/2's common case where
+    // nothing here ever wraps -- normally repaints only the one row that
+    // actually changed (Hardware Fix #3's original intent, preserved).
+    for (uint8_t i = 0; i < challengeShown; i++) {
+      int16_t y = static_cast<int16_t>(challengeY + i * lh);
+      if (strcmp(challengeRowsFull[i], g_lastChallengeRowText[i]) != 0) {
+        Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+        if (i == 0 && challengeMarker) Display::printLine(2, y, ">");
+        Display::printLine(contentX, y, challengeRowsFull[i]);
+      }
+    }
+    if (challengeMarker != g_lastPracticeChallengeMarker) {
+      Display::tft().fillRect(2, challengeY, markerW, lh, ST77XX_BLACK);
+      if (challengeMarker) Display::printLine(2, challengeY, ">");
+    }
+    for (uint8_t i = 0; i < answerShown; i++) {
+      int16_t y = static_cast<int16_t>(answerY + i * lh);
+      const char* text = answerRowsFull[answerStart + i];
+      if (strcmp(text, g_lastAnswerRowText[i]) != 0) {
+        Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+        if (i == 0 && answerMarker) Display::printLine(2, y, ">");
+        Display::printLine(contentX, y, text);
+      }
+    }
+    if (answerMarker != g_lastPracticeAnswerMarker) {
+      Display::tft().fillRect(2, answerY, markerW, lh, ST77XX_BLACK);
+      if (answerMarker) Display::printLine(2, answerY, ">");
+    }
+    for (uint8_t i = 0; i < resultShown; i++) {
+      int16_t y = static_cast<int16_t>(resultY + i * lh);
+      const char* text = resultRowsFull[resultStart + i];
+      if (strcmp(text, g_lastResultRowText[i]) != 0) {
+        int16_t oldW = Display::textWidth(g_lastResultRowText[i]);
+        int16_t newW = Display::textWidth(text);
+        int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+        int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+        if (eraseW > maxW) eraseW = maxW;
+        Display::tft().fillRect(2, y, eraseW, lh, ST77XX_BLACK);
+        if (text[0] != '\0') Display::printLine(2, y, text);
+      }
+    }
+    if (strcmp(hiLine, g_lastPracticeHiLine) != 0) {
+      int16_t oldW = Display::textWidth(g_lastPracticeHiLine);
+      int16_t newW = Display::textWidth(hiLine);
+      int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
+      int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
+      if (eraseW > maxW) eraseW = maxW;
+      Display::tft().fillRect(2, hiY, eraseW, lh, ST77XX_BLACK);
+      if (hiLine[0] != '\0') Display::printLine(2, hiY, hiLine);
+    }
   }
+
+  strncpy(g_lastPracticeTitleLine, titleLine, sizeof(g_lastPracticeTitleLine) - 1);
+  g_lastPracticeTitleLine[sizeof(g_lastPracticeTitleLine) - 1] = '\0';
+  strncpy(g_lastPracticeHiLine, hiLine, sizeof(g_lastPracticeHiLine) - 1);
+  g_lastPracticeHiLine[sizeof(g_lastPracticeHiLine) - 1] = '\0';
+  for (uint8_t i = 0; i < challengeShown; i++) {
+    strncpy(g_lastChallengeRowText[i], challengeRowsFull[i], sizeof(g_lastChallengeRowText[i]) - 1);
+    g_lastChallengeRowText[i][sizeof(g_lastChallengeRowText[i]) - 1] = '\0';
+  }
+  for (uint8_t i = 0; i < answerShown; i++) {
+    strncpy(g_lastAnswerRowText[i], answerRowsFull[answerStart + i], sizeof(g_lastAnswerRowText[i]) - 1);
+    g_lastAnswerRowText[i][sizeof(g_lastAnswerRowText[i]) - 1] = '\0';
+  }
+  for (uint8_t i = 0; i < resultShown; i++) {
+    strncpy(g_lastResultRowText[i], resultRowsFull[resultStart + i], sizeof(g_lastResultRowText[i]) - 1);
+    g_lastResultRowText[i][sizeof(g_lastResultRowText[i]) - 1] = '\0';
+  }
+  g_lastPracticeChallengeMarker = challengeMarker;
+  g_lastPracticeAnswerMarker = answerMarker;
+  g_lastChallengeRowCount = challengeShown;
+  g_lastAnswerRowCount = answerShown;
+  g_lastResultRowCount = resultShown;
 }
 
 // Storage::init() runs from setup() after every global constructor has

@@ -10,6 +10,7 @@
 #include "core/input.h"
 #include "core/menu.h"
 #include "core/modes.h"
+#include "core/morse.h"
 #include "core/mqtt_manager.h"
 #include "core/notifications.h"
 #include "core/number_guessing.h"
@@ -519,6 +520,13 @@ void screenFriendRecipient() {
 // =============================================================================
 constexpr uint16_t kNoHistoryCursor = 0xFFFF;
 uint16_t g_historyCursor = kNoHistoryCursor;
+// Which of the selected logical message's own wrapped visual rows is
+// focused (Hardware Fix #4.4 issue D, reusing the Hardware Fix #4.3a
+// design already proven in enigma.cpp/text_message.cpp) -- this screen
+// shows the same unified per-contact thread as Text/Enigma Chat, so a
+// long Text/Enigma message viewed from here needs the identical
+// multi-row viewport treatment, not just a plain message index.
+uint16_t g_historyRowOffset = 0;
 
 bool g_indexDirty = true;
 uint16_t g_indexTotal = 0;
@@ -557,6 +565,174 @@ void drawRowIcon(int16_t x, int16_t y, MessageIconKind icon) {
     case MessageIconKind::NONE:
       break;
   }
+}
+
+// =============================================================================
+// Multi-line history viewport (Hardware Fix #4.4 issue D), reusing the
+// Hardware Fix #4.3a/4.4 design already proven in enigma.cpp/
+// text_message.cpp -- this screen has no compose text of its own (its
+// "compose area" is a fixed hint line, see below), only history, so only
+// that side of the shared design is needed here.
+// =============================================================================
+
+// Matches the identical worst case in text_message.cpp: this thread mixes
+// Text (canonical RAW-Morse expansion, up to kMaxDecodedTextLen chars each
+// expanding to up to Morse::kMaxPatternLength symbol chars + a space),
+// Enigma, and Game (short, templated) messages through the same RenderFn
+// registry, so the buffer must cover the largest of those.
+constexpr size_t kHistoryLineBufCap = PacketCodec::kMaxDecodedTextLen * (Morse::kMaxPatternLength + 1) + 1;
+
+// Single shared static buffer (see text_message.cpp's identical reasoning)
+// -- keeps HistoryRowInfo small regardless of how long a message's
+// canonical-Morse expansion is, safe because this screen's rendering is
+// strictly single-threaded/sequential.
+char g_historyLineBufScratch[kHistoryLineBufCap];
+
+struct HistoryRowInfo {
+  const char* lineBuf;  // points at g_historyLineBufScratch; valid until the next loadHistoryRow() call
+  char senderPrefix[24];
+  MessageIconKind icon;
+  int16_t bodyX;
+  int16_t bodyWidth;
+};
+
+void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
+  out->lineBuf = g_historyLineBufScratch;
+  g_historyLineBufScratch[0] = '?';
+  g_historyLineBufScratch[1] = '\0';
+  out->senderPrefix[0] = '\0';
+  out->icon = MessageIconKind::NONE;
+  const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(index);
+  if (entry != nullptr) {
+    MessageRef ref = refForIndexEntry(*entry);
+    StoredMessageView view;
+    if (MessageStore::loadMessage(ref, &view)) {
+      RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
+      if (renderFn != nullptr) renderFn(view, g_historyLineBufScratch, sizeof(g_historyLineBufScratch));
+      MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
+      MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
+      if (iconFn != nullptr) out->icon = iconFn(view);
+    }
+  }
+  int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+  out->bodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
+  out->bodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->bodyX);
+}
+
+uint16_t countHistoryRows(const HistoryRowInfo& info) {
+  size_t len = strlen(info.lineBuf);
+  if (len == 0) return 1;
+  uint16_t rows = 0;
+  size_t pos = 0;
+  while (pos < len) {
+    uint16_t s, l;
+    if (!Display::wrapLineAt(info.lineBuf, pos, info.bodyWidth, &s, &l)) break;
+    pos = static_cast<size_t>(s) + l;
+    rows++;
+  }
+  return (rows > 0) ? rows : 1;
+}
+
+uint16_t countHistoryRowsFor(uint16_t index, int16_t labelX) {
+  HistoryRowInfo info;
+  loadHistoryRow(index, labelX, &info);
+  return countHistoryRows(info);
+}
+
+// Identical algorithm to enigma.cpp's/text_message.cpp's
+// computeHistoryViewport() (Hardware Fix #4.3a issue 1).
+void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* outStartIdx,
+                            uint16_t* outStartRowSkip) {
+  *outStartIdx = 0;
+  *outStartRowSkip = 0;
+  if (g_indexTotal == 0) return;
+
+  int32_t budget = viewportLines;
+  uint16_t defIdx = 0;
+  uint16_t defSkip = 0;
+  uint16_t idx = g_indexTotal;
+  bool placedAny = false;
+  while (idx > 0) {
+    idx--;
+    uint16_t rows = countHistoryRowsFor(idx, labelX);
+    if (static_cast<int32_t>(rows) <= budget) {
+      budget -= rows;
+      defIdx = idx;
+      defSkip = 0;
+      placedAny = true;
+      if (budget == 0) break;
+    } else {
+      defIdx = idx;
+      defSkip = static_cast<uint16_t>(rows - static_cast<uint16_t>(budget));
+      placedAny = true;
+      break;
+    }
+  }
+  if (!placedAny) {
+    defIdx = 0;
+    defSkip = 0;
+  }
+
+  if (g_historyCursor == kNoHistoryCursor) {
+    *outStartIdx = defIdx;
+    *outStartRowSkip = defSkip;
+    return;
+  }
+
+  if (g_historyCursor < defIdx || (g_historyCursor == defIdx && g_historyRowOffset < defSkip)) {
+    *outStartIdx = g_historyCursor;
+    *outStartRowSkip = g_historyRowOffset;
+    return;
+  }
+
+  int32_t rowsBefore;
+  {
+    HistoryRowInfo first;
+    loadHistoryRow(defIdx, labelX, &first);
+    if (defIdx == g_historyCursor) {
+      rowsBefore = static_cast<int32_t>(g_historyRowOffset) - static_cast<int32_t>(defSkip);
+    } else {
+      rowsBefore = static_cast<int32_t>(countHistoryRows(first)) - static_cast<int32_t>(defSkip);
+      for (uint16_t i = static_cast<uint16_t>(defIdx + 1); i < g_historyCursor; i++) {
+        rowsBefore += countHistoryRowsFor(i, labelX);
+      }
+      rowsBefore += g_historyRowOffset;
+    }
+  }
+
+  if (rowsBefore < static_cast<int32_t>(viewportLines)) {
+    *outStartIdx = defIdx;
+    *outStartRowSkip = defSkip;
+    return;
+  }
+
+  uint16_t curIdx = defIdx;
+  uint16_t curSkip = defSkip;
+  while (rowsBefore >= static_cast<int32_t>(viewportLines)) {
+    uint16_t rows = countHistoryRowsFor(curIdx, labelX);
+    if (static_cast<uint16_t>(curSkip + 1) < rows) {
+      curSkip++;
+    } else {
+      curIdx++;
+      curSkip = 0;
+    }
+    rowsBefore--;
+  }
+  *outStartIdx = curIdx;
+  *outStartRowSkip = curSkip;
+}
+
+int16_t historyRowY(uint16_t startIdx, uint16_t startRowSkip, uint16_t targetIdx, uint16_t targetRowIdx,
+                    int16_t labelX, int16_t contentTop, int16_t lh) {
+  int32_t rows = 0;
+  for (uint16_t i = startIdx; i <= targetIdx; i++) {
+    HistoryRowInfo info;
+    loadHistoryRow(i, labelX, &info);
+    uint16_t skip = (i == startIdx) ? startRowSkip : 0;
+    uint16_t limit = (i == targetIdx) ? targetRowIdx : countHistoryRows(info);
+    if (limit > skip) rows += static_cast<int32_t>(limit - skip);
+  }
+  return static_cast<int16_t>(contentTop + rows * lh);
 }
 
 void dispatchHistoryMessageEvent(const MessageStore::ConversationIndexEntry& entry, MessageEventType eventType) {
@@ -600,18 +776,27 @@ void handleFriendChatEvent(const InputEvent& e) {
 bool g_friendChatDirty = true;
 bool g_friendChatNeedsFullRedraw = true;
 int16_t g_friendChatLastStartIdx = -1;
+int16_t g_friendChatLastStartRowSkip = -1;
 uint16_t g_friendChatLastCursor = kNoHistoryCursor;
+uint16_t g_friendChatLastRowOffset = 0;
+constexpr uint16_t kNoViewportLines = 0xFFFF;
+uint16_t g_friendChatLastViewportLines = kNoViewportLines;
 bool g_friendChatLastHintNoCursor = true;
 char g_friendChatLastHintText[40] = {0};
 
 void screenFriendChat() {
   if (Menu::consumeJustEntered()) {
     g_historyCursor = kNoHistoryCursor;
+    g_historyRowOffset = 0;
     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
     markIndexDirty();
     g_friendChatDirty = true;
     g_friendChatNeedsFullRedraw = true;
   }
+
+  // Needed before input handling below (Hardware Fix #4.4 issue D): see
+  // the identical reasoning in enigma.cpp/text_message.cpp.
+  Display::setFont(Display::Font::PRIMARY);
 
   Input::update();
   InputEvent e;
@@ -620,15 +805,36 @@ void screenFriendChat() {
     hadEvent = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
       refreshIndexIfNeeded();
+      // Hardware Fix #4.4 issue D: identical to enigma.cpp's/
+      // text_message.cpp's ENCODER_ROTATE handler (Hardware Fix #4.3a
+      // issue 1) -- steps through the focused message's own rows before
+      // moving to the next/previous logical message.
+      int16_t rotMarkerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+      int16_t rotLabelX = static_cast<int16_t>(2 + rotMarkerW);
       if (g_historyCursor == kNoHistoryCursor) {
-        if (e.value < 0 && g_indexTotal > 0) g_historyCursor = static_cast<uint16_t>(g_indexTotal - 1);
+        if (e.value < 0 && g_indexTotal > 0) {
+          g_historyCursor = static_cast<uint16_t>(g_indexTotal - 1);
+          uint16_t rows = countHistoryRowsFor(g_historyCursor, rotLabelX);
+          g_historyRowOffset = static_cast<uint16_t>((rows > 0) ? rows - 1 : 0);
+        }
       } else if (e.value < 0) {
-        if (g_historyCursor > 0) g_historyCursor--;
+        if (g_historyRowOffset > 0) {
+          g_historyRowOffset--;
+        } else if (g_historyCursor > 0) {
+          g_historyCursor--;
+          uint16_t rows = countHistoryRowsFor(g_historyCursor, rotLabelX);
+          g_historyRowOffset = static_cast<uint16_t>((rows > 0) ? rows - 1 : 0);
+        }
       } else {
-        if (g_historyCursor + 1 >= g_indexTotal) {
+        uint16_t rows = countHistoryRowsFor(g_historyCursor, rotLabelX);
+        if (static_cast<uint16_t>(g_historyRowOffset + 1) < rows) {
+          g_historyRowOffset++;
+        } else if (g_historyCursor + 1 >= g_indexTotal) {
           g_historyCursor = kNoHistoryCursor;
+          g_historyRowOffset = 0;
         } else {
           g_historyCursor++;
+          g_historyRowOffset = 0;
         }
       }
     } else {
@@ -645,76 +851,88 @@ void screenFriendChat() {
   if (!g_friendChatDirty) return;
   g_friendChatDirty = false;
 
-  Display::setFont(Display::Font::PRIMARY);
+  // Font was already set to PRIMARY above (before input handling).
   int16_t lh = Display::lineHeight();
 
   int16_t contentTop = Display::kStatusBarHeight + 2;
   int16_t contentHeight = Display::kScreenHeight - contentTop;
   uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
   if (totalLines < 2) totalLines = 2;
-  uint16_t viewportLines = static_cast<uint16_t>(totalLines - 1);
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);
+  uint16_t viewportLines = static_cast<uint16_t>(totalLines - 1);  // -1 = fixed hint-line row
 
   uint16_t startIdx = 0;
-  if (g_indexTotal > viewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - viewportLines);
-  if (g_historyCursor != kNoHistoryCursor) {
-    if (g_historyCursor < startIdx) {
-      startIdx = g_historyCursor;
-    } else if (g_historyCursor >= startIdx + viewportLines) {
-      startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
-    }
-  }
+  uint16_t startRowSkip = 0;
+  computeHistoryViewport(viewportLines, labelX, &startIdx, &startRowSkip);
   int16_t hintY = static_cast<int16_t>(contentTop + viewportLines * lh);
 
   bool firstDraw = g_friendChatNeedsFullRedraw;
-  bool contentChanged = !firstDraw && wasIndexDirty;
-  bool scrolled = !firstDraw && !contentChanged && (static_cast<int16_t>(startIdx) != g_friendChatLastStartIdx);
-  bool selectionOnlyChanged =
-      !firstDraw && !contentChanged && !scrolled && (g_historyCursor != g_friendChatLastCursor);
+  // Any change to how many rows the history viewport has means every Y
+  // coordinate below the status bar shifted (Hardware Fix #4.4 issue D).
+  bool historyLayoutChanged = firstDraw || (viewportLines != g_friendChatLastViewportLines);
+  bool contentChanged = !historyLayoutChanged && wasIndexDirty;
+  bool scrolled = !historyLayoutChanged && !contentChanged &&
+                  (static_cast<int16_t>(startIdx) != g_friendChatLastStartIdx ||
+                   static_cast<int16_t>(startRowSkip) != g_friendChatLastStartRowSkip);
+  bool selectionOnlyChanged = !historyLayoutChanged && !contentChanged && !scrolled &&
+                              (g_historyCursor != g_friendChatLastCursor ||
+                               g_historyRowOffset != g_friendChatLastRowOffset);
 
-  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-  int16_t labelX = static_cast<int16_t>(2 + markerW);
-
-  if (firstDraw || contentChanged || scrolled) {
-    if (firstDraw) {
+  if (historyLayoutChanged || contentChanged || scrolled) {
+    if (historyLayoutChanged) {
       Display::clearContentArea();
     } else {
       int16_t regionH = static_cast<int16_t>(hintY - contentTop);
       if (regionH < 0) regionH = 0;
       Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
+    // Hardware Fix #4.4 issue D: streams each message's rows on demand via
+    // Display::wrapLineAt() instead of a fixed-size lineBuf[48] -- see the
+    // identical draw loop in enigma.cpp/text_message.cpp.
     int16_t y = contentTop;
-    for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
-      const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
-      if (entry == nullptr) continue;
-      MessageRef ref = refForIndexEntry(*entry);
-      StoredMessageView view;
-      char lineBuf[48] = "?";
-      char senderPrefix[24] = {0};
-      MessageIconKind icon = MessageIconKind::NONE;
-      if (MessageStore::loadMessage(ref, &view)) {
-        RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-        if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
-        MessageStore::buildSenderPrefix(view.envelope, senderPrefix, sizeof(senderPrefix));
-        MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
-        if (iconFn != nullptr) icon = iconFn(view);
+    uint16_t rowsDrawn = 0;
+    for (uint16_t i = startIdx; i < g_indexTotal && rowsDrawn < viewportLines; i++) {
+      HistoryRowInfo info;
+      loadHistoryRow(i, labelX, &info);
+      uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;
+      size_t len = strlen(info.lineBuf);
+      size_t pos = 0;
+      uint16_t rowIdx = 0;
+      while (rowsDrawn < viewportLines) {
+        uint16_t s = 0, l = 0;
+        bool has = (len == 0) ? (rowIdx == 0) : Display::wrapLineAt(info.lineBuf, pos, info.bodyWidth, &s, &l);
+        if (!has) break;
+        if (rowIdx >= rowSkip) {
+          if (rowIdx == 0) {
+            drawRowIcon(labelX, y, info.icon);
+            int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+            Display::printLine(textX, y, info.senderPrefix);
+          }
+          if (i == g_historyCursor && rowIdx == g_historyRowOffset) Display::printLine(2, y, ">");
+          char lineChunk[Display::kPrintLineBufferSize];
+          size_t clen = l;
+          if (clen > Display::kPrintLineMaxChars) clen = Display::kPrintLineMaxChars;
+          memcpy(lineChunk, info.lineBuf + s, clen);
+          lineChunk[clen] = '\0';
+          Display::printLine(info.bodyX, y, lineChunk);
+          y = static_cast<int16_t>(y + lh);
+          rowsDrawn++;
+        }
+        if (len == 0) break;
+        pos = static_cast<size_t>(s) + l;
+        rowIdx++;
       }
-      if (i == g_historyCursor) Display::printLine(2, y, ">");
-      // Icon cell reserved on every row so sender names stay X-aligned in
-      // a thread that mixes Enigma rows (icon) with Text/Game rows (none).
-      drawRowIcon(labelX, y, icon);
-      int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-      Display::printLine(textX, y, senderPrefix);
-      Display::printLine(static_cast<int16_t>(textX + Display::textWidth(senderPrefix)), y, lineBuf);
-      y += lh;
     }
     g_friendChatNeedsFullRedraw = false;
-  } else if (selectionOnlyChanged) {
+  } else if (selectionOnlyChanged && viewportLines > 0) {
     if (g_friendChatLastCursor != kNoHistoryCursor) {
-      int16_t oldY = static_cast<int16_t>(contentTop + (g_friendChatLastCursor - startIdx) * lh);
+      int16_t oldY =
+          historyRowY(startIdx, startRowSkip, g_friendChatLastCursor, g_friendChatLastRowOffset, labelX, contentTop, lh);
       Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
     }
     if (g_historyCursor != kNoHistoryCursor) {
-      int16_t newY = static_cast<int16_t>(contentTop + (g_historyCursor - startIdx) * lh);
+      int16_t newY = historyRowY(startIdx, startRowSkip, g_historyCursor, g_historyRowOffset, labelX, contentTop, lh);
       Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
       Display::printLine(2, newY, ">");
     }
@@ -727,8 +945,8 @@ void screenFriendChat() {
   bool hintFocused = (g_historyCursor == kNoHistoryCursor);
   bool hintTextChanged = strcmp(hintText, g_friendChatLastHintText) != 0;
   bool hintFocusChanged = hintFocused != g_friendChatLastHintNoCursor;
-  if (firstDraw || hintTextChanged) {
-    if (!firstDraw) Display::tft().fillRect(0, hintY, Display::kScreenWidth, lh, ST77XX_BLACK);
+  if (historyLayoutChanged || hintTextChanged) {
+    if (!historyLayoutChanged) Display::tft().fillRect(0, hintY, Display::kScreenWidth, lh, ST77XX_BLACK);
     Display::printLine(labelX, hintY, hintText);
     if (hintFocused) Display::printLine(2, hintY, ">");
     strncpy(g_friendChatLastHintText, hintText, sizeof(g_friendChatLastHintText) - 1);
@@ -739,8 +957,11 @@ void screenFriendChat() {
   }
   g_friendChatLastHintNoCursor = hintFocused;
 
+  g_friendChatLastViewportLines = viewportLines;
   g_friendChatLastStartIdx = static_cast<int16_t>(startIdx);
+  g_friendChatLastStartRowSkip = static_cast<int16_t>(startRowSkip);
   g_friendChatLastCursor = g_historyCursor;
+  g_friendChatLastRowOffset = g_historyRowOffset;
 }
 
 // =============================================================================

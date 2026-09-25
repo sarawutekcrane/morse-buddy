@@ -161,7 +161,7 @@ int16_t textWidth(const char* text) {
 }
 
 void printLine(int16_t x, int16_t topY, const char* text) {
-  char buf[64];
+  char buf[kPrintLineBufferSize];
   strncpy(buf, text, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
 
@@ -185,19 +185,30 @@ bool wrapLineAt(const char* text, size_t from, int16_t maxWidthPx, uint16_t* out
   if (text == nullptr || maxWidthPx <= 0) return false;
   size_t len = strlen(text);
   size_t pos = from;
+  // A wrap boundary normalizes away the one space that would otherwise be
+  // the redundant last character of the previous line (same convention as
+  // any word-wrapping renderer); it never drops a non-space character, and
+  // never touches an intentional multi-character token (e.g. Enigma RAW
+  // mode's "/" word-gap marker is its own character, untouched here).
   while (pos < len && text[pos] == ' ') pos++;
   if (pos >= len) return false;
 
   // Scratch buffer for width-measuring a candidate line via
-  // getTextBounds(), which needs a null-terminated string. 48 matches
-  // printLine()'s own clip buffer -- comfortably wider than any line that
-  // could actually fit inside kScreenWidth in either font.
-  constexpr size_t kScratch = 48;
+  // getTextBounds(), which needs a null-terminated string. Hardware Fix
+  // #4.4 issue A: this MUST equal kPrintLineBufferSize, not some smaller
+  // guessed size -- widthOf() below refuses to report a verdict for any
+  // span it cannot measure in full (rather than silently measuring a
+  // truncated prefix and reporting THAT width), so kScratch is also the
+  // hard ceiling on how long a returned span can ever be. Keeping it in
+  // lock-step with printLine()'s own buffer is what guarantees a caller
+  // that copies exactly *outLen bytes into a kPrintLineBufferSize buffer
+  // and calls printLine() can never have any of those bytes clipped.
+  constexpr size_t kScratch = kPrintLineBufferSize;
   char scratch[kScratch];
   auto widthOf = [&](size_t start, size_t count) -> int16_t {
-    size_t c = (count >= kScratch) ? kScratch - 1 : count;
-    memcpy(scratch, text + start, c);
-    scratch[c] = '\0';
+    if (count > kScratch - 1) return INT16_MAX;  // can't measure the whole span -- never claim it fits
+    memcpy(scratch, text + start, count);
+    scratch[count] = '\0';
     return textWidth(scratch);
   };
 
@@ -215,14 +226,25 @@ bool wrapLineAt(const char* text, size_t from, int16_t maxWidthPx, uint16_t* out
       continue;
     }
     if (lineEnd > lineStart) break;  // an earlier word already fit -- stop the line there
-    // Not even the first word fits: hard-split it by character so it is
-    // never dropped, only spread across more lines.
+    // Not even the first word fits within maxWidthPx (or it's simply too
+    // long to ever measure/draw as one span) -- hard-split it by character
+    // so it is never dropped, only spread across more lines. widthOf()'s
+    // own kPrintLineMaxChars ceiling bounds `chars` the same way it bounds
+    // the word-fit check above, so this can never grow past what
+    // printLine() can draw in full either.
     size_t chars = 1;
     while (lineStart + chars < wordEnd && widthOf(lineStart, chars + 1) <= maxWidthPx) chars++;
     lineEnd = lineStart + chars;
     break;
   }
   if (lineEnd <= lineStart) lineEnd = lineStart + 1;  // guarantee forward progress
+  if (lineEnd - lineStart > kPrintLineMaxChars) {
+    // Belt-and-suspenders: no path above should reach this (every accepted
+    // span was itself verified to measure at <= kPrintLineMaxChars bytes),
+    // but never return a span longer than what printLine() can draw in
+    // full, whatever the reason.
+    lineEnd = lineStart + kPrintLineMaxChars;
+  }
 
   *outStart = static_cast<uint16_t>(lineStart);
   *outLen = static_cast<uint16_t>(lineEnd - lineStart);

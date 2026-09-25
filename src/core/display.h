@@ -61,11 +61,22 @@ Font currentFont();
 // hardcoded), so callers never need to know exact glyph dimensions.
 int16_t lineHeight();
 
+// Single explicit source of truth (Hardware Fix #4.4 issue A) for the
+// longest byte span printLine() can ever draw in full: its internal
+// working buffer is exactly this size, so any caller -- including
+// wrapLineAt()/wrapText() below -- that keeps its own spans/copies at or
+// under kPrintLineMaxChars bytes is guaranteed nothing it hands to
+// printLine() can be silently clipped.
+constexpr size_t kPrintLineBufferSize = 64;
+constexpr size_t kPrintLineMaxChars = kPrintLineBufferSize - 1;
+
 // Prints one line of text with its TOP-LEFT corner at (x, topY), using
 // whichever font is currently active -- handles the COMPACT-vs-PRIMARY
 // baseline difference internally. Clips (truncates, never wraps) so the
 // drawn text never extends past kScreenWidth, regardless of font or
-// string length.
+// string length; also clips to kPrintLineMaxChars bytes regardless of
+// pixel width, so pass at most that many bytes if the full text must
+// actually be drawn (see kPrintLineMaxChars above).
 void printLine(int16_t x, int16_t topY, const char* text);
 
 // Pixel width `text` would occupy in the currently active font -- for
@@ -95,7 +106,10 @@ void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
 // lines than maxLines, the text beyond the last produced line is simply
 // not represented in the output -- callers that need "show the most
 // recent lines" call this with a generous maxLines to get the full
-// breakdown, then window the result themselves.
+// breakdown, then window the result themselves. Every returned span is at
+// most kPrintLineMaxChars bytes (see wrapLineAt() below) -- a run of text
+// too long or too narrow-glyphed to naturally break within that many
+// bytes is wrapped early rather than ever exceeding it.
 uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint16_t* outLens, uint8_t maxLines);
 
 // Streaming counterpart to wrapText() (Hardware Fix #4.3a issue 1): computes
@@ -107,6 +121,19 @@ uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint
 // sized to a worst-case row count, so a message's true length (bounded only
 // by its own existing storage capacity) can never be silently capped by an
 // unrelated, guessed array size.
+//
+// *outLen is ALWAYS <= kPrintLineMaxChars (Hardware Fix #4.4 issue A): a
+// candidate span is only ever accepted as "fits" after its FULL width (up
+// to kPrintLineMaxChars bytes) was actually measured, never a truncated
+// prefix of a longer span -- so a caller that copies exactly *outLen bytes
+// starting at *outStart into a kPrintLineBufferSize-or-larger buffer and
+// hands it to printLine() is guaranteed the whole span is drawn, and that
+// advancing `from` by *outLen for the next call can never skip over bytes
+// that were never actually drawn. A span that would otherwise need to
+// exceed kPrintLineMaxChars (an unbroken run of text, or many narrow
+// glyphs that would still fit maxWidthPx past that many bytes) is wrapped
+// early at that byte boundary instead -- preferring an earlier break to
+// ever losing or silently truncating text.
 bool wrapLineAt(const char* text, size_t from, int16_t maxWidthPx, uint16_t* outStart, uint16_t* outLen);
 
 }  // namespace Display

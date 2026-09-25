@@ -1695,9 +1695,13 @@ void screenEnigmaChat() {
           // range for the selected message -- it may be a continuation row
           // when that message's true row 0 has been scrolled off.
           if (i == g_historyCursor && rowIdx == g_historyRowOffset) Display::printLine(2, y, ">");
-          char lineChunk[64];
+          // Hardware Fix #4.4 issue F: Display::wrapLineAt() guarantees
+          // l <= kPrintLineMaxChars for any span it returns, so this clamp
+          // can never actually trigger -- kept only as defense-in-depth,
+          // tied to the shared constant rather than a magic 64.
+          char lineChunk[Display::kPrintLineBufferSize];
           size_t clen = l;
-          if (clen >= sizeof(lineChunk)) clen = sizeof(lineChunk) - 1;
+          if (clen > Display::kPrintLineMaxChars) clen = Display::kPrintLineMaxChars;
           memcpy(lineChunk, info.lineBuf + s, clen);
           lineChunk[clen] = '\0';
           Display::printLine(info.bodyX, y, lineChunk);
