@@ -194,8 +194,15 @@ bool g_ownRadioAvailable = true;
 
 void buildPayload(char* out, size_t outSize, const char* status) {
   uint32_t ts = WifiManager::getUnixTime();
-  snprintf(out, outSize, "MBP1|%s|%s|%s|%d|%lu", Identity::deviceId(), Settings::getMyName(), status,
-           g_ownRadioAvailable ? 1 : 0, static_cast<unsigned long>(ts));
+  // Hardware Fix #4.3a issue 2: same fallback policy as
+  // MessageStore::buildSenderPrefix()/Presence::resolveDisplayName()'s self
+  // branch -- a never-configured device broadcasts its own device id in
+  // this field instead of the compiled "Me" placeholder, so remote devices
+  // never cache and display "Me" as if it were this device's chosen name.
+  // Packet format (field count/order/delimiters) is unchanged.
+  const char* name = Settings::hasCustomMyName() ? Settings::getMyName() : Identity::deviceId();
+  snprintf(out, outSize, "MBP1|%s|%s|%s|%d|%lu", Identity::deviceId(), name, status, g_ownRadioAvailable ? 1 : 0,
+           static_cast<unsigned long>(ts));
 }
 
 void publishStatus(const char* group_code, const char* status) {

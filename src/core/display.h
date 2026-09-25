@@ -98,4 +98,15 @@ void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
 // breakdown, then window the result themselves.
 uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint16_t* outLens, uint8_t maxLines);
 
+// Streaming counterpart to wrapText() (Hardware Fix #4.3a issue 1): computes
+// just the ONE wrapped line starting at byte offset `from` in `text`, using
+// the identical greedy word-wrap / hard-split rules, and writes its span to
+// *outStart/*outLen. Returns false (nothing written) once `from` is at or
+// past the end of `text`. Callers stream through arbitrarily long text --
+// advancing `from` by *outLen each call -- without needing an output array
+// sized to a worst-case row count, so a message's true length (bounded only
+// by its own existing storage capacity) can never be silently capped by an
+// unrelated, guessed array size.
+bool wrapLineAt(const char* text, size_t from, int16_t maxWidthPx, uint16_t* outStart, uint16_t* outLen);
+
 }  // namespace Display

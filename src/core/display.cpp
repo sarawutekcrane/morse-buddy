@@ -181,10 +181,12 @@ void printLine(int16_t x, int16_t topY, const char* text) {
   g_tft.print(buf);
 }
 
-uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint16_t* outLens, uint8_t maxLines) {
-  if (text == nullptr || maxLines == 0 || maxWidthPx <= 0) return 0;
+bool wrapLineAt(const char* text, size_t from, int16_t maxWidthPx, uint16_t* outStart, uint16_t* outLen) {
+  if (text == nullptr || maxWidthPx <= 0) return false;
   size_t len = strlen(text);
-  if (len == 0) return 0;
+  size_t pos = from;
+  while (pos < len && text[pos] == ' ') pos++;
+  if (pos >= len) return false;
 
   // Scratch buffer for width-measuring a candidate line via
   // getTextBounds(), which needs a null-terminated string. 48 matches
@@ -199,38 +201,45 @@ uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint
     return textWidth(scratch);
   };
 
+  size_t lineStart = pos;
+  size_t lineEnd = lineStart;
+  size_t wordScan = lineStart;
+
+  while (wordScan <= len) {
+    size_t wordEnd = wordScan;
+    while (wordEnd < len && text[wordEnd] != ' ') wordEnd++;
+    if (widthOf(lineStart, wordEnd - lineStart) <= maxWidthPx) {
+      lineEnd = wordEnd;
+      if (wordEnd >= len) break;
+      wordScan = wordEnd + 1;
+      continue;
+    }
+    if (lineEnd > lineStart) break;  // an earlier word already fit -- stop the line there
+    // Not even the first word fits: hard-split it by character so it is
+    // never dropped, only spread across more lines.
+    size_t chars = 1;
+    while (lineStart + chars < wordEnd && widthOf(lineStart, chars + 1) <= maxWidthPx) chars++;
+    lineEnd = lineStart + chars;
+    break;
+  }
+  if (lineEnd <= lineStart) lineEnd = lineStart + 1;  // guarantee forward progress
+
+  *outStart = static_cast<uint16_t>(lineStart);
+  *outLen = static_cast<uint16_t>(lineEnd - lineStart);
+  return true;
+}
+
+uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint16_t* outLens, uint8_t maxLines) {
+  if (text == nullptr || maxLines == 0) return 0;
   uint8_t lineCount = 0;
   size_t pos = 0;
-  while (pos < len && lineCount < maxLines) {
-    while (pos < len && text[pos] == ' ') pos++;
-    if (pos >= len) break;
-    size_t lineStart = pos;
-    size_t lineEnd = lineStart;
-    size_t wordScan = lineStart;
-
-    while (wordScan <= len) {
-      size_t wordEnd = wordScan;
-      while (wordEnd < len && text[wordEnd] != ' ') wordEnd++;
-      if (widthOf(lineStart, wordEnd - lineStart) <= maxWidthPx) {
-        lineEnd = wordEnd;
-        if (wordEnd >= len) break;
-        wordScan = wordEnd + 1;
-        continue;
-      }
-      if (lineEnd > lineStart) break;  // an earlier word already fit -- stop the line there
-      // Not even the first word fits: hard-split it by character so it is
-      // never dropped, only spread across more lines.
-      size_t chars = 1;
-      while (lineStart + chars < wordEnd && widthOf(lineStart, chars + 1) <= maxWidthPx) chars++;
-      lineEnd = lineStart + chars;
-      break;
-    }
-    if (lineEnd <= lineStart) lineEnd = lineStart + 1;  // guarantee forward progress
-
-    outStarts[lineCount] = static_cast<uint16_t>(lineStart);
-    outLens[lineCount] = static_cast<uint16_t>(lineEnd - lineStart);
+  while (lineCount < maxLines) {
+    uint16_t s, l;
+    if (!wrapLineAt(text, pos, maxWidthPx, &s, &l)) break;
+    outStarts[lineCount] = s;
+    outLens[lineCount] = l;
     lineCount++;
-    pos = lineEnd;
+    pos = static_cast<size_t>(s) + l;
   }
   return lineCount;
 }
