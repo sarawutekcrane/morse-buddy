@@ -113,26 +113,128 @@ volatile uint8_t g_encIsrLastState = 0;
 volatile int8_t g_encIsrSubAccum = 0;        // raw transition-table accumulation between whole detents
 volatile int32_t g_encIsrPendingDetents = 0;  // net whole detents not yet drained by update()
 
+// ---------------------------------------------------------------------------
+// TEMPORARY encoder raw-transition diagnostic (observation only).
+//
+// Records every raw quadrature transition the ISR observes into a small
+// fixed ring buffer, purely so Input::update() (normal task context) can
+// print it over Serial afterwards for hardware analysis. This is wired
+// in PARALLEL to the production dir/sub-accum/pending-detent logic below
+// -- it reads the same locals the production logic already computed
+// after that logic has fully run, and does not alter, gate, delay, or
+// feed back into any of it in any way. Remove this whole block (and its
+// two call sites) once the mechanical encoder investigation is done.
+//
+// The ISR side only writes plain fields into a fixed array and bumps a
+// count under the same critical section already used above -- no
+// Serial/millis()/delay()/heap/Display/MQTT/NVS calls.
+// ---------------------------------------------------------------------------
+struct EncoderDiagRecord {
+  uint8_t prevState;
+  uint8_t currState;
+  int8_t tableDir;
+  int8_t subAccumAfter;
+  int8_t wholeDetent;  // -1, 0, +1
+};
+
+constexpr uint8_t kEncoderDiagCap = 128;
+EncoderDiagRecord g_encDiagBuf[kEncoderDiagCap];  // contents only ever touched under g_encMux
+volatile uint8_t g_encDiagHead = 0;               // next slot the ISR will write
+volatile uint8_t g_encDiagCount = 0;              // unread records waiting to be drained
+volatile uint32_t g_encDiagDropped = 0;           // records lost because the ring was full
+
 void IRAM_ATTR onEncoderChangeIsr() {
   uint8_t clk = digitalRead(Pins::kEncoderClk) == HIGH ? 1 : 0;
   uint8_t dt = digitalRead(Pins::kEncoderDt) == HIGH ? 1 : 0;
   uint8_t curr = static_cast<uint8_t>((clk << 1) | dt);
 
   portENTER_CRITICAL_ISR(&g_encMux);
+  uint8_t prevState = g_encIsrLastState;
   uint8_t idx = static_cast<uint8_t>((g_encIsrLastState << 2) | curr);
   g_encIsrLastState = curr;
   int8_t dir = kQuadratureTable[idx & 0x0F];
+  int8_t wholeDetent = 0;
   if (dir != 0) {
     g_encIsrSubAccum = static_cast<int8_t>(g_encIsrSubAccum + dir);
     if (g_encIsrSubAccum >= kDetentTransitions) {
       g_encIsrSubAccum = 0;
       g_encIsrPendingDetents++;
+      wholeDetent = 1;
     } else if (g_encIsrSubAccum <= -kDetentTransitions) {
       g_encIsrSubAccum = 0;
       g_encIsrPendingDetents--;
+      wholeDetent = -1;
     }
   }
+
+  // Diagnostic capture only, appended after the production decision above
+  // has already fully executed; it observes the outcome, it does not
+  // participate in producing it.
+  if (g_encDiagCount < kEncoderDiagCap) {
+    uint8_t slot = g_encDiagHead;
+    g_encDiagBuf[slot].prevState = prevState;
+    g_encDiagBuf[slot].currState = curr;
+    g_encDiagBuf[slot].tableDir = dir;
+    g_encDiagBuf[slot].subAccumAfter = g_encIsrSubAccum;
+    g_encDiagBuf[slot].wholeDetent = wholeDetent;
+    g_encDiagHead = static_cast<uint8_t>((slot + 1) % kEncoderDiagCap);
+    g_encDiagCount++;
+  } else {
+    g_encDiagDropped++;
+  }
   portEXIT_CRITICAL_ISR(&g_encMux);
+}
+
+// Drains and prints whatever raw transition records the ISR captured since
+// the last call. Runs entirely in normal task context (called from
+// Input::update()) -- the ring is snapshotted into a local buffer under
+// the same critical section the ISR uses, then Serial is written only
+// after the section is released, so the ISR is never blocked on Serial
+// I/O. Observation only: never touches g_encIsrSubAccum/
+// g_encIsrPendingDetents/g_encIsrLastState.
+void drainEncoderDiagnostics() {
+  EncoderDiagRecord localBuf[kEncoderDiagCap];
+  uint8_t count;
+  uint32_t dropped;
+
+  portENTER_CRITICAL(&g_encMux);
+  count = g_encDiagCount;
+  uint8_t oldest = static_cast<uint8_t>((g_encDiagHead + kEncoderDiagCap - count) % kEncoderDiagCap);
+  for (uint8_t i = 0; i < count; i++) {
+    localBuf[i] = g_encDiagBuf[(oldest + i) % kEncoderDiagCap];
+  }
+  g_encDiagCount = 0;
+  dropped = g_encDiagDropped;
+  g_encDiagDropped = 0;
+  portEXIT_CRITICAL(&g_encMux);
+
+  for (uint8_t i = 0; i < count; i++) {
+    const EncoderDiagRecord& r = localBuf[i];
+    Serial.print("ENC ");
+    Serial.print(r.prevState);
+    Serial.print('>');
+    Serial.print(r.currState);
+    Serial.print(" dir=");
+    if (r.tableDir > 0) Serial.print('+');
+    Serial.print(r.tableDir);
+    Serial.print(" sub=");
+    if (r.subAccumAfter > 0) Serial.print('+');
+    Serial.print(r.subAccumAfter);
+    Serial.print(" step=");
+    if (r.wholeDetent > 0) Serial.print('+');
+    Serial.print(r.wholeDetent);
+    if (r.prevState == r.currState) {
+      Serial.print(" REPEAT");
+    } else if (r.tableDir == 0) {
+      Serial.print(" INVALID");
+    }
+    Serial.println();
+  }
+
+  if (dropped > 0) {
+    Serial.print("ENC_DIAG_DROP=");
+    Serial.println(dropped);
+  }
 }
 
 // Drains whatever whole detents the ISR has accumulated since the last
@@ -300,6 +402,7 @@ void update() {
   updateDebounce(g_dot, now);
   updateDebounce(g_encSw, now);
   drainQuadrature();
+  drainEncoderDiagnostics();  // TEMPORARY: raw quadrature diagnostic (observation only)
 
   updateDotStateMachine(now);
   updateEncoderSwStateMachine(now);
