@@ -87,18 +87,33 @@ DebouncedButton g_encSw{Pins::kEncoderSw};
 // structurally by the transition table itself -- kQuadratureTable only
 // returns +-1 for the two valid forward/backward Gray-code steps from
 // each state; any other observed transition (including a bounce that
-// jumps to a non-adjacent or repeated state) yields 0 and is ignored, so
-// a single physical detent's bounce cannot accumulate into a second
-// logical step. Grouping 4 valid transitions into one logical detent
-// (kDetentTransitions) is unchanged from before, preserving the existing
-// CW/CCW direction semantics and one-physical-detent-per-logical-step
-// behavior.
+// jumps to a non-adjacent or repeated state) yields 0. CW/CCW direction
+// semantics (+1/-1) and kDetentTransitions (4 valid transitions per
+// logical detent) are unchanged from before.
 //
 // kQuadratureTable is DRAM_ATTR (not left in flash-mapped .rodata) and
 // the ISR itself is IRAM_ATTR, so both the code and the data it reads
 // remain safely accessible even if the ISR fires while flash access is
 // briefly unavailable (e.g. during an NVS commit) -- standard ESP32
 // GPIO-ISR safety practice.
+//
+// Hardware Fix #4.5 (TEMPORARY validation): real-hardware raw diagnostic
+// captures (see the Fix4.3a/#4.3 raw-transition ring, parent commit
+// baeab293) proved the original free-running +/-4 accumulator had two
+// bugs: (1) a genuine physical detent can finish with a sampled two-bit
+// "skipped" transition straight back to REST (observed: 0->3, tableDir
+// ==0) that the old decoder simply discarded, silently dropping a real
+// click; (2) because the accumulator was only ever reset when IT ITSELF
+// reached +/-4, that dropped click's partial count survived into the
+// NEXT physical detent and corrupted it. The decoder below is now
+// detent-bound instead of free-running: a candidate detent only exists
+// between leaving the measured rest state (CLK=HIGH, DT=HIGH == state 3)
+// and returning to it, and returning to rest -- by any means, including
+// the confirmed skipped-transition case -- is an unconditional boundary
+// that always resets the accumulator to 0, so a corrupted or partial
+// detent can never bleed into the next one. This changes only how those
+// 4 transitions are grouped into a detent; the table, the CW=+1/CCW=-1
+// convention, and kDetentTransitions itself are unchanged.
 // ---------------------------------------------------------------------------
 DRAM_ATTR const int8_t kQuadratureTable[16] = {
     0, -1, 1, 0,
@@ -107,11 +122,16 @@ DRAM_ATTR const int8_t kQuadratureTable[16] = {
     0, 1, -1, 0,
 };
 constexpr int8_t kDetentTransitions = 4;
+constexpr uint8_t kEncoderRestState = 3;    // measured rest/detent state: CLK HIGH, DT HIGH
+constexpr int8_t kRecoveryMinEvidence = 2;  // min |subAccum| trusted to recover a skipped-transition return-to-rest
 
 portMUX_TYPE g_encMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t g_encIsrLastState = 0;
-volatile int8_t g_encIsrSubAccum = 0;        // raw transition-table accumulation between whole detents
+volatile int8_t g_encIsrSubAccum = 0;        // directional evidence accumulated within the CURRENT cycle only
 volatile int32_t g_encIsrPendingDetents = 0;  // net whole detents not yet drained by update()
+volatile bool g_encSynced = false;        // true once REST has been observed at least once since boot
+volatile bool g_encCycleActive = false;   // true while away from REST inside a candidate detent
+volatile bool g_encCycleInvalid = false;  // true once this cycle has seen an unrelated away-from-rest invalid jump
 
 // ---------------------------------------------------------------------------
 // TEMPORARY encoder raw-transition diagnostic (observation only).
@@ -135,7 +155,11 @@ struct EncoderDiagRecord {
   int8_t tableDir;
   int8_t subAccumAfter;
   int8_t wholeDetent;  // -1, 0, +1
+  uint8_t flags;       // kDiagFlagRecovered / kDiagFlagDesync (Fix4.5 TEMPORARY)
 };
+
+constexpr uint8_t kDiagFlagRecovered = 0x01;  // detent emitted via skipped-transition recovery (rule 4)
+constexpr uint8_t kDiagFlagDesync = 0x02;     // invalid jump away from rest desynchronized the cycle (rule 5)
 
 constexpr uint8_t kEncoderDiagCap = 128;
 EncoderDiagRecord g_encDiagBuf[kEncoderDiagCap];  // contents only ever touched under g_encMux
@@ -154,17 +178,94 @@ void IRAM_ATTR onEncoderChangeIsr() {
   g_encIsrLastState = curr;
   int8_t dir = kQuadratureTable[idx & 0x0F];
   int8_t wholeDetent = 0;
-  if (dir != 0) {
-    g_encIsrSubAccum = static_cast<int8_t>(g_encIsrSubAccum + dir);
-    if (g_encIsrSubAccum >= kDetentTransitions) {
+  uint8_t diagFlags = 0;
+
+  if (prevState == curr) {
+    // Rule 6 (REPEAT): both GPIO CHANGE interrupts can fire after the
+    // combined pin state has already settled to the same value. Total
+    // no-op -- must not touch subAccum, the cycle state, or emit.
+  } else if (!g_encSynced) {
+    // Boot resync: never fabricate a detent before REST has been
+    // observed at least once since startup.
+    if (curr == kEncoderRestState) {
+      g_encSynced = true;
       g_encIsrSubAccum = 0;
-      g_encIsrPendingDetents++;
-      wholeDetent = 1;
-    } else if (g_encIsrSubAccum <= -kDetentTransitions) {
-      g_encIsrSubAccum = 0;
-      g_encIsrPendingDetents--;
-      wholeDetent = -1;
+      g_encCycleActive = false;
+      g_encCycleInvalid = false;
     }
+    // else: still unsynced: ignore this transition entirely and keep
+    // waiting for REST.
+  } else if (curr == kEncoderRestState) {
+    // Rule 7: returning to REST is an absolute cycle boundary, whatever
+    // path got us here (normal completion, recovered skipped-transition,
+    // or an aborted/desynchronized cycle returning home).
+    if (g_encCycleActive && !g_encCycleInvalid) {
+      if (dir != 0) {
+        // Rule 3: normal valid return to rest.
+        g_encIsrSubAccum = static_cast<int8_t>(g_encIsrSubAccum + dir);
+        if (g_encIsrSubAccum >= kDetentTransitions) {
+          g_encIsrPendingDetents++;
+          wholeDetent = 1;
+        } else if (g_encIsrSubAccum <= -kDetentTransitions) {
+          g_encIsrPendingDetents--;
+          wholeDetent = -1;
+        }
+      } else if (g_encIsrSubAccum >= kRecoveryMinEvidence) {
+        // Rule 4: confirmed skipped-transition recovery (e.g. 0->3):
+        // trust the directional evidence already collected this cycle.
+        g_encIsrPendingDetents++;
+        wholeDetent = 1;
+        diagFlags |= kDiagFlagRecovered;
+      } else if (g_encIsrSubAccum <= -kRecoveryMinEvidence) {
+        g_encIsrPendingDetents--;
+        wholeDetent = -1;
+        diagFlags |= kDiagFlagRecovered;
+      }
+    }
+    // Unconditional reset at the rest boundary (rules 3/4/7): no stale
+    // partial accumulation may ever survive past this point, whether or
+    // not a detent was just emitted.
+    g_encIsrSubAccum = 0;
+    g_encCycleActive = false;
+    g_encCycleInvalid = false;
+  } else if (dir != 0) {
+    // Away from rest, valid Gray-code step.
+    if (!g_encCycleActive) {
+      if (prevState == kEncoderRestState) {
+        // Rule 1: start a fresh candidate cycle. Never inherits a prior
+        // cycle's accumulator -- subAccum was already 0 from the last
+        // rest-boundary reset, and is set (not added) here regardless.
+        g_encCycleActive = true;
+        g_encCycleInvalid = false;
+        g_encIsrSubAccum = dir;
+      } else {
+        // Defensive: a valid step observed while not already in a cycle
+        // and not leaving from REST should not happen if the invariants
+        // above hold, but if it ever does, don't guess -- desynchronize
+        // rather than start a cycle from an unknown position.
+        g_encCycleActive = true;
+        g_encCycleInvalid = true;
+        g_encIsrSubAccum = 0;
+        diagFlags |= kDiagFlagDesync;
+      }
+    } else if (!g_encCycleInvalid) {
+      // Rule 2: keep accumulating directional evidence for this cycle;
+      // mechanical bounce naturally cancels via its own opposite-signed
+      // contribution. Do NOT emit here even if this temporarily reaches
+      // +/-kDetentTransitions -- only a return to REST finalizes a detent.
+      g_encIsrSubAccum = static_cast<int8_t>(g_encIsrSubAccum + dir);
+    }
+    // else: this cycle is already desynchronized (rule 5) -- further
+    // valid evidence does not recover it; ignore until REST is observed.
+  } else {
+    // Rule 5: invalid two-bit jump away from rest (prev != curr,
+    // tableDir == 0, curr != REST). Never guess a direction here --
+    // desynchronize the cycle and wait for REST before accepting a new
+    // one. False positives are worse than dropping one corrupted detent.
+    g_encCycleActive = true;
+    g_encCycleInvalid = true;
+    g_encIsrSubAccum = 0;
+    diagFlags |= kDiagFlagDesync;
   }
 
   // Diagnostic capture only, appended after the production decision above
@@ -177,6 +278,7 @@ void IRAM_ATTR onEncoderChangeIsr() {
     g_encDiagBuf[slot].tableDir = dir;
     g_encDiagBuf[slot].subAccumAfter = g_encIsrSubAccum;
     g_encDiagBuf[slot].wholeDetent = wholeDetent;
+    g_encDiagBuf[slot].flags = diagFlags;
     g_encDiagHead = static_cast<uint8_t>((slot + 1) % kEncoderDiagCap);
     g_encDiagCount++;
   } else {
@@ -227,6 +329,11 @@ void drainEncoderDiagnostics() {
       Serial.print(" REPEAT");
     } else if (r.tableDir == 0) {
       Serial.print(" INVALID");
+      if (r.flags & kDiagFlagRecovered) {
+        Serial.print(" RECOVER");
+      } else if (r.flags & kDiagFlagDesync) {
+        Serial.print(" DESYNC");
+      }
     }
     Serial.println();
   }
@@ -388,6 +495,14 @@ void init() {
                                             (digitalRead(Pins::kEncoderDt) == HIGH ? 1 : 0));
   g_encIsrSubAccum = 0;
   g_encIsrPendingDetents = 0;
+  // Hardware Fix #4.5 (TEMPORARY): only trust the boot pin state as a
+  // synchronized rest position if it actually IS rest; otherwise wait
+  // for the ISR to observe REST for the first time before decoding any
+  // cycle, rather than fabricating a detent from an unknown starting
+  // position.
+  g_encSynced = (g_encIsrLastState == kEncoderRestState);
+  g_encCycleActive = false;
+  g_encCycleInvalid = false;
 
   // Either pin's edge can be the first or second half of a valid
   // transition, so both are watched by the same ISR (Hardware Fix #4.3
