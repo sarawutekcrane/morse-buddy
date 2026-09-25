@@ -114,6 +114,22 @@ DebouncedButton g_encSw{Pins::kEncoderSw};
 // detent can never bleed into the next one. This changes only how those
 // 4 transitions are grouped into a detent; the table, the CW=+1/CCW=-1
 // convention, and kDetentTransitions itself are unchanged.
+//
+// Hardware Fix #4.5b (TEMPORARY validation): a real-hardware run of
+// Fix4.5a (20 physical CW detents, WPM 15->30) still only accepted 15/20,
+// with the raw diagnostic showing the misses as two-bit INVALID DESYNC
+// jumps (3->0, 2->1) rather than as the expected single-bit steps. The
+// SAME ISR was previously attached to both CLK and DT and read BOTH pins
+// on every firing to build the combined 2-bit state; if both physical
+// edges of one intermediate quadrature step occurred before that shared
+// ISR ran, it could observe the two pins' ALREADY-final combined level
+// and collapse an intermediate state entirely (3->1->0 sampled as a
+// direct 3->0). This is a raw CAPTURE change only, testing whether a
+// separate per-pin ISR -- one for CLK, one for DT, each updating only
+// its own bit of the cached state -- preserves the intermediate state
+// the shared-ISR read was potentially losing. The Fix4.5a decoder logic
+// itself (thresholds, peak tracking, recovery rule, reset rule) is
+// unchanged; only how g_encIsrLastState's next value is computed differs.
 // ---------------------------------------------------------------------------
 DRAM_ATTR const int8_t kQuadratureTable[16] = {
     0, -1, 1, 0,
@@ -123,6 +139,8 @@ DRAM_ATTR const int8_t kQuadratureTable[16] = {
 };
 constexpr int8_t kDetentTransitions = 4;
 constexpr uint8_t kEncoderRestState = 3;    // measured rest/detent state: CLK HIGH, DT HIGH
+constexpr uint8_t kEncoderClkBit = 0x02;    // state = (CLK<<1)|DT -- CLK owns bit 1
+constexpr uint8_t kEncoderDtBit = 0x01;     // DT owns bit 0
 constexpr int8_t kRecoveryMinEvidence = 2;  // min final |subAccum| trusted to recover a skipped-transition return-to-rest
 // Hardware Fix #4.5a (TEMPORARY): the final subAccum alone cannot tell a
 // real missed detent (measured peak evidence +3, final +2 after bounce)
@@ -158,6 +176,11 @@ volatile int8_t g_encCyclePeakNegative = 0;  // lowest subAccum reached this cyc
 // count under the same critical section already used above -- no
 // Serial/millis()/delay()/heap/Display/MQTT/NVS calls.
 // ---------------------------------------------------------------------------
+// Which pin's own ISR generated this record (Fix4.5b TEMPORARY): lets the
+// drained log show whether the per-pin capture preserves physical edge
+// order, without the decoder itself depending on this value in any way.
+enum class EncoderDiagSource : uint8_t { CLK = 0, DT = 1 };
+
 struct EncoderDiagRecord {
   uint8_t prevState;
   uint8_t currState;
@@ -167,6 +190,7 @@ struct EncoderDiagRecord {
   uint8_t flags;       // kDiagFlagRecovered / kDiagFlagDesync (Fix4.5 TEMPORARY)
   int8_t peakPositive;  // this cycle's peak subAccum (>=0) at the moment of this transition (Fix4.5a)
   int8_t peakNegative;  // this cycle's trough subAccum (<=0) at the moment of this transition (Fix4.5a)
+  EncoderDiagSource source;  // which pin's ISR produced this record (Fix4.5b)
 };
 
 constexpr uint8_t kDiagFlagRecovered = 0x01;  // detent emitted via skipped-transition recovery (rule 4)
@@ -178,14 +202,17 @@ volatile uint8_t g_encDiagHead = 0;               // next slot the ISR will writ
 volatile uint8_t g_encDiagCount = 0;              // unread records waiting to be drained
 volatile uint32_t g_encDiagDropped = 0;           // records lost because the ring was full
 
-void IRAM_ATTR onEncoderChangeIsr() {
-  uint8_t clk = digitalRead(Pins::kEncoderClk) == HIGH ? 1 : 0;
-  uint8_t dt = digitalRead(Pins::kEncoderDt) == HIGH ? 1 : 0;
-  uint8_t curr = static_cast<uint8_t>((clk << 1) | dt);
-
+// Shared ISR-safe decoder body (Fix4.5b TEMPORARY): computes the new
+// cached state from the PREVIOUS cached state plus only the ONE bit the
+// calling per-pin ISR observed changing, then runs the unmodified
+// Fix4.5a detent-bound decoder on that (prev, curr) pair. Called only
+// from onEncoderClkChangeIsr()/onEncoderDtChangeIsr(), so it must itself
+// be IRAM_ATTR.
+void IRAM_ATTR processEncoderPinSampleIsr(uint8_t bitMask, bool pinHigh, EncoderDiagSource source) {
   portENTER_CRITICAL_ISR(&g_encMux);
   uint8_t prevState = g_encIsrLastState;
-  uint8_t idx = static_cast<uint8_t>((g_encIsrLastState << 2) | curr);
+  uint8_t curr = pinHigh ? static_cast<uint8_t>(prevState | bitMask) : static_cast<uint8_t>(prevState & ~bitMask);
+  uint8_t idx = static_cast<uint8_t>((prevState << 2) | curr);
   g_encIsrLastState = curr;
   int8_t dir = kQuadratureTable[idx & 0x0F];
   int8_t wholeDetent = 0;
@@ -338,12 +365,30 @@ void IRAM_ATTR onEncoderChangeIsr() {
     g_encDiagBuf[slot].flags = diagFlags;
     g_encDiagBuf[slot].peakPositive = diagPeakPos;
     g_encDiagBuf[slot].peakNegative = diagPeakNeg;
+    g_encDiagBuf[slot].source = source;
     g_encDiagHead = static_cast<uint8_t>((slot + 1) % kEncoderDiagCap);
     g_encDiagCount++;
   } else {
     g_encDiagDropped++;
   }
   portEXIT_CRITICAL_ISR(&g_encMux);
+}
+
+// Per-pin ISR entry points (Fix4.5b TEMPORARY): each reads ONLY its own
+// GPIO -- the CLK ISR never reads DT, and the DT ISR never reads CLK --
+// so the decoder-state bit each one owns is always taken from that pin's
+// own most recent observation, never reconstructed by re-reading the
+// other pin (which is what the previous shared-ISR architecture did and
+// what the real-hardware evidence suggests could lose an intermediate
+// quadrature state).
+void IRAM_ATTR onEncoderClkChangeIsr() {
+  bool clkHigh = digitalRead(Pins::kEncoderClk) == HIGH;
+  processEncoderPinSampleIsr(kEncoderClkBit, clkHigh, EncoderDiagSource::CLK);
+}
+
+void IRAM_ATTR onEncoderDtChangeIsr() {
+  bool dtHigh = digitalRead(Pins::kEncoderDt) == HIGH;
+  processEncoderPinSampleIsr(kEncoderDtBit, dtHigh, EncoderDiagSource::DT);
 }
 
 // Drains and prints whatever raw transition records the ISR captured since
@@ -371,7 +416,7 @@ void drainEncoderDiagnostics() {
 
   for (uint8_t i = 0; i < count; i++) {
     const EncoderDiagRecord& r = localBuf[i];
-    Serial.print("ENC ");
+    Serial.print(r.source == EncoderDiagSource::CLK ? "ENC[C] " : "ENC[D] ");
     Serial.print(r.prevState);
     Serial.print('>');
     Serial.print(r.currState);
@@ -569,11 +614,12 @@ void init() {
   g_encCyclePeakPositive = 0;
   g_encCyclePeakNegative = 0;
 
-  // Either pin's edge can be the first or second half of a valid
-  // transition, so both are watched by the same ISR (Hardware Fix #4.3
-  // issue A).
-  attachInterrupt(digitalPinToInterrupt(Pins::kEncoderClk), onEncoderChangeIsr, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(Pins::kEncoderDt), onEncoderChangeIsr, CHANGE);
+  // Each pin gets its OWN ISR (Hardware Fix #4.5b TEMPORARY): CLK's ISR
+  // updates only the CLK bit of the cached state, DT's ISR updates only
+  // the DT bit, and neither re-reads the other pin -- see the per-pin
+  // capture comment above onEncoderClkChangeIsr()/onEncoderDtChangeIsr().
+  attachInterrupt(digitalPinToInterrupt(Pins::kEncoderClk), onEncoderClkChangeIsr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(Pins::kEncoderDt), onEncoderDtChangeIsr, CHANGE);
 }
 
 void update() {
