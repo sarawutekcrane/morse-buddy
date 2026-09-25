@@ -123,7 +123,14 @@ DRAM_ATTR const int8_t kQuadratureTable[16] = {
 };
 constexpr int8_t kDetentTransitions = 4;
 constexpr uint8_t kEncoderRestState = 3;    // measured rest/detent state: CLK HIGH, DT HIGH
-constexpr int8_t kRecoveryMinEvidence = 2;  // min |subAccum| trusted to recover a skipped-transition return-to-rest
+constexpr int8_t kRecoveryMinEvidence = 2;  // min final |subAccum| trusted to recover a skipped-transition return-to-rest
+// Hardware Fix #4.5a (TEMPORARY): the final subAccum alone cannot tell a
+// real missed detent (measured peak evidence +3, final +2 after bounce)
+// apart from a partial-turn-and-abort that the ISR happened to observe
+// as a skipped return (e.g. 3->1->0->3, which never actually reached the
+// next detent and only ever accumulated +2). Requiring the CYCLE'S PEAK
+// evidence to have reached kDetentTransitions-1 makes that distinction.
+constexpr int8_t kRecoveryMinPeakEvidence = 3;
 
 portMUX_TYPE g_encMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint8_t g_encIsrLastState = 0;
@@ -132,6 +139,8 @@ volatile int32_t g_encIsrPendingDetents = 0;  // net whole detents not yet drain
 volatile bool g_encSynced = false;        // true once REST has been observed at least once since boot
 volatile bool g_encCycleActive = false;   // true while away from REST inside a candidate detent
 volatile bool g_encCycleInvalid = false;  // true once this cycle has seen an unrelated away-from-rest invalid jump
+volatile int8_t g_encCyclePeakPositive = 0;  // highest subAccum reached this cycle (>=0), reset at every REST boundary
+volatile int8_t g_encCyclePeakNegative = 0;  // lowest subAccum reached this cycle (<=0), reset at every REST boundary
 
 // ---------------------------------------------------------------------------
 // TEMPORARY encoder raw-transition diagnostic (observation only).
@@ -156,6 +165,8 @@ struct EncoderDiagRecord {
   int8_t subAccumAfter;
   int8_t wholeDetent;  // -1, 0, +1
   uint8_t flags;       // kDiagFlagRecovered / kDiagFlagDesync (Fix4.5 TEMPORARY)
+  int8_t peakPositive;  // this cycle's peak subAccum (>=0) at the moment of this transition (Fix4.5a)
+  int8_t peakNegative;  // this cycle's trough subAccum (<=0) at the moment of this transition (Fix4.5a)
 };
 
 constexpr uint8_t kDiagFlagRecovered = 0x01;  // detent emitted via skipped-transition recovery (rule 4)
@@ -179,17 +190,23 @@ void IRAM_ATTR onEncoderChangeIsr() {
   int8_t dir = kQuadratureTable[idx & 0x0F];
   int8_t wholeDetent = 0;
   uint8_t diagFlags = 0;
+  int8_t diagPeakPos = 0;
+  int8_t diagPeakNeg = 0;
+  bool diagPeakCaptured = false;  // REST-arrival branch snapshots peaks BEFORE resetting them; all other branches read live values below
 
   if (prevState == curr) {
     // Rule 6 (REPEAT): both GPIO CHANGE interrupts can fire after the
     // combined pin state has already settled to the same value. Total
-    // no-op -- must not touch subAccum, the cycle state, or emit.
+    // no-op -- must not touch subAccum, the peaks, the cycle state, or
+    // emit.
   } else if (!g_encSynced) {
     // Boot resync: never fabricate a detent before REST has been
     // observed at least once since startup.
     if (curr == kEncoderRestState) {
       g_encSynced = true;
       g_encIsrSubAccum = 0;
+      g_encCyclePeakPositive = 0;
+      g_encCyclePeakNegative = 0;
       g_encCycleActive = false;
       g_encCycleInvalid = false;
     }
@@ -201,8 +218,16 @@ void IRAM_ATTR onEncoderChangeIsr() {
     // or an aborted/desynchronized cycle returning home).
     if (g_encCycleActive && !g_encCycleInvalid) {
       if (dir != 0) {
-        // Rule 3: normal valid return to rest.
+        // Rule 3: normal valid return to rest. Still tracks peaks (every
+        // valid directional transition does), though peak evidence is
+        // only ever CONSULTED for the skipped-transition recovery case
+        // below, not for this normal-completion threshold.
         g_encIsrSubAccum = static_cast<int8_t>(g_encIsrSubAccum + dir);
+        if (g_encIsrSubAccum > g_encCyclePeakPositive) g_encCyclePeakPositive = g_encIsrSubAccum;
+        if (g_encIsrSubAccum < g_encCyclePeakNegative) g_encCyclePeakNegative = g_encIsrSubAccum;
+        diagPeakPos = g_encCyclePeakPositive;
+        diagPeakNeg = g_encCyclePeakNegative;
+        diagPeakCaptured = true;
         if (g_encIsrSubAccum >= kDetentTransitions) {
           g_encIsrPendingDetents++;
           wholeDetent = 1;
@@ -210,22 +235,34 @@ void IRAM_ATTR onEncoderChangeIsr() {
           g_encIsrPendingDetents--;
           wholeDetent = -1;
         }
-      } else if (g_encIsrSubAccum >= kRecoveryMinEvidence) {
-        // Rule 4: confirmed skipped-transition recovery (e.g. 0->3):
-        // trust the directional evidence already collected this cycle.
-        g_encIsrPendingDetents++;
-        wholeDetent = 1;
-        diagFlags |= kDiagFlagRecovered;
-      } else if (g_encIsrSubAccum <= -kRecoveryMinEvidence) {
-        g_encIsrPendingDetents--;
-        wholeDetent = -1;
-        diagFlags |= kDiagFlagRecovered;
+      } else {
+        // Rule 4 (Fix4.5a): confirmed skipped-transition recovery (e.g.
+        // 0->3). The final accumulator alone cannot tell a real missed
+        // detent (measured peak +3, final +2 after bounce) apart from a
+        // partial-turn-and-abort that only ever reached +2 -- requiring
+        // the cycle's PEAK evidence to have reached kRecoveryMinPeak-
+        // Evidence makes that distinction; a same-detent abort like
+        // 3->1->0->3 peaks at +2 and is correctly rejected.
+        diagPeakPos = g_encCyclePeakPositive;
+        diagPeakNeg = g_encCyclePeakNegative;
+        diagPeakCaptured = true;
+        if (g_encIsrSubAccum >= kRecoveryMinEvidence && g_encCyclePeakPositive >= kRecoveryMinPeakEvidence) {
+          g_encIsrPendingDetents++;
+          wholeDetent = 1;
+          diagFlags |= kDiagFlagRecovered;
+        } else if (g_encIsrSubAccum <= -kRecoveryMinEvidence && g_encCyclePeakNegative <= -kRecoveryMinPeakEvidence) {
+          g_encIsrPendingDetents--;
+          wholeDetent = -1;
+          diagFlags |= kDiagFlagRecovered;
+        }
       }
     }
     // Unconditional reset at the rest boundary (rules 3/4/7): no stale
-    // partial accumulation may ever survive past this point, whether or
-    // not a detent was just emitted.
+    // partial accumulation -- subAccum OR peaks -- may ever survive past
+    // this point, whether or not a detent was just emitted.
     g_encIsrSubAccum = 0;
+    g_encCyclePeakPositive = 0;
+    g_encCyclePeakNegative = 0;
     g_encCycleActive = false;
     g_encCycleInvalid = false;
   } else if (dir != 0) {
@@ -233,11 +270,15 @@ void IRAM_ATTR onEncoderChangeIsr() {
     if (!g_encCycleActive) {
       if (prevState == kEncoderRestState) {
         // Rule 1: start a fresh candidate cycle. Never inherits a prior
-        // cycle's accumulator -- subAccum was already 0 from the last
-        // rest-boundary reset, and is set (not added) here regardless.
+        // cycle's accumulator or peaks -- both were already 0 from the
+        // last rest-boundary reset, and are explicitly reset here too.
         g_encCycleActive = true;
         g_encCycleInvalid = false;
         g_encIsrSubAccum = dir;
+        g_encCyclePeakPositive = 0;
+        g_encCyclePeakNegative = 0;
+        if (g_encIsrSubAccum > g_encCyclePeakPositive) g_encCyclePeakPositive = g_encIsrSubAccum;
+        if (g_encIsrSubAccum < g_encCyclePeakNegative) g_encCyclePeakNegative = g_encIsrSubAccum;
       } else {
         // Defensive: a valid step observed while not already in a cycle
         // and not leaving from REST should not happen if the invariants
@@ -246,14 +287,21 @@ void IRAM_ATTR onEncoderChangeIsr() {
         g_encCycleActive = true;
         g_encCycleInvalid = true;
         g_encIsrSubAccum = 0;
+        g_encCyclePeakPositive = 0;
+        g_encCyclePeakNegative = 0;
         diagFlags |= kDiagFlagDesync;
       }
     } else if (!g_encCycleInvalid) {
-      // Rule 2: keep accumulating directional evidence for this cycle;
-      // mechanical bounce naturally cancels via its own opposite-signed
-      // contribution. Do NOT emit here even if this temporarily reaches
+      // Rule 2: keep accumulating directional evidence for this cycle
+      // and tracking its peak; mechanical bounce naturally cancels the
+      // accumulator via its own opposite-signed contribution, but the
+      // peak (a running max/min, never itself decremented by bounce)
+      // remembers how far the cycle got before any bounce pulled it
+      // back. Do NOT emit here even if this temporarily reaches
       // +/-kDetentTransitions -- only a return to REST finalizes a detent.
       g_encIsrSubAccum = static_cast<int8_t>(g_encIsrSubAccum + dir);
+      if (g_encIsrSubAccum > g_encCyclePeakPositive) g_encCyclePeakPositive = g_encIsrSubAccum;
+      if (g_encIsrSubAccum < g_encCyclePeakNegative) g_encCyclePeakNegative = g_encIsrSubAccum;
     }
     // else: this cycle is already desynchronized (rule 5) -- further
     // valid evidence does not recover it; ignore until REST is observed.
@@ -265,7 +313,16 @@ void IRAM_ATTR onEncoderChangeIsr() {
     g_encCycleActive = true;
     g_encCycleInvalid = true;
     g_encIsrSubAccum = 0;
+    g_encCyclePeakPositive = 0;
+    g_encCyclePeakNegative = 0;
     diagFlags |= kDiagFlagDesync;
+  }
+
+  if (!diagPeakCaptured) {
+    // No rest-boundary reset happened this call, so the live values
+    // still reflect whatever this transition just did (or left alone).
+    diagPeakPos = g_encCyclePeakPositive;
+    diagPeakNeg = g_encCyclePeakNegative;
   }
 
   // Diagnostic capture only, appended after the production decision above
@@ -279,6 +336,8 @@ void IRAM_ATTR onEncoderChangeIsr() {
     g_encDiagBuf[slot].subAccumAfter = g_encIsrSubAccum;
     g_encDiagBuf[slot].wholeDetent = wholeDetent;
     g_encDiagBuf[slot].flags = diagFlags;
+    g_encDiagBuf[slot].peakPositive = diagPeakPos;
+    g_encDiagBuf[slot].peakNegative = diagPeakNeg;
     g_encDiagHead = static_cast<uint8_t>((slot + 1) % kEncoderDiagCap);
     g_encDiagCount++;
   } else {
@@ -322,6 +381,10 @@ void drainEncoderDiagnostics() {
     Serial.print(" sub=");
     if (r.subAccumAfter > 0) Serial.print('+');
     Serial.print(r.subAccumAfter);
+    Serial.print(" peak+=");
+    Serial.print(r.peakPositive);  // always >=0 by construction, no sign prefix needed
+    Serial.print(" peak-=");
+    Serial.print(r.peakNegative);  // always <=0 by construction, prints its own '-' when nonzero
     Serial.print(" step=");
     if (r.wholeDetent > 0) Serial.print('+');
     Serial.print(r.wholeDetent);
@@ -503,6 +566,8 @@ void init() {
   g_encSynced = (g_encIsrLastState == kEncoderRestState);
   g_encCycleActive = false;
   g_encCycleInvalid = false;
+  g_encCyclePeakPositive = 0;
+  g_encCyclePeakNegative = 0;
 
   // Either pin's edge can be the first or second half of a valid
   // transition, so both are watched by the same ISR (Hardware Fix #4.3
