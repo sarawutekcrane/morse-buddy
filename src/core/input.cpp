@@ -1,6 +1,7 @@
 #include "core/input.h"
 
 #include <Arduino.h>
+#include "esp_timer.h"
 
 #include "core/morse.h"
 #include "core/pins.h"
@@ -115,21 +116,46 @@ DebouncedButton g_encSw{Pins::kEncoderSw};
 // 4 transitions are grouped into a detent; the table, the CW=+1/CCW=-1
 // convention, and kDetentTransitions itself are unchanged.
 //
-// Hardware Fix #4.5b (TEMPORARY validation): a real-hardware run of
-// Fix4.5a (20 physical CW detents, WPM 15->30) still only accepted 15/20,
-// with the raw diagnostic showing the misses as two-bit INVALID DESYNC
-// jumps (3->0, 2->1) rather than as the expected single-bit steps. The
-// SAME ISR was previously attached to both CLK and DT and read BOTH pins
-// on every firing to build the combined 2-bit state; if both physical
-// edges of one intermediate quadrature step occurred before that shared
-// ISR ran, it could observe the two pins' ALREADY-final combined level
-// and collapse an intermediate state entirely (3->1->0 sampled as a
-// direct 3->0). This is a raw CAPTURE change only, testing whether a
-// separate per-pin ISR -- one for CLK, one for DT, each updating only
-// its own bit of the cached state -- preserves the intermediate state
-// the shared-ISR read was potentially losing. The Fix4.5a decoder logic
-// itself (thresholds, peak tracking, recovery rule, reset rule) is
-// unchanged; only how g_encIsrLastState's next value is computed differs.
+// Hardware Fix #4.5b (TEMPORARY validation, SUPERSEDED by Fix4.6 below):
+// a real-hardware run of Fix4.5a (20 physical CW detents, WPM 15->30)
+// still only accepted 15/20, with the raw diagnostic showing the misses
+// as two-bit INVALID DESYNC jumps (3->0, 2->1) rather than as the
+// expected single-bit steps. The SAME ISR was previously attached to
+// both CLK and DT and read BOTH pins on every firing to build the
+// combined 2-bit state; if both physical edges of one intermediate
+// quadrature step occurred before that shared ISR ran, it could observe
+// the two pins' ALREADY-final combined level and collapse an
+// intermediate state entirely (3->1->0 sampled as a direct 3->0). Fix4.5b
+// tried a separate per-pin ISR -- one for CLK, one for DT, each updating
+// only its own bit of the cached state -- to preserve that intermediate
+// state. On real hardware this DID remove most of the two-bit collapses,
+// but it now followed heavy mechanical contact bounce far too literally
+// (rapid 3<->1<->3<->1 oscillation, huge REPEAT counts) and the accepted
+// rate got WORSE (15/20 -> 11/20, WPM 15->26). Edge interrupts of any
+// granularity -- shared or per-pin -- follow whatever the contact is
+// doing at the instant it fires, with no way to tell a real settling
+// transition from bounce-in-progress. That per-pin ISR architecture
+// (onEncoderClkChangeIsr/onEncoderDtChangeIsr/processEncoderPinSampleIsr/
+// EncoderDiagSource) is fully removed in Fix4.6 below.
+//
+// Hardware Fix #4.6 (TEMPORARY validation): replaces ALL encoder GPIO
+// edge interrupts with a periodic STABLE-STATE sampler, independent of
+// both interrupt timing and the Arduino loop/UI redraw. A dedicated
+// esp_timer (ESP_TIMER_TASK dispatch, so it runs as a normal FreeRTOS
+// task callback, not inside interrupt context) samples both pins every
+// kEncoderSamplePeriodUs and only PRESENTS a new raw state to the
+// unchanged Fix4.5a detent-bound decoder once that state has been
+// observed for kEncoderStableSamples consecutive samples in a row --
+// see encoderSampleTimerCallback()/processEncoderStableTransition()
+// below. This directly targets what Fix4.5b's real-hardware run
+// exposed: edge interrupts have no concept of "settled," only "changed
+// just now"; a fixed 1ms/2-sample stability window waits out contact
+// bounce structurally, the same way Fix4.3's transition table structurally
+// rejects it, without adding any new edge-triggered heuristics. The
+// decoder itself (kEncoderRestState, kDetentTransitions, peak tracking,
+// recovery thresholds, DESYNC handling, the unconditional REST-boundary
+// reset, CW=+1/CCW=-1) is completely unchanged from Fix4.5a; only how
+// (and how often) it is FED a (prevState, currState) pair differs.
 // ---------------------------------------------------------------------------
 DRAM_ATTR const int8_t kQuadratureTable[16] = {
     0, -1, 1, 0,
@@ -139,8 +165,6 @@ DRAM_ATTR const int8_t kQuadratureTable[16] = {
 };
 constexpr int8_t kDetentTransitions = 4;
 constexpr uint8_t kEncoderRestState = 3;    // measured rest/detent state: CLK HIGH, DT HIGH
-constexpr uint8_t kEncoderClkBit = 0x02;    // state = (CLK<<1)|DT -- CLK owns bit 1
-constexpr uint8_t kEncoderDtBit = 0x01;     // DT owns bit 0
 constexpr int8_t kRecoveryMinEvidence = 2;  // min final |subAccum| trusted to recover a skipped-transition return-to-rest
 // Hardware Fix #4.5a (TEMPORARY): the final subAccum alone cannot tell a
 // real missed detent (measured peak evidence +3, final +2 after bounce)
@@ -150,8 +174,13 @@ constexpr int8_t kRecoveryMinEvidence = 2;  // min final |subAccum| trusted to r
 // evidence to have reached kDetentTransitions-1 makes that distinction.
 constexpr int8_t kRecoveryMinPeakEvidence = 3;
 
+// Hardware Fix #4.6 (TEMPORARY): periodic stable-state sampler tunables.
+// Do NOT change these during this validation task -- see the Fix4.6
+// comment block above.
+constexpr uint32_t kEncoderSamplePeriodUs = 1000;  // 1ms sample period
+constexpr uint8_t kEncoderStableSamples = 2;       // consecutive identical non-stable samples required to accept
+
 portMUX_TYPE g_encMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint8_t g_encIsrLastState = 0;
 volatile int8_t g_encIsrSubAccum = 0;        // directional evidence accumulated within the CURRENT cycle only
 volatile int32_t g_encIsrPendingDetents = 0;  // net whole detents not yet drained by update()
 volatile bool g_encSynced = false;        // true once REST has been observed at least once since boot
@@ -160,27 +189,37 @@ volatile bool g_encCycleInvalid = false;  // true once this cycle has seen an un
 volatile int8_t g_encCyclePeakPositive = 0;  // highest subAccum reached this cycle (>=0), reset at every REST boundary
 volatile int8_t g_encCyclePeakNegative = 0;  // lowest subAccum reached this cycle (<=0), reset at every REST boundary
 
+// Hardware Fix #4.6 (TEMPORARY): periodic stable-state sampler state.
+// Touched ONLY from encoderSampleTimerCallback(), which the ESP_TIMER_TASK
+// dispatch mode guarantees runs as ordinary sequential (non-reentrant,
+// non-overlapping) calls on esp_timer's own task -- no other code ever
+// reads or writes these, so unlike the decoder state below they need
+// neither `volatile` nor g_encMux protection.
+uint8_t g_encStableState = 0;     // last ACCEPTED stable (CLK<<1|DT) state -- what the decoder is fed as prevStable
+uint8_t g_encCandidateState = 0;  // a raw state currently being evaluated for stability
+uint8_t g_encCandidateCount = 0;  // consecutive samples candidateState has been observed (not yet accepted)
+uint8_t g_encNoiseCount = 0;      // candidate starts rejected since the last accepted stable transition (diagnostic only; saturates, never wraps)
+
+esp_timer_handle_t g_encoderSampleTimer = nullptr;
+volatile bool g_encoderSamplerInitFailed = false;  // set on create/start failure; drained+printed once from task context
+
 // ---------------------------------------------------------------------------
 // TEMPORARY encoder raw-transition diagnostic (observation only).
 //
-// Records every raw quadrature transition the ISR observes into a small
-// fixed ring buffer, purely so Input::update() (normal task context) can
-// print it over Serial afterwards for hardware analysis. This is wired
-// in PARALLEL to the production dir/sub-accum/pending-detent logic below
-// -- it reads the same locals the production logic already computed
-// after that logic has fully run, and does not alter, gate, delay, or
-// feed back into any of it in any way. Remove this whole block (and its
-// two call sites) once the mechanical encoder investigation is done.
+// Records each ACCEPTED STABLE transition (Fix4.6) -- never a raw 1ms
+// sample -- into a small fixed ring buffer, purely so Input::update()
+// (normal task context) can print it over Serial afterwards for hardware
+// analysis. This is wired in PARALLEL to the production decoder logic
+// below -- it reads the same locals the production logic already
+// computed after that logic has fully run, and does not alter, gate,
+// delay, or feed back into any of it in any way. Remove this whole block
+// (and its call sites) once the mechanical encoder investigation is done.
 //
-// The ISR side only writes plain fields into a fixed array and bumps a
-// count under the same critical section already used above -- no
-// Serial/millis()/delay()/heap/Display/MQTT/NVS calls.
+// Fix4.6 removed the Fix4.5b per-pin CLK/DT `EncoderDiagSource` field --
+// every record now originates from the single stable-state sampler, so a
+// source label is no longer meaningful -- and replaced it with a `noise`
+// count (see below), keeping the record at the same 9 bytes.
 // ---------------------------------------------------------------------------
-// Which pin's own ISR generated this record (Fix4.5b TEMPORARY): lets the
-// drained log show whether the per-pin capture preserves physical edge
-// order, without the decoder itself depending on this value in any way.
-enum class EncoderDiagSource : uint8_t { CLK = 0, DT = 1 };
-
 struct EncoderDiagRecord {
   uint8_t prevState;
   uint8_t currState;
@@ -190,7 +229,7 @@ struct EncoderDiagRecord {
   uint8_t flags;       // kDiagFlagRecovered / kDiagFlagDesync (Fix4.5 TEMPORARY)
   int8_t peakPositive;  // this cycle's peak subAccum (>=0) at the moment of this transition (Fix4.5a)
   int8_t peakNegative;  // this cycle's trough subAccum (<=0) at the moment of this transition (Fix4.5a)
-  EncoderDiagSource source;  // which pin's ISR produced this record (Fix4.5b)
+  uint8_t noise;  // rejected candidate starts since the previous accepted stable transition (Fix4.6, saturates at 255)
 };
 
 constexpr uint8_t kDiagFlagRecovered = 0x01;  // detent emitted via skipped-transition recovery (rule 4)
@@ -202,18 +241,21 @@ volatile uint8_t g_encDiagHead = 0;               // next slot the ISR will writ
 volatile uint8_t g_encDiagCount = 0;              // unread records waiting to be drained
 volatile uint32_t g_encDiagDropped = 0;           // records lost because the ring was full
 
-// Shared ISR-safe decoder body (Fix4.5b TEMPORARY): computes the new
-// cached state from the PREVIOUS cached state plus only the ONE bit the
-// calling per-pin ISR observed changing, then runs the unmodified
-// Fix4.5a detent-bound decoder on that (prev, curr) pair. Called only
-// from onEncoderClkChangeIsr()/onEncoderDtChangeIsr(), so it must itself
-// be IRAM_ATTR.
-void IRAM_ATTR processEncoderPinSampleIsr(uint8_t bitMask, bool pinHigh, EncoderDiagSource source) {
-  portENTER_CRITICAL_ISR(&g_encMux);
-  uint8_t prevState = g_encIsrLastState;
-  uint8_t curr = pinHigh ? static_cast<uint8_t>(prevState | bitMask) : static_cast<uint8_t>(prevState & ~bitMask);
-  uint8_t idx = static_cast<uint8_t>((prevState << 2) | curr);
-  g_encIsrLastState = curr;
+// Fix4.5a detent-bound decoder, now expressed as a helper that receives
+// an already-ACCEPTED STABLE (prevStable, currStable) transition from
+// encoderSampleTimerCallback() below, rather than reading GPIO or
+// tracking its own "last state" itself -- every call is exactly one
+// accepted stable transition, so the decoder logic itself is otherwise
+// BYTE-FOR-BYTE IDENTICAL to Fix4.5a's. Runs in the esp_timer
+// ESP_TIMER_TASK context (an ordinary FreeRTOS task, not interrupt
+// context), so it uses the normal TASK-context critical section
+// (portENTER_CRITICAL/portEXIT_CRITICAL), never the _ISR variants --
+// Input::update()'s drainQuadrature()/drainEncoderDiagnostics() already
+// used the same task-context macros, so this is consistent cross-task
+// locking between the esp_timer task and the Arduino loop task.
+void processEncoderStableTransition(uint8_t prevStable, uint8_t currStable, uint8_t noise) {
+  portENTER_CRITICAL(&g_encMux);
+  uint8_t idx = static_cast<uint8_t>((prevStable << 2) | currStable);
   int8_t dir = kQuadratureTable[idx & 0x0F];
   int8_t wholeDetent = 0;
   uint8_t diagFlags = 0;
@@ -221,15 +263,16 @@ void IRAM_ATTR processEncoderPinSampleIsr(uint8_t bitMask, bool pinHigh, Encoder
   int8_t diagPeakNeg = 0;
   bool diagPeakCaptured = false;  // REST-arrival branch snapshots peaks BEFORE resetting them; all other branches read live values below
 
-  if (prevState == curr) {
-    // Rule 6 (REPEAT): both GPIO CHANGE interrupts can fire after the
-    // combined pin state has already settled to the same value. Total
-    // no-op -- must not touch subAccum, the peaks, the cycle state, or
-    // emit.
+  if (prevStable == currStable) {
+    // Rule 6 (REPEAT): the stable-state sampler only ever calls this once
+    // a genuinely NEW state has been accepted, so this should not fire in
+    // practice -- kept as defense-in-depth, matching Fix4.5a's original
+    // REPEAT handling exactly. Total no-op -- must not touch subAccum,
+    // the peaks, the cycle state, or emit.
   } else if (!g_encSynced) {
     // Boot resync: never fabricate a detent before REST has been
     // observed at least once since startup.
-    if (curr == kEncoderRestState) {
+    if (currStable == kEncoderRestState) {
       g_encSynced = true;
       g_encIsrSubAccum = 0;
       g_encCyclePeakPositive = 0;
@@ -239,7 +282,7 @@ void IRAM_ATTR processEncoderPinSampleIsr(uint8_t bitMask, bool pinHigh, Encoder
     }
     // else: still unsynced: ignore this transition entirely and keep
     // waiting for REST.
-  } else if (curr == kEncoderRestState) {
+  } else if (currStable == kEncoderRestState) {
     // Rule 7: returning to REST is an absolute cycle boundary, whatever
     // path got us here (normal completion, recovered skipped-transition,
     // or an aborted/desynchronized cycle returning home).
@@ -295,7 +338,7 @@ void IRAM_ATTR processEncoderPinSampleIsr(uint8_t bitMask, bool pinHigh, Encoder
   } else if (dir != 0) {
     // Away from rest, valid Gray-code step.
     if (!g_encCycleActive) {
-      if (prevState == kEncoderRestState) {
+      if (prevStable == kEncoderRestState) {
         // Rule 1: start a fresh candidate cycle. Never inherits a prior
         // cycle's accumulator or peaks -- both were already 0 from the
         // last rest-boundary reset, and are explicitly reset here too.
@@ -357,47 +400,78 @@ void IRAM_ATTR processEncoderPinSampleIsr(uint8_t bitMask, bool pinHigh, Encoder
   // participate in producing it.
   if (g_encDiagCount < kEncoderDiagCap) {
     uint8_t slot = g_encDiagHead;
-    g_encDiagBuf[slot].prevState = prevState;
-    g_encDiagBuf[slot].currState = curr;
+    g_encDiagBuf[slot].prevState = prevStable;
+    g_encDiagBuf[slot].currState = currStable;
     g_encDiagBuf[slot].tableDir = dir;
     g_encDiagBuf[slot].subAccumAfter = g_encIsrSubAccum;
     g_encDiagBuf[slot].wholeDetent = wholeDetent;
     g_encDiagBuf[slot].flags = diagFlags;
     g_encDiagBuf[slot].peakPositive = diagPeakPos;
     g_encDiagBuf[slot].peakNegative = diagPeakNeg;
-    g_encDiagBuf[slot].source = source;
+    g_encDiagBuf[slot].noise = noise;
     g_encDiagHead = static_cast<uint8_t>((slot + 1) % kEncoderDiagCap);
     g_encDiagCount++;
   } else {
     g_encDiagDropped++;
   }
-  portEXIT_CRITICAL_ISR(&g_encMux);
+  portEXIT_CRITICAL(&g_encMux);
 }
 
-// Per-pin ISR entry points (Fix4.5b TEMPORARY): each reads ONLY its own
-// GPIO -- the CLK ISR never reads DT, and the DT ISR never reads CLK --
-// so the decoder-state bit each one owns is always taken from that pin's
-// own most recent observation, never reconstructed by re-reading the
-// other pin (which is what the previous shared-ISR architecture did and
-// what the real-hardware evidence suggests could lose an intermediate
-// quadrature state).
-void IRAM_ATTR onEncoderClkChangeIsr() {
-  bool clkHigh = digitalRead(Pins::kEncoderClk) == HIGH;
-  processEncoderPinSampleIsr(kEncoderClkBit, clkHigh, EncoderDiagSource::CLK);
+// Periodic stable-state sampler (Fix4.6 TEMPORARY): runs every
+// kEncoderSamplePeriodUs from the esp_timer ESP_TIMER_TASK, independent
+// of Input::update()/the Arduino loop, replacing ALL encoder GPIO edge
+// interrupts. Reads both pins once, then applies the stability filter
+// (see the STABILITY ALGORITHM cases below) before ever presenting a
+// transition to the decoder -- a raw sample on its own never reaches
+// processEncoderStableTransition(). No Serial/Display/MQTT/NVS/LittleFS/
+// heap/delay/pushEvent()/Sleep::notifyActivity() calls here; those stay
+// task-context responsibilities in Input::update().
+void encoderSampleTimerCallback(void* /*arg*/) {
+  uint8_t clk = digitalRead(Pins::kEncoderClk) == HIGH ? 1 : 0;
+  uint8_t dt = digitalRead(Pins::kEncoderDt) == HIGH ? 1 : 0;
+  uint8_t rawState = static_cast<uint8_t>((clk << 1) | dt);
+
+  if (rawState == g_encStableState) {
+    // CASE A: back at the currently accepted state -- whatever candidate
+    // was forming is discarded; do NOT call the decoder.
+    g_encCandidateState = g_encStableState;
+    g_encCandidateCount = 0;
+    return;
+  }
+
+  if (rawState != g_encCandidateState) {
+    // CASE B: a possible new state appeared, replacing whatever candidate
+    // (if any) was previously forming -- that previous candidate never
+    // reached kEncoderStableSamples, so count it as rejected/noise. Not
+    // accepted yet.
+    g_encCandidateState = rawState;
+    g_encCandidateCount = 1;
+    if (g_encNoiseCount < 255) g_encNoiseCount++;  // saturate, never wrap
+    return;
+  }
+
+  // CASE C: rawState == candidateState != stableState.
+  g_encCandidateCount++;
+  if (g_encCandidateCount < kEncoderStableSamples) return;  // not stable yet -- two consecutive samples required
+
+  uint8_t prevStable = g_encStableState;
+  uint8_t newStable = g_encCandidateState;
+  g_encStableState = newStable;
+  g_encCandidateCount = 0;
+
+  uint8_t noise = g_encNoiseCount;
+  g_encNoiseCount = 0;  // reset the per-transition noise counter once a stable state is accepted
+
+  processEncoderStableTransition(prevStable, newStable, noise);
 }
 
-void IRAM_ATTR onEncoderDtChangeIsr() {
-  bool dtHigh = digitalRead(Pins::kEncoderDt) == HIGH;
-  processEncoderPinSampleIsr(kEncoderDtBit, dtHigh, EncoderDiagSource::DT);
-}
-
-// Drains and prints whatever raw transition records the ISR captured since
-// the last call. Runs entirely in normal task context (called from
-// Input::update()) -- the ring is snapshotted into a local buffer under
-// the same critical section the ISR uses, then Serial is written only
-// after the section is released, so the ISR is never blocked on Serial
-// I/O. Observation only: never touches g_encIsrSubAccum/
-// g_encIsrPendingDetents/g_encIsrLastState.
+// Drains and prints whatever accepted-stable-transition records were
+// captured since the last call. Runs entirely in normal task context
+// (called from Input::update()) -- the ring is snapshotted into a local
+// buffer under the same critical section processEncoderStableTransition()
+// uses, then Serial is written only after the section is released, so
+// the esp_timer task is never blocked on Serial I/O. Observation only:
+// never touches g_encIsrSubAccum/g_encIsrPendingDetents/g_encStableState.
 void drainEncoderDiagnostics() {
   EncoderDiagRecord localBuf[kEncoderDiagCap];
   uint8_t count;
@@ -416,7 +490,7 @@ void drainEncoderDiagnostics() {
 
   for (uint8_t i = 0; i < count; i++) {
     const EncoderDiagRecord& r = localBuf[i];
-    Serial.print(r.source == EncoderDiagSource::CLK ? "ENC[C] " : "ENC[D] ");
+    Serial.print("ENC[S] ");  // every record now comes from the single stable-state sampler (Fix4.6)
     Serial.print(r.prevState);
     Serial.print('>');
     Serial.print(r.currState);
@@ -433,6 +507,8 @@ void drainEncoderDiagnostics() {
     Serial.print(" step=");
     if (r.wholeDetent > 0) Serial.print('+');
     Serial.print(r.wholeDetent);
+    Serial.print(" noise=");
+    Serial.print(r.noise);
     if (r.prevState == r.currState) {
       Serial.print(" REPEAT");
     } else if (r.tableDir == 0) {
@@ -599,27 +675,48 @@ void init() {
   pinMode(Pins::kEncoderClk, INPUT_PULLUP);
   pinMode(Pins::kEncoderDt, INPUT_PULLUP);
 
-  g_encIsrLastState = static_cast<uint8_t>((digitalRead(Pins::kEncoderClk) == HIGH ? 1 : 0) << 1 |
-                                            (digitalRead(Pins::kEncoderDt) == HIGH ? 1 : 0));
+  uint8_t initialRaw = static_cast<uint8_t>((digitalRead(Pins::kEncoderClk) == HIGH ? 1 : 0) << 1 |
+                                             (digitalRead(Pins::kEncoderDt) == HIGH ? 1 : 0));
+  g_encStableState = initialRaw;
+  g_encCandidateState = initialRaw;
+  g_encCandidateCount = 0;
+  g_encNoiseCount = 0;
+
   g_encIsrSubAccum = 0;
   g_encIsrPendingDetents = 0;
   // Hardware Fix #4.5 (TEMPORARY): only trust the boot pin state as a
   // synchronized rest position if it actually IS rest; otherwise wait
-  // for the ISR to observe REST for the first time before decoding any
-  // cycle, rather than fabricating a detent from an unknown starting
+  // for the sampler to accept REST for the first time before decoding
+  // any cycle, rather than fabricating a detent from an unknown starting
   // position.
-  g_encSynced = (g_encIsrLastState == kEncoderRestState);
+  g_encSynced = (g_encStableState == kEncoderRestState);
   g_encCycleActive = false;
   g_encCycleInvalid = false;
   g_encCyclePeakPositive = 0;
   g_encCyclePeakNegative = 0;
 
-  // Each pin gets its OWN ISR (Hardware Fix #4.5b TEMPORARY): CLK's ISR
-  // updates only the CLK bit of the cached state, DT's ISR updates only
-  // the DT bit, and neither re-reads the other pin -- see the per-pin
-  // capture comment above onEncoderClkChangeIsr()/onEncoderDtChangeIsr().
-  attachInterrupt(digitalPinToInterrupt(Pins::kEncoderClk), onEncoderClkChangeIsr, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(Pins::kEncoderDt), onEncoderDtChangeIsr, CHANGE);
+  // Hardware Fix #4.6 (TEMPORARY): NO GPIO edge interrupts for CLK/DT --
+  // see the Fix4.6 comment block above encoderSampleTimerCallback(). A
+  // periodic esp_timer replaces them entirely. Guarded so calling init()
+  // more than once never creates a second periodic timer (no repeated
+  // heap churn); if one already exists it is left running as-is.
+  if (g_encoderSampleTimer == nullptr) {
+    esp_timer_create_args_t timerArgs = {};
+    timerArgs.callback = &encoderSampleTimerCallback;
+    timerArgs.arg = nullptr;
+    timerArgs.dispatch_method = ESP_TIMER_TASK;
+    timerArgs.name = "enc_sample";
+    esp_err_t createErr = esp_timer_create(&timerArgs, &g_encoderSampleTimer);
+    if (createErr != ESP_OK) {
+      g_encoderSampleTimer = nullptr;
+      g_encoderSamplerInitFailed = true;
+    } else {
+      esp_err_t startErr = esp_timer_start_periodic(g_encoderSampleTimer, kEncoderSamplePeriodUs);
+      if (startErr != ESP_OK) {
+        g_encoderSamplerInitFailed = true;
+      }
+    }
+  }
 }
 
 void update() {
@@ -628,7 +725,15 @@ void update() {
   updateDebounce(g_dot, now);
   updateDebounce(g_encSw, now);
   drainQuadrature();
-  drainEncoderDiagnostics();  // TEMPORARY: raw quadrature diagnostic (observation only)
+  drainEncoderDiagnostics();  // TEMPORARY: accepted-stable-transition diagnostic (observation only)
+  if (g_encoderSamplerInitFailed) {
+    // TEMPORARY (Fix4.6): report exactly once, from normal task context,
+    // never from init() itself and never repeatedly -- the encoder simply
+    // will not produce ENCODER_ROTATE events if this fires, since no
+    // sampler is running to feed the decoder.
+    g_encoderSamplerInitFailed = false;
+    Serial.println("ENC_SAMPLER_INIT_FAILED");
+  }
 
   updateDotStateMachine(now);
   updateEncoderSwStateMachine(now);
