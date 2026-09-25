@@ -19,6 +19,7 @@
 #include "core/settings.h"
 #include "core/storage_messages.h"
 #include "core/text_message.h"
+#include "core/ui_scratch.h"
 #include "core/wifi_manager.h"
 
 namespace {
@@ -876,8 +877,14 @@ uint8_t g_composeLen = 0;
 // alone would still show only one un-wrapped line; wrapping alone would
 // still lose confirmed text past the old 64-byte cap before it ever
 // reached the wrapper. Both are needed together.
+//
+// Hardware Fix #4.4b: at 1801 bytes, this is no longer a permanent global
+// array -- four screens each keeping one of these in static .bss
+// overflowed the ESP32's DRAM segment at link time. screenEnigmaChat()
+// instead obtains it from UiScratch::ensure(Slot::A, ...) on each render
+// (heap-backed, allocated once and reused, never freed/realloced per
+// frame -- see ui_scratch.h).
 constexpr size_t kComposePrefixCap = EnigmaCrypto::kMaxEscapedLen * (Morse::kMaxPatternLength + 1) + 1;
-char g_composePrefixBuf[kComposePrefixCap];
 char g_composePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_composePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
@@ -1604,6 +1611,19 @@ void screenEnigmaChat() {
   uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
   if (totalLines < 3) totalLines = 3;  // at least 1 history row + error row + compose row
 
+  // Hardware Fix #4.4b: this screen's large RAW-Morse compose expansion
+  // buffer now comes from the shared heap-backed scratch pool instead of
+  // its own permanent static array (ui_scratch.h). Checked before any
+  // drawing happens this pass, so a failure never leaves a half-drawn
+  // screen or touches g_composeText/the draft.
+  char* composePrefixBuf = UiScratch::ensure(UiScratch::Slot::A, kComposePrefixCap);
+  if (composePrefixBuf == nullptr) {
+    Display::clearContentArea();
+    Display::printLine(2, contentTop, "Memory Low");
+    g_enigmaChatNeedsFullRedraw = true;  // force a full redraw once a later pass succeeds
+    return;
+  }
+
   int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
   int16_t labelX = static_cast<int16_t>(2 + markerW);            // history icon-cell X
   int16_t composePrefixX = labelX;                                // compose shares the same left margin
@@ -1615,11 +1635,11 @@ void screenEnigmaChat() {
   // being keyed in -- only the last confirmed line + in-progress suffix is
   // ever re-wrapped on a dot/dash.
   char composeSuffix[Morse::kMaxPatternLength + 2];
-  buildComposePrefixSuffix(g_composePrefixBuf, kComposePrefixCap, composeSuffix, sizeof(composeSuffix));
+  buildComposePrefixSuffix(composePrefixBuf, kComposePrefixCap, composeSuffix, sizeof(composeSuffix));
   bool composeFocused = (g_historyCursor == kNoHistoryCursor);
 
   ComposeLayout layout;
-  buildComposeLayout(g_composePrefixBuf, composeSuffix, composeWidth, &layout);
+  buildComposeLayout(composePrefixBuf, composeSuffix, composeWidth, &layout);
 
   uint16_t maxComposeRows = (totalLines > 1) ? static_cast<uint16_t>(totalLines - 1) : 1;  // reserve 1 row for error line
   if (maxComposeRows > kMaxShownComposeRows) maxComposeRows = kMaxShownComposeRows;
@@ -1763,7 +1783,7 @@ void screenEnigmaChat() {
     for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
       uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
       char rowText[64];
-      composeRowText(layout, g_composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
       Display::printLine(composePrefixX, y, rowText);
@@ -1774,7 +1794,7 @@ void screenEnigmaChat() {
     for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
       uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
       char rowText[64];
-      composeRowText(layout, g_composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       bool textChanged = strcmp(rowText, g_enigmaChatLastComposeRowText[shownRow]) != 0;
       bool markerNeedsRedraw = (shownRow == 0) && composeFocusChanged;

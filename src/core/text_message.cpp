@@ -17,6 +17,7 @@
 #include "core/settings.h"
 #include "core/sleep.h"
 #include "core/storage_messages.h"
+#include "core/ui_scratch.h"
 #include "core/wifi_manager.h"
 
 namespace {
@@ -271,8 +272,15 @@ uint8_t g_composeLen = 0;
 // longer than g_composeText itself, so the display-side buffer that holds
 // it is sized from that same worst case instead of an arbitrary guess --
 // see the identical reasoning in enigma.cpp.
+//
+// Hardware Fix #4.4b: at 1801 bytes, this is no longer a permanent global
+// array -- this screen needs it AND its own history scratch (below) live
+// at once during one render pass (the compose prefix is read again to
+// draw the compose row AFTER history has already been drawn using its own
+// scratch), so it comes from UiScratch::Slot::A while history uses
+// Slot::B -- two distinct slots, never aliased against each other. See
+// ui_scratch.h.
 constexpr size_t kComposePrefixCap = PacketCodec::kMaxDecodedTextLen * (Morse::kMaxPatternLength + 1) + 1;
-char g_composePrefixBuf[kComposePrefixCap];
 char g_composePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_composePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
@@ -366,22 +374,21 @@ void drawRowIcon(int16_t x, int16_t y, MessageIconKind icon) {
 // expanding to up to Morse::kMaxPatternLength symbol chars plus a trailing
 // space. Sized from that exact worst case so history text is never
 // silently capped by an unrelated guessed buffer size, matching
-// g_composePrefixBuf's identical reasoning above.
+// the compose-prefix buffer's identical reasoning above (Hardware Fix
+// #4.4b: both now come from the shared UiScratch pool, not a static array).
 constexpr size_t kHistoryLineBufCap = PacketCodec::kMaxDecodedTextLen * (Morse::kMaxPatternLength + 1) + 1;
 
-// kHistoryLineBufCap (1801 bytes) is too large to embed directly in a
-// struct that gets stack-allocated repeatedly across the nested nature of
-// the scan/draw helpers below (computeHistoryViewport() alone can have
-// several of these live on the stack at once via countHistoryRowsFor()).
-// A single shared static buffer -- safe because this screen's rendering is
-// strictly single-threaded/sequential, never reentrant or concurrent, and
-// every caller below fully consumes one message's row count or drawn text
-// before loading the next message -- keeps HistoryRowInfo itself small
-// regardless of how long a message's canonical-Morse expansion is.
-char g_historyLineBufScratch[kHistoryLineBufCap];
-
+// Hardware Fix #4.4b: kHistoryLineBufCap (1801 bytes) is no longer a
+// permanent global array either -- it now comes from the shared
+// UiScratch::Slot::B pool (ui_scratch.h), heap-backed and allocated once.
+// loadHistoryRow() below is called from many places, including during
+// input handling (ENCODER_ROTATE row-stepping) well before the render
+// body's own up-front availability check runs, so it defensively falls
+// back to a small static "?" placeholder -- the same one already used for
+// an unloadable message -- if the pool has no memory to give it, rather
+// than ever handing any caller a null or dangling lineBuf pointer.
 struct HistoryRowInfo {
-  const char* lineBuf;  // points at g_historyLineBufScratch; valid until the next loadHistoryRow() call
+  const char* lineBuf;  // points into the Slot::B scratch buffer (or a static fallback); valid until the next loadHistoryRow() call
   char senderPrefix[24];
   MessageIconKind icon;
   int16_t bodyX;
@@ -393,18 +400,28 @@ struct HistoryRowInfo {
 // (2 + the "> " selection-marker width); continuation rows align under
 // the message body (bodyX), not the icon or sender name.
 void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
-  out->lineBuf = g_historyLineBufScratch;
-  g_historyLineBufScratch[0] = '?';
-  g_historyLineBufScratch[1] = '\0';
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
+  char* scratch = UiScratch::ensure(UiScratch::Slot::B, kHistoryLineBufCap);
+  if (scratch == nullptr) {
+    // Never dereference a failed allocation (Hardware Fix #4.4b) -- degrade
+    // to the existing "message failed to load" placeholder instead.
+    out->lineBuf = "?";
+    int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+    out->bodyX = textX;
+    out->bodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->bodyX);
+    return;
+  }
+  out->lineBuf = scratch;
+  scratch[0] = '?';
+  scratch[1] = '\0';
   const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(index);
   if (entry != nullptr) {
     MessageRef ref = refForIndexEntry(*entry);
     StoredMessageView view;
     if (MessageStore::loadMessage(ref, &view)) {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-      if (renderFn != nullptr) renderFn(view, g_historyLineBufScratch, sizeof(g_historyLineBufScratch));
+      if (renderFn != nullptr) renderFn(view, scratch, kHistoryLineBufCap);
       MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
       MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
       if (iconFn != nullptr) out->icon = iconFn(view);
@@ -925,6 +942,23 @@ void screenChat() {
   uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
   if (totalLines < 2) totalLines = 2;  // at least 1 history row + compose row
 
+  // Hardware Fix #4.4b: this screen needs two large RAW-Morse expansion
+  // scratch buffers live at once -- the confirmed compose prefix (read
+  // again below to draw the compose row, AFTER history has already used
+  // its own scratch to draw) and the history renderer's own per-message
+  // scratch -- so it claims BOTH shared pool slots up front, before any
+  // drawing happens this pass, and bails out cleanly if either is
+  // unavailable rather than leaving a half-drawn screen or touching
+  // g_composeText/the draft.
+  char* composePrefixBuf = UiScratch::ensure(UiScratch::Slot::A, kComposePrefixCap);
+  char* historyScratchCheck = UiScratch::ensure(UiScratch::Slot::B, kHistoryLineBufCap);
+  if (composePrefixBuf == nullptr || historyScratchCheck == nullptr) {
+    Display::clearContentArea();
+    Display::printLine(2, contentTop, "Memory Low");
+    g_chatNeedsFullRedraw = true;  // force a full redraw once a later pass succeeds
+    return;
+  }
+
   int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
   int16_t labelX = static_cast<int16_t>(2 + markerW);            // history icon-cell X
   int16_t composePrefixX = labelX;                                // compose shares the same left margin
@@ -938,11 +972,11 @@ void screenChat() {
   // Display still controls COMPOSE only (buildComposePrefixSuffix() itself
   // is untouched).
   char composeSuffix[Morse::kMaxPatternLength + 2];
-  buildComposePrefixSuffix(g_composePrefixBuf, kComposePrefixCap, composeSuffix, sizeof(composeSuffix));
+  buildComposePrefixSuffix(composePrefixBuf, kComposePrefixCap, composeSuffix, sizeof(composeSuffix));
   bool composeFocused = (g_historyCursor == kNoHistoryCursor);
 
   ComposeLayout layout;
-  buildComposeLayout(g_composePrefixBuf, composeSuffix, composeWidth, &layout);
+  buildComposeLayout(composePrefixBuf, composeSuffix, composeWidth, &layout);
 
   // No separate error row in this screen (unlike Enigma) -- the whole
   // budget below the history viewport is compose's own.
@@ -1059,7 +1093,7 @@ void screenChat() {
     for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
       uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
       char rowText[64];
-      composeRowText(layout, g_composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
       Display::printLine(composePrefixX, y, rowText);
@@ -1070,7 +1104,7 @@ void screenChat() {
     for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
       uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
       char rowText[64];
-      composeRowText(layout, g_composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       bool textChanged = strcmp(rowText, g_chatLastComposeRowText[shownRow]) != 0;
       bool markerNeedsRedraw = (shownRow == 0) && composeFocusChanged;

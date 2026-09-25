@@ -19,6 +19,7 @@
 #include "core/settings.h"
 #include "core/storage_messages.h"
 #include "core/text_message.h"
+#include "core/ui_scratch.h"
 #include "core/wifi_manager.h"
 
 namespace {
@@ -582,14 +583,16 @@ void drawRowIcon(int16_t x, int16_t y, MessageIconKind icon) {
 // registry, so the buffer must cover the largest of those.
 constexpr size_t kHistoryLineBufCap = PacketCodec::kMaxDecodedTextLen * (Morse::kMaxPatternLength + 1) + 1;
 
-// Single shared static buffer (see text_message.cpp's identical reasoning)
-// -- keeps HistoryRowInfo small regardless of how long a message's
-// canonical-Morse expansion is, safe because this screen's rendering is
-// strictly single-threaded/sequential.
-char g_historyLineBufScratch[kHistoryLineBufCap];
-
+// Hardware Fix #4.4b: no longer a permanent global array -- this screen
+// has no compose text of its own (see above), so it needs only ONE large
+// scratch buffer at a time, reused from the shared UiScratch::Slot::B pool
+// (ui_scratch.h) -- the same slot Text Message's history renderer uses;
+// this screen and Text/Enigma's are never rendering concurrently. Falls
+// back to the existing static "?" placeholder if the pool has no memory
+// to give, since loadHistoryRow() is called from many places (including
+// during input handling) that cannot show an on-screen error themselves.
 struct HistoryRowInfo {
-  const char* lineBuf;  // points at g_historyLineBufScratch; valid until the next loadHistoryRow() call
+  const char* lineBuf;  // points into the Slot::B scratch buffer (or a static fallback); valid until the next loadHistoryRow() call
   char senderPrefix[24];
   MessageIconKind icon;
   int16_t bodyX;
@@ -597,18 +600,26 @@ struct HistoryRowInfo {
 };
 
 void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
-  out->lineBuf = g_historyLineBufScratch;
-  g_historyLineBufScratch[0] = '?';
-  g_historyLineBufScratch[1] = '\0';
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
+  char* scratch = UiScratch::ensure(UiScratch::Slot::B, kHistoryLineBufCap);
+  if (scratch == nullptr) {
+    out->lineBuf = "?";
+    int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+    out->bodyX = textX;
+    out->bodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->bodyX);
+    return;
+  }
+  out->lineBuf = scratch;
+  scratch[0] = '?';
+  scratch[1] = '\0';
   const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(index);
   if (entry != nullptr) {
     MessageRef ref = refForIndexEntry(*entry);
     StoredMessageView view;
     if (MessageStore::loadMessage(ref, &view)) {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-      if (renderFn != nullptr) renderFn(view, g_historyLineBufScratch, sizeof(g_historyLineBufScratch));
+      if (renderFn != nullptr) renderFn(view, scratch, kHistoryLineBufCap);
       MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
       MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
       if (iconFn != nullptr) out->icon = iconFn(view);
@@ -858,6 +869,18 @@ void screenFriendChat() {
   int16_t contentHeight = Display::kScreenHeight - contentTop;
   uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
   if (totalLines < 2) totalLines = 2;
+
+  // Hardware Fix #4.4b: this screen's large RAW-Morse history expansion
+  // scratch now comes from the shared heap-backed pool. Checked before any
+  // drawing happens this pass, so a failure never leaves a half-drawn
+  // screen.
+  if (UiScratch::ensure(UiScratch::Slot::B, kHistoryLineBufCap) == nullptr) {
+    Display::clearContentArea();
+    Display::printLine(2, contentTop, "Memory Low");
+    g_friendChatNeedsFullRedraw = true;  // force a full redraw once a later pass succeeds
+    return;
+  }
+
   int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
   int16_t labelX = static_cast<int16_t>(2 + markerW);
   uint16_t viewportLines = static_cast<uint16_t>(totalLines - 1);  // -1 = fixed hint-line row
