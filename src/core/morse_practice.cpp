@@ -443,6 +443,11 @@ constexpr uint8_t kNoRowCount = 0xFF;
 uint8_t g_lastChallengeRowCount = kNoRowCount;
 uint8_t g_lastAnswerRowCount = kNoRowCount;
 uint8_t g_lastResultRowCount = kNoRowCount;
+// Hardware Fix #4.4a: High Score can now be hidden (0 rows) while the
+// Result banner needs the space, so its visibility is tracked the same
+// way as the other three sections to force a full repaint on the
+// transition (no stale pixels left behind when it disappears/reappears).
+uint8_t g_lastHiShown = kNoRowCount;
 char g_lastChallengeRowText[kMaxChallengeRows][64] = {{0}};
 char g_lastAnswerRowText[kMaxAnswerRows][64] = {{0}};
 char g_lastResultRowText[kMaxResultRows][64] = {{0}};
@@ -566,21 +571,78 @@ void screenPractice() {
   char resultRowsFull[kMaxResultRows][64];
   uint8_t resultRowCountFull = showingResult ? wrapIntoRows(resultLine, rowWidth, resultRowsFull, kMaxResultRows) : 0;
 
-  // Fits Challenge/Answer/Result into whatever's left after Title and High
-  // Score's fixed single rows, prioritizing Answer (the row actively being
-  // keyed -- "answer entry must keep the currently typed end visible"),
-  // then Challenge, then the transient Result banner. On this 135px-tall
-  // screen these three will usually all fit fully (Level 1/2 challenges
-  // and any Letters-Only view never wrap at all); only a Level 3 sentence
-  // shown as RAW Morse can be wide enough to need this budget to matter.
-  int32_t budget = static_cast<int32_t>(totalLines) - 2;
-  if (budget < 0) budget = 0;
-  uint8_t answerShown = static_cast<uint8_t>((answerRowCountFull < budget) ? answerRowCountFull : budget);
-  budget -= answerShown;
-  uint8_t challengeShown = static_cast<uint8_t>((challengeRowCountFull < budget) ? challengeRowCountFull : budget);
-  budget -= challengeShown;
-  uint8_t resultShown = static_cast<uint8_t>((resultRowCountFull < budget) ? resultRowCountFull : budget);
-  budget -= resultShown;
+  // Hardware Fix #4.4a: deterministic row-budget policy replacing the
+  // strict answer>challenge>result priority chain that could silently
+  // starve Result down to 0 rows -- submitAnswer()'s transient feedback
+  // ("Correct!"/"Wrong: <challenge>") must always be visible after
+  // Submit. Two distinct policies, chosen by whether the result banner is
+  // currently showing:
+  uint8_t challengeShown;
+  uint8_t answerShown;
+  uint8_t resultShown;
+  uint8_t hiShown;
+  if (!showingResult) {
+    // Normal state: Title and High Score are always shown (1 row each).
+    // Challenge and Answer are EACH guaranteed at least 1 row; any extra
+    // rows left over favor whichever section is currently focused (up to
+    // its actual need), then the other section.
+    int32_t budget = static_cast<int32_t>(totalLines) - 4;  // -4 = title(1) + hiscore(1) + challenge/answer minimums
+    if (budget < 0) budget = 0;
+    challengeShown = 1;
+    answerShown = 1;
+    if (g_cursor == PracticeCursor::ANSWER) {
+      uint8_t extraAnswer = static_cast<uint8_t>((answerRowCountFull - 1 < budget) ? answerRowCountFull - 1 : budget);
+      answerShown = static_cast<uint8_t>(answerShown + extraAnswer);
+      budget -= extraAnswer;
+      uint8_t extraChallenge =
+          static_cast<uint8_t>((challengeRowCountFull - 1 < budget) ? challengeRowCountFull - 1 : budget);
+      challengeShown = static_cast<uint8_t>(challengeShown + extraChallenge);
+      budget -= extraChallenge;
+    } else {
+      uint8_t extraChallenge =
+          static_cast<uint8_t>((challengeRowCountFull - 1 < budget) ? challengeRowCountFull - 1 : budget);
+      challengeShown = static_cast<uint8_t>(challengeShown + extraChallenge);
+      budget -= extraChallenge;
+      uint8_t extraAnswer = static_cast<uint8_t>((answerRowCountFull - 1 < budget) ? answerRowCountFull - 1 : budget);
+      answerShown = static_cast<uint8_t>(answerShown + extraAnswer);
+      budget -= extraAnswer;
+    }
+    resultShown = 0;
+    hiShown = 1;
+  } else {
+    // Result banner state: Title, Challenge, Answer, and Result are each
+    // guaranteed at least 1 row (Result can never be 0 while
+    // showingResult==true) before High Score -- the lowest priority here
+    // -- gets whatever is left, which may be nothing. Extra rows beyond
+    // the four guaranteed ones go to Result first (up to its full wrapped
+    // need), then to Challenge/Answer favoring the focused section.
+    int32_t budget = static_cast<int32_t>(totalLines) - 4;  // -4 = title(1) + challenge/answer/result minimums
+    if (budget < 0) budget = 0;
+    challengeShown = 1;
+    answerShown = 1;
+    resultShown = 1;  // resultRowCountFull is always >= 1 here (g_resultText is non-empty while showingResult)
+    uint8_t extraResult = static_cast<uint8_t>((resultRowCountFull - 1 < budget) ? resultRowCountFull - 1 : budget);
+    resultShown = static_cast<uint8_t>(resultShown + extraResult);
+    budget -= extraResult;
+    if (g_cursor == PracticeCursor::ANSWER) {
+      uint8_t extraAnswer = static_cast<uint8_t>((answerRowCountFull - 1 < budget) ? answerRowCountFull - 1 : budget);
+      answerShown = static_cast<uint8_t>(answerShown + extraAnswer);
+      budget -= extraAnswer;
+      uint8_t extraChallenge =
+          static_cast<uint8_t>((challengeRowCountFull - 1 < budget) ? challengeRowCountFull - 1 : budget);
+      challengeShown = static_cast<uint8_t>(challengeShown + extraChallenge);
+      budget -= extraChallenge;
+    } else {
+      uint8_t extraChallenge =
+          static_cast<uint8_t>((challengeRowCountFull - 1 < budget) ? challengeRowCountFull - 1 : budget);
+      challengeShown = static_cast<uint8_t>(challengeShown + extraChallenge);
+      budget -= extraChallenge;
+      uint8_t extraAnswer = static_cast<uint8_t>((answerRowCountFull - 1 < budget) ? answerRowCountFull - 1 : budget);
+      answerShown = static_cast<uint8_t>(answerShown + extraAnswer);
+      budget -= extraAnswer;
+    }
+    hiShown = (budget >= 1) ? 1 : 0;  // High Score is temporarily hidden if nothing is left for it
+  }
 
   // If Answer or Result had to be clamped, keep their LAST rows visible
   // (the active caret for Answer; the tail for Result) rather than losing
@@ -596,12 +658,16 @@ void screenPractice() {
   int16_t hiY = static_cast<int16_t>(resultY + resultShown * lh);
 
   bool firstDraw = g_practiceNeedsFullRedraw;
-  // Any change to how many rows Challenge/Answer/Result actually need
-  // shifts every row below it, so that forces one full mid-screen repaint
-  // (Hardware Fix #4.4 issue E) -- rare: only a new challenge, a reveal
-  // toggle, or text crossing a wrap boundary triggers it.
+  // Any change to how many rows Challenge/Answer/Result/High Score
+  // actually get shifts every row below it, so that forces one full
+  // mid-screen repaint (Hardware Fix #4.4 issue E, extended in #4.4a to
+  // also cover High Score's own show/hide transition so it never leaves
+  // stale pixels behind) -- rare: only a new challenge, a reveal toggle,
+  // text crossing a wrap boundary, a focus change that shifts the extra
+  // row, or the result banner appearing/expiring triggers it.
   bool layoutChanged = firstDraw || challengeShown != g_lastChallengeRowCount ||
-                       answerShown != g_lastAnswerRowCount || resultShown != g_lastResultRowCount;
+                       answerShown != g_lastAnswerRowCount || resultShown != g_lastResultRowCount ||
+                       hiShown != g_lastHiShown;
 
   if (layoutChanged) {
     Display::clearContentArea();
@@ -620,7 +686,7 @@ void screenPractice() {
       int16_t y = static_cast<int16_t>(resultY + i * lh);
       Display::printLine(2, y, resultRowsFull[resultStart + i]);
     }
-    if (hiLine[0] != '\0') Display::printLine(2, hiY, hiLine);
+    if (hiShown > 0 && hiLine[0] != '\0') Display::printLine(2, hiY, hiLine);
     g_practiceNeedsFullRedraw = false;
   } else {
     if (strcmp(titleLine, g_lastPracticeTitleLine) != 0) {
@@ -674,7 +740,11 @@ void screenPractice() {
         if (text[0] != '\0') Display::printLine(2, y, text);
       }
     }
-    if (strcmp(hiLine, g_lastPracticeHiLine) != 0) {
+    // hiShown is guaranteed unchanged from last frame here (a change would
+    // have set layoutChanged above), so hiShown == 0 means High Score is
+    // still hidden -- already cleared when it was hidden -- and there is
+    // nothing to diff.
+    if (hiShown > 0 && strcmp(hiLine, g_lastPracticeHiLine) != 0) {
       int16_t oldW = Display::textWidth(g_lastPracticeHiLine);
       int16_t newW = Display::textWidth(hiLine);
       int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
@@ -706,6 +776,7 @@ void screenPractice() {
   g_lastChallengeRowCount = challengeShown;
   g_lastAnswerRowCount = answerShown;
   g_lastResultRowCount = resultShown;
+  g_lastHiShown = hiShown;
 }
 
 // Storage::init() runs from setup() after every global constructor has
