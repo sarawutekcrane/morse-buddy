@@ -354,7 +354,14 @@ uint8_t getRecentContacts(const char* group_code, RecentContact* outArr, uint8_t
 
 void resolveDisplayName(const char* group_code, const char* device_id, char* out, size_t outSize) {
   if (strcmp(device_id, Identity::deviceId()) == 0) {
-    strncpy(out, Settings::getMyName(), outSize - 1);
+    // Hardware Fix #4.3 issue F: only resolve to a real, user-chosen name.
+    // A never-configured device falls back to its own device id, the same
+    // fallback MessageStore::buildSenderPrefix() already uses for a peer
+    // with no cached name, instead of showing the compiled "Me" default as
+    // if it were this device's actual chosen name (e.g. in a Race Room
+    // participant list's own "(You)" row).
+    const char* name = Settings::hasCustomMyName() ? Settings::getMyName() : Identity::deviceId();
+    strncpy(out, name, outSize - 1);
     out[outSize - 1] = '\0';
     return;
   }

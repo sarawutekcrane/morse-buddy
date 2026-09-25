@@ -453,6 +453,28 @@ void screenRaceGuess() {
 // =============================================================================
 // Room screen
 // =============================================================================
+// Hardware Fix #4.3 issue D audit: a one-device Invite press was reported as
+// "appearing to do nothing" on hardware. Traced end-to-end -- publishInvite()
+// below is entirely local/synchronous (sets g_inviteId, owner=self,
+// g_haveJoined, g_phase=LOBBY_WAITING, resets and re-adds self to
+// g_participants) before it ever touches the network, and
+// MqttManager::publishBinary() returns immediately (false, non-blocking) when
+// no broker connection is up, so a missing/slow connection cannot stall or
+// skip the state transition. screenRaceRoom() also has no top-level dirty
+// gate (by design, so it keeps reflecting async network/presence events --
+// see the Hardware Fix #3 comment above it); its action-label, score, and
+// participant rows are unconditionally recomputed and diffed every tick, and
+// that render happens in the same screenRaceRoom() call as the
+// ENCODER_SHORT event that triggered handleRoomAction(), so the label
+// ("Invite to Play" -> "Start Round") and the new "<name> (You)" row are
+// guaranteed to be current on the very next frame. No logic or redraw defect
+// was found in this path. The most likely explanation for the observed
+// non-responsiveness is the encoder pushbutton press itself not registering
+// a clean ENCODER_SHORT edge on that hardware unit (a separate GPIO/contact
+// from the CLK/DT rotary pins fixed under issue A, and not touched by that
+// fix), which is indistinguishable to a user from "the feature does
+// nothing" since a dropped press currently produces no visible feedback
+// either way.
 void handleRoomAction() {
   if (g_phase == RoomPhase::NO_LOBBY) {
     publishInvite();

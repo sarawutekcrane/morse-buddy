@@ -243,10 +243,28 @@ void submitGuess() {
 
 bool g_soloGuessDirty = true;
 bool g_soloGuessNeedsFullRedraw = true;
-char g_lastSoloAttemptLine[32] = {0};
-char g_lastSoloClueLine[24] = {0};
 NumberGuessing::DigitRowRenderState g_soloGuessRowState;
+// Sentinel (not a valid historyCount) so the very first render after entry
+// always treats history as "changed" even if historyCount happens to
+// already be 0 (e.g. resuming a puzzle with no attempts yet).
+constexpr uint16_t kNoHistorySentinel = 0xFFFF;
+uint16_t g_soloGuessLastHistoryCount = kNoHistorySentinel;
 
+// Hardware Fix #4.3 issue C: canonical live layout --
+//
+//        1 2 3 4   2A2B
+//        5 6 7 8   1A1B
+//        9 0 2 6   1A2B
+//  Guess: _ _ _ _
+//
+// Every history row's four digit columns and its xAyB result share EXACT
+// pixel X coordinates with the live Guess row's four digit cells and its
+// own trailing text -- PRIMARY is proportional, so this is fixed-pixel
+// cell math (matching NumberGuessing::renderDigitRow()'s own fixed-cell
+// approach), never a formatted/padded string. The Guess row is pinned to
+// the bottom of the content area; history fills upward from there, most
+// recent immediately above Guess, older attempts scrolling off the top
+// when they no longer fit.
 void screenSoloGuess() {
   if (Menu::consumeJustEntered()) {
     NumberGuessing::resetDigitEntry(&g_digitEntry);
@@ -286,47 +304,60 @@ void screenSoloGuess() {
 
   Display::setFont(Display::Font::PRIMARY);
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t guessY = static_cast<int16_t>(Display::kScreenHeight - lh);
 
-  char attemptLine[32];
-  snprintf(attemptLine, sizeof(attemptLine), "Attempt %d", g_solo.totalAttempts + 1);
+  static const char* const kGuessLabel = "Guess: ";
+  int16_t digitsX = static_cast<int16_t>(2 + Display::textWidth(kGuessLabel) + 4);
+  int16_t cellW = NumberGuessing::digitCellWidth();
+  int16_t resultX = static_cast<int16_t>(digitsX + NumberGuessing::kSecretDigits * cellW + 8);
+
+  int16_t availableHistoryHeight = static_cast<int16_t>(guessY - contentTop);
+  uint16_t maxHistoryRows = (availableHistoryHeight > 0) ? static_cast<uint16_t>(availableHistoryHeight / lh) : 0;
+  uint16_t shown = (g_solo.historyCount < maxHistoryRows) ? g_solo.historyCount : maxHistoryRows;
+  uint16_t startIdx = static_cast<uint16_t>(g_solo.historyCount - shown);
 
   bool firstDraw = g_soloGuessNeedsFullRedraw;
+  // A new attempt changes which rows are visible (the window scrolls up
+  // by one) -- a genuine viewport change, so (like ListMenu's own scroll
+  // case) the history region is redrawn in full, but the Guess row below
+  // it never is; a plain digit-preview rotation with no new attempt
+  // leaves history completely untouched, only the Guess row's own
+  // fixed-cell diffing (inside renderDigitRow()) repaints anything.
+  bool historyChanged = firstDraw || (g_solo.historyCount != g_soloGuessLastHistoryCount);
+
   if (firstDraw) {
     Display::clearContentArea();
-    Display::printLine(2, y, attemptLine);
-    g_soloGuessNeedsFullRedraw = false;
-  } else if (strcmp(attemptLine, g_lastSoloAttemptLine) != 0) {
-    Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
-    Display::printLine(2, y, attemptLine);
+  } else if (historyChanged) {
+    int16_t regionH = static_cast<int16_t>(guessY - contentTop);
+    if (regionH < 0) regionH = 0;
+    Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
   }
-  strncpy(g_lastSoloAttemptLine, attemptLine, sizeof(g_lastSoloAttemptLine) - 1);
-  g_lastSoloAttemptLine[sizeof(g_lastSoloAttemptLine) - 1] = '\0';
-  y += lh;
 
-  NumberGuessing::renderDigitRow(&g_soloGuessRowState, 2, y, "Guess: ", g_digitEntry);
-  y += lh;
+  if (historyChanged) {
+    for (uint16_t i = startIdx; i < g_solo.historyCount; i++) {
+      uint16_t rowIndex = static_cast<uint16_t>(i - startIdx);
+      int16_t rowY = static_cast<int16_t>(guessY - (shown - rowIndex) * lh);
+      const GuessEntry& g = g_solo.history[i];
+      uint8_t digits[NumberGuessing::kSecretDigits] = {
+          static_cast<uint8_t>((g.guessValue / 1000) % 10),
+          static_cast<uint8_t>((g.guessValue / 100) % 10),
+          static_cast<uint8_t>((g.guessValue / 10) % 10),
+          static_cast<uint8_t>(g.guessValue % 10),
+      };
+      for (uint8_t d = 0; d < NumberGuessing::kSecretDigits; d++) {
+        char buf[2] = {static_cast<char>('0' + digits[d]), '\0'};
+        Display::printLine(static_cast<int16_t>(digitsX + d * cellW), rowY, buf);
+      }
+      char resultBuf[8];
+      snprintf(resultBuf, sizeof(resultBuf), "%uA%uB", g.aCount, g.bCount);
+      Display::printLine(resultX, rowY, resultBuf);
+    }
+    g_soloGuessLastHistoryCount = g_solo.historyCount;
+  }
+  g_soloGuessNeedsFullRedraw = false;
 
-  // Hardware Fix #4 issue 8: persistent immediate clue after an incorrect
-  // guess, reusing submitGuess()'s already-computed A/B result (the most
-  // recent history entry) rather than duplicating the evaluate() logic.
-  // Digits = A+B (total correct digits regardless of position), Pos = A
-  // (correct digits in the correct position). Stays visible until the
-  // next guess replaces it, or a new puzzle clears history (historyCount
-  // back to 0 makes the clue disappear with it -- no separate reset
-  // needed). Diffed independently so it never repaints the Guess row.
-  char clueLine[24] = {0};
-  if (g_solo.historyCount > 0) {
-    const GuessEntry& last = g_solo.history[g_solo.historyCount - 1];
-    uint8_t digitsCorrect = static_cast<uint8_t>(last.aCount + last.bCount);
-    snprintf(clueLine, sizeof(clueLine), "Digits: %u  Pos: %u", digitsCorrect, last.aCount);
-  }
-  if (firstDraw || strcmp(clueLine, g_lastSoloClueLine) != 0) {
-    if (!firstDraw) Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
-    if (clueLine[0] != '\0') Display::printLine(2, y, clueLine);
-    strncpy(g_lastSoloClueLine, clueLine, sizeof(g_lastSoloClueLine) - 1);
-    g_lastSoloClueLine[sizeof(g_lastSoloClueLine) - 1] = '\0';
-  }
+  NumberGuessing::renderDigitRow(&g_soloGuessRowState, 2, guessY, kGuessLabel, g_digitEntry);
 }
 
 // Hardware Fix #3: same three-way redraw split as ListMenu -- full draw

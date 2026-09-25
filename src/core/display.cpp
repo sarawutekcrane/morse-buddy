@@ -181,6 +181,60 @@ void printLine(int16_t x, int16_t topY, const char* text) {
   g_tft.print(buf);
 }
 
+uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint16_t* outLens, uint8_t maxLines) {
+  if (text == nullptr || maxLines == 0 || maxWidthPx <= 0) return 0;
+  size_t len = strlen(text);
+  if (len == 0) return 0;
+
+  // Scratch buffer for width-measuring a candidate line via
+  // getTextBounds(), which needs a null-terminated string. 48 matches
+  // printLine()'s own clip buffer -- comfortably wider than any line that
+  // could actually fit inside kScreenWidth in either font.
+  constexpr size_t kScratch = 48;
+  char scratch[kScratch];
+  auto widthOf = [&](size_t start, size_t count) -> int16_t {
+    size_t c = (count >= kScratch) ? kScratch - 1 : count;
+    memcpy(scratch, text + start, c);
+    scratch[c] = '\0';
+    return textWidth(scratch);
+  };
+
+  uint8_t lineCount = 0;
+  size_t pos = 0;
+  while (pos < len && lineCount < maxLines) {
+    while (pos < len && text[pos] == ' ') pos++;
+    if (pos >= len) break;
+    size_t lineStart = pos;
+    size_t lineEnd = lineStart;
+    size_t wordScan = lineStart;
+
+    while (wordScan <= len) {
+      size_t wordEnd = wordScan;
+      while (wordEnd < len && text[wordEnd] != ' ') wordEnd++;
+      if (widthOf(lineStart, wordEnd - lineStart) <= maxWidthPx) {
+        lineEnd = wordEnd;
+        if (wordEnd >= len) break;
+        wordScan = wordEnd + 1;
+        continue;
+      }
+      if (lineEnd > lineStart) break;  // an earlier word already fit -- stop the line there
+      // Not even the first word fits: hard-split it by character so it is
+      // never dropped, only spread across more lines.
+      size_t chars = 1;
+      while (lineStart + chars < wordEnd && widthOf(lineStart, chars + 1) <= maxWidthPx) chars++;
+      lineEnd = lineStart + chars;
+      break;
+    }
+    if (lineEnd <= lineStart) lineEnd = lineStart + 1;  // guarantee forward progress
+
+    outStarts[lineCount] = static_cast<uint16_t>(lineStart);
+    outLens[lineCount] = static_cast<uint16_t>(lineEnd - lineStart);
+    lineCount++;
+    pos = lineEnd;
+  }
+  return lineCount;
+}
+
 void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565) {
   // Drawn with TFT primitives (never a font glyph) inside a fixed
   // kLockIconCellWidth x kLockIconCellHeight cell, so text after it always

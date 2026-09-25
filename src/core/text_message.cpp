@@ -340,7 +340,15 @@ void sendComposedMessage() {
   env.schema_version = 1;
   env.message_type = PacketCodec::MSG_TYPE_TEXT;
   strncpy(env.sender_device_id, Identity::deviceId(), sizeof(env.sender_device_id) - 1);
-  strncpy(env.sender_name_cache, Settings::getMyName(), sizeof(env.sender_name_cache) - 1);
+  // Hardware Fix #4.3 issue F: only embed a real, user-chosen name. env is
+  // already zeroed above, so leaving this unset when no name has been
+  // configured yet keeps sender_name_cache empty, letting
+  // MessageStore::buildSenderPrefix()'s existing fallback show the device
+  // id instead of the compiled "Me" placeholder leaking out as if it were
+  // this device's actual chosen name.
+  if (Settings::hasCustomMyName()) {
+    strncpy(env.sender_name_cache, Settings::getMyName(), sizeof(env.sender_name_cache) - 1);
+  }
   strncpy(env.group_code, g_selectedGroupCode, sizeof(env.group_code) - 1);
   env.timestamp = WifiManager::getUnixTime();
 

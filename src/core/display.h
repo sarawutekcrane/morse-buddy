@@ -83,4 +83,19 @@ constexpr int16_t kLockIconCellWidth = 12;
 constexpr int16_t kLockIconCellHeight = 12;
 void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
 
+// Greedy word-wrap of `text` into visual lines that each fit within
+// `maxWidthPx` in the currently active font (Hardware Fix #4.3 issue E).
+// Writes up to `maxLines` line spans as byte offsets into `text` --
+// outStarts[i]/outLens[i], not copies; callers slice the substring
+// themselves (e.g. via memcpy) using those offsets. Wraps on space
+// boundaries where possible; a single word wider than maxWidthPx is
+// hard-split by character so text is never silently dropped, only ever
+// bounded by how many lines the caller has room to draw. Returns the
+// number of lines actually produced (<= maxLines); if `text` needs more
+// lines than maxLines, the text beyond the last produced line is simply
+// not represented in the output -- callers that need "show the most
+// recent lines" call this with a generous maxLines to get the full
+// breakdown, then window the result themselves.
+uint8_t wrapText(const char* text, int16_t maxWidthPx, uint16_t* outStarts, uint16_t* outLens, uint8_t maxLines);
+
 }  // namespace Display

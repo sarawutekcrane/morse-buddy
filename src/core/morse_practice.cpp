@@ -216,7 +216,7 @@ void playChallengeAudio() {
 // Screen state
 // =============================================================================
 enum class PracticeCursor : uint8_t { CHALLENGE, ANSWER };
-PracticeCursor g_cursor = PracticeCursor::CHALLENGE;
+PracticeCursor g_cursor = PracticeCursor::ANSWER;
 bool g_revealHeld = false;
 
 char g_answerText[24];
@@ -269,7 +269,12 @@ void startNewChallenge() {
   generateChallenge(level, g_challengeText, sizeof(g_challengeText));
   g_challengeShownAtMs = millis();
   resetAnswerCompose();
-  g_cursor = PracticeCursor::CHALLENGE;
+  // Hardware Fix #4.3 issue B: default focus to ANSWER on every new
+  // challenge (both first entry and after Submit) so the user can start
+  // keying Morse immediately without first having to rotate the encoder
+  // away from CHALLENGE. CHALLENGE remains reachable by rotating there
+  // (for Audio Preview / Reveal Answer).
+  g_cursor = PracticeCursor::ANSWER;
   g_revealHeld = false;
   if (g_audioPreview) playChallengeAudio();
 }

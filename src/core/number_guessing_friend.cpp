@@ -1067,7 +1067,11 @@ void sendChallenge(const char* group_code, const char* contact_key, const uint8_
   env.schema_version = 1;
   env.message_type = PacketCodec::MSG_TYPE_GAME;
   strncpy(env.sender_device_id, Identity::deviceId(), sizeof(env.sender_device_id) - 1);
-  strncpy(env.sender_name_cache, Settings::getMyName(), sizeof(env.sender_name_cache) - 1);
+  // Hardware Fix #4.3 issue F: only embed a real, user-chosen name (env is
+  // already zeroed above) -- see the matching comment in text_message.cpp.
+  if (Settings::hasCustomMyName()) {
+    strncpy(env.sender_name_cache, Settings::getMyName(), sizeof(env.sender_name_cache) - 1);
+  }
   strncpy(env.group_code, group_code, sizeof(env.group_code) - 1);
   env.timestamp = WifiManager::getUnixTime();
 

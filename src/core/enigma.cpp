@@ -859,6 +859,19 @@ uint16_t g_historyCursor = kNoHistoryCursor;
 
 char g_composeText[EnigmaCrypto::kMaxEscapedLen + 1];
 uint8_t g_composeLen = 0;
+
+// Hardware Fix #4.3 issue E: buildComposePrefixSuffix()'s RAW-mode output
+// (one-way canonical Morse text -- dots/dashes/slashes/spaces, up to
+// Morse::kMaxPatternLength symbol chars plus a trailing space per
+// confirmed character) can be far longer than g_composeText itself, so the
+// display-side buffer that holds it is sized from that same worst case
+// instead of an arbitrary guess -- this is the buffer the task's "do NOT
+// merely enlarge composePrefix[64]" instruction refers to; enlarging it
+// alone would still show only one un-wrapped line; wrapping alone would
+// still lose confirmed text past the old 64-byte cap before it ever
+// reached the wrapper. Both are needed together.
+constexpr size_t kComposePrefixCap = EnigmaCrypto::kMaxEscapedLen * (Morse::kMaxPatternLength + 1) + 1;
+char g_composePrefixBuf[kComposePrefixCap];
 char g_composePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_composePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
@@ -944,6 +957,198 @@ void drawRowIcon(int16_t x, int16_t y, MessageIconKind icon) {
   }
 }
 
+// =============================================================================
+// Multi-line history + compose layout (Hardware Fix #4.3 issue E). A single
+// logical message/compose line can now span more than one visual row,
+// word-wrapped to the real pixel width of the currently-active font
+// (Display::wrapText()) instead of being clipped at a fixed character
+// count (the old lineBuf[48]/composePrefix[64]). This never changes
+// message storage, wire format, or crypto -- it only changes how the
+// already-decoded text is laid out on screen.
+// =============================================================================
+
+// Matches EnigmaCrypto's own ciphertext[kMaxEscapedLen+1] (201) and
+// decodeLocalPayload's cachedText[251] caps used by renderEnigmaMessage()
+// above -- no RenderFn implementation (Enigma's or any other message
+// type's) can ever produce more text than those already hold, so sizing
+// the display-side buffer to match can only recover text the old
+// lineBuf[48] used to silently clip, never mask a truncation that isn't
+// already there.
+constexpr size_t kHistoryLineBufCap = 251;
+constexpr uint8_t kMaxHistoryWrapLines = 20;
+
+struct HistoryRowInfo {
+  char lineBuf[kHistoryLineBufCap];
+  char senderPrefix[24];
+  MessageIconKind icon;
+  int16_t bodyX;
+  uint16_t wrapStarts[kMaxHistoryWrapLines];
+  uint16_t wrapLens[kMaxHistoryWrapLines];
+  uint8_t wrapCount;  // always >= 1
+};
+
+// Loads history entry `index` and word-wraps its body to fit after the
+// icon+sender cell on row 0. `labelX` is the fixed icon-cell X already used
+// by every history row (2 + the "> " selection-marker width); continuation
+// rows align under the message body (bodyX), not the icon or sender name,
+// matching the canonical layout from the task spec.
+void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
+  out->lineBuf[0] = '?';
+  out->lineBuf[1] = '\0';
+  out->senderPrefix[0] = '\0';
+  out->icon = MessageIconKind::NONE;
+  const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(index);
+  if (entry != nullptr) {
+    MessageRef ref = refForIndexEntry(*entry);
+    StoredMessageView view;
+    if (MessageStore::loadMessage(ref, &view)) {
+      RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
+      if (renderFn != nullptr) renderFn(view, out->lineBuf, sizeof(out->lineBuf));
+      MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
+      MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
+      if (iconFn != nullptr) out->icon = iconFn(view);
+    }
+  }
+  int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+  out->bodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
+  int16_t bodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->bodyX);
+  out->wrapCount = Display::wrapText(out->lineBuf, bodyWidth, out->wrapStarts, out->wrapLens, kMaxHistoryWrapLines);
+  if (out->wrapCount == 0) {
+    // Empty body (or zero/negative width from a very long sender name) --
+    // still occupy one row rather than vanish, with an explicit empty span
+    // rather than leaving wrapStarts[0]/wrapLens[0] uninitialized.
+    out->wrapStarts[0] = 0;
+    out->wrapLens[0] = 0;
+    out->wrapCount = 1;
+  }
+}
+
+// Bottom-anchored, row-budget scan: picks the first history index to show
+// so the most recent messages fill the viewport from the bottom, the same
+// intent as the old index-count-based startIdx math, just counted in
+// wrapped visual rows instead of one-row-per-message. Keeps the focused
+// history entry (if any) fully inside the viewport, same as before.
+uint16_t computeHistoryStartIdx(uint16_t viewportLines, int16_t labelX) {
+  if (g_indexTotal == 0) return 0;
+  uint16_t startIdx = g_indexTotal;
+  int32_t budget = viewportLines;
+  uint16_t idx = g_indexTotal;
+  while (idx > 0) {
+    idx--;
+    HistoryRowInfo info;
+    loadHistoryRow(idx, labelX, &info);
+    if (info.wrapCount > budget) {
+      if (startIdx == g_indexTotal) startIdx = idx;  // show it best-effort even if it overflows
+      break;
+    }
+    budget -= info.wrapCount;
+    startIdx = idx;
+    if (budget == 0) break;
+  }
+
+  if (g_historyCursor != kNoHistoryCursor) {
+    if (g_historyCursor < startIdx) {
+      startIdx = g_historyCursor;
+    } else {
+      int32_t rowsUsed = 0;
+      for (uint16_t i = startIdx; i <= g_historyCursor; i++) {
+        HistoryRowInfo info;
+        loadHistoryRow(i, labelX, &info);
+        rowsUsed += info.wrapCount;
+      }
+      while (rowsUsed > static_cast<int32_t>(viewportLines) && startIdx < g_historyCursor) {
+        HistoryRowInfo info;
+        loadHistoryRow(startIdx, labelX, &info);
+        rowsUsed -= info.wrapCount;
+        startIdx++;
+      }
+    }
+  }
+  return startIdx;
+}
+
+// Y of the first visual row belonging to history index `targetIdx`, given
+// the entries from `startIdx` up to it are already on screen.
+int16_t historyRowY(uint16_t startIdx, uint16_t targetIdx, int16_t labelX, int16_t contentTop, int16_t lh) {
+  int32_t rows = 0;
+  for (uint16_t i = startIdx; i < targetIdx; i++) {
+    HistoryRowInfo info;
+    loadHistoryRow(i, labelX, &info);
+    rows += info.wrapCount;
+  }
+  return static_cast<int16_t>(contentTop + rows * lh);
+}
+
+constexpr uint8_t kMaxComposeWrapLines = 128;
+constexpr size_t kComposeTailSrcCap = 96;
+
+struct ComposeLayout {
+  uint16_t prefixStarts[kMaxComposeWrapLines];
+  uint16_t prefixLens[kMaxComposeWrapLines];
+  uint8_t prefixCount;    // rows wrapping the confirmed compose text alone
+  char tailSrc[kComposeTailSrcCap];
+  uint16_t tailStarts[8];
+  uint16_t tailLens[8];
+  uint8_t tailCount;      // rows wrapping (last confirmed line + in-progress suffix)
+  uint8_t confirmedRows;  // prefixCount>0 ? prefixCount-1 : 0 -- stable across suffix changes
+  uint8_t totalRows;      // confirmedRows + tailCount, always >= 1
+};
+
+// Splits the compose line into rows that are provably stable while a
+// Morse pattern is being keyed in (every row except the very last) and
+// rows that depend on the in-progress suffix (the last confirmed line
+// re-wrapped together with the suffix). Greedy word-wrap only ever makes
+// decisions using text already seen, so appending the suffix can only
+// affect where the last confirmed line's own wrap ended -- never any
+// earlier line -- which is what lets a single dot/dash repaint just the
+// tail instead of the whole compose block (Hardware Fix #3 corrective
+// item 3's intent, preserved under multi-line layout).
+void buildComposeLayout(const char* prefix, const char* suffix, int16_t widthPx, ComposeLayout* out) {
+  out->prefixCount = Display::wrapText(prefix, widthPx, out->prefixStarts, out->prefixLens, kMaxComposeWrapLines);
+  out->confirmedRows = (out->prefixCount > 0) ? static_cast<uint8_t>(out->prefixCount - 1) : 0;
+
+  size_t tp = 0;
+  if (out->prefixCount > 0) {
+    size_t lastStart = out->prefixStarts[out->prefixCount - 1];
+    size_t lastLen = out->prefixLens[out->prefixCount - 1];
+    if (lastLen >= kComposeTailSrcCap) lastLen = kComposeTailSrcCap - 1;
+    memcpy(out->tailSrc, prefix + lastStart, lastLen);
+    tp = lastLen;
+  }
+  size_t suffixLen = strlen(suffix);
+  if (tp + suffixLen >= kComposeTailSrcCap) suffixLen = kComposeTailSrcCap - 1 - tp;
+  memcpy(out->tailSrc + tp, suffix, suffixLen);
+  tp += suffixLen;
+  out->tailSrc[tp] = '\0';
+
+  out->tailCount = Display::wrapText(out->tailSrc, widthPx, out->tailStarts, out->tailLens, 8);
+  if (out->tailCount == 0) {
+    out->tailStarts[0] = 0;
+    out->tailLens[0] = 0;
+    out->tailCount = 1;  // always at least one (possibly empty) row for the caret
+  }
+  out->totalRows = static_cast<uint8_t>(out->confirmedRows + out->tailCount);
+}
+
+// Slices out the text of logical compose row `rowIdx` (0-based over the
+// full, unwindowed row list -- confirmed rows first, then tail rows).
+void composeRowText(const ComposeLayout& layout, const char* prefix, uint8_t rowIdx, char* out, size_t outCap) {
+  size_t s, l;
+  if (rowIdx < layout.confirmedRows) {
+    s = layout.prefixStarts[rowIdx];
+    l = layout.prefixLens[rowIdx];
+    if (l >= outCap) l = outCap - 1;
+    memcpy(out, prefix + s, l);
+  } else {
+    uint8_t tIdx = static_cast<uint8_t>(rowIdx - layout.confirmedRows);
+    s = layout.tailStarts[tIdx];
+    l = layout.tailLens[tIdx];
+    if (l >= outCap) l = outCap - 1;
+    memcpy(out, layout.tailSrc + s, l);
+  }
+  out[l] = '\0';
+}
+
 void sendEnigmaMessage() {
   char escaped[EnigmaCrypto::kMaxEscapedLen + 1];
   if (!EnigmaCrypto::normalizeAndEscape(g_composeText, escaped, sizeof(escaped))) {
@@ -978,7 +1183,11 @@ void sendEnigmaMessage() {
   env.schema_version = 1;
   env.message_type = PacketCodec::MSG_TYPE_ENIGMA;
   strncpy(env.sender_device_id, Identity::deviceId(), sizeof(env.sender_device_id) - 1);
-  strncpy(env.sender_name_cache, Settings::getMyName(), sizeof(env.sender_name_cache) - 1);
+  // Hardware Fix #4.3 issue F: only embed a real, user-chosen name (env is
+  // already zeroed above) -- see the matching comment in text_message.cpp.
+  if (Settings::hasCustomMyName()) {
+    strncpy(env.sender_name_cache, Settings::getMyName(), sizeof(env.sender_name_cache) - 1);
+  }
   strncpy(env.group_code, g_selectedGroupCode, sizeof(env.group_code) - 1);
   env.timestamp = WifiManager::getUnixTime();
 
@@ -1171,13 +1380,31 @@ bool g_enigmaChatDirty = true;
 // and compose rows. Stored message history is never touched by a plain
 // cursor move or by compose activity, only by a genuine content or
 // viewport change.
+//
+// Hardware Fix #4.3 issue E extends this: a history message and the
+// compose line can each now span multiple visual rows (word-wrapped by
+// real pixel width instead of being truncated), so "the viewport itself
+// moved" is tracked directly via g_enigmaChatLastViewportLines (how many
+// rows the history region actually had last frame) rather than assumed
+// constant -- any change forces a full below-status-bar repaint, since
+// every row's Y position shifts together. g_enigmaChatLastComposeSkipped
+// catches the one case that doesn't change the history viewport size but
+// still moves compose row positions: an already-overflowing compose area
+// (more wrapped rows than fit) getting one row longer, which keeps the
+// same number of visible compose rows but slides the visible window down
+// by one. g_enigmaChatLastComposeRowText snapshots each currently-visible
+// compose row's own text so a single dot/dash only repaints the one row
+// it actually changed, never the whole compose block.
 bool g_enigmaChatNeedsFullRedraw = true;
 int16_t g_enigmaChatLastStartIdx = -1;
 uint16_t g_enigmaChatLastCursor = kNoHistoryCursor;
 char g_enigmaChatLastErrorLine[40] = {0};
-char g_enigmaChatLastComposePrefix[64] = {0};
-char g_enigmaChatLastComposeSuffix[Morse::kMaxPatternLength + 2] = {0};
 bool g_enigmaChatLastComposeFocused = true;
+constexpr uint16_t kNoViewportLines = 0xFFFF;
+uint16_t g_enigmaChatLastViewportLines = kNoViewportLines;
+constexpr uint8_t kMaxShownComposeRows = 10;
+uint8_t g_enigmaChatLastComposeSkipped = 0xFF;
+char g_enigmaChatLastComposeRowText[kMaxShownComposeRows][64] = {{0}};
 
 void screenEnigmaChat() {
   if (Menu::consumeJustEntered()) {
@@ -1237,38 +1464,57 @@ void screenEnigmaChat() {
   Display::setFont(Display::Font::PRIMARY);
   int16_t lh = Display::lineHeight();
 
-  // Reserve the last 2 rows for the (optional) compose-error line and the
-  // compose line itself, same fixed-slot layout as before, just computed
-  // from the real line height instead of a hardcoded 10px (Hardware Fix #1).
   int16_t contentTop = Display::kStatusBarHeight + 2;
   int16_t contentHeight = Display::kScreenHeight - contentTop;
   uint16_t totalLines = (contentHeight > 0) ? static_cast<uint16_t>(contentHeight / lh) : 0;
   if (totalLines < 3) totalLines = 3;  // at least 1 history row + error row + compose row
-  uint16_t viewportLines = static_cast<uint16_t>(totalLines - 2);
 
-  uint16_t startIdx = 0;
-  if (g_indexTotal > viewportLines) startIdx = static_cast<uint16_t>(g_indexTotal - viewportLines);
-  if (g_historyCursor != kNoHistoryCursor) {
-    if (g_historyCursor < startIdx) {
-      startIdx = g_historyCursor;
-    } else if (g_historyCursor >= startIdx + viewportLines) {
-      startIdx = static_cast<uint16_t>(g_historyCursor - viewportLines + 1);
-    }
-  }
+  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
+  int16_t labelX = static_cast<int16_t>(2 + markerW);            // history icon-cell X
+  int16_t composePrefixX = labelX;                                // compose shares the same left margin
+  int16_t composeWidth = static_cast<int16_t>(Display::kScreenWidth - composePrefixX);
+
+  // Compose text (Hardware Fix #4.3 issue E): word-wrapped by real pixel
+  // width instead of clipped at a fixed character count. Confirmed rows
+  // (everything except the last) are provably stable while a pattern is
+  // being keyed in -- only the last confirmed line + in-progress suffix is
+  // ever re-wrapped on a dot/dash.
+  char composeSuffix[Morse::kMaxPatternLength + 2];
+  buildComposePrefixSuffix(g_composePrefixBuf, kComposePrefixCap, composeSuffix, sizeof(composeSuffix));
+  bool composeFocused = (g_historyCursor == kNoHistoryCursor);
+
+  ComposeLayout layout;
+  buildComposeLayout(g_composePrefixBuf, composeSuffix, composeWidth, &layout);
+
+  uint16_t maxComposeRows = (totalLines > 1) ? static_cast<uint16_t>(totalLines - 1) : 1;  // reserve 1 row for error line
+  if (maxComposeRows > kMaxShownComposeRows) maxComposeRows = kMaxShownComposeRows;
+  uint16_t shownComposeRows = (layout.totalRows < maxComposeRows) ? layout.totalRows : maxComposeRows;
+  if (shownComposeRows == 0) shownComposeRows = 1;
+  uint8_t skippedComposeRows = static_cast<uint8_t>(layout.totalRows - shownComposeRows);
+
+  // History gets whatever vertical space compose doesn't need this frame
+  // (Hardware Fix #4.3 issue E: "as compose grows, history viewport must
+  // shrink accordingly"); can reach 0 when compose alone fills the screen.
+  uint16_t viewportLines =
+      static_cast<uint16_t>(totalLines - 1 - shownComposeRows);  // -1 = fixed error-line row
+
+  uint16_t startIdx = computeHistoryStartIdx(viewportLines, labelX);
   int16_t errorY = static_cast<int16_t>(contentTop + viewportLines * lh);
   int16_t composeY = static_cast<int16_t>(errorY + lh);
 
   bool firstDraw = g_enigmaChatNeedsFullRedraw;
-  bool contentChanged = !firstDraw && wasIndexDirty;
-  bool scrolled = !firstDraw && !contentChanged && (static_cast<int16_t>(startIdx) != g_enigmaChatLastStartIdx);
+  // Any change to how many rows the history viewport has means every Y
+  // coordinate below the status bar shifted, so history, error, and
+  // compose all need a full repaint together (Hardware Fix #4.3 issue E).
+  bool historyLayoutChanged = firstDraw || (viewportLines != g_enigmaChatLastViewportLines);
+  bool contentChanged = !historyLayoutChanged && wasIndexDirty;
+  bool scrolled =
+      !historyLayoutChanged && !contentChanged && (static_cast<int16_t>(startIdx) != g_enigmaChatLastStartIdx);
   bool selectionOnlyChanged =
-      !firstDraw && !contentChanged && !scrolled && (g_historyCursor != g_enigmaChatLastCursor);
+      !historyLayoutChanged && !contentChanged && !scrolled && (g_historyCursor != g_enigmaChatLastCursor);
 
-  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-  int16_t labelX = static_cast<int16_t>(2 + markerW);
-
-  if (firstDraw || contentChanged || scrolled) {
-    if (firstDraw) {
+  if (historyLayoutChanged || contentChanged || scrolled) {
+    if (historyLayoutChanged) {
       Display::clearContentArea();
     } else {
       int16_t regionH = static_cast<int16_t>(errorY - contentTop);
@@ -1276,102 +1522,105 @@ void screenEnigmaChat() {
       Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
     int16_t y = contentTop;
-    for (uint16_t i = startIdx; i < g_indexTotal && i < startIdx + viewportLines; i++) {
-      const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(i);
-      if (entry == nullptr) continue;
-      MessageRef ref = refForIndexEntry(*entry);
-      StoredMessageView view;
-      char lineBuf[48] = "?";
-      char senderPrefix[24] = {0};
-      MessageIconKind icon = MessageIconKind::NONE;
-      if (MessageStore::loadMessage(ref, &view)) {
-        RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-        if (renderFn != nullptr) renderFn(view, lineBuf, sizeof(lineBuf));
-        MessageStore::buildSenderPrefix(view.envelope, senderPrefix, sizeof(senderPrefix));
-        MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
-        if (iconFn != nullptr) icon = iconFn(view);
-      }
+    uint16_t rowsDrawn = 0;
+    for (uint16_t i = startIdx; i < g_indexTotal && rowsDrawn < viewportLines; i++) {
+      HistoryRowInfo info;
+      loadHistoryRow(i, labelX, &info);
       if (i == g_historyCursor) Display::printLine(2, y, ">");
-      // Icon cell reserved on every row so sender names stay X-aligned in
-      // a thread that mixes Enigma rows (icon) with Text/Game rows (none)
-      // (Hardware Fix #4 issues 2/5).
-      drawRowIcon(labelX, y, icon);
+      // Icon cell + sender name appear on the message's FIRST visual row
+      // only; continuation rows start at the body X position, same column
+      // as the first row's body text (Hardware Fix #4 issues 2/5, extended
+      // for issue E's multi-row messages).
+      drawRowIcon(labelX, y, info.icon);
       int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-      Display::printLine(textX, y, senderPrefix);
-      Display::printLine(static_cast<int16_t>(textX + Display::textWidth(senderPrefix)), y, lineBuf);
-      y += lh;
+      Display::printLine(textX, y, info.senderPrefix);
+      char lineChunk[64];
+      for (uint8_t r = 0; r < info.wrapCount && rowsDrawn < viewportLines; r++) {
+        size_t clen = info.wrapLens[r];
+        if (clen >= sizeof(lineChunk)) clen = sizeof(lineChunk) - 1;
+        memcpy(lineChunk, info.lineBuf + info.wrapStarts[r], clen);
+        lineChunk[clen] = '\0';
+        Display::printLine(info.bodyX, static_cast<int16_t>(y + r * lh), lineChunk);
+        rowsDrawn++;
+      }
+      y = static_cast<int16_t>(y + info.wrapCount * lh);
     }
     g_enigmaChatNeedsFullRedraw = false;
   } else if (selectionOnlyChanged) {
     if (g_enigmaChatLastCursor != kNoHistoryCursor) {
-      int16_t oldY = static_cast<int16_t>(contentTop + (g_enigmaChatLastCursor - startIdx) * lh);
+      int16_t oldY = historyRowY(startIdx, g_enigmaChatLastCursor, labelX, contentTop, lh);
       Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
     }
     if (g_historyCursor != kNoHistoryCursor) {
-      int16_t newY = static_cast<int16_t>(contentTop + (g_historyCursor - startIdx) * lh);
+      int16_t newY = historyRowY(startIdx, g_historyCursor, labelX, contentTop, lh);
       Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
       Display::printLine(2, newY, ">");
     }
   }
 
-  // Error and compose rows are diffed completely independently of the
-  // history rows above them (Hardware Fix #3, Section F/G).
+  // Error and compose rows are diffed independently of the history rows
+  // above them (Hardware Fix #3, Section F/G); historyLayoutChanged forces
+  // a full redraw of both since clearContentArea() already wiped them.
   char errorLine[40];
   if (g_composeError != nullptr) {
     snprintf(errorLine, sizeof(errorLine), "%s", g_composeError);
   } else {
     errorLine[0] = '\0';
   }
-  if (firstDraw || strcmp(errorLine, g_enigmaChatLastErrorLine) != 0) {
-    if (!firstDraw) Display::tft().fillRect(0, errorY, Display::kScreenWidth, lh, ST77XX_BLACK);
+  if (historyLayoutChanged || strcmp(errorLine, g_enigmaChatLastErrorLine) != 0) {
+    if (!historyLayoutChanged) Display::tft().fillRect(0, errorY, Display::kScreenWidth, lh, ST77XX_BLACK);
     if (errorLine[0] != '\0') Display::printLine(2, errorY, errorLine);
     strncpy(g_enigmaChatLastErrorLine, errorLine, sizeof(g_enigmaChatLastErrorLine) - 1);
     g_enigmaChatLastErrorLine[sizeof(g_enigmaChatLastErrorLine) - 1] = '\0';
   }
 
-  // The compose row is further split into a fixed-width focus marker, a
-  // stable confirmed-text prefix, and a dynamic Morse-pattern suffix, so an
-  // in-progress dot/dash never repaints already-confirmed compose text
-  // (corrective item 3). Encryption/key/message semantics are untouched.
-  char composePrefix[64];
-  char composeSuffix[Morse::kMaxPatternLength + 2];
-  buildComposePrefixSuffix(composePrefix, sizeof(composePrefix), composeSuffix, sizeof(composeSuffix));
-  bool composeFocused = (g_historyCursor == kNoHistoryCursor);
-
-  int16_t composeMarkerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-  int16_t composePrefixX = static_cast<int16_t>(2 + composeMarkerW);
-  int16_t composePrefixW = Display::textWidth(composePrefix);
-  int16_t composeSuffixX = static_cast<int16_t>(composePrefixX + composePrefixW);
-
   bool composeFocusChanged = (composeFocused != g_enigmaChatLastComposeFocused);
-  bool composePrefixChanged = strcmp(composePrefix, g_enigmaChatLastComposePrefix) != 0;
-  bool composeSuffixChanged = strcmp(composeSuffix, g_enigmaChatLastComposeSuffix) != 0;
+  // A change in which rows are visible (row count via historyLayoutChanged,
+  // or the visible window sliding while compose is already overflowing)
+  // moves every compose row's Y/content, so redraw the whole block; only
+  // then is a stable per-row text diff (below) valid.
+  bool composeWindowChanged = (skippedComposeRows != g_enigmaChatLastComposeSkipped);
+  bool composeBlockChanged = historyLayoutChanged || composeWindowChanged;
 
-  if (firstDraw || composePrefixChanged) {
-    if (!firstDraw) Display::tft().fillRect(0, composeY, Display::kScreenWidth, lh, ST77XX_BLACK);
-    Display::printLine(2, composeY, composeFocused ? ">" : " ");
-    Display::printLine(composePrefixX, composeY, composePrefix);
-    if (composeSuffix[0] != '\0') Display::printLine(composeSuffixX, composeY, composeSuffix);
-  } else if (composeFocusChanged) {
-    Display::tft().fillRect(2, composeY, composeMarkerW, lh, ST77XX_BLACK);
-    Display::printLine(2, composeY, composeFocused ? ">" : " ");
-  } else if (composeSuffixChanged) {
-    int16_t oldSuffixW = Display::textWidth(g_enigmaChatLastComposeSuffix);
-    int16_t newSuffixW = Display::textWidth(composeSuffix);
-    int16_t eraseW = static_cast<int16_t>((oldSuffixW > newSuffixW ? oldSuffixW : newSuffixW) + 4);
-    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - composeSuffixX);
-    if (eraseW > maxW) eraseW = maxW;
-    if (eraseW < 0) eraseW = 0;
-    Display::tft().fillRect(composeSuffixX, composeY, eraseW, lh, ST77XX_BLACK);
-    if (composeSuffix[0] != '\0') Display::printLine(composeSuffixX, composeY, composeSuffix);
+  if (composeBlockChanged) {
+    if (!historyLayoutChanged) {
+      int16_t blockH = static_cast<int16_t>(shownComposeRows * lh);
+      Display::tft().fillRect(0, composeY, Display::kScreenWidth, blockH, ST77XX_BLACK);
+    }
+    for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
+      uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
+      char rowText[64];
+      composeRowText(layout, g_composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
+      if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
+      Display::printLine(composePrefixX, y, rowText);
+      strncpy(g_enigmaChatLastComposeRowText[shownRow], rowText, sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1);
+      g_enigmaChatLastComposeRowText[shownRow][sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1] = '\0';
+    }
+  } else {
+    for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
+      uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
+      char rowText[64];
+      composeRowText(layout, g_composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
+      bool textChanged = strcmp(rowText, g_enigmaChatLastComposeRowText[shownRow]) != 0;
+      bool markerNeedsRedraw = (shownRow == 0) && composeFocusChanged;
+      if (textChanged) {
+        Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+        if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
+        Display::printLine(composePrefixX, y, rowText);
+        strncpy(g_enigmaChatLastComposeRowText[shownRow], rowText, sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1);
+        g_enigmaChatLastComposeRowText[shownRow][sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1] = '\0';
+      } else if (markerNeedsRedraw) {
+        Display::tft().fillRect(2, y, markerW, lh, ST77XX_BLACK);
+        Display::printLine(2, y, composeFocused ? ">" : " ");
+      }
+    }
   }
 
-  strncpy(g_enigmaChatLastComposePrefix, composePrefix, sizeof(g_enigmaChatLastComposePrefix) - 1);
-  g_enigmaChatLastComposePrefix[sizeof(g_enigmaChatLastComposePrefix) - 1] = '\0';
-  strncpy(g_enigmaChatLastComposeSuffix, composeSuffix, sizeof(g_enigmaChatLastComposeSuffix) - 1);
-  g_enigmaChatLastComposeSuffix[sizeof(g_enigmaChatLastComposeSuffix) - 1] = '\0';
   g_enigmaChatLastComposeFocused = composeFocused;
-
+  g_enigmaChatLastComposeSkipped = skippedComposeRows;
+  g_enigmaChatLastViewportLines = viewportLines;
   g_enigmaChatLastStartIdx = static_cast<int16_t>(startIdx);
   g_enigmaChatLastCursor = g_historyCursor;
 }

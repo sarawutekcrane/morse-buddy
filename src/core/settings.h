@@ -32,6 +32,14 @@ void init();
 // ---- My Name -------------------------------------------------------------
 const char* getMyName();
 void setMyName(const char* name);
+// True once the user has actually chosen a name (setMyName() was called, or
+// NVS already had one from a previous session) -- false while getMyName()
+// is still returning the compiled "Me" placeholder for a never-configured
+// device. Callers that present this device's name to OTHER people (a
+// message sender label, a contact's resolved display name) check this
+// first so an unset device is never shown as if "Me" were its real chosen
+// name (Hardware Fix #4.3 issue F).
+bool hasCustomMyName();
 
 // ---- Display & Sound -------------------------------------------------------
 uint8_t getBrightness();  // 0-100

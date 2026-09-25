@@ -25,6 +25,7 @@ Settings::FamilyGroup g_groups[Settings::kMaxGroups];
 uint8_t g_groupCount = 0;
 
 char g_myName[17] = "Me";
+bool g_hasCustomMyName = false;
 uint8_t g_brightness = 100;
 uint8_t g_speakerVolume = 80;
 Settings::TypingDisplay g_typingDisplay = Settings::TypingDisplay::MIXED;
@@ -71,9 +72,11 @@ void init() {
   g_practiceLevel = p.isKey("practLvl") ? p.getUChar("practLvl") : 1;
   if (p.isKey("myName")) {
     p.getString("myName", g_myName, sizeof(g_myName));
+    g_hasCustomMyName = true;
   } else {
     strncpy(g_myName, "Me", sizeof(g_myName) - 1);
     g_myName[sizeof(g_myName) - 1] = '\0';
+    g_hasCustomMyName = false;
   }
 
   loadWifiSlots();
@@ -89,8 +92,10 @@ const char* getMyName() { return g_myName; }
 void setMyName(const char* name) {
   strncpy(g_myName, name, sizeof(g_myName) - 1);
   g_myName[sizeof(g_myName) - 1] = '\0';
+  g_hasCustomMyName = true;
   Storage::core().putString("myName", g_myName);
 }
+bool hasCustomMyName() { return g_hasCustomMyName; }
 
 uint8_t getBrightness() { return g_brightness; }
 void setBrightness(uint8_t percent) {
