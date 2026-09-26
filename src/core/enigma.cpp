@@ -1800,7 +1800,21 @@ void screenEnigmaChat() {
   // moves every compose row's Y/content, so redraw the whole block; only
   // then is a stable per-row text diff (below) valid.
   bool composeWindowChanged = (skippedComposeRows != g_enigmaChatLastComposeSkipped);
-  bool composeBlockChanged = historyLayoutChanged || composeWindowChanged;
+  // Hardware Fix #4.7c: composeFocusChanged folded into composeBlockChanged
+  // here too, for the same reason as text_message.cpp's identical compose
+  // block (see the comment there) -- Text and Enigma share this dirty-cache
+  // architecture and must behave consistently. A pure HISTORY <-> COMPOSE
+  // focus transition, with compose text itself unchanged, previously fell
+  // into the small per-row diff below, which only ever patches the cursor's
+  // own cell and never touches the rest of a row whose text still compares
+  // equal -- letting stale pixels drawn while focus was elsewhere survive
+  // until the text itself next changed. Row-count shrink safety is the same
+  // as text_message.cpp: shownComposeRows can only change via a
+  // viewportLines change (totalLines/maxComposeRows are per-tick constants
+  // derived only from screen height), which already forces
+  // historyLayoutChanged and a full clearContentArea(), so no obsolete
+  // taller-block row can survive a shrink without going through that path.
+  bool composeBlockChanged = historyLayoutChanged || composeWindowChanged || composeFocusChanged;
 
   if (composeBlockChanged) {
     if (!historyLayoutChanged) {

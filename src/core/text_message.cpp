@@ -1115,9 +1115,38 @@ void screenChat() {
   // (Hardware Fix #3, Section F; extended for multi-row in Hardware Fix
   // #4.4 issue B); historyLayoutChanged forces a full redraw since
   // clearContentArea() already wiped the compose region too.
+  //
+  // Hardware Fix #4.7c: composeFocusChanged is now also folded into
+  // composeBlockChanged. Real hardware testing found stale text surviving
+  // in the compose area after HISTORY -> COMPOSE (rotate up into history,
+  // then back down to the bottom). Root cause: a pure focus transition,
+  // with the compose text itself unchanged, previously left
+  // composeBlockChanged false, so it fell into the small per-row diff
+  // below -- which only compares rowText against the cached snapshot
+  // (equal, since the text didn't change) and, at most, patches the
+  // cursor's own kCursorCellWidth-wide cell. That patch never touches the
+  // rest of the row, so any pixels drawn there while focus was elsewhere
+  // (or left over from a still-uncorrected earlier partial draw) could
+  // survive until something else finally changed the row's text. Treating
+  // every focus transition as a full compose-block clear+redraw removes
+  // that gap entirely, at the cost of one extra full redraw exactly on the
+  // tick focus flips -- not on every tick while focus is held.
   bool composeFocusChanged = (composeFocused != g_chatLastComposeFocused);
   bool composeWindowChanged = (skippedComposeRows != g_chatLastComposeSkipped);
-  bool composeBlockChanged = historyLayoutChanged || composeWindowChanged;
+  // Row-count shrink safety (reviewed, not patched): shownComposeRows can
+  // only change when layout.totalRows crosses the maxComposeRows cap,
+  // since totalLines and maxComposeRows are both per-tick constants
+  // derived only from screen height -- and viewportLines is defined as
+  // exactly (totalLines - shownComposeRows) above, so ANY shownComposeRows
+  // change necessarily changes viewportLines too, which already forces
+  // historyLayoutChanged (and therefore composeBlockChanged) true and
+  // clearContentArea() wipes the WHOLE content area, including any taller
+  // previous compose block. The remaining case -- totalRows shrinking
+  // while still capped at maxComposeRows -- changes skippedComposeRows
+  // (composeWindowChanged) but never shownComposeRows itself, so the
+  // block's own height never shrinks in that case. No obsolete row can
+  // therefore survive a shrink without already going through a full clear.
+  bool composeBlockChanged = historyLayoutChanged || composeWindowChanged || composeFocusChanged;
 
   if (composeBlockChanged) {
     if (!historyLayoutChanged) {

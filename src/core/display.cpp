@@ -51,6 +51,15 @@ uint8_t g_lastBatteryPercent = 0xFF;
 Display::Font g_currentFont = Display::Font::COMPACT;
 int16_t g_primaryAscent = 14;      // fallback until computePrimaryMetrics() runs
 int16_t g_primaryLineHeight = 18;  // fallback until computePrimaryMetrics() runs
+// Hardware Fix #4.7c: the actual measured PRIMARY glyph ink height (the `h`
+// computePrimaryMetrics() already measures via getTextBounds()), kept
+// separate from g_primaryLineHeight -- lineHeight() includes ~40% extra
+// leading so consecutive PRIMARY lines never visually touch, but that
+// leading is not part of the visible glyph box, so centering the red
+// selection-cursor triangle on lineHeight()/2 places it below where the
+// ink actually sits. Fallback matches g_primaryLineHeight's own fallback
+// ratio until computePrimaryMetrics() runs.
+int16_t g_primaryInkHeight = 13;
 constexpr int16_t kCompactLineHeight = 10;  // built-in font: existing project convention
 
 void computePrimaryMetrics() {
@@ -62,6 +71,7 @@ void computePrimaryMetrics() {
   // to that baseline) and h (ink height) reflect the font's real extremes.
   g_tft.getTextBounds("Ag0Xy", 0, 50, &x1, &y1, &w, &h);
   g_primaryAscent = static_cast<int16_t>(50 - y1);
+  g_primaryInkHeight = static_cast<int16_t>(h);
   // ~40% leading above the raw ink height, matching the ratio the existing
   // built-in-font screens already use (8px glyph height at 10-12px line
   // pitch), so consecutive PRIMARY lines never visually touch.
@@ -291,7 +301,19 @@ void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565) {
 }
 
 void drawSelectionCursor(int16_t x, int16_t rowTop) {
-  int16_t centerY = static_cast<int16_t>(rowTop + lineHeight() / 2);
+  // Hardware Fix #4.7c: on real hardware the RED cursor visibly sat lower
+  // than the PRIMARY text it marks. lineHeight() includes ~40% leading
+  // above the glyph ink (see computePrimaryMetrics()) so that consecutive
+  // PRIMARY lines don't visually touch, but printLine() draws that ink
+  // starting exactly at rowTop -- centering on the leading-inclusive
+  // lineHeight()/2 therefore biases the triangle toward the leading below
+  // the ink rather than the ink itself. Centering on the actually-measured
+  // ink height (g_primaryInkHeight) instead aligns the triangle with the
+  // visible glyphs. COMPACT keeps its original line-centered behavior
+  // unchanged -- it never had this leading gap.
+  int16_t centerY = (g_currentFont == Display::Font::PRIMARY)
+                         ? static_cast<int16_t>(rowTop + g_primaryInkHeight / 2)
+                         : static_cast<int16_t>(rowTop + lineHeight() / 2);
   constexpr int16_t kHalfHeight = kCursorTriangleHeight / 2;  // 3: apex-to-base half-span
   g_tft.fillTriangle(x, static_cast<int16_t>(centerY - kHalfHeight), x, static_cast<int16_t>(centerY + kHalfHeight),
                      static_cast<int16_t>(x + kCursorTriangleWidth), centerY, ST77XX_RED);
