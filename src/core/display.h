@@ -137,19 +137,35 @@ void drawSelectionCursor(int16_t x, int16_t rowTop);
 // all explicitly rejected as either too wide or unreliable across fonts.
 // A small solid TFT-primitive bar, drawn in the sender's own color right
 // after their name, reads as a clear divider at minimal width cost.
-constexpr int16_t kSenderDividerWidth = 3;  // solid bar width
-constexpr int16_t kSenderBodyGap = 2;       // fixed gap between the bar and the WHITE message body that follows
+//
+// Hardware Fix #4.9d Part B2: a real-hardware retest found the bar sitting
+// too close to the sender name -- a small lead gap is now inserted BEFORE
+// the bar too, so the row reads as "name  |  body" with breathing room on
+// both sides of the divider, not just after it.
+constexpr int16_t kSenderDividerLeadGap = 2;  // gap between the sender name and the bar
+constexpr int16_t kSenderDividerWidth = 3;    // solid bar width
+constexpr int16_t kSenderBodyGap = 2;         // fixed gap between the bar and the WHITE message body that follows
 
-// Draws the divider bar with its left edge at x, top at rowTop, height
-// equal to the actual measured PRIMARY glyph ink height (the same metric
-// drawSelectionCursor() aligns to) so it visually matches the sender
-// name's own glyph box rather than the leading-inclusive lineHeight().
+// Hardware Fix #4.9d Part B1: draws the divider bar with its left edge at
+// x, sized to the ACTUAL ink of `senderText` -- the same string already
+// drawn as the sender name -- rather than the generic PRIMARY font sample
+// ("Ag0Xy", chosen to include a descender for METRICS purposes) the old
+// signature used via g_primaryInkHeight. A real hardware retest found that
+// generic sample's height did not reliably match a given sender name's own
+// glyph box, making the bar look taller/lower than the letters beside it.
+// Internally (PRIMARY font only): getTextBounds(senderText, x, rowTop +
+// g_primaryAscent, ...) is measured at the exact baseline printLine() uses
+// for this row, and the bar is drawn to the returned actual top/height --
+// so it visually matches THIS sender name's ink box, not a generic sample.
+// senderText == nullptr or "" falls back safely (uses the previous
+// g_primaryInkHeight-based sizing) rather than measuring nothing.
 // Pure TFT-primitive drawing, like drawSelectionCursor() -- never touches
 // text color/font state. Callers only ever draw this on a message's TRUE
-// first row, immediately after the sender name, in the same color565
-// used for that name; continuation rows never call this (Hardware Fix
-// #4.7b Part C: they start at senderX with no repeated sender/divider).
-void drawSenderDivider(int16_t x, int16_t rowTop, uint16_t color565);
+// first row, immediately after the sender name (plus kSenderDividerLeadGap),
+// in the same color565 used for that name; continuation rows never call
+// this (Hardware Fix #4.7b Part C: they start at senderX with no repeated
+// sender/divider).
+void drawSenderDivider(int16_t x, int16_t rowTop, const char* senderText, uint16_t color565);
 
 // Greedy word-wrap of `text` into visual lines that each fit within
 // `maxWidthPx` in the currently active font (Hardware Fix #4.3 issue E).

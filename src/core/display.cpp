@@ -329,15 +329,35 @@ void drawSelectionCursor(int16_t x, int16_t rowTop) {
                      static_cast<int16_t>(x + kCursorTriangleWidth), centerY, ST77XX_RED);
 }
 
-void drawSenderDivider(int16_t x, int16_t rowTop, uint16_t color565) {
-  // Hardware Fix #4.8b: height matches the actual measured PRIMARY glyph
-  // ink box (g_primaryInkHeight -- the same metric drawSelectionCursor()
-  // already aligns its own vertical center to), so the bar visually spans
-  // the sender name's own glyph bounds rather than the leading-inclusive
-  // lineHeight(). Every caller draws this only on a PRIMARY-font sender
-  // row (the Unified Thread history/compose screens never use COMPACT
-  // here), so no COMPACT variant is needed.
-  g_tft.fillRect(x, rowTop, kSenderDividerWidth, g_primaryInkHeight, color565);
+void drawSenderDivider(int16_t x, int16_t rowTop, const char* senderText, uint16_t color565) {
+  // Hardware Fix #4.9d Part B1: a real-hardware retest found the bar
+  // visibly taller/lower than the sender letters beside it -- the old
+  // implementation sized it from g_primaryInkHeight, a metric measured
+  // once at init() from a generic sample string ("Ag0Xy", chosen to
+  // include a descender purely for metrics purposes), which does not
+  // reliably match any GIVEN sender name's own ink box. Measuring
+  // senderText itself, at the exact baseline printLine() uses for PRIMARY
+  // text (rowTop + g_primaryAscent -- see printLine()'s own cursorY
+  // computation above), makes the bar visually match THIS sender name's
+  // real glyph bounds instead of a generic sample's. Every caller draws
+  // this only on a PRIMARY-font sender row (the Unified Thread history/
+  // compose screens never use COMPACT here), so no COMPACT variant is
+  // needed. A null/empty senderText (defensive only -- every real caller
+  // passes the same non-empty string it already drew as the sender name)
+  // falls back to the previous g_primaryInkHeight-based sizing rather than
+  // measuring nothing.
+  int16_t barTop = rowTop;
+  int16_t barHeight = g_primaryInkHeight;
+  if (senderText != nullptr && senderText[0] != '\0') {
+    int16_t x1, y1;
+    uint16_t w, h;
+    g_tft.getTextBounds(senderText, x, static_cast<int16_t>(rowTop + g_primaryAscent), &x1, &y1, &w, &h);
+    if (h > 0) {
+      barTop = y1;
+      barHeight = static_cast<int16_t>(h);
+    }
+  }
+  g_tft.fillRect(x, barTop, kSenderDividerWidth, barHeight, color565);
 }
 
 }  // namespace Display

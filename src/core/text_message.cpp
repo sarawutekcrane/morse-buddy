@@ -497,11 +497,13 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   // usable space between the cursor and the sender name.
   int16_t iconWidth = (out->icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
   int16_t senderX = static_cast<int16_t>(labelX + iconWidth);
-  // Hardware Fix #4.8b Part C16: sender name, then the divider bar
-  // (Display::kSenderDividerWidth), then a fixed 2px gap
+  // Hardware Fix #4.8b Part C16, refined by #4.9d Part B2: sender name,
+  // then a 2px lead gap (Display::kSenderDividerLeadGap), then the divider
+  // bar (Display::kSenderDividerWidth), then a 2px gap
   // (Display::kSenderBodyGap) before the WHITE message body -- replacing
   // the old ": " suffix that used to be baked into senderPrefix itself.
-  out->dividerX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
+  out->dividerX =
+      static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix) + Display::kSenderDividerLeadGap);
   out->firstBodyX = static_cast<int16_t>(out->dividerX + Display::kSenderDividerWidth + Display::kSenderBodyGap);
   out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
   // Continuation rows start at the SAME X as the sender name on row 0
@@ -1195,7 +1197,7 @@ void screenChat() {
             // load placeholder row has an empty senderPrefix and its
             // dividerX == firstBodyX, i.e. zero-width -- nothing to draw).
             if (info.senderPrefix[0] != '\0') {
-              Display::drawSenderDivider(info.dividerX, y, info.senderColor565);
+              Display::drawSenderDivider(info.dividerX, y, info.senderPrefix, info.senderColor565);
             }
           }
           // The marker sits on the exact focused row (g_historyRowOffset),

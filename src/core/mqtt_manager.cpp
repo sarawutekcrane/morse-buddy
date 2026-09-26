@@ -30,10 +30,37 @@ struct GroupClient {
   char client_id[24] = {0};
   WiFiClient net;
   MQTTClient* mqtt = nullptr;
+  // Hardware Fix #4.9d Part A1: rate-limits reconnect attempts. Real
+  // hardware testing found DOT/DASH, encoder rotation/push, and menu
+  // navigation ALL delayed together (a global loop-starvation symptom, not
+  // an individual input debounce defect) whenever a group was disconnected
+  // -- the old serviceTick() called connectGroupIfNeeded() on every
+  // disconnected group on EVERY tick, and MQTTClient::connect() is
+  // synchronous, so a single unreachable broker blocked the whole Arduino/
+  // main task (and therefore Input::popEvent()/Menu::tick()) for the
+  // entire command timeout, repeatedly. 0 means "never attempted yet /
+  // eligible immediately"; otherwise the millis() deadline before which no
+  // further attempt is made.
+  uint32_t nextReconnectAttemptMs = 0;
 };
 
 GroupClient g_clients[Settings::kMaxGroups];
 bool g_maintenanceMode = false;
+
+// Hardware Fix #4.9d Part A1/A2: a disconnected group may retry at most
+// once every 5000ms (rather than once per tick), and any single connect
+// attempt is now bounded to 500ms instead of the old 5000ms -- both
+// necessary together, since MQTTClient::connect() is still fully
+// synchronous: throttling alone would still let one attempt block the UI
+// task for up to the old 5-second timeout when its turn came up.
+constexpr uint32_t kMqttReconnectIntervalMs = 5000;
+constexpr uint32_t kMqttCommandTimeoutMs = 500;
+
+// Hardware Fix #4.9d Part A3: round-robin cursor so that, across
+// consecutive ticks, every disconnected group eventually gets its turn to
+// attempt reconnecting -- a single persistently-broken group parked at a
+// low array index can never starve the others by always winning the scan.
+uint8_t g_nextReconnectCandidateIndex = 0;
 
 GroupClient* findClientSlot(const char* group_code) {
   for (auto& c : g_clients) {
@@ -208,8 +235,16 @@ void subscribeAll(GroupClient& gc) {
   sub("radio/audio/broadcast", 0);
 }
 
-void connectGroupIfNeeded(GroupClient& gc) {
+// Hardware Fix #4.9d Part A1: `now` is passed in (the single millis()
+// snapshot serviceTick() already took for this whole call) rather than
+// read again here, and a synchronous connect attempt is only actually
+// made once every kMqttReconnectIntervalMs -- a disconnected/unreachable
+// group can no longer consume the UI loop on every single tick.
+void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   if (gc.mqtt->connected()) return;
+  // Rollover-safe "deadline not yet reached" check (same idiom already
+  // used by sound_facade.cpp's isPlaying()) -- 0 always means due now.
+  if (gc.nextReconnectAttemptMs != 0 && static_cast<int32_t>(now - gc.nextReconnectAttemptMs) < 0) return;
 
   char willTopic[48];
   snprintf(willTopic, sizeof(willTopic), "morsebuddy/%s/presence/%s", gc.group_code, Identity::deviceId());
@@ -224,11 +259,22 @@ void connectGroupIfNeeded(GroupClient& gc) {
            Settings::getMyName(), static_cast<unsigned long>(WifiManager::getUnixTime()),
            Settings::getMyColorIndex());
   gc.mqtt->setWill(willTopic, willPayload, /*retained=*/true, /*qos=*/1);
-  gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/5000);
+  // Hardware Fix #4.9d Part A2: 5000ms was unacceptable to block the UI
+  // task on -- bounded to kMqttCommandTimeoutMs (500ms) instead. Note:
+  // MQTTClient::connect() itself remains fully synchronous underneath
+  // (the underlying WiFiClient::connect(host, port) call it uses is not
+  // bounded by this timeout parameter), which is exactly why the
+  // kMqttReconnectIntervalMs throttle above is mandatory too, not
+  // optional -- see this file's header comment / the final report for the
+  // verified state of a bounded-connect WiFiClient override attempt.
+  gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/kMqttCommandTimeoutMs);
 
   if (gc.mqtt->connect(gc.client_id, nullptr, nullptr)) {
     subscribeAll(gc);
     Presence::publishOnline(gc.group_code);
+    gc.nextReconnectAttemptMs = 0;  // connected -- no throttle needed until it drops again
+  } else {
+    gc.nextReconnectAttemptMs = now + kMqttReconnectIntervalMs;
   }
 }
 
@@ -338,11 +384,33 @@ void serviceInit() {
 void serviceTick() {
   if (g_maintenanceMode) return;  // Phase 5 OTA: reconnect/receive paused
   if (!WifiManager::isConnected()) return;  // never block; just wait until WiFi is up
+
+  uint32_t now = millis();
+
+  // mqtt->loop() is the library's own lightweight per-connection servicing
+  // (keepalive/incoming-message pump) -- cheap and non-blocking regardless
+  // of connection state, so every active client still gets it every tick.
   for (auto& gc : g_clients) {
-    if (!gc.active || gc.mqtt == nullptr) continue;
-    gc.mqtt->loop();
-    if (!gc.mqtt->connected()) connectGroupIfNeeded(gc);
+    if (gc.active && gc.mqtt != nullptr) gc.mqtt->loop();
   }
+
+  // Hardware Fix #4.9d Part A3: the potentially-blocking reconnect
+  // attempt itself is limited to AT MOST ONE group per tick, chosen
+  // round-robin starting from g_nextReconnectCandidateIndex, so a single
+  // broken/unreachable group parked at a low array index can never starve
+  // the others' turns. connectGroupIfNeeded() still no-ops internally if
+  // that group isn't actually due yet (Part A1's throttle), so this loop
+  // just finds the next disconnected candidate to OFFER a turn to.
+  for (uint8_t attempts = 0; attempts < Settings::kMaxGroups; attempts++) {
+    uint8_t idx = g_nextReconnectCandidateIndex;
+    g_nextReconnectCandidateIndex = static_cast<uint8_t>((g_nextReconnectCandidateIndex + 1) % Settings::kMaxGroups);
+    GroupClient& gc = g_clients[idx];
+    if (gc.active && gc.mqtt != nullptr && !gc.mqtt->connected()) {
+      connectGroupIfNeeded(gc, now);
+      break;
+    }
+  }
+
   drainReceiveQueue();
 }
 
