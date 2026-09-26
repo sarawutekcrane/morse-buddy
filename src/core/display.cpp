@@ -329,4 +329,15 @@ void drawSelectionCursor(int16_t x, int16_t rowTop) {
                      static_cast<int16_t>(x + kCursorTriangleWidth), centerY, ST77XX_RED);
 }
 
+void drawSenderDivider(int16_t x, int16_t rowTop, uint16_t color565) {
+  // Hardware Fix #4.8b: height matches the actual measured PRIMARY glyph
+  // ink box (g_primaryInkHeight -- the same metric drawSelectionCursor()
+  // already aligns its own vertical center to), so the bar visually spans
+  // the sender name's own glyph bounds rather than the leading-inclusive
+  // lineHeight(). Every caller draws this only on a PRIMARY-font sender
+  // row (the Unified Thread history/compose screens never use COMPACT
+  // here), so no COMPACT variant is needed.
+  g_tft.fillRect(x, rowTop, kSenderDividerWidth, g_primaryInkHeight, color565);
+}
+
 }  // namespace Display

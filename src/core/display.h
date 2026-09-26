@@ -129,6 +129,28 @@ constexpr int16_t kCursorTriangleHeight = 7; // base height
 // printLine()/printLineColored() calls with nothing to restore afterward.
 void drawSelectionCursor(int16_t x, int16_t rowTop);
 
+// Hardware Fix #4.8b: compact sender/body boundary for the Unified Thread
+// history rows (Text/Enigma/Friend), replacing the old ": " suffix on the
+// sender name. On a 240x135 TFT, a proportional PRIMARY font plus Morse
+// dots/dashes made "WUT:.- . .." read with no visible start boundary; a
+// literal colon-plus-space, multiple spaces, "|", or a Unicode glyph were
+// all explicitly rejected as either too wide or unreliable across fonts.
+// A small solid TFT-primitive bar, drawn in the sender's own color right
+// after their name, reads as a clear divider at minimal width cost.
+constexpr int16_t kSenderDividerWidth = 3;  // solid bar width
+constexpr int16_t kSenderBodyGap = 2;       // fixed gap between the bar and the WHITE message body that follows
+
+// Draws the divider bar with its left edge at x, top at rowTop, height
+// equal to the actual measured PRIMARY glyph ink height (the same metric
+// drawSelectionCursor() aligns to) so it visually matches the sender
+// name's own glyph box rather than the leading-inclusive lineHeight().
+// Pure TFT-primitive drawing, like drawSelectionCursor() -- never touches
+// text color/font state. Callers only ever draw this on a message's TRUE
+// first row, immediately after the sender name, in the same color565
+// used for that name; continuation rows never call this (Hardware Fix
+// #4.7b Part C: they start at senderX with no repeated sender/divider).
+void drawSenderDivider(int16_t x, int16_t rowTop, uint16_t color565);
+
 // Greedy word-wrap of `text` into visual lines that each fit within
 // `maxWidthPx` in the currently active font (Hardware Fix #4.3 issue E).
 // Writes up to `maxLines` line spans as byte offsets into `text` --

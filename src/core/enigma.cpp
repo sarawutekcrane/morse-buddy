@@ -1026,8 +1026,14 @@ constexpr size_t kHistoryLineBufCap = 251;
 // can never disagree.
 struct HistoryRowInfo {
   char lineBuf[kHistoryLineBufCap];
-  char senderPrefix[24];
+  char senderPrefix[24];  // bare sender name only (Hardware Fix #4.8b: no more trailing ": ")
   MessageIconKind icon;
+  // Hardware Fix #4.8b Part C16/C18: X of the sender-divider bar on the
+  // TRUE first row, i.e. senderX + textWidth(senderPrefix), drawn AFTER
+  // the optional lock icon cell and sender name, in the sender's own
+  // Personal Color -- never the lock icon's color. Only meaningful (and
+  // only ever drawn) when senderPrefix is non-empty.
+  int16_t dividerX;
   int16_t firstBodyX;
   int16_t firstBodyWidth;
   int16_t continuationX;
@@ -1035,7 +1041,8 @@ struct HistoryRowInfo {
   // Feature Fix #4.8: see the identical field in text_message.cpp's
   // HistoryRowInfo -- resolved once here via Presence::resolveColorIndex(),
   // CYAN fallback for a legacy/unknown sender. Enigma's own lock icon
-  // colors and message-body WHITE are entirely unaffected.
+  // colors and message-body WHITE are entirely unaffected. Hardware Fix
+  // #4.8b: also the color the sender-divider bar itself is drawn in.
   uint16_t senderColor565;
 };
 
@@ -1072,7 +1079,12 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   // still gets its existing reserved cell exactly as before.
   int16_t iconWidth = (out->icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
   int16_t senderX = static_cast<int16_t>(labelX + iconWidth);
-  out->firstBodyX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
+  // Hardware Fix #4.8b Part C16/C18: sender name, then the divider bar
+  // (Display::kSenderDividerWidth), then a fixed 2px gap
+  // (Display::kSenderBodyGap) before the WHITE message body -- replacing
+  // the old ": " suffix that used to be baked into senderPrefix itself.
+  out->dividerX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
+  out->firstBodyX = static_cast<int16_t>(out->dividerX + Display::kSenderDividerWidth + Display::kSenderBodyGap);
   out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
   // Continuation rows start at the SAME X as the sender name on row 0
   // (Hardware Fix #4.7b Part C), not merely past the cursor cell.
@@ -1501,10 +1513,22 @@ void handleComposeEvent(const InputEvent& e) {
       Morse::cancelWordGap(&g_composeWordGap);
     }
   } else if (e.type == InputEventType::ENCODER_SHORT) {
-    if (g_composeLen > 0) {
-      sendEnigmaMessage();
-    } else {
-      invokeEmptyLineAction(Modes::ENIGMA, g_selectedGroupCode, g_selectedContactKey);
+    // Hardware Fix #4.8b Part C11 (Safe Send): identical invariant to
+    // text_message.cpp's Send handler -- never force-finalize while
+    // DOT/DASH is still physically held (ignore the click), otherwise
+    // finalize any pending final symbol BEFORE checking g_composeLen so
+    // the plaintext handed to encryption/sendEnigmaMessage() always
+    // includes the last character the user keyed in. Encryption, key
+    // generation, escaping, lock states, and the Enigma packet format are
+    // all untouched -- this only changes when finalizeComposeChar() runs
+    // relative to the Send click.
+    if (!g_composeKeyHeld) {
+      if (g_composePatternLen > 0) finalizeComposeChar();
+      if (g_composeLen > 0) {
+        sendEnigmaMessage();
+      } else {
+        invokeEmptyLineAction(Modes::ENIGMA, g_selectedGroupCode, g_selectedContactKey);
+      }
     }
   } else if (e.type == InputEventType::ENCODER_LONG) {
     TextMessage::clearOpenConversation();
@@ -1793,6 +1817,12 @@ void screenEnigmaChat() {
             int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
             int16_t textX = static_cast<int16_t>(labelX + iconWidth);
             Display::printLineColored(textX, y, info.senderPrefix, info.senderColor565);
+            // Hardware Fix #4.8b Part C14/C16/C18: solid divider bar right
+            // after the sender name, in the sender's own Personal Color
+            // (never the lock icon's color), replacing the old ": " suffix.
+            if (info.senderPrefix[0] != '\0') {
+              Display::drawSenderDivider(info.dividerX, y, info.senderColor565);
+            }
           }
           // The marker sits on the exact focused row (g_historyRowOffset),
           // which computeHistoryViewport() always keeps inside the drawn

@@ -655,7 +655,12 @@ void buildSenderPrefix(const PacketCodec::MessageEnvelope& env, char* out, size_
     // back to the raw device id when the cache is empty.
     name = (env.sender_name_cache[0] != '\0') ? env.sender_name_cache : env.sender_device_id;
   }
-  snprintf(out, outSize, "%s: ", name);
+  // Hardware Fix #4.8b Part C14/C16: no trailing ": " (or any other
+  // text-space suffix) here anymore -- callers now draw a small TFT-
+  // primitive divider bar (Display::drawSenderDivider()) immediately after
+  // this bare name instead, so this string must contain only the resolved
+  // sender name for layout (Display::textWidth()) to measure correctly.
+  snprintf(out, outSize, "%s", name);
 }
 
 }  // namespace MessageStore

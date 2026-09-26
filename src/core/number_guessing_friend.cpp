@@ -604,15 +604,20 @@ constexpr size_t kHistoryLineBufCap = PacketCodec::kMaxDecodedTextLen * (Morse::
 // fields off one HistoryRowInfo, so they can never disagree.
 struct HistoryRowInfo {
   const char* lineBuf;  // points into the Slot::B scratch buffer (or a static fallback); valid until the next loadHistoryRow() call
-  char senderPrefix[24];
+  char senderPrefix[24];  // bare sender name only (Hardware Fix #4.8b: no more trailing ": ")
   MessageIconKind icon;
+  // Hardware Fix #4.8b Part C16/C19: X of the sender-divider bar on the
+  // TRUE first row, i.e. senderX + textWidth(senderPrefix). Only
+  // meaningful (and only ever drawn) when senderPrefix is non-empty.
+  int16_t dividerX;
   int16_t firstBodyX;
   int16_t firstBodyWidth;
   int16_t continuationX;
   int16_t continuationWidth;
   // Feature Fix #4.8: see the identical field in text_message.cpp's
   // HistoryRowInfo -- resolved once here via Presence::resolveColorIndex(),
-  // CYAN fallback for a legacy/unknown sender.
+  // CYAN fallback for a legacy/unknown sender. Hardware Fix #4.8b: also
+  // the color the sender-divider bar itself is drawn in.
   uint16_t senderColor565;
 };
 
@@ -625,6 +630,7 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
     // icon is NONE here, so the icon cell is correctly not reserved either
     // (Hardware Fix #4.7b).
     out->lineBuf = "?";
+    out->dividerX = labelX;
     out->firstBodyX = labelX;
     out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
     out->continuationX = out->firstBodyX;
@@ -657,7 +663,12 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   // gets its existing reserved cell exactly as before.
   int16_t iconWidth = (out->icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
   int16_t senderX = static_cast<int16_t>(labelX + iconWidth);
-  out->firstBodyX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
+  // Hardware Fix #4.8b Part C16/C19: sender name, then the divider bar
+  // (Display::kSenderDividerWidth), then a fixed 2px gap
+  // (Display::kSenderBodyGap) before the WHITE message body -- replacing
+  // the old ": " suffix that used to be baked into senderPrefix itself.
+  out->dividerX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
+  out->firstBodyX = static_cast<int16_t>(out->dividerX + Display::kSenderDividerWidth + Display::kSenderBodyGap);
   out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
   // Continuation rows start at the SAME X as the sender name on row 0
   // (Hardware Fix #4.7b Part C), not merely past the cursor cell.
@@ -975,6 +986,13 @@ void screenFriendChat() {
             int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
             int16_t textX = static_cast<int16_t>(labelX + iconWidth);
             Display::printLineColored(textX, y, info.senderPrefix, info.senderColor565);
+            // Hardware Fix #4.8b Part C14/C16/C19: solid divider bar right
+            // after the sender name, same color, replacing the old ": "
+            // suffix -- see the identical draw call in text_message.cpp/
+            // enigma.cpp.
+            if (info.senderPrefix[0] != '\0') {
+              Display::drawSenderDivider(info.dividerX, y, info.senderColor565);
+            }
           }
           if (i == g_historyCursor && rowIdx == g_historyRowOffset) Display::drawSelectionCursor(2, y);
           char lineChunk[Display::kPrintLineBufferSize];

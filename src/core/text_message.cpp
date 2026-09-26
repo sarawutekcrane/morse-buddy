@@ -428,8 +428,13 @@ constexpr size_t kHistoryLineBufCap = PacketCodec::kMaxDecodedTextLen * (Morse::
 // so they can never disagree.
 struct HistoryRowInfo {
   const char* lineBuf;  // points into the Slot::B scratch buffer (or a static fallback); valid until the next loadHistoryRow() call
-  char senderPrefix[24];
+  char senderPrefix[24];  // bare sender name only (Hardware Fix #4.8b: no more trailing ": ")
   MessageIconKind icon;
+  // Hardware Fix #4.8b Part C16: X of the sender-divider bar on the TRUE
+  // first row, i.e. senderX + textWidth(senderPrefix) -- only meaningful
+  // (and only ever drawn) when senderPrefix is non-empty; a placeholder/
+  // no-sender row leaves this equal to firstBodyX and simply never draws it.
+  int16_t dividerX;
   int16_t firstBodyX;
   int16_t firstBodyWidth;
   int16_t continuationX;
@@ -438,7 +443,8 @@ struct HistoryRowInfo {
   // Presence::resolveColorIndex()) rather than the fixed ST77XX_CYAN every
   // sender name used before -- already falls back to CYAN for a legacy/
   // unknown sender so old peers stay readable. Message BODY color is
-  // untouched (always WHITE, drawn via plain printLine()).
+  // untouched (always WHITE, drawn via plain printLine()). Hardware Fix
+  // #4.8b: also the color the sender-divider bar itself is drawn in.
   uint16_t senderColor565;
 };
 
@@ -455,6 +461,7 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
     // to the existing "message failed to load" placeholder instead. icon
     // is NONE here, so the icon cell is correctly not reserved either.
     out->lineBuf = "?";
+    out->dividerX = labelX;
     out->firstBodyX = labelX;
     out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
     out->continuationX = out->firstBodyX;
@@ -490,7 +497,12 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   // usable space between the cursor and the sender name.
   int16_t iconWidth = (out->icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
   int16_t senderX = static_cast<int16_t>(labelX + iconWidth);
-  out->firstBodyX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
+  // Hardware Fix #4.8b Part C16: sender name, then the divider bar
+  // (Display::kSenderDividerWidth), then a fixed 2px gap
+  // (Display::kSenderBodyGap) before the WHITE message body -- replacing
+  // the old ": " suffix that used to be baked into senderPrefix itself.
+  out->dividerX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
+  out->firstBodyX = static_cast<int16_t>(out->dividerX + Display::kSenderDividerWidth + Display::kSenderBodyGap);
   out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
   // Continuation rows start at the SAME X as the sender name on row 0
   // (Hardware Fix #4.7b Part C), not merely past the cursor cell -- this
@@ -865,10 +877,26 @@ void handleComposeEvent(const InputEvent& e) {
       Morse::cancelWordGap(&g_composeWordGap);
     }
   } else if (e.type == InputEventType::ENCODER_SHORT) {
-    if (g_composeLen > 0) {
-      sendComposedMessage();
-    } else {
-      invokeEmptyLineAction(Modes::TEXT, g_selectedGroupCode, g_selectedContactKey);
+    // Hardware Fix #4.8b Part C10 (Safe Send): never force-finalize a
+    // Morse symbol while the key is still physically held -- that would
+    // evaluate a half-keyed symbol. Simply ignore this Send click; the
+    // Combined Gesture (if any) is unaffected since this branch never
+    // touches g_composeKeyHeld/g_dotPressState itself.
+    if (!g_composeKeyHeld) {
+      // A completed final symbol may still be sitting only in
+      // g_composePattern, waiting for the normal 3-dit idle finalizer,
+      // when Send is pressed -- finalize it BEFORE checking g_composeLen
+      // so the message actually sent always reflects everything the user
+      // keyed in, including its last character. No trailing word
+      // separator is invented here; finalizeComposeChar() only ever
+      // commits the separator it already decided on via the normal
+      // deferred word-gap model.
+      if (g_composePatternLen > 0) finalizeComposeChar();
+      if (g_composeLen > 0) {
+        sendComposedMessage();
+      } else {
+        invokeEmptyLineAction(Modes::TEXT, g_selectedGroupCode, g_selectedContactKey);
+      }
     }
   } else if (e.type == InputEventType::ENCODER_LONG) {
     g_chatIsOpen = false;
@@ -1161,6 +1189,14 @@ void screenChat() {
             int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
             int16_t textX = static_cast<int16_t>(labelX + iconWidth);
             Display::printLineColored(textX, y, info.senderPrefix, info.senderColor565);
+            // Hardware Fix #4.8b Part C14/C16: solid divider bar right after
+            // the sender name, same color, replacing the old ": " suffix.
+            // Only drawn when a sender name was actually loaded (a failed-
+            // load placeholder row has an empty senderPrefix and its
+            // dividerX == firstBodyX, i.e. zero-width -- nothing to draw).
+            if (info.senderPrefix[0] != '\0') {
+              Display::drawSenderDivider(info.dividerX, y, info.senderColor565);
+            }
           }
           // The marker sits on the exact focused row (g_historyRowOffset),
           // which computeHistoryViewport() always keeps inside the drawn

@@ -21,17 +21,21 @@ struct InputEvent {
   InputEventType type;
   int8_t value;
   uint32_t durationMs;
-  // Hardware Fix #4.7d: the physical/debounced accepted event time
-  // (millis()) at the moment this event's edge was actually accepted --
-  // NOT when Input::popEvent() happened to be called for it. Fix #4.7b's
-  // independent DOT/DASH timer already captures this instant in
-  // ButtonEdgeRecord::atMs; this field is how it survives into the
-  // semantic InputEvent so a busy main loop that only gets around to
-  // draining several queued edges later can still reconstruct the user's
-  // real key rhythm instead of the loop's own processing time. 0 means
-  // "no physical time known" (e.g. a non-DOT/DASH event, or one synthesized
-  // without one) -- every Morse-timing consumer must fall back to
-  // millis() in that case (eventMs != 0 ? eventMs : millis()) so
+  // Hardware Fix #4.7d (DOT/DASH), extended by Hardware Fix #4.8b (Encoder
+  // SW): the physical/debounced accepted event time (millis()) at the
+  // moment this event's edge was actually accepted -- NOT when
+  // Input::popEvent() happened to be called for it. Both DOT/DASH's and
+  // Encoder SW's independent samplers capture this instant in their own
+  // edge records; this field is how it survives into the semantic
+  // InputEvent so a busy main loop that only gets around to draining
+  // several queued edges later can still reconstruct the user's real key
+  // rhythm instead of the loop's own processing time. Carried on
+  // DOT_PRESS_START/DOT_RELEASE and, since #4.8b, ENCODER_SHORT/
+  // ENCODER_LONG too (ENCODER_LONG uses the moment the long-press
+  // threshold was crossed, not necessarily the later release). 0 means "no
+  // physical time known" (e.g. ENCODER_ROTATE/COMBINED_* events, or one
+  // synthesized without one) -- every Morse-timing consumer must fall back
+  // to millis() in that case (eventMs != 0 ? eventMs : millis()) so
   // synthetic/legacy/default-constructed events stay safe.
   uint32_t eventMs;
 

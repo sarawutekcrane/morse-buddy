@@ -240,6 +240,22 @@ void handleMorse(const InputEvent& e) {
       resetMorsePattern();
       g_state = State::EMPTY;
     }
+  } else if (e.type == InputEventType::ENCODER_SHORT) {
+    // Hardware Fix #4.8b Part C12: previously ENCODER_SHORT was simply
+    // unhandled in State::MORSE, so a user who finished the LAST Morse
+    // character of a field and immediately pressed the Encoder saw
+    // nothing happen (the button appeared unresponsive) -- they had to
+    // wait for the idle finalizer or press again. This single physical
+    // click now means "finish the pending letter, then proceed to
+    // confirmation," without requiring a second click. Never force-
+    // finalizes while the key is still physically held.
+    if (!g_morseKeyHeld) {
+      if (g_morsePatternLen > 0) finalizeMorseChar();
+      if (g_length >= g_config.minLength) {
+        g_state = State::CONFIRM;
+        g_confirmSaveSelected = true;
+      }
+    }
   } else if (e.type == InputEventType::ENCODER_LONG) {
     cancelWholeEdit();
   }

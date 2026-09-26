@@ -12,7 +12,6 @@ namespace {
 // ---------------------------------------------------------------------------
 // Tunables (Addendum section 1.6 / 9).
 // ---------------------------------------------------------------------------
-constexpr uint32_t kButtonDebounceMs = 10;      // Encoder SW only (Hardware Fix #4.7b: DOT/DASH now uses its own independent esp_timer sampler, see below)
 constexpr uint32_t kEncoderLongPressMs = 500;
 constexpr uint32_t kCombinedWindowMs = 200;
 constexpr uint32_t kCombinedRevealMs = Morse::kSpecialCommandMs;  // 2000ms
@@ -43,33 +42,6 @@ void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0, u
   g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueSize);
   g_queueCount++;
 }
-
-// ---------------------------------------------------------------------------
-// Debounced digital button (active LOW: pressed == digitalRead() == LOW).
-// ---------------------------------------------------------------------------
-struct DebouncedButton {
-  int pin;
-  bool stablePressed;
-  bool lastRaw;
-  uint32_t lastChangeMs;
-
-  // Plain constructor (not default member initializers) so this stays
-  // usable with direct-list-init like DebouncedButton g_encSw{Pins::kEncoderSw}
-  // under C++11.
-  explicit DebouncedButton(int p) : pin(p), stablePressed(false), lastRaw(false), lastChangeMs(0) {}
-};
-
-void updateDebounce(DebouncedButton& b, uint32_t now) {
-  bool raw = digitalRead(b.pin) == LOW;
-  if (raw != b.lastRaw) {
-    b.lastRaw = raw;
-    b.lastChangeMs = now;
-  } else if (now - b.lastChangeMs >= kButtonDebounceMs) {
-    b.stablePressed = raw;
-  }
-}
-
-DebouncedButton g_encSw{Pins::kEncoderSw};
 
 // ---------------------------------------------------------------------------
 // DOT/DASH reliable capture (Hardware Fix #4.7b).
@@ -186,20 +158,155 @@ void buttonSampleTimerCallback(void* /*arg*/) {
 // still produces both events with an accurate duration.
 void processDotEdge(bool pressed, uint32_t atMs);
 
-void drainButtonEdges() {
-  ButtonEdgeRecord local[kButtonEdgeQueueCap];
-  uint8_t count;
-  portENTER_CRITICAL(&g_buttonMux);
-  count = g_dotEdgeCount;
-  for (uint8_t i = 0; i < count; i++) {
-    local[i] = g_dotEdgeQueue[(g_dotEdgeHead + i) % kButtonEdgeQueueCap];
+// ---------------------------------------------------------------------------
+// Encoder SW reliable capture (Hardware Fix #4.8b).
+//
+// Real-hardware testing after Fix #4.7b/#4.7d/#4.7e found DOT/DASH capture
+// fully reliable, but the physical Encoder push/switch (Send/Submit/
+// Confirm/Save) was frequently NOT recognized. Root cause: Encoder SW was
+// the one remaining input still using the old loop-polled updateDebounce()
+// mechanism (removed above) -- the exact same class of bug DOT/DASH had
+// before Fix #4.7b: a complete short physical press+release can occur
+// entirely while the main loop is busy with TFT/UI/storage/network work
+// and vanish between two Input::update() calls.
+//
+// This applies the identical fix already validated for DOT/DASH: a
+// periodic esp_timer (ESP_TIMER_TASK dispatch, its OWN independent timer,
+// mutex, and queue -- zero shared state with the DOT sampler above or the
+// CLK/DT quadrature decoder below) samples Pins::kEncoderSw every
+// kEncSwSamplePeriodUs and only accepts a new stable level after
+// kEncSwStableSamples consecutive identical samples (~10ms at 1ms
+// sampling). Every accepted PRESS/RELEASE transition is timestamped and
+// queued, so a complete press+release captured while Input::update() was
+// not running still survives, in order, with real timestamps, the next
+// time it runs.
+//
+// This is structurally similar to the DOT/DASH sampler by necessity (the
+// same class of defect needs the same class of fix), but is its own
+// separate implementation -- the validated DOT sampler above is untouched.
+constexpr uint32_t kEncSwSamplePeriodUs = 1000;  // 1ms sample period, independent of every other timer
+constexpr uint8_t kEncSwStableSamples = 10;      // ~10ms debounce at 1ms sampling
+constexpr uint8_t kEncSwEdgeQueueCap = 16;       // bounded: at ~10ms/edge minimum spacing, holds >150ms of edges
+
+struct EncSwEdgeRecord {
+  bool pressed;   // true = accepted stable PRESS, false = accepted stable RELEASE
+  uint32_t atMs;  // millis() at the moment this edge was accepted (debounce-completion time, not drain time)
+};
+
+portMUX_TYPE g_encSwMux = portMUX_INITIALIZER_UNLOCKED;
+EncSwEdgeRecord g_encSwEdgeQueue[kEncSwEdgeQueueCap];  // contents only ever touched under g_encSwMux
+uint8_t g_encSwEdgeHead = 0;
+uint8_t g_encSwEdgeTail = 0;
+uint8_t g_encSwEdgeCount = 0;
+uint32_t g_encSwEdgeDropped = 0;  // overflow count (see encSwSampleTimerCallback()); g_encSwMux-protected
+
+// Stable-state sampler bookkeeping, touched ONLY from
+// encSwSampleTimerCallback() (ESP_TIMER_TASK dispatch guarantees ordinary
+// sequential, non-reentrant calls) -- no locking needed, identical
+// reasoning to the DOT sampler's own state above.
+bool g_encSwRawStable = false;
+bool g_encSwCandidateState = false;
+uint8_t g_encSwCandidateCount = 0;
+
+esp_timer_handle_t g_encSwSampleTimer = nullptr;
+bool g_encSwSamplerFailed = false;  // set if esp_timer create/start fails; Encoder SW simply produces no events in that case
+
+// Periodic stable-state sampler for Encoder SW: runs every
+// kEncSwSamplePeriodUs from its own ESP_TIMER_TASK callback, independent
+// of Input::update()/the Arduino loop and independent of every other
+// timer in this file. No Serial/Display/MQTT/NVS/LittleFS/heap/delay/
+// pushEvent()/Sleep::notifyActivity()/application-callback calls here --
+// only a digitalRead(), the stability filter, and (on an accepted
+// transition) a millis() timestamp read and a plain struct write into the
+// bounded queue under the critical section.
+void encSwSampleTimerCallback(void* /*arg*/) {
+  bool raw = digitalRead(Pins::kEncoderSw) == LOW;  // active LOW: pressed == LOW
+
+  if (raw == g_encSwRawStable) {
+    g_encSwCandidateState = g_encSwRawStable;
+    g_encSwCandidateCount = 0;
+    return;
   }
-  g_dotEdgeHead = static_cast<uint8_t>((g_dotEdgeHead + count) % kButtonEdgeQueueCap);
+  if (raw != g_encSwCandidateState) {
+    g_encSwCandidateState = raw;
+    g_encSwCandidateCount = 1;
+    return;
+  }
+  g_encSwCandidateCount++;
+  if (g_encSwCandidateCount < kEncSwStableSamples) return;  // not stable yet
+
+  g_encSwRawStable = g_encSwCandidateState;
+  g_encSwCandidateCount = 0;
+  uint32_t atMs = millis();  // a plain hardware-timer read, safe from ESP_TIMER_TASK context
+
+  portENTER_CRITICAL(&g_encSwMux);
+  if (g_encSwEdgeCount < kEncSwEdgeQueueCap) {
+    g_encSwEdgeQueue[g_encSwEdgeTail] = EncSwEdgeRecord{g_encSwRawStable, atMs};
+    g_encSwEdgeTail = static_cast<uint8_t>((g_encSwEdgeTail + 1) % kEncSwEdgeQueueCap);
+    g_encSwEdgeCount++;
+  } else {
+    // Bounded queue, deterministic overflow policy identical to DOT's:
+    // drop the new edge (not an already-queued one) and count it.
+    g_encSwEdgeDropped++;
+  }
+  portEXIT_CRITICAL(&g_encSwMux);
+}
+
+// Forward-declared: defined alongside the DOT/Encoder-SW press state
+// machines below (it reads/writes the same Combined Gesture state
+// processDotEdge() does).
+void processEncSwEdge(bool pressed, uint32_t atMs);
+
+// Hardware Fix #4.8b Part C5: DOT/DASH and Encoder SW both participate in
+// the existing Combined Gesture, so a busy-loop backlog spanning BOTH
+// physical edge queues must be replayed in real chronological order, not
+// "all of one queue, then all of the other" (which could process a later
+// DOT edge before an earlier-but-later-drained Encoder-SW edge). Each
+// queue is snapshotted under its own critical section exactly like the
+// DOT-only drain used to, then the two already-internally-ordered
+// snapshots are merge-drained by atMs -- equal timestamps process DOT
+// first, preserving the original documented DOT-first arbitration.
+// Quadrature rotation is entirely separate and never enters this merge.
+void drainInputEdges() {
+  ButtonEdgeRecord dotLocal[kButtonEdgeQueueCap];
+  uint8_t dotCount;
+  portENTER_CRITICAL(&g_buttonMux);
+  dotCount = g_dotEdgeCount;
+  for (uint8_t i = 0; i < dotCount; i++) {
+    dotLocal[i] = g_dotEdgeQueue[(g_dotEdgeHead + i) % kButtonEdgeQueueCap];
+  }
+  g_dotEdgeHead = static_cast<uint8_t>((g_dotEdgeHead + dotCount) % kButtonEdgeQueueCap);
   g_dotEdgeCount = 0;
   portEXIT_CRITICAL(&g_buttonMux);
 
-  for (uint8_t i = 0; i < count; i++) {
-    processDotEdge(local[i].pressed, local[i].atMs);
+  EncSwEdgeRecord encLocal[kEncSwEdgeQueueCap];
+  uint8_t encCount;
+  portENTER_CRITICAL(&g_encSwMux);
+  encCount = g_encSwEdgeCount;
+  for (uint8_t i = 0; i < encCount; i++) {
+    encLocal[i] = g_encSwEdgeQueue[(g_encSwEdgeHead + i) % kEncSwEdgeQueueCap];
+  }
+  g_encSwEdgeHead = static_cast<uint8_t>((g_encSwEdgeHead + encCount) % kEncSwEdgeQueueCap);
+  g_encSwEdgeCount = 0;
+  portEXIT_CRITICAL(&g_encSwMux);
+
+  uint8_t di = 0, ei = 0;
+  while (di < dotCount && ei < encCount) {
+    if (dotLocal[di].atMs <= encLocal[ei].atMs) {  // tie -> DOT first
+      processDotEdge(dotLocal[di].pressed, dotLocal[di].atMs);
+      di++;
+    } else {
+      processEncSwEdge(encLocal[ei].pressed, encLocal[ei].atMs);
+      ei++;
+    }
+  }
+  while (di < dotCount) {
+    processDotEdge(dotLocal[di].pressed, dotLocal[di].atMs);
+    di++;
+  }
+  while (ei < encCount) {
+    processEncSwEdge(encLocal[ei].pressed, encLocal[ei].atMs);
+    ei++;
   }
 }
 
@@ -489,41 +596,69 @@ void processDotEdge(bool pressed, uint32_t atMs) {
   }
 }
 
-void updateEncoderSwStateMachine(uint32_t now) {
-  bool pressed = g_encSw.stablePressed;
-
-  if (pressed && g_encPressState == PressState::IDLE) {
-    g_encDownMs = now;
-    g_encLongFired = false;
-    Sleep::notifyActivity();
-    if (g_dotPressState == PressState::INDIVIDUAL && (now - g_dotDownMs) < kCombinedWindowMs) {
-      enterCombined(now);
-    } else {
-      g_encPressState = PressState::INDIVIDUAL;
+// Replaces the old polled updateEncoderSwStateMachine() (Hardware Fix
+// #4.8b): driven by one accepted Encoder-SW edge (from drainInputEdges())
+// at a time, using that edge's own captured timestamp rather than
+// whenever Input::update() happened to run. Long-press detection while
+// the switch is STILL held (no release edge exists yet) is handled
+// separately by updateEncoderLongHold() below, since a hold produces no
+// edge of its own to react to.
+void processEncSwEdge(bool pressed, uint32_t atMs) {
+  if (pressed) {
+    if (g_encPressState == PressState::IDLE) {
+      g_encDownMs = atMs;
+      g_encLongFired = false;
+      Sleep::notifyActivity();
+      if (g_dotPressState == PressState::INDIVIDUAL && (atMs - g_dotDownMs) < kCombinedWindowMs) {
+        enterCombined(atMs);
+      } else {
+        g_encPressState = PressState::INDIVIDUAL;
+      }
     }
     return;
   }
 
-  if (pressed && g_encPressState == PressState::INDIVIDUAL) {
-    Sleep::notifyActivity();
-    if (!g_encLongFired && (now - g_encDownMs) >= kEncoderLongPressMs) {
-      g_encLongFired = true;
-      pushEvent(InputEventType::ENCODER_LONG);
-    }
-    return;
-  }
-
-  if (!pressed && g_encPressState == PressState::INDIVIDUAL) {
+  if (g_encPressState == PressState::INDIVIDUAL) {
+    // Hardware Fix #4.8b Part C6: classify strictly from the physical
+    // press/release timestamps, never from whether the per-tick
+    // updateEncoderLongHold() poll happened to run in between -- a
+    // complete press+release whose FULL duration already exceeds
+    // kEncoderLongPressMs can be captured entirely while the main loop was
+    // busy (both edges already queued before Input::update() next runs),
+    // and must still classify as LONG with no ENCODER_SHORT, exactly as if
+    // the user had released after the long-press UI had already fired.
+    uint32_t duration = atMs - g_encDownMs;
     if (!g_encLongFired) {
-      pushEvent(InputEventType::ENCODER_SHORT);
+      if (duration >= kEncoderLongPressMs) {
+        g_encLongFired = true;
+        pushEvent(InputEventType::ENCODER_LONG, 0, 0, static_cast<uint32_t>(g_encDownMs + kEncoderLongPressMs));
+      } else {
+        pushEvent(InputEventType::ENCODER_SHORT, 0, 0, atMs);
+      }
     }
+    // else: long already fired (either just above, or earlier via
+    // updateEncoderLongHold() while still held) -- release emits nothing.
     g_encPressState = PressState::IDLE;
     return;
   }
 
-  if (!pressed && g_combinedActive && g_encPressState == PressState::COMBINED) {
-    endCombined(now);
+  if (g_combinedActive && g_encPressState == PressState::COMBINED) {
+    endCombined(atMs);
     return;
+  }
+}
+
+// Hardware Fix #4.8b Part C7: a hold produces no edge of its own, so
+// ENCODER_LONG firing while the switch is STILL physically held (release
+// not required first) must be detected by polling elapsed time each tick,
+// exactly like updateCombinedHold() below already does for the combined
+// gesture's own reveal threshold. Uses processing-time `now`, not a
+// physical edge timestamp, since there is no edge to attach one to yet.
+void updateEncoderLongHold(uint32_t now) {
+  if (g_encPressState != PressState::INDIVIDUAL || g_encLongFired) return;
+  if (now - g_encDownMs >= kEncoderLongPressMs) {
+    g_encLongFired = true;
+    pushEvent(InputEventType::ENCODER_LONG, 0, 0, static_cast<uint32_t>(g_encDownMs + kEncoderLongPressMs));
   }
 }
 
@@ -620,24 +755,65 @@ void init() {
       }
     }
   }
+
+  // Encoder SW reliable capture (Hardware Fix #4.8b) -- a fully
+  // independent periodic esp_timer, separate from both the DOT sampler
+  // above and the CLK/DT quadrature sampler further above (its own
+  // g_encSwSampleTimer, its own g_encSwMux, zero shared state), fixing the
+  // same class of "missed while Input::update() wasn't running" bug on the
+  // Encoder push switch. See the comment block above
+  // encSwSampleTimerCallback().
+  bool initialEncSwRaw = digitalRead(Pins::kEncoderSw) == LOW;
+  g_encSwRawStable = initialEncSwRaw;
+  g_encSwCandidateState = initialEncSwRaw;
+  g_encSwCandidateCount = 0;
+
+  portENTER_CRITICAL(&g_encSwMux);
+  g_encSwEdgeHead = 0;
+  g_encSwEdgeTail = 0;
+  g_encSwEdgeCount = 0;
+  g_encSwEdgeDropped = 0;
+  portEXIT_CRITICAL(&g_encSwMux);
+
+  // Guarded so calling init() more than once never creates a second
+  // periodic timer, exactly like the timers above.
+  if (g_encSwSampleTimer == nullptr) {
+    esp_timer_create_args_t encSwTimerArgs = {};
+    encSwTimerArgs.callback = &encSwSampleTimerCallback;
+    encSwTimerArgs.arg = nullptr;
+    encSwTimerArgs.dispatch_method = ESP_TIMER_TASK;
+    encSwTimerArgs.name = "encsw_sample";
+    esp_err_t encSwCreateErr = esp_timer_create(&encSwTimerArgs, &g_encSwSampleTimer);
+    if (encSwCreateErr != ESP_OK) {
+      g_encSwSampleTimer = nullptr;
+      g_encSwSamplerFailed = true;
+    } else {
+      esp_err_t encSwStartErr = esp_timer_start_periodic(g_encSwSampleTimer, kEncSwSamplePeriodUs);
+      if (encSwStartErr != ESP_OK) {
+        g_encSwSamplerFailed = true;
+      }
+    }
+  }
 }
 
 void update() {
   uint32_t now = millis();
 
-  updateDebounce(g_encSw, now);
   drainQuadrature();
-  // Hardware Fix #4.7b: DOT/DASH is no longer polled here at all -- it is
-  // continuously sampled and debounced by its own independent esp_timer
-  // (buttonSampleTimerCallback()) regardless of how often update() runs;
-  // drainButtonEdges() only replays whatever accepted press/release edges
-  // have accumulated since the last call, in order, each with its own
-  // real timestamp. This preserves the original relative ordering (DOT
-  // edges processed before the encoder-switch state machine) so combined-
-  // gesture tie-breaking behavior is unchanged.
-  drainButtonEdges();
+  // Hardware Fix #4.8b: DOT/DASH and Encoder SW are both now sampled and
+  // debounced by their own independent esp_timers regardless of how often
+  // update() runs; drainInputEdges() merge-drains whatever accepted
+  // press/release edges have accumulated on EITHER queue since the last
+  // call, in real chronological order (tie: DOT first) -- preserving the
+  // original documented DOT-first combined-gesture arbitration even
+  // across a busy-loop backlog spanning both queues.
+  drainInputEdges();
 
-  updateEncoderSwStateMachine(now);
+  // Encoder SW long-press-while-held detection has no edge of its own to
+  // react to (see updateEncoderLongHold()'s own comment) so it remains a
+  // per-tick poll, run after the edge drain above establishes/clears
+  // g_encPressState for this tick.
+  updateEncoderLongHold(now);
   updateCombinedHold(now);
 }
 
