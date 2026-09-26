@@ -311,8 +311,18 @@ void drawSelectionCursor(int16_t x, int16_t rowTop) {
   // ink height (g_primaryInkHeight) instead aligns the triangle with the
   // visible glyphs. COMPACT keeps its original line-centered behavior
   // unchanged -- it never had this leading gap.
+  //
+  // Hardware Fix #4.7g: even after the #4.7c ink-height centering, real
+  // hardware still perceived the triangle as sitting slightly below the
+  // optical vertical center of PRIMARY text -- glyph ink is not
+  // perfectly symmetric top/bottom around its bounding box, so a small
+  // fixed optical correction (kPrimaryCursorYOffset) nudges it up a
+  // couple of pixels. PRIMARY-only; COMPACT is untouched. This does not
+  // touch printLine(), g_primaryAscent, g_primaryInkHeight, or
+  // g_primaryLineHeight -- purely a cursor-drawing adjustment.
+  constexpr int16_t kPrimaryCursorYOffset = -2;
   int16_t centerY = (g_currentFont == Display::Font::PRIMARY)
-                         ? static_cast<int16_t>(rowTop + g_primaryInkHeight / 2)
+                         ? static_cast<int16_t>(rowTop + g_primaryInkHeight / 2 + kPrimaryCursorYOffset)
                          : static_cast<int16_t>(rowTop + lineHeight() / 2);
   constexpr int16_t kHalfHeight = kCursorTriangleHeight / 2;  // 3: apex-to-base half-span
   g_tft.fillTriangle(x, static_cast<int16_t>(centerY - kHalfHeight), x, static_cast<int16_t>(centerY + kHalfHeight),

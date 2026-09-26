@@ -112,9 +112,13 @@ void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
 // as touching/overlapping the first glyph. The triangle itself is
 // unchanged (same width/height, same draw X) -- only this budget grows,
 // so every caller that derives its text/erase X from
-// 2 + Display::kCursorCellWidth automatically gets the extra ~3px gap
-// (about 5px visual gap after the triangle) without any per-file change.
-constexpr int16_t kCursorCellWidth = 9;      // fixed horizontal budget callers reserve for this cursor's cell
+// 2 + Display::kCursorCellWidth automatically gets the extra gap without
+// any per-file change.
+// Hardware Fix #4.7g: widened again from 9 to 11 -- real hardware still
+// perceived the ~5px gap left by Fix #4.7f as too tight; this raises the
+// perceived black gap to ~7px, still with zero change to the triangle
+// itself or its draw X.
+constexpr int16_t kCursorCellWidth = 11;     // fixed horizontal budget callers reserve for this cursor's cell
 constexpr int16_t kCursorTriangleWidth = 4;  // point-to-base width
 constexpr int16_t kCursorTriangleHeight = 7; // base height
 
