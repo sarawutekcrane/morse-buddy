@@ -606,7 +606,14 @@ void screenIdentityColorPicker() {
       g_identityPendingColor = static_cast<uint8_t>(next);
       g_colorPickerMessage[0] = '\0';  // rotating to a different color clears a stale "Color in use"
       g_colorPickerDirty = true;
-    } else if (Input::isMenuConfirm(e)) {
+    } else if (e.type == InputEventType::ENCODER_SHORT || Input::isMenuConfirm(e)) {
+      // Feature Fix #4.8a: ENCODER_SHORT (the rotary encoder push button)
+      // is the intended primary confirm gesture for this picker --
+      // Input::isMenuConfirm() only recognizes a short DOT/DASH release,
+      // so pressing the encoder switch previously did nothing here. Both
+      // inputs run through this exact same conflict-check/save/hook/
+      // goBack() path below; nothing is duplicated.
+      //
       // Feature Fix #4.8 section 2G (COLOR): centralized conflict check,
       // only rejected while the affected group still has an unused
       // palette color left (Presence::isColorInUseByKnownMember() already

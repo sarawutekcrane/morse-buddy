@@ -291,6 +291,27 @@ void touchRecentColor(const char* group_code, const char* device_id, uint8_t col
   saveRecentColorsTables();
 }
 
+// Feature Fix #4.8a: strict decimal-integer parser for the optional
+// trailing Presence color-index token -- deliberately NOT atoi(), which
+// would silently accept "4x" as 4, "" as 0, or a negative-looking string
+// as some wrapped unsigned value. Accepts ONLY a complete run of decimal
+// digits (no sign, no leading/trailing garbage, not empty) whose value
+// falls in [0, IdentityColor::kColorCount); writes *outIndex and returns
+// true on success, otherwise returns false and leaves *outIndex
+// completely untouched (callers pre-set it to IdentityColor::kInvalidColor
+// so a rejected/missing token never overwrites an already-known color).
+bool parseStrictColorIndex(const char* s, uint8_t* outIndex) {
+  if (s == nullptr || s[0] == '\0') return false;
+  uint32_t value = 0;
+  for (const char* p = s; *p != '\0'; p++) {
+    if (*p < '0' || *p > '9') return false;
+    value = value * 10 + static_cast<uint32_t>(*p - '0');
+    if (value >= IdentityColor::kColorCount) return false;  // also bounds runaway accumulation on a long digit run
+  }
+  *outIndex = static_cast<uint8_t>(value);
+  return true;
+}
+
 bool g_ownRadioAvailable = true;
 
 void buildPayload(char* out, size_t outSize, const char* status) {
@@ -387,9 +408,20 @@ void handleIncoming(const char* group_code, const char* payload, uint16_t len) {
   char* displayName = strtok_r(nullptr, "|", &saveptr);
   char* status = strtok_r(nullptr, "|", &saveptr);
   char* radioStr = strtok_r(nullptr, "|", &saveptr);
-  // Feature Fix #4.8 section 2H: OPTIONAL trailing color-index field.
-  // radioStr's own strtok_r() call already advances past it whether or
-  // not a 7th field follows, so this is simply nullptr for any legacy
+  // Feature Fix #4.8a: the wire timestamp token occupies the 6th field --
+  // it MUST be consumed here, in its real position, before the OPTIONAL
+  // 7th (trailing color-index) field. #4.8's original parser skipped
+  // straight from radioStr to what it called colorStr, which was actually
+  // still reading the TIMESTAMP token; the real color field was never
+  // parsed at all. This value remains semantically unused by Presence,
+  // exactly as before this fix -- receiptTs (WifiManager's own clock,
+  // just below) is still what Recent Contacts/color are stamped with, not
+  // the sender's own wire timestamp.
+  char* timestampStr = strtok_r(nullptr, "|", &saveptr);
+  (void)timestampStr;  // consumed only to advance past it to the real color token
+  // OPTIONAL trailing color-index field. Its own strtok_r() call above
+  // (timestampStr) already advances past the timestamp whether or not a
+  // 7th field follows, so colorStr is simply nullptr for any legacy
   // peer's shorter payload -- never rejected, just treated as "no color
   // observed" (colorIdx stays IdentityColor::kInvalidColor).
   char* colorStr = strtok_r(nullptr, "|", &saveptr);
@@ -398,11 +430,14 @@ void handleIncoming(const char* group_code, const char* payload, uint16_t len) {
 
   bool online = (strcmp(status, "ONLINE") == 0);
   bool radioAvail = (radioStr != nullptr) && (atoi(radioStr) != 0);
+  // Feature Fix #4.8a: strict parsing -- accepts ONLY a complete decimal
+  // integer in [0, kColorCount) (see parseStrictColorIndex() above), never
+  // a loose atoi() that would silently turn "abc"/"4x"/"" into color 0.
+  // Leaves colorIdx at kInvalidColor (untouched) for anything else,
+  // including a missing token, a negative-looking string, an out-of-range
+  // value, or trailing garbage after otherwise-valid digits.
   uint8_t colorIdx = IdentityColor::kInvalidColor;
-  if (colorStr != nullptr) {
-    int parsed = atoi(colorStr);
-    if (parsed >= 0 && IdentityColor::isValid(static_cast<uint8_t>(parsed))) colorIdx = static_cast<uint8_t>(parsed);
-  }
+  parseStrictColorIndex(colorStr, &colorIdx);
   uint32_t receiptTs = WifiManager::getUnixTime();
 
   GroupPresenceTable* t = findOrCreateTable(group_code);
