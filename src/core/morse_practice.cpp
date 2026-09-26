@@ -317,6 +317,25 @@ Morse::WordGapState g_answerWordGap;
 // Fix #4.2).
 bool g_answerPatternStartsNewWord = false;
 
+// Hardware Fix #4.9a: fixed-capacity rollback checkpoints, one per
+// CONFIRMED (finalized) character, so the delete prosign can restore both
+// the visible RAW answer (g_answerRaw) and the internal grading state
+// (g_answerDecoded) together, to exactly the state that existed
+// immediately before that character was committed. Since a word-boundary
+// ASCII space (in g_answerDecoded) and its "/ " token (in g_answerRaw)
+// are written atomically together with the character that follows them in
+// finalizeAnswerChar(), restoring to the pre-commit checkpoint
+// automatically undoes those too -- never leaving a dangling separator
+// behind. No heap; capacity is kChallengeCap, the same bound
+// g_answerDecoded itself uses, since a legitimate answer can never have
+// more confirmed characters than the challenge text has bytes.
+struct AnswerCheckpoint {
+  uint8_t decodedLen;
+  uint16_t rawLen;
+};
+AnswerCheckpoint g_answerCheckpoints[kChallengeCap];
+uint8_t g_answerCheckpointCount = 0;
+
 // Dirty-gated redraw flag (Hardware Fix #1's original pattern) -- declared
 // here, before startNewTest()/evaluateAnswer()/finishTest()/
 // advanceAfterFeedback() below, all of which set it directly on any state
@@ -332,6 +351,10 @@ void resetAnswerCompose() {
   g_answerPattern[0] = '\0';
   g_answerPatternStartsNewWord = false;
   Morse::cancelWordGap(&g_answerWordGap);
+  // Hardware Fix #4.9a: no confirmed characters survive into a new
+  // question/test, so no stale checkpoint can ever be popped against the
+  // wrong answer.
+  g_answerCheckpointCount = 0;
   // Hardware Fix #4.7e: reset held state here too -- resetAnswerCompose()
   // runs both on special-command hold and at the start of every new
   // question, so no stale true can ever survive into a new question/test.
@@ -405,14 +428,24 @@ void finalizeAnswerChar() {
   // never left dangling with no room for the letter that was supposed to
   // follow it.
   bool needsSpace = g_answerPatternStartsNewWord && g_answerDecodedLen > 0 && g_answerDecoded[g_answerDecodedLen - 1] != ' ';
+
+  // Hardware Fix #4.9a: snapshot both buffers' lengths BEFORE this
+  // character mutates either of them, so a later delete prosign can
+  // restore this exact pre-commit state -- see the checkpoint push below.
+  uint8_t preDecodedLen = g_answerDecodedLen;
+  uint16_t preRawLen = g_answerRawLen;
+  bool committed = false;
+
   size_t needed = needsSpace ? 2 : 1;
   if (g_answerDecodedLen + needed <= sizeof(g_answerDecoded) - 1) {
     if (needsSpace) g_answerDecoded[g_answerDecodedLen++] = ' ';
     g_answerDecoded[g_answerDecodedLen++] = c;
     g_answerDecoded[g_answerDecodedLen] = '\0';
+    committed = true;
   } else if (g_answerDecodedLen < sizeof(g_answerDecoded) - 1) {
     g_answerDecoded[g_answerDecodedLen++] = c;
     g_answerDecoded[g_answerDecodedLen] = '\0';
+    committed = true;
   }
 
   // Feature Fix #4.9 Part D13/D14: raw display buffer mirrors
@@ -432,6 +465,16 @@ void finalizeAnswerChar() {
     memcpy(g_answerRaw + g_answerRawLen, g_answerPattern, patLen);
     g_answerRawLen = static_cast<uint16_t>(g_answerRawLen + patLen);
     g_answerRaw[g_answerRawLen] = '\0';
+  }
+
+  // Hardware Fix #4.9a: only a character that actually landed in
+  // g_answerDecoded needs a rollback point -- push the PRE-commit lengths
+  // for both buffers as one checkpoint, so a later delete prosign can
+  // restore both together (see handleAnswerEvent()'s delete branch).
+  if (committed && g_answerCheckpointCount < kChallengeCap) {
+    g_answerCheckpoints[g_answerCheckpointCount].decodedLen = preDecodedLen;
+    g_answerCheckpoints[g_answerCheckpointCount].rawLen = preRawLen;
+    g_answerCheckpointCount++;
   }
 
   g_answerPatternStartsNewWord = false;
@@ -526,20 +569,28 @@ void handleAnswerEvent(const InputEvent& e) {
     // processing-time millis().
     g_lastAnswerReleaseMs = e.eventMs != 0 ? e.eventMs : millis();
     if (Morse::isDeletePattern(g_answerPattern)) {
-      // A delete prosign never commits a word boundary -- it must remove
-      // the previous REAL confirmed character, not an auto-inserted
-      // separator that was never actually written to either answer draft
-      // (Hardware Fix #4.2).
+      // Hardware Fix #4.9a: roll back to the checkpoint saved immediately
+      // before the last CONFIRMED character was committed, restoring BOTH
+      // g_answerDecoded (grading state) and g_answerRaw (the visible
+      // answer) together -- a delete prosign must never leave the two
+      // disagreeing. Because a word-boundary ASCII space and its "/ "
+      // raw token are written atomically together with the character that
+      // follows them in finalizeAnswerChar(), restoring to the pre-commit
+      // checkpoint automatically undoes those too, never leaving a
+      // dangling separator behind. If nothing has been confirmed yet, this
+      // is a safe no-op -- no underflow. The delete prosign itself was
+      // never committed to g_answerRaw in the first place (it only ever
+      // lived in g_answerPattern up to this point), so there is nothing of
+      // its own to strip back out of the raw buffer here.
       g_answerPatternStartsNewWord = false;
-      if (g_answerDecodedLen > 0) {
-        g_answerDecodedLen--;
+      if (g_answerCheckpointCount > 0) {
+        g_answerCheckpointCount--;
+        const AnswerCheckpoint& cp = g_answerCheckpoints[g_answerCheckpointCount];
+        g_answerDecodedLen = cp.decodedLen;
         g_answerDecoded[g_answerDecodedLen] = '\0';
+        g_answerRawLen = cp.rawLen;
+        g_answerRaw[g_answerRawLen] = '\0';
       }
-      // Delete only ever removes the just-finalized DECODED character; the
-      // raw display buffer intentionally keeps every symbol the user
-      // physically keyed (Part D13/D14 -- "must preserve an invalid
-      // user-entered pattern rather than silently replacing it"), so it is
-      // never rewound here.
       g_answerPatternLen = 0;
       g_answerPattern[0] = '\0';
       Morse::cancelWordGap(&g_answerWordGap);

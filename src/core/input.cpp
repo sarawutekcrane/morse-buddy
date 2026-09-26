@@ -797,8 +797,6 @@ void init() {
 }
 
 void update() {
-  uint32_t now = millis();
-
   drainQuadrature();
   // Hardware Fix #4.8b: DOT/DASH and Encoder SW are both now sampled and
   // debounced by their own independent esp_timers regardless of how often
@@ -808,6 +806,20 @@ void update() {
   // original documented DOT-first combined-gesture arbitration even
   // across a busy-loop backlog spanning both queues.
   drainInputEdges();
+
+  // Hardware Fix #4.9a: `now` is captured ONLY after every physical edge
+  // above has been drained, never before. The independent esp_timer
+  // samplers can accept a new edge (setting g_encDownMs/g_combinedStartMs
+  // to that edge's own physical atMs) at any point during
+  // drainQuadrature()/drainInputEdges() -- a `now` snapshotted before that
+  // could be strictly LESS than the timestamp drainInputEdges() just
+  // stored, and now - g_encDownMs (both uint32_t) would silently wrap to a
+  // huge value instead of going negative, making a brand-new press look
+  // like it had already been held for hours and firing a false
+  // ENCODER_LONG/COMBINED_REVEAL immediately. Capturing `now` after the
+  // drain guarantees now >= any edge timestamp accepted during this same
+  // call, so the subtraction below can never underflow.
+  uint32_t now = millis();
 
   // Encoder SW long-press-while-held detection has no edge of its own to
   // react to (see updateEncoderLongHold()'s own comment) so it remains a
