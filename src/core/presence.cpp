@@ -214,6 +214,23 @@ void publishStatus(const char* group_code, const char* status) {
 }
 
 void onSettingsChanged(const SettingsChangeInfo& info) {
+  if (info.event == SET_MY_NAME_CHANGED) {
+    // Hardware Fix #4.7a: a device can have WiFi already configured but no
+    // valid name yet, so it may already be publishing presence under its
+    // temporary device-ID identity (buildPayload()'s existing
+    // !hasCustomMyName() fallback) before Set Name is completed. Without
+    // this, peers would keep showing that device-ID identity until some
+    // unrelated reconnect/publish happened to occur -- republishing
+    // immediately on every name change (first-time save or a later rename
+    // via the regular My Name editor) means every configured group's
+    // peers see the real chosen name right away, no reconnect required.
+    // republishOwnPresenceAllGroups() is declared in presence.h, included
+    // at the top of this file, so this unqualified call resolves via the
+    // enclosing Presence namespace even though its definition appears
+    // later in this same file -- no forward declaration needed.
+    republishOwnPresenceAllGroups();
+    return;
+  }
   if (info.event != SET_GROUP_DELETED) return;
   GroupPresenceTable* t = findTable(info.group_code);
   if (t != nullptr) t->active = false;

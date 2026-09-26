@@ -101,8 +101,18 @@ void init() {
 
 const char* getMyName() { return g_myName; }
 void setMyName(const char* name) {
-  strncpy(g_myName, name, sizeof(g_myName) - 1);
-  g_myName[sizeof(g_myName) - 1] = '\0';
+  // Hardware Fix #4.7a: MixedTextEntry's own min/maxLength enforcement
+  // already keeps every UI-driven call within 1..kMaxMyNameLen, but this
+  // is the single public entry point any caller reaches -- it must reject
+  // an invalid name itself rather than relying on that being the only
+  // caller, since silently truncating a too-long name would produce a
+  // "valid" 4-character name that was never actually chosen (Hardware Fix
+  // #4.7's own invariant: invalid input is never silently truncated).
+  if (name == nullptr) return;
+  size_t len = strlen(name);
+  if (len < 1 || len > kMaxMyNameLen) return;
+  memcpy(g_myName, name, len);
+  g_myName[len] = '\0';
   g_hasCustomMyName = true;
   Storage::core().putString("myName", g_myName);
 }
