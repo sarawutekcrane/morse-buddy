@@ -221,16 +221,63 @@ struct RecentColorsForGroup {
   RecentColorRecord contacts[kMaxRecentPerGroup];
 };
 
-RecentColorsForGroup g_recentColors[Settings::kMaxGroups];
+// Memory Fix #4.9c: this cache no longer lives in static .bss (it was
+// contributing 1.6KB+ toward a DRAM segment overflow) -- only a small
+// pointer is static, with the actual Settings::kMaxGroups-element array
+// allocated once, on first use, from the ordinary internal heap. This is
+// the same "small pointer in .bss, backing storage allocated once, no
+// per-frame allocation" pattern already used successfully by UiScratch.
+// The persisted NVS blob's layout is completely unaffected -- it is still
+// exactly Settings::kMaxGroups RecentColorsForGroup records, byte-for-byte
+// identical to what Feature Fix #4.8 originally wrote.
+RecentColorsForGroup* g_recentColors = nullptr;
 
-void saveRecentColorsTables() { Storage::recent().putBytes("colors", g_recentColors, sizeof(g_recentColors)); }
+// Exact byte length of the logical array, independent of how it happens to
+// be stored -- every getBytes()/putBytes()/memset() call below uses this,
+// NEVER sizeof(g_recentColors) (which, now that g_recentColors is a
+// pointer, would silently shrink to the pointer's own size instead of the
+// array it points to).
+constexpr size_t kRecentColorsBytes = sizeof(RecentColorsForGroup) * Settings::kMaxGroups;
+
+// Allocates the backing array the first time it's needed and leaves it
+// allocated for the rest of the program's life -- never freed or
+// reallocated during normal runtime. calloc() zero-initializes it, so a
+// freshly allocated cache starts in exactly the same all-zero state the
+// old static array began in before any NVS load. Safe to call repeatedly:
+// a prior successful allocation short-circuits immediately, and a prior
+// failed attempt can be retried later from normal task context.
+bool ensureRecentColorsStorage() {
+  if (g_recentColors != nullptr) return true;
+  g_recentColors = static_cast<RecentColorsForGroup*>(calloc(Settings::kMaxGroups, sizeof(RecentColorsForGroup)));
+  return g_recentColors != nullptr;
+}
+
+void saveRecentColorsTables() {
+  // Nothing allocated (e.g. the one-time heap allocation never succeeded)
+  // -- there is nothing meaningful to persist yet; never dereference a
+  // null backing pointer.
+  if (g_recentColors == nullptr) return;
+  Storage::recent().putBytes("colors", g_recentColors, kRecentColorsBytes);
+}
 
 void loadRecentColorsTables() {
-  size_t got = Storage::recent().getBytes("colors", g_recentColors, sizeof(g_recentColors));
-  if (got != sizeof(g_recentColors)) memset(g_recentColors, 0, sizeof(g_recentColors));
+  // Feature Fix #4.8's offline color cache is purely cosmetic metadata
+  // (Presence/messaging/identity all keep working without it, falling
+  // back to CYAN) -- a failed allocation here must never crash or block
+  // boot, it simply leaves the cache unavailable until a later successful
+  // ensureRecentColorsStorage() call.
+  if (!ensureRecentColorsStorage()) return;
+  size_t got = Storage::recent().getBytes("colors", g_recentColors, kRecentColorsBytes);
+  if (got != kRecentColorsBytes) memset(g_recentColors, 0, kRecentColorsBytes);
 }
 
 RecentColorsForGroup* findRecentColorsTable(const char* group_code) {
+  // Memory Fix #4.9c: safe to call even if the heap allocation never
+  // happened/succeeded -- every existing caller already null-checks this
+  // function's return value (it could already return nullptr for "no
+  // table found"), so this simply becomes another way to reach that same,
+  // already-handled outcome.
+  if (g_recentColors == nullptr) return nullptr;
   for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
     if (g_recentColors[i].active && strcmp(g_recentColors[i].group_code, group_code) == 0) return &g_recentColors[i];
   }
@@ -240,6 +287,12 @@ RecentColorsForGroup* findRecentColorsTable(const char* group_code) {
 RecentColorsForGroup* findOrCreateRecentColorsTable(const char* group_code) {
   RecentColorsForGroup* t = findRecentColorsTable(group_code);
   if (t != nullptr) return t;
+  // Memory Fix #4.9c: retry the one-time allocation here too, in case the
+  // boot-time attempt (loadRecentColorsTables()) ever failed -- a later
+  // successful allocation from normal task context still lets the cache
+  // start working, rather than staying permanently disabled for the rest
+  // of the session.
+  if (!ensureRecentColorsStorage()) return nullptr;
   for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
     if (!g_recentColors[i].active) {
       g_recentColors[i].active = true;
