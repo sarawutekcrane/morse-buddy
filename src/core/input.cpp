@@ -12,7 +12,7 @@ namespace {
 // ---------------------------------------------------------------------------
 // Tunables (Addendum section 1.6 / 9).
 // ---------------------------------------------------------------------------
-constexpr uint32_t kButtonDebounceMs = 10;      // DOT/DASH and Encoder SW
+constexpr uint32_t kButtonDebounceMs = 10;      // Encoder SW only (Hardware Fix #4.7b: DOT/DASH now uses its own independent esp_timer sampler, see below)
 constexpr uint32_t kEncoderLongPressMs = 500;
 constexpr uint32_t kCombinedWindowMs = 200;
 constexpr uint32_t kCombinedRevealMs = Morse::kSpecialCommandMs;  // 2000ms
@@ -43,7 +43,7 @@ struct DebouncedButton {
   uint32_t lastChangeMs;
 
   // Plain constructor (not default member initializers) so this stays
-  // usable with direct-list-init like DebouncedButton g_dot{Pins::kDotDash}
+  // usable with direct-list-init like DebouncedButton g_encSw{Pins::kEncoderSw}
   // under C++11.
   explicit DebouncedButton(int p) : pin(p), stablePressed(false), lastRaw(false), lastChangeMs(0) {}
 };
@@ -58,8 +58,139 @@ void updateDebounce(DebouncedButton& b, uint32_t now) {
   }
 }
 
-DebouncedButton g_dot{Pins::kDotDash};
 DebouncedButton g_encSw{Pins::kEncoderSw};
+
+// ---------------------------------------------------------------------------
+// DOT/DASH reliable capture (Hardware Fix #4.7b).
+//
+// Real-hardware testing found 3 of 10 deliberate short DOT presses (at both
+// WPM 10 and WPM 8) produced no character at all -- not misclassified as
+// DASH, simply missing. The previous mechanism (updateDebounce() polled
+// once per Input::update() call, exactly the same shape of bug the
+// quadrature encoder already had before Hardware Fix #4.6) meant a
+// complete short press+release could occur entirely between two loop
+// iterations and never be observed.
+//
+// This applies the same fix already validated for the encoder: a periodic
+// esp_timer (ESP_TIMER_TASK dispatch, its own independent timer -- NOT
+// shared with the encoder's, so this has zero code/state overlap with the
+// validated Hardware Fix #4.6 quadrature sampler/decoder) samples the pin
+// every kButtonSamplePeriodUs and only accepts a new stable level after
+// kButtonStableSamples consecutive identical samples (~10ms at 1ms
+// sampling, matching the previous kButtonDebounceMs). Unlike the encoder
+// (which only needs the latest stable STATE), a button press/release is a
+// pair of discrete EVENTS whose durations matter, so every accepted
+// PRESS/RELEASE transition is timestamped and queued -- if a complete
+// press+release both become stable while Input::update() is not running,
+// BOTH are still in the queue, in order, with their own real timestamps,
+// the next time it runs; nothing can be missed just because the level was
+// only sampled once.
+//
+// The encoder switch (Pins::kEncoderSw) deliberately keeps its existing
+// updateDebounce()/polled mechanism unchanged -- it was never reported as
+// having this problem, and migrating only the pin that actually needs it
+// keeps this fix as small as it can be.
+constexpr uint32_t kButtonSamplePeriodUs = 1000;  // 1ms sample period, independent of the encoder's own timer
+constexpr uint8_t kButtonStableSamples = 10;      // ~10ms debounce at 1ms sampling, matching kButtonDebounceMs
+constexpr uint8_t kButtonEdgeQueueCap = 16;       // bounded: at ~10ms/edge minimum spacing, holds >150ms of edges
+
+struct ButtonEdgeRecord {
+  bool pressed;     // true = accepted stable PRESS, false = accepted stable RELEASE
+  uint32_t atMs;    // millis() at the moment this edge was accepted (debounce-completion time, not drain time)
+};
+
+portMUX_TYPE g_buttonMux = portMUX_INITIALIZER_UNLOCKED;
+ButtonEdgeRecord g_dotEdgeQueue[kButtonEdgeQueueCap];  // contents only ever touched under g_buttonMux
+uint8_t g_dotEdgeHead = 0;    // next slot to read; g_buttonMux-protected
+uint8_t g_dotEdgeTail = 0;    // next slot to write; g_buttonMux-protected
+uint8_t g_dotEdgeCount = 0;   // queued, undrained edges; g_buttonMux-protected
+uint32_t g_dotEdgeDropped = 0;  // overflow count (see buttonSampleTimerCallback()); g_buttonMux-protected
+
+// Stable-state sampler bookkeeping, touched ONLY from
+// buttonSampleTimerCallback() (ESP_TIMER_TASK dispatch guarantees ordinary
+// sequential, non-reentrant calls on esp_timer's own task) -- no locking
+// needed, identical reasoning to the encoder's own sampler state.
+bool g_dotRawStable = false;
+bool g_dotCandidateState = false;
+uint8_t g_dotCandidateCount = 0;
+
+esp_timer_handle_t g_buttonSampleTimer = nullptr;
+bool g_buttonSamplerFailed = false;  // set if esp_timer create/start fails; DOT/DASH simply produces no events in that case
+
+// Periodic stable-state sampler for DOT/DASH: runs every
+// kButtonSamplePeriodUs from its own ESP_TIMER_TASK callback, independent
+// of Input::update()/the Arduino loop and independent of the encoder's
+// timer. No Serial/Display/MQTT/NVS/LittleFS/heap/delay/pushEvent()/
+// Sleep::notifyActivity()/application-callback calls here -- only a
+// digitalRead(), the stability filter, and (on an accepted transition) a
+// millis() timestamp read and a plain struct write into the bounded queue
+// under the critical section. Input::update() (via drainButtonEdges())
+// remains solely responsible for turning accepted edges into InputEvents
+// and for Sleep::notifyActivity().
+void buttonSampleTimerCallback(void* /*arg*/) {
+  bool raw = digitalRead(Pins::kDotDash) == LOW;  // active LOW: pressed == LOW
+
+  if (raw == g_dotRawStable) {
+    // Back at the currently accepted level -- discard any in-progress
+    // candidate.
+    g_dotCandidateState = g_dotRawStable;
+    g_dotCandidateCount = 0;
+    return;
+  }
+  if (raw != g_dotCandidateState) {
+    // A possible new level appeared, replacing any previous candidate.
+    g_dotCandidateState = raw;
+    g_dotCandidateCount = 1;
+    return;
+  }
+  g_dotCandidateCount++;
+  if (g_dotCandidateCount < kButtonStableSamples) return;  // not stable yet
+
+  g_dotRawStable = g_dotCandidateState;
+  g_dotCandidateCount = 0;
+  uint32_t atMs = millis();  // a plain hardware-timer read, safe from ESP_TIMER_TASK context
+
+  portENTER_CRITICAL(&g_buttonMux);
+  if (g_dotEdgeCount < kButtonEdgeQueueCap) {
+    g_dotEdgeQueue[g_dotEdgeTail] = ButtonEdgeRecord{g_dotRawStable, atMs};
+    g_dotEdgeTail = static_cast<uint8_t>((g_dotEdgeTail + 1) % kButtonEdgeQueueCap);
+    g_dotEdgeCount++;
+  } else {
+    // Bounded queue, deterministic overflow policy: the new edge is
+    // dropped (not the oldest already-queued one) and counted. At 16
+    // slots and a ~10ms minimum spacing between accepted edges, this would
+    // require Input::update() to go unserviced for >150ms while DOT/DASH
+    // is being actively pressed -- far longer than any single screen
+    // redraw -- before a single edge could ever be lost this way.
+    g_dotEdgeDropped++;
+  }
+  portEXIT_CRITICAL(&g_buttonMux);
+}
+
+// Drains accepted DOT/DASH edges in the order they were captured, each
+// with its own real acceptance timestamp, and runs them through the exact
+// same press-state-machine logic updateDotStateMachine() used to run
+// polled every tick -- now driven by discrete events instead of a live
+// level, so a complete press+release captured while this wasn't running
+// still produces both events with an accurate duration.
+void processDotEdge(bool pressed, uint32_t atMs);
+
+void drainButtonEdges() {
+  ButtonEdgeRecord local[kButtonEdgeQueueCap];
+  uint8_t count;
+  portENTER_CRITICAL(&g_buttonMux);
+  count = g_dotEdgeCount;
+  for (uint8_t i = 0; i < count; i++) {
+    local[i] = g_dotEdgeQueue[(g_dotEdgeHead + i) % kButtonEdgeQueueCap];
+  }
+  g_dotEdgeHead = static_cast<uint8_t>((g_dotEdgeHead + count) % kButtonEdgeQueueCap);
+  g_dotEdgeCount = 0;
+  portEXIT_CRITICAL(&g_buttonMux);
+
+  for (uint8_t i = 0; i < count; i++) {
+    processDotEdge(local[i].pressed, local[i].atMs);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Quadrature decoder (Hardware Fix #4.6).
@@ -301,35 +432,39 @@ void endCombined(uint32_t now) {
   g_encLongFired = false;
 }
 
-void updateDotStateMachine(uint32_t now) {
-  bool pressed = g_dot.stablePressed;
-
-  if (pressed && g_dotPressState == PressState::IDLE) {
-    g_dotDownMs = now;
-    Sleep::notifyActivity();
-    if (g_encPressState == PressState::INDIVIDUAL && (now - g_encDownMs) < kCombinedWindowMs) {
-      enterCombined(now);
-    } else {
-      g_dotPressState = PressState::INDIVIDUAL;
-      pushEvent(InputEventType::DOT_PRESS_START);
+// Replaces the old polled updateDotStateMachine(): driven by one accepted
+// DOT/DASH edge (from drainButtonEdges(), Hardware Fix #4.7b) at a time,
+// using that edge's own captured timestamp rather than the current
+// millis() -- so duration/combined-gesture timing is computed from the
+// real debounce-acceptance instant, not from whenever Input::update()
+// happened to run. Behavior is otherwise identical to the polled version:
+// a redundant same-level edge (pressed while already INDIVIDUAL, or a
+// release outside INDIVIDUAL/COMBINED) is simply not observed here in the
+// first place, since only genuine accepted transitions are ever queued.
+void processDotEdge(bool pressed, uint32_t atMs) {
+  if (pressed) {
+    if (g_dotPressState == PressState::IDLE) {
+      g_dotDownMs = atMs;
+      Sleep::notifyActivity();
+      if (g_encPressState == PressState::INDIVIDUAL && (atMs - g_encDownMs) < kCombinedWindowMs) {
+        enterCombined(atMs);
+      } else {
+        g_dotPressState = PressState::INDIVIDUAL;
+        pushEvent(InputEventType::DOT_PRESS_START);
+      }
     }
     return;
   }
 
-  if (pressed && g_dotPressState == PressState::INDIVIDUAL) {
-    Sleep::notifyActivity();
-    return;
-  }
-
-  if (!pressed && g_dotPressState == PressState::INDIVIDUAL) {
-    uint32_t duration = now - g_dotDownMs;
+  if (g_dotPressState == PressState::INDIVIDUAL) {
+    uint32_t duration = atMs - g_dotDownMs;
     pushEvent(InputEventType::DOT_RELEASE, 0, duration);
     g_dotPressState = PressState::IDLE;
     return;
   }
 
-  if (!pressed && g_combinedActive && g_dotPressState == PressState::COMBINED) {
-    endCombined(now);
+  if (g_combinedActive && g_dotPressState == PressState::COMBINED) {
+    endCombined(atMs);
     return;
   }
 }
@@ -427,16 +562,61 @@ void init() {
       }
     }
   }
+
+  // DOT/DASH reliable capture (Hardware Fix #4.7b) -- a fully independent
+  // periodic esp_timer, separate from the encoder's above (its own
+  // g_buttonSampleTimer, its own g_buttonMux, zero shared state), fixing
+  // the same class of "missed while Input::update() wasn't running" bug
+  // real-hardware testing found on DOT/DASH. See the comment block above
+  // buttonSampleTimerCallback().
+  bool initialDotRaw = digitalRead(Pins::kDotDash) == LOW;
+  g_dotRawStable = initialDotRaw;
+  g_dotCandidateState = initialDotRaw;
+  g_dotCandidateCount = 0;
+
+  portENTER_CRITICAL(&g_buttonMux);
+  g_dotEdgeHead = 0;
+  g_dotEdgeTail = 0;
+  g_dotEdgeCount = 0;
+  g_dotEdgeDropped = 0;
+  portEXIT_CRITICAL(&g_buttonMux);
+
+  // Guarded so calling init() more than once never creates a second
+  // periodic timer, exactly like the encoder timer above.
+  if (g_buttonSampleTimer == nullptr) {
+    esp_timer_create_args_t buttonTimerArgs = {};
+    buttonTimerArgs.callback = &buttonSampleTimerCallback;
+    buttonTimerArgs.arg = nullptr;
+    buttonTimerArgs.dispatch_method = ESP_TIMER_TASK;
+    buttonTimerArgs.name = "btn_sample";
+    esp_err_t buttonCreateErr = esp_timer_create(&buttonTimerArgs, &g_buttonSampleTimer);
+    if (buttonCreateErr != ESP_OK) {
+      g_buttonSampleTimer = nullptr;
+      g_buttonSamplerFailed = true;
+    } else {
+      esp_err_t buttonStartErr = esp_timer_start_periodic(g_buttonSampleTimer, kButtonSamplePeriodUs);
+      if (buttonStartErr != ESP_OK) {
+        g_buttonSamplerFailed = true;
+      }
+    }
+  }
 }
 
 void update() {
   uint32_t now = millis();
 
-  updateDebounce(g_dot, now);
   updateDebounce(g_encSw, now);
   drainQuadrature();
+  // Hardware Fix #4.7b: DOT/DASH is no longer polled here at all -- it is
+  // continuously sampled and debounced by its own independent esp_timer
+  // (buttonSampleTimerCallback()) regardless of how often update() runs;
+  // drainButtonEdges() only replays whatever accepted press/release edges
+  // have accumulated since the last call, in order, each with its own
+  // real timestamp. This preserves the original relative ordering (DOT
+  // edges processed before the encoder-switch state machine) so combined-
+  // gesture tie-breaking behavior is unchanged.
+  drainButtonEdges();
 
-  updateDotStateMachine(now);
   updateEncoderSwStateMachine(now);
   updateCombinedHold(now);
 }

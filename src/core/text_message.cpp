@@ -412,16 +412,16 @@ struct HistoryRowInfo {
 void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
-  out->continuationX = labelX;
-  out->continuationWidth = static_cast<int16_t>(Display::kScreenWidth - out->continuationX);
   char* scratch = UiScratch::ensure(UiScratch::Slot::B, kHistoryLineBufCap);
   if (scratch == nullptr) {
     // Never dereference a failed allocation (Hardware Fix #4.4b) -- degrade
-    // to the existing "message failed to load" placeholder instead.
+    // to the existing "message failed to load" placeholder instead. icon
+    // is NONE here, so the icon cell is correctly not reserved either.
     out->lineBuf = "?";
-    int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-    out->firstBodyX = textX;
+    out->firstBodyX = labelX;
     out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
+    out->continuationX = out->firstBodyX;
+    out->continuationWidth = out->firstBodyWidth;
     return;
   }
   out->lineBuf = scratch;
@@ -439,9 +439,20 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
       if (iconFn != nullptr) out->icon = iconFn(view);
     }
   }
-  int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-  out->firstBodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
+  // Hardware Fix #4.7b: only reserve the lock-icon cell when a message
+  // actually has one -- MessageIconKind::NONE (the overwhelming majority
+  // of Text history) no longer wastes kLockIconCellWidth of otherwise-
+  // usable space between the cursor and the sender name.
+  int16_t iconWidth = (out->icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
+  int16_t senderX = static_cast<int16_t>(labelX + iconWidth);
+  out->firstBodyX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
   out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
+  // Continuation rows start at the SAME X as the sender name on row 0
+  // (Hardware Fix #4.7b Part C), not merely past the cursor cell -- this
+  // keeps the history cursor's own cell clear and gives row 0 and its
+  // continuations a consistent visual left edge.
+  out->continuationX = senderX;
+  out->continuationWidth = static_cast<int16_t>(Display::kScreenWidth - out->continuationX);
 }
 
 // Streams through an already-loaded message's wrapped rows via
@@ -1054,12 +1065,14 @@ void screenChat() {
         if (rowIdx >= rowSkip) {
           int16_t rowBodyX = (rowIdx == 0) ? info.firstBodyX : info.continuationX;
           if (rowIdx == 0) {
-            // Icon cell + CYAN sender name appear on the message's true
-            // FIRST row only; continuation rows start right after the
-            // compact cursor cell, with no icon/sender indentation
-            // (Hardware Fix #4.7 Part E).
+            // Icon cell (only reserved when an icon is actually present,
+            // Hardware Fix #4.7b Part B) + CYAN sender name appear on the
+            // message's true FIRST row only; continuation rows start at
+            // that same sender X, with no icon/sender repeated (Hardware
+            // Fix #4.7 Part E, #4.7b Part C).
             drawRowIcon(labelX, y, info.icon);
-            int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+            int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
+            int16_t textX = static_cast<int16_t>(labelX + iconWidth);
             Display::printLineColored(textX, y, info.senderPrefix, ST77XX_CYAN);
           }
           // The marker sits on the exact focused row (g_historyRowOffset),

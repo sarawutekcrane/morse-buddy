@@ -1024,8 +1024,6 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   out->lineBuf[1] = '\0';
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
-  out->continuationX = labelX;
-  out->continuationWidth = static_cast<int16_t>(Display::kScreenWidth - out->continuationX);
   const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(index);
   if (entry != nullptr) {
     MessageRef ref = refForIndexEntry(*entry);
@@ -1038,9 +1036,19 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
       if (iconFn != nullptr) out->icon = iconFn(view);
     }
   }
-  int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-  out->firstBodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
+  // Hardware Fix #4.7b: only reserve the lock-icon cell when a message
+  // actually has one -- an Enigma message with icon NONE (should not
+  // normally occur, but handled the same way for consistency) no longer
+  // wastes kLockIconCellWidth of otherwise-usable space; a real lock icon
+  // still gets its existing reserved cell exactly as before.
+  int16_t iconWidth = (out->icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
+  int16_t senderX = static_cast<int16_t>(labelX + iconWidth);
+  out->firstBodyX = static_cast<int16_t>(senderX + Display::textWidth(out->senderPrefix));
   out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
+  // Continuation rows start at the SAME X as the sender name on row 0
+  // (Hardware Fix #4.7b Part C), not merely past the cursor cell.
+  out->continuationX = senderX;
+  out->continuationWidth = static_cast<int16_t>(Display::kScreenWidth - out->continuationX);
 }
 
 // Streams through an already-loaded message's wrapped rows via
@@ -1719,13 +1727,14 @@ void screenEnigmaChat() {
         if (rowIdx >= rowSkip) {
           int16_t rowBodyX = (rowIdx == 0) ? info.firstBodyX : info.continuationX;
           if (rowIdx == 0) {
-            // Icon cell + CYAN sender name appear on the message's true
-            // FIRST row only; continuation rows start right after the
-            // compact cursor cell, with no icon/sender indentation
-            // (Hardware Fix #4 issues 2/5, extended for issue E/4.3a,
-            // Hardware Fix #4.7 Part E).
+            // Icon cell (only reserved when an icon is actually present,
+            // Hardware Fix #4.7b Part B) + CYAN sender name appear on the
+            // message's true FIRST row only; continuation rows start at
+            // that same sender X (Hardware Fix #4 issues 2/5, extended for
+            // issue E/4.3a, Hardware Fix #4.7 Part E, #4.7b Part C).
             drawRowIcon(labelX, y, info.icon);
-            int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
+            int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
+            int16_t textX = static_cast<int16_t>(labelX + iconWidth);
             Display::printLineColored(textX, y, info.senderPrefix, ST77XX_CYAN);
           }
           // The marker sits on the exact focused row (g_historyRowOffset),

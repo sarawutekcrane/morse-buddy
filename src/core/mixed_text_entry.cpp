@@ -12,13 +12,15 @@ namespace {
 
 enum class State : uint8_t { EMPTY, PREVIEW, MORSE, CONFIRM };
 
-// The control row shows one of three things: nothing, a validation error
-// (EMPTY state), or the Save/Cancel selector (CONFIRM state). Save/Cancel
-// is tracked as its own kind (rather than folded into a single string)
-// because its two labels are fixed text -- only the "> " marker between
-// them ever moves -- so a plain toggle never needs to touch label pixels
-// (Hardware Fix #3 corrective).
-enum class ControlKind : uint8_t { NONE, ERROR, CONFIRM };
+// The control row shows one of four things: nothing, a validation error
+// (EMPTY state), the "reached max length" info line (EMPTY state, Hardware
+// Fix #4.7b -- deliberately its own kind, not ERROR: reaching the bound is
+// informational, never an error tone/state), or the Save/Cancel selector
+// (CONFIRM state). Save/Cancel is tracked as its own kind (rather than
+// folded into a single string) because its two labels are fixed text --
+// only the "> " marker between them ever moves -- so a plain toggle never
+// needs to touch label pixels (Hardware Fix #3 corrective).
+enum class ControlKind : uint8_t { NONE, ERROR, MAX_LENGTH, CONFIRM };
 
 const char kGeneralNameChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,-_!?@#";
 const char kGroupCodeChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -119,13 +121,22 @@ void cancelWholeEdit() {
 
 void handleEmpty(const InputEvent& e) {
   g_errorMessage = nullptr;
+  // Hardware Fix #4.7b: once the buffer has reached g_config.maxLength, no
+  // further character can actually be appended (appendConfirmedChar()
+  // already refuses), so entering PREVIEW/MORSE to compose one anyway is
+  // pure UI noise -- a fifth preview character that can never be saved.
+  // The one exception is the long-DOT/DASH delete command below, which
+  // must keep working unconditionally so the user can shorten the name and
+  // resume editing.
+  bool atMax = (g_length >= g_config.maxLength);
   if (e.type == InputEventType::ENCODER_ROTATE) {
+    if (atMax) return;  // no fifth-character preview once max length is reached
     g_state = State::PREVIEW;
     g_previewIndex = 0;
   } else if (e.type == InputEventType::DOT_RELEASE) {
     if (e.durationMs >= Morse::kSpecialCommandMs) {
-      deletePreviousConfirmedChar();
-    } else {
+      deletePreviousConfirmedChar();  // delete must still work at max length
+    } else if (!atMax) {
       Morse::SymbolClass sc = Morse::classifyPress(e.durationMs, Settings::getWpm());
       resetMorsePattern();
       g_morsePattern[0] = (sc == Morse::SymbolClass::DOT) ? '.' : '-';
@@ -134,6 +145,8 @@ void handleEmpty(const InputEvent& e) {
       g_lastMorseReleaseMs = millis();
       g_state = State::MORSE;
     }
+    // else: at max length and this is a normal (non-delete) press -- no
+    // new Morse character can be appended, so it is simply ignored.
   } else if (e.type == InputEventType::ENCODER_SHORT) {
     if (g_length >= g_config.minLength) {
       g_state = State::CONFIRM;
@@ -218,7 +231,13 @@ void computeParts(char* prefixOut, size_t prefixCap, char* suffixOut, size_t suf
 
   switch (g_state) {
     case State::EMPTY:
-      snprintf(suffixOut, suffixCap, "_");
+      // Hardware Fix #4.7b: no editing cursor once the buffer has reached
+      // maxLength -- there is nothing left to type into it.
+      if (g_length >= g_config.maxLength) {
+        suffixOut[0] = '\0';
+      } else {
+        snprintf(suffixOut, suffixCap, "_");
+      }
       break;
     case State::PREVIEW: {
       char c = charsetAt(g_config.charset, g_previewIndex);
@@ -236,6 +255,11 @@ void computeParts(char* prefixOut, size_t prefixCap, char* suffixOut, size_t suf
 
 ControlKind computeControlKind() {
   if (g_state == State::EMPTY && g_errorMessage != nullptr) return ControlKind::ERROR;
+  // Hardware Fix #4.7b: informational only (never ERROR) once EMPTY-state
+  // editing has reached maxLength -- checked after g_errorMessage so a
+  // real validator failure (which also lands back in EMPTY) still takes
+  // priority on the one tick it's shown.
+  if (g_state == State::EMPTY && g_length >= g_config.maxLength) return ControlKind::MAX_LENGTH;
   if (g_state == State::CONFIRM) return ControlKind::CONFIRM;
   return ControlKind::NONE;
 }
@@ -337,17 +361,27 @@ void render() {
   int16_t cancelMarkerX = static_cast<int16_t>(saveLabelX + saveLabelW + gapW);
   int16_t cancelLabelX = static_cast<int16_t>(cancelMarkerX + markerW);
 
-  bool kindChanged = (controlKind != g_lastControlKind);
-  bool errorTextChanged =
-      (controlKind == ControlKind::ERROR) && (g_errorMessage != nullptr) && strcmp(g_errorMessage, g_lastErrorText) != 0;
+  // Hardware Fix #4.7b: MAX_LENGTH reuses the same single-line "message on
+  // the control row" mechanism ERROR already used (g_lastErrorText as the
+  // generic "last shown message" buffer) rather than duplicating it --
+  // it's a different ControlKind (never tagged/treated as an error), just
+  // the same neutral text-row drawing/diffing underneath.
+  char maxLenMsg[24];
+  snprintf(maxLenMsg, sizeof(maxLenMsg), "Max %u chars", static_cast<unsigned>(g_config.maxLength));
+  const char* controlMessage = nullptr;
+  if (controlKind == ControlKind::ERROR) controlMessage = g_errorMessage;
+  else if (controlKind == ControlKind::MAX_LENGTH) controlMessage = maxLenMsg;
 
-  if (kindChanged || errorTextChanged) {
+  bool kindChanged = (controlKind != g_lastControlKind);
+  bool messageTextChanged = (controlMessage != nullptr) && strcmp(controlMessage, g_lastErrorText) != 0;
+
+  if (kindChanged || messageTextChanged) {
     // PRIMARY is a GFX custom font and never draws with an opaque
     // background, so the row is explicitly erased before its replacement
     // is drawn.
     if (!firstDraw) Display::tft().fillRect(0, controlY, Display::kScreenWidth, lh, ST77XX_BLACK);
-    if (controlKind == ControlKind::ERROR) {
-      Display::printLine(2, controlY, g_errorMessage);
+    if (controlKind == ControlKind::ERROR || controlKind == ControlKind::MAX_LENGTH) {
+      Display::printLine(2, controlY, controlMessage);
     } else if (controlKind == ControlKind::CONFIRM) {
       if (g_confirmSaveSelected) Display::printLine(saveMarkerX, controlY, ">");
       Display::printLine(saveLabelX, controlY, "Save");
@@ -363,8 +397,8 @@ void render() {
   }
 
   g_lastControlKind = controlKind;
-  if (controlKind == ControlKind::ERROR && g_errorMessage != nullptr) {
-    strncpy(g_lastErrorText, g_errorMessage, sizeof(g_lastErrorText) - 1);
+  if (controlMessage != nullptr) {
+    strncpy(g_lastErrorText, controlMessage, sizeof(g_lastErrorText) - 1);
     g_lastErrorText[sizeof(g_lastErrorText) - 1] = '\0';
   } else {
     g_lastErrorText[0] = '\0';
