@@ -40,6 +40,13 @@ enum SettingsChangeEvent : uint8_t {
   SET_GROUP_ADDED,
   SET_GROUP_DELETED,
   SET_GROUP_NAME_CHANGED,
+  // Feature Fix #4.8: fired once after a successful identity save, which
+  // now means Name AND/OR Personal Color -- i.e. "this device's public
+  // identity/presentation changed," not literally "only the name text
+  // changed." Kept under its original name for compatibility (existing
+  // hook registrations/call sites are unaffected); Presence's own handler
+  // reacts to it by republishing this device's presence exactly once,
+  // which is correct whether the name, the color, or both changed.
   SET_MY_NAME_CHANGED,
   SET_MUTE_RADIO_CHANGED
 };

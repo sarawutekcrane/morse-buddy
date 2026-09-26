@@ -6,6 +6,7 @@
 
 #include "core/hooks.h"
 #include "core/identity.h"
+#include "core/identity_color.h"
 #include "core/mqtt_manager.h"
 #include "core/settings.h"
 #include "core/storage_init.h"
@@ -26,6 +27,9 @@ struct OnlineEntry {
   char display_name[17] = {0};
   bool radio_available = false;
   uint32_t lastObservedMs = 0;
+  // Feature Fix #4.8: kInvalidColor until an ONLINE payload with a valid
+  // trailing color field is observed for this device.
+  uint8_t color_index = IdentityColor::kInvalidColor;
 };
 
 struct GroupPresenceTable {
@@ -85,6 +89,7 @@ OnlineEntry* claimOnlineSlot(GroupPresenceTable* t, const char* device_id) {
   target->device_id[sizeof(target->device_id) - 1] = '\0';
   target->display_name[0] = '\0';
   target->radio_available = false;
+  target->color_index = IdentityColor::kInvalidColor;
   return target;
 }
 
@@ -190,6 +195,102 @@ void touchRecentOfflineOnly(const char* group_code, const char* device_id, uint3
   saveRecentTables();
 }
 
+// ---------------------------------------------------------------------------
+// Persisted personal-color cache (Feature Fix #4.8 section 2K), kept as its
+// own SEPARATE blob under the same mb_recent namespace ("colors" key) --
+// deliberately not folded into RecentContactRecord/the existing "recent"
+// blob, so that blob's layout/size never changes just to add one byte,
+// preserving every existing device's persisted Recent Contacts across this
+// firmware upgrade. Bounded the same way (kMaxGroups groups x
+// kMaxRecentPerGroup devices/group) and evicted by the same
+// least-recently-touched policy, but keyed purely by (group_code,
+// device_id) -- last_seen_timestamp isn't meaningful for a color cache, so
+// eviction here simply reuses the first unused slot, or (when full) an
+// arbitrary occupied one; losing one rarely-touched cached color under
+// long-term churn is a purely cosmetic degradation (falls back to CYAN),
+// never a correctness issue.
+struct RecentColorRecord {
+  bool used;
+  char device_id[13];
+  uint8_t color_index;
+};
+
+struct RecentColorsForGroup {
+  bool active;
+  char group_code[33];
+  RecentColorRecord contacts[kMaxRecentPerGroup];
+};
+
+RecentColorsForGroup g_recentColors[Settings::kMaxGroups];
+
+void saveRecentColorsTables() { Storage::recent().putBytes("colors", g_recentColors, sizeof(g_recentColors)); }
+
+void loadRecentColorsTables() {
+  size_t got = Storage::recent().getBytes("colors", g_recentColors, sizeof(g_recentColors));
+  if (got != sizeof(g_recentColors)) memset(g_recentColors, 0, sizeof(g_recentColors));
+}
+
+RecentColorsForGroup* findRecentColorsTable(const char* group_code) {
+  for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
+    if (g_recentColors[i].active && strcmp(g_recentColors[i].group_code, group_code) == 0) return &g_recentColors[i];
+  }
+  return nullptr;
+}
+
+RecentColorsForGroup* findOrCreateRecentColorsTable(const char* group_code) {
+  RecentColorsForGroup* t = findRecentColorsTable(group_code);
+  if (t != nullptr) return t;
+  for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
+    if (!g_recentColors[i].active) {
+      g_recentColors[i].active = true;
+      strncpy(g_recentColors[i].group_code, group_code, sizeof(g_recentColors[i].group_code) - 1);
+      g_recentColors[i].group_code[sizeof(g_recentColors[i].group_code) - 1] = '\0';
+      for (auto& c : g_recentColors[i].contacts) c.used = false;
+      return &g_recentColors[i];
+    }
+  }
+  return nullptr;
+}
+
+RecentColorRecord* findRecentColorRecord(RecentColorsForGroup* t, const char* device_id) {
+  for (auto& c : t->contacts) {
+    if (c.used && strcmp(c.device_id, device_id) == 0) return &c;
+  }
+  return nullptr;
+}
+
+RecentColorRecord* claimRecentColorSlot(RecentColorsForGroup* t, const char* device_id) {
+  RecentColorRecord* target = nullptr;
+  for (auto& c : t->contacts) {
+    if (!c.used) {
+      target = &c;
+      break;
+    }
+  }
+  if (target == nullptr) target = &t->contacts[0];  // full: reuse the first slot (see comment above)
+  target->used = true;
+  strncpy(target->device_id, device_id, sizeof(target->device_id) - 1);
+  target->device_id[sizeof(target->device_id) - 1] = '\0';
+  target->color_index = IdentityColor::kInvalidColor;
+  return target;
+}
+
+// Only ever called with a VALID color (see call sites) -- an incoming
+// legacy/no-color payload leaves whatever was already cached untouched
+// rather than overwriting known-good data with "unknown" (section 2K:
+// "preserve UNKNOWN unless a valid newer value is received", which is
+// really "preserve whatever is cached unless a valid newer value replaces
+// it"). Persists only on an actual change, never every frame.
+void touchRecentColor(const char* group_code, const char* device_id, uint8_t color_index) {
+  RecentColorsForGroup* t = findOrCreateRecentColorsTable(group_code);
+  if (t == nullptr) return;
+  RecentColorRecord* r = findRecentColorRecord(t, device_id);
+  if (r == nullptr) r = claimRecentColorSlot(t, device_id);
+  if (r->color_index == color_index) return;  // no actual change -- skip the NVS write
+  r->color_index = color_index;
+  saveRecentColorsTables();
+}
+
 bool g_ownRadioAvailable = true;
 
 void buildPayload(char* out, size_t outSize, const char* status) {
@@ -201,8 +302,14 @@ void buildPayload(char* out, size_t outSize, const char* status) {
   // never cache and display "Me" as if it were this device's chosen name.
   // Packet format (field count/order/delimiters) is unchanged.
   const char* name = Settings::hasCustomMyName() ? Settings::getMyName() : Identity::deviceId();
-  snprintf(out, outSize, "MBP1|%s|%s|%s|%d|%lu", Identity::deviceId(), name, status, g_ownRadioAvailable ? 1 : 0,
-           static_cast<unsigned long>(ts));
+  // Feature Fix #4.8 section 2H: an optional trailing color-index field,
+  // APPENDED after the existing 5 fields -- the tag stays "MBP1" since
+  // this is a backward-compatible optional field a legacy receiver
+  // already ignores (it only reads the leading fields it recognizes).
+  // IdentityColor::kInvalidColor (0xFF, printed as "255") is sent as-is
+  // when no color is configured yet -- never a fabricated color.
+  snprintf(out, outSize, "MBP1|%s|%s|%s|%d|%lu|%u", Identity::deviceId(), name, status, g_ownRadioAvailable ? 1 : 0,
+           static_cast<unsigned long>(ts), Settings::getMyColorIndex());
 }
 
 void publishStatus(const char* group_code, const char* status) {
@@ -239,10 +346,19 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
     rt->active = false;
     saveRecentTables();
   }
+  // Feature Fix #4.8: the persisted recent-color cache is cleaned up
+  // alongside the existing Recent Contacts cleanup above, on the exact
+  // same group-delete event.
+  RecentColorsForGroup* ct = findRecentColorsTable(info.group_code);
+  if (ct != nullptr) {
+    ct->active = false;
+    saveRecentColorsTables();
+  }
 }
 
 void serviceInit() {
   loadRecentTables();
+  loadRecentColorsTables();
   registerSettingsChangeHook(onSettingsChanged);
 }
 
@@ -271,11 +387,22 @@ void handleIncoming(const char* group_code, const char* payload, uint16_t len) {
   char* displayName = strtok_r(nullptr, "|", &saveptr);
   char* status = strtok_r(nullptr, "|", &saveptr);
   char* radioStr = strtok_r(nullptr, "|", &saveptr);
+  // Feature Fix #4.8 section 2H: OPTIONAL trailing color-index field.
+  // radioStr's own strtok_r() call already advances past it whether or
+  // not a 7th field follows, so this is simply nullptr for any legacy
+  // peer's shorter payload -- never rejected, just treated as "no color
+  // observed" (colorIdx stays IdentityColor::kInvalidColor).
+  char* colorStr = strtok_r(nullptr, "|", &saveptr);
   if (deviceId == nullptr || displayName == nullptr || status == nullptr) return;
   if (strcmp(deviceId, Identity::deviceId()) == 0) return;  // exclude self
 
   bool online = (strcmp(status, "ONLINE") == 0);
   bool radioAvail = (radioStr != nullptr) && (atoi(radioStr) != 0);
+  uint8_t colorIdx = IdentityColor::kInvalidColor;
+  if (colorStr != nullptr) {
+    int parsed = atoi(colorStr);
+    if (parsed >= 0 && IdentityColor::isValid(static_cast<uint8_t>(parsed))) colorIdx = static_cast<uint8_t>(parsed);
+  }
   uint32_t receiptTs = WifiManager::getUnixTime();
 
   GroupPresenceTable* t = findOrCreateTable(group_code);
@@ -288,11 +415,22 @@ void handleIncoming(const char* group_code, const char* payload, uint16_t len) {
     e->display_name[sizeof(e->display_name) - 1] = '\0';
     e->radio_available = radioAvail;
     e->lastObservedMs = millis();
+    // Feature Fix #4.8: a legacy/no-color ONLINE payload leaves the
+    // already-cached online color_index alone (it stays whatever it was,
+    // e.g. kInvalidColor if never observed) instead of stomping a
+    // previously-observed valid color back to unknown.
+    if (IdentityColor::isValid(colorIdx)) e->color_index = colorIdx;
     touchRecentOnline(group_code, deviceId, displayName, receiptTs);
+    if (IdentityColor::isValid(colorIdx)) touchRecentColor(group_code, deviceId, colorIdx);
   } else {
     OnlineEntry* e = findOnlineEntry(t, deviceId);
     if (e != nullptr) e->used = false;
     touchRecentOfflineOnly(group_code, deviceId, receiptTs);
+    // OFFLINE/LWT: same "never overwrite with unknown" rule as the name
+    // cache above -- only ever refresh the recent color cache when this
+    // OFFLINE payload actually carries a valid one (e.g. an LWT that was
+    // set with a configured color).
+    if (IdentityColor::isValid(colorIdx)) touchRecentColor(group_code, deviceId, colorIdx);
   }
 }
 
@@ -332,6 +470,7 @@ uint8_t getOnlineContacts(const char* group_code, OnlineContact* outArr, uint8_t
       strncpy(outArr[n].display_name, e.display_name, sizeof(outArr[n].display_name) - 1);
       outArr[n].display_name[sizeof(outArr[n].display_name) - 1] = '\0';
       outArr[n].radio_available = e.radio_available;
+      outArr[n].color_index = e.color_index;
       n++;
     }
   }
@@ -413,6 +552,121 @@ void resolveDisplayName(const char* group_code, const char* device_id, char* out
 
   strncpy(out, device_id, outSize - 1);
   out[outSize - 1] = '\0';
+}
+
+// Feature Fix #4.8: mirrors resolveDisplayName()'s exact fallback shape
+// (self -> current online -> persisted recent/offline) but for the
+// sender's chosen personal color instead of their name. Read-only.
+uint8_t resolveColorIndex(const char* group_code, const char* device_id) {
+  if (strcmp(device_id, Identity::deviceId()) == 0) return Settings::getMyColorIndex();
+
+  GroupPresenceTable* t = findTable(group_code);
+  if (t != nullptr) {
+    OnlineEntry* e = findOnlineEntry(t, device_id);
+    if (e != nullptr && IdentityColor::isValid(e->color_index)) return e->color_index;
+  }
+
+  RecentColorsForGroup* rt = findRecentColorsTable(group_code);
+  if (rt != nullptr) {
+    RecentColorRecord* r = findRecentColorRecord(rt, device_id);
+    if (r != nullptr && IdentityColor::isValid(r->color_index)) return r->color_index;
+  }
+
+  return IdentityColor::kInvalidColor;
+}
+
+bool isNameInUseByKnownMember(const char* candidateName, char* conflictingGroupCode, size_t outSize) {
+  if (candidateName == nullptr) return false;
+  uint8_t groupCount = Settings::getGroupCount();
+  for (uint8_t gi = 0; gi < groupCount; gi++) {
+    Settings::FamilyGroup g = Settings::getGroup(gi);
+    if (!g.configured) continue;
+
+    GroupPresenceTable* t = findTable(g.code);
+    if (t != nullptr) {
+      for (auto& e : t->online) {
+        if (e.used && strcmp(e.device_id, Identity::deviceId()) != 0 && strcmp(e.display_name, candidateName) == 0) {
+          if (conflictingGroupCode != nullptr) {
+            strncpy(conflictingGroupCode, g.code, outSize - 1);
+            conflictingGroupCode[outSize - 1] = '\0';
+          }
+          return true;
+        }
+      }
+    }
+
+    RecentContactsForGroup* rt = findRecentTable(g.code);
+    if (rt != nullptr) {
+      for (auto& c : rt->contacts) {
+        if (c.used && strcmp(c.device_id, Identity::deviceId()) != 0 &&
+            strcmp(c.last_known_name, candidateName) == 0) {
+          if (conflictingGroupCode != nullptr) {
+            strncpy(conflictingGroupCode, g.code, outSize - 1);
+            conflictingGroupCode[outSize - 1] = '\0';
+          }
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+namespace {
+uint8_t countSetBits(uint16_t mask) {
+  uint8_t n = 0;
+  while (mask != 0) {
+    n = static_cast<uint8_t>(n + (mask & 1));
+    mask = static_cast<uint16_t>(mask >> 1);
+  }
+  return n;
+}
+}  // namespace
+
+bool isColorInUseByKnownMember(uint8_t candidateColor, char* conflictingGroupCode, size_t outSize) {
+  if (!IdentityColor::isValid(candidateColor)) return false;
+  uint8_t groupCount = Settings::getGroupCount();
+  for (uint8_t gi = 0; gi < groupCount; gi++) {
+    Settings::FamilyGroup g = Settings::getGroup(gi);
+    if (!g.configured) continue;
+
+    // A bitmask of every DISTINCT color currently occupied by a known
+    // OTHER member of this group -- ORing bits from both the online and
+    // recent tables is naturally immune to one device appearing in both
+    // (the same bit is simply set twice), so this never double-counts a
+    // single device the way a per-device tally would (section 2R).
+    uint16_t occupiedMask = 0;
+    GroupPresenceTable* t = findTable(g.code);
+    if (t != nullptr) {
+      for (auto& e : t->online) {
+        if (e.used && strcmp(e.device_id, Identity::deviceId()) != 0 && IdentityColor::isValid(e.color_index)) {
+          occupiedMask = static_cast<uint16_t>(occupiedMask | (1u << e.color_index));
+        }
+      }
+    }
+    RecentColorsForGroup* rt = findRecentColorsTable(g.code);
+    if (rt != nullptr) {
+      for (auto& c : rt->contacts) {
+        if (c.used && strcmp(c.device_id, Identity::deviceId()) != 0 && IdentityColor::isValid(c.color_index)) {
+          occupiedMask = static_cast<uint16_t>(occupiedMask | (1u << c.color_index));
+        }
+      }
+    }
+
+    bool candidateUsed = (occupiedMask & (1u << candidateColor)) != 0;
+    if (!candidateUsed) continue;
+    // Section 2G/2J: only a conflict while an unused palette color still
+    // exists for this group -- once membership already occupies all 12,
+    // color reuse is allowed rather than blocking additional members.
+    if (countSetBits(occupiedMask) < IdentityColor::kColorCount) {
+      if (conflictingGroupCode != nullptr) {
+        strncpy(conflictingGroupCode, g.code, outSize - 1);
+        conflictingGroupCode[outSize - 1] = '\0';
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace Presence

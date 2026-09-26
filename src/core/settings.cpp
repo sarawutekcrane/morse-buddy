@@ -6,11 +6,13 @@
 
 #include "core/display.h"
 #include "core/hooks.h"
+#include "core/identity_color.h"
 #include "core/input.h"
 #include "core/menu.h"
 #include "core/mixed_text_entry.h"
 #include "core/modes.h"
 #include "core/morse.h"
+#include "core/presence.h"
 #include "core/sleep.h"
 #include "core/storage_init.h"
 #include "ota/ota_manager.h"
@@ -26,6 +28,8 @@ uint8_t g_groupCount = 0;
 
 char g_myName[Settings::kMaxMyNameLen + 1] = "";
 bool g_hasCustomMyName = false;
+uint8_t g_myColorIndex = IdentityColor::kInvalidColor;
+bool g_hasCustomMyColor = false;
 uint8_t g_brightness = 100;
 uint8_t g_speakerVolume = 80;
 Settings::TypingDisplay g_typingDisplay = Settings::TypingDisplay::MIXED;
@@ -90,6 +94,26 @@ void init() {
     }
   }
 
+  // Feature Fix #4.8 migration rule: a persisted "myColor" only counts as
+  // configured if it is a valid palette index. A never-configured device
+  // (no key) and an out-of-range/corrupt legacy value are both treated as
+  // NOT configured -- this is the exact same "invalid persisted value is
+  // never silently accepted" rule the name migration above already
+  // follows. In particular, an existing device that already has a valid
+  // "myName" but predates this fix (no "myColor" key at all) keeps its
+  // name untouched here and simply has hasCustomMyColor() == false, so
+  // hasConfiguredIdentity() drives it into the color-only mandatory
+  // workflow instead of losing its chosen name.
+  g_myColorIndex = IdentityColor::kInvalidColor;
+  g_hasCustomMyColor = false;
+  if (p.isKey("myColor")) {
+    uint8_t stored = p.getUChar("myColor");
+    if (IdentityColor::isValid(stored)) {
+      g_myColorIndex = stored;
+      g_hasCustomMyColor = true;
+    }
+  }
+
   loadWifiSlots();
   loadGroups();
 
@@ -117,6 +141,32 @@ void setMyName(const char* name) {
   Storage::core().putString("myName", g_myName);
 }
 bool hasCustomMyName() { return g_hasCustomMyName; }
+
+uint8_t getMyColorIndex() { return g_myColorIndex; }
+uint16_t getMyColor565() { return IdentityColor::color565(g_myColorIndex); }
+bool hasCustomMyColor() { return g_hasCustomMyColor; }
+bool hasConfiguredIdentity() { return g_hasCustomMyName && g_hasCustomMyColor; }
+
+bool setMyIdentity(const char* name, uint8_t colorIndex) {
+  // Feature Fix #4.8: validate BOTH inputs before touching any RAM or
+  // persisted state -- a rejected save must never leave a half-updated
+  // identity (new name with the stale color, or vice versa), and an
+  // invalid name is never silently truncated (same invariant setMyName()
+  // already enforces).
+  if (name == nullptr) return false;
+  size_t len = strlen(name);
+  if (len < 1 || len > kMaxMyNameLen) return false;
+  if (!IdentityColor::isValid(colorIndex)) return false;
+
+  memcpy(g_myName, name, len);
+  g_myName[len] = '\0';
+  g_hasCustomMyName = true;
+  g_myColorIndex = colorIndex;
+  g_hasCustomMyColor = true;
+  Storage::core().putString("myName", g_myName);
+  Storage::core().putUChar("myColor", colorIndex);
+  return true;
+}
 
 uint8_t getBrightness() { return g_brightness; }
 void setBrightness(uint8_t percent) {
@@ -494,21 +544,156 @@ void screenSpeedPower() {
   g_speedPowerListMenu.tick("Speed & Power");
 }
 
+// ---- Identity Name Color Picker (Feature Fix #4.8) --------------------------
+// Shared by both the mandatory first-run/migration identity workflow
+// (screenSetName() below) and the regular "My Name" edit flow just below
+// it -- both stage a candidate name into g_identityPendingName and push
+// this screen; it is the ONLY place that actually calls
+// Settings::setMyIdentity(), so name+color are always committed together,
+// atomically, exactly once, whichever flow reached it (Feature Fix #4.8
+// section 2C/2E: "do not persist a half-edited identity before the
+// complete flow is saved").
+char g_identityPendingName[Settings::kMaxMyNameLen + 1] = "";
+uint8_t g_identityPendingColor = 0;
+// True while reached from the mandatory first-run/migration flow, where
+// ENCODER_LONG/back must not escape identity setup (matching
+// screenSetName()'s own existing "cannot be cancelled past" invariant).
+// False from the regular Settings "My Name" edit flow, where back
+// discards the whole pending edit -- since the name-entry screen already
+// popped itself off the stack before pushing this one (see both call
+// sites below), a single Menu::goBack() from here always lands correctly
+// on whatever was beneath the ORIGINAL entry point (WiFi setup/Main Menu
+// for mandatory, Settings root for a regular edit), with no risk of
+// re-entering an already-finished MixedTextEntry session.
+bool g_identityMandatory = false;
+
+bool g_colorPickerNeedsFullRedraw = true;
+bool g_colorPickerDirty = true;
+uint8_t g_colorPickerLastIndex = 0xFF;  // no valid palette index -- forces the first draw
+char g_colorPickerMessage[24] = "";
+char g_colorPickerLastMessage[24] = "";
+
+// Feature Fix #4.8 section 2G (NAME): centralized in Presence
+// (isNameInUseByKnownMember), reused here as an ordinary MixedTextEntry
+// validator -- exactly the same mechanism screenAddGroupCode() already
+// uses for Group Code uniqueness (groupCodeValidator() below), just with
+// its own "Name in use" wording instead of the generic default.
+bool identityNameValidator(const char* candidate) {
+  char conflictGroup[33];
+  return !Presence::isNameInUseByKnownMember(candidate, conflictGroup, sizeof(conflictGroup));
+}
+
+void screenIdentityColorPicker() {
+  if (Menu::consumeJustEntered()) {
+    // Default selection: the current color if one is already configured
+    // (Feature Fix #4.8 test C: "Color screen starts on Violet"), else
+    // palette index 0 for a brand-new identity.
+    g_identityPendingColor = Settings::hasCustomMyColor() ? Settings::getMyColorIndex() : 0;
+    g_colorPickerMessage[0] = '\0';
+    g_colorPickerLastMessage[0] = '\0';
+    g_colorPickerLastIndex = 0xFF;
+    g_colorPickerNeedsFullRedraw = true;
+    g_colorPickerDirty = true;
+  }
+
+  Input::update();
+  InputEvent e;
+  while (Input::popEvent(e)) {
+    if (e.type == InputEventType::ENCODER_ROTATE) {
+      int16_t next = static_cast<int16_t>(g_identityPendingColor) + e.value;
+      if (next < 0) next = static_cast<int16_t>(IdentityColor::kColorCount) - 1;
+      if (next >= static_cast<int16_t>(IdentityColor::kColorCount)) next = 0;
+      g_identityPendingColor = static_cast<uint8_t>(next);
+      g_colorPickerMessage[0] = '\0';  // rotating to a different color clears a stale "Color in use"
+      g_colorPickerDirty = true;
+    } else if (Input::isMenuConfirm(e)) {
+      // Feature Fix #4.8 section 2G (COLOR): centralized conflict check,
+      // only rejected while the affected group still has an unused
+      // palette color left (Presence::isColorInUseByKnownMember() already
+      // encodes that rule) -- a large/palette-exhausted family is never
+      // blocked from completing identity setup.
+      char conflictGroup[33];
+      if (Presence::isColorInUseByKnownMember(g_identityPendingColor, conflictGroup, sizeof(conflictGroup))) {
+        strncpy(g_colorPickerMessage, "Color in use", sizeof(g_colorPickerMessage) - 1);
+        g_colorPickerMessage[sizeof(g_colorPickerMessage) - 1] = '\0';
+        g_colorPickerDirty = true;
+      } else {
+        bool ok = Settings::setMyIdentity(g_identityPendingName, g_identityPendingColor);
+        if (ok) {
+          // One identity save -> one republish cycle (Feature Fix #4.8
+          // section 2Q), whether this save changed the name, the color,
+          // or both -- reusing the existing SET_MY_NAME_CHANGED hook,
+          // which Presence::onSettingsChanged() already reacts to with a
+          // single republishOwnPresenceAllGroups() call.
+          SettingsChangeInfo info{SET_MY_NAME_CHANGED, 0, {0}};
+          fireSettingsChangeHooks(info);
+        }
+        Menu::goBack();
+        return;
+      }
+    } else if (Input::isBack(e) && !g_identityMandatory) {
+      Menu::goBack();
+      return;
+    }
+    // Mandatory + back: intentionally no-op -- mandatory setup cannot be cancelled past.
+  }
+
+  Display::drawStatusBar();
+  if (!g_colorPickerDirty) return;
+  g_colorPickerDirty = false;
+
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t lh = Display::lineHeight();
+  int16_t titleY = Display::kStatusBarHeight + 2;
+  int16_t nameY = static_cast<int16_t>(titleY + lh);
+  int16_t colorNameY = static_cast<int16_t>(nameY + lh);
+  int16_t msgY = static_cast<int16_t>(colorNameY + lh);
+
+  if (g_colorPickerNeedsFullRedraw) {
+    Display::clearContentArea();
+    Display::printLine(2, titleY, "Name Color");
+    g_colorPickerNeedsFullRedraw = false;
+  }
+  // Only redraw the preview name/color-name block when the selection
+  // actually changed -- no continuous redraw/flicker on an idle screen.
+  if (g_identityPendingColor != g_colorPickerLastIndex) {
+    int16_t regionH = static_cast<int16_t>(lh * 2);
+    Display::tft().fillRect(0, nameY, Display::kScreenWidth, regionH, ST77XX_BLACK);
+    // The pending name preview is drawn in the currently-highlighted
+    // color itself -- the whole point of this screen.
+    Display::printLineColored(2, nameY, g_identityPendingName, IdentityColor::color565(g_identityPendingColor));
+    Display::printLine(2, colorNameY, IdentityColor::colorName(g_identityPendingColor));
+    g_colorPickerLastIndex = g_identityPendingColor;
+  }
+  if (strcmp(g_colorPickerMessage, g_colorPickerLastMessage) != 0) {
+    Display::tft().fillRect(0, msgY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    if (g_colorPickerMessage[0] != '\0') Display::printLine(2, msgY, g_colorPickerMessage);
+    strncpy(g_colorPickerLastMessage, g_colorPickerMessage, sizeof(g_colorPickerLastMessage) - 1);
+    g_colorPickerLastMessage[sizeof(g_colorPickerLastMessage) - 1] = '\0';
+  }
+}
+
 // ---- My Name ----------------------------------------------------------------
 void screenEditMyName() {
+  static const MixedTextEntryConfig cfg = {"My Name", FieldCharset::GENERAL_NAME, Settings::kMaxMyNameLen, 1,
+                                            identityNameValidator, "Name in use"};
   if (Menu::consumeJustEntered()) {
-    static const MixedTextEntryConfig cfg = {"My Name", FieldCharset::GENERAL_NAME, Settings::kMaxMyNameLen, 1,
-                                              nullptr};
     MixedTextEntry::start(cfg, Settings::getMyName());
   }
   MixedTextEntry::tick();
   if (MixedTextEntry::isFinished()) {
     if (MixedTextEntry::result() == MixedTextEntryResult::SAVED) {
-      Settings::setMyName(MixedTextEntry::getValue());
-      SettingsChangeInfo info{SET_MY_NAME_CHANGED, 0, {0}};
-      fireSettingsChangeHooks(info);
+      // Feature Fix #4.8: stage the name and hand off to the color
+      // picker instead of saving here directly -- Name + Color are one
+      // identity, saved together (see screenIdentityColorPicker() above).
+      strncpy(g_identityPendingName, MixedTextEntry::getValue(), sizeof(g_identityPendingName) - 1);
+      g_identityPendingName[sizeof(g_identityPendingName) - 1] = '\0';
+      g_identityMandatory = false;
+      Menu::goBack();
+      Menu::pushScreen(screenIdentityColorPicker);
+    } else {
+      Menu::goBack();
     }
-    Menu::goBack();
   }
 }
 
@@ -1006,25 +1191,48 @@ void screenTrainingGame() {
 
 void registerMorsePracticeStartHandler(ScreenHandlerFn fn) { g_morsePracticeStartHandler = fn; }
 
-// Hardware Fix #4.7: mandatory first-run name entry. Reuses the same
-// MixedTextEntry infrastructure and GENERAL_NAME charset as the regular
-// "My Name" editor above, but is pushed from main.cpp before Main Menu is
-// ever reachable, and a CANCELLED session re-enters itself instead of
-// calling Menu::goBack() -- so there is no gesture that exposes whatever
-// screen is underneath (WiFi setup or Main Menu) without saving a valid
-// 1..kMaxMyNameLen character name first.
+// Hardware Fix #4.7 / Feature Fix #4.8: mandatory first-run/migration
+// identity entry. Reuses the same MixedTextEntry infrastructure and
+// GENERAL_NAME charset as the regular "My Name" editor above, but is
+// pushed from main.cpp before Main Menu is ever reachable (gated on
+// !hasConfiguredIdentity(), not name alone, since #4.8), and a CANCELLED
+// name-entry session re-enters itself instead of calling Menu::goBack()
+// -- so there is no gesture that exposes whatever screen is underneath
+// (WiFi setup or Main Menu) without completing a full Name+Color identity
+// first.
+//
+// Feature Fix #4.8 migration case: a device that already has a valid
+// 1..kMaxMyNameLen name from before this fix (hasCustomMyName() true) but
+// no configured color skips the name-entry UI entirely -- its existing
+// name is staged unchanged and this goes straight to the mandatory color
+// picker, per section 2D Case 2.
 void screenSetName() {
-  static const MixedTextEntryConfig cfg = {"Set Name", FieldCharset::GENERAL_NAME, kMaxMyNameLen, 1, nullptr};
+  static const MixedTextEntryConfig cfg = {"Set Name", FieldCharset::GENERAL_NAME, kMaxMyNameLen, 1,
+                                            identityNameValidator, "Name in use"};
   if (Menu::consumeJustEntered()) {
+    if (hasCustomMyName()) {
+      strncpy(g_identityPendingName, getMyName(), sizeof(g_identityPendingName) - 1);
+      g_identityPendingName[sizeof(g_identityPendingName) - 1] = '\0';
+      g_identityMandatory = true;
+      Menu::goBack();
+      Menu::pushScreen(screenIdentityColorPicker);
+      return;
+    }
     MixedTextEntry::start(cfg, "");
   }
   MixedTextEntry::tick();
   if (MixedTextEntry::isFinished()) {
     if (MixedTextEntry::result() == MixedTextEntryResult::SAVED) {
-      setMyName(MixedTextEntry::getValue());
-      SettingsChangeInfo info{SET_MY_NAME_CHANGED, 0, {0}};
-      fireSettingsChangeHooks(info);
+      // Feature Fix #4.8: stage the name and hand off to the mandatory
+      // color picker instead of saving here directly -- see
+      // screenIdentityColorPicker() above, which performs the single
+      // atomic Settings::setMyIdentity() call and republish for both the
+      // brand-new (Case 1) and migration (Case 2, handled above) paths.
+      strncpy(g_identityPendingName, MixedTextEntry::getValue(), sizeof(g_identityPendingName) - 1);
+      g_identityPendingName[sizeof(g_identityPendingName) - 1] = '\0';
+      g_identityMandatory = true;
       Menu::goBack();
+      Menu::pushScreen(screenIdentityColorPicker);
     } else {
       // Mandatory screen: cancellation must not reveal whatever is
       // beneath it on the navigation stack.

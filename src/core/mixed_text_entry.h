@@ -30,6 +30,23 @@ struct MixedTextEntryConfig {
   uint8_t maxLength;
   uint8_t minLength;                          // 0 allowed (e.g. WiFi Password)
   bool (*validator)(const char* candidate);   // optional, e.g. Group Code uniqueness; nullptr = none
+  // Feature Fix #4.8: shown on the control row instead of the generic
+  // "Not allowed" when `validator` rejects a candidate -- e.g. Identity
+  // name entry shows "Name in use" instead of the generic Group Code
+  // wording. nullptr keeps the existing "Not allowed" text, so every
+  // existing call site (which does not set this) is unaffected.
+  const char* validatorErrorMessage;
+
+  // Plain constructor (not default member initializers) so this stays a
+  // non-aggregate-safe brace-init type under C++11 (the standard
+  // PlatformIO's arduino-esp32 core builds with) -- validatorErrorMessage
+  // defaults to nullptr so every existing 5-argument brace-init call site
+  // (e.g. MixedTextEntryConfig{"My Name", FieldCharset::GENERAL_NAME,
+  // kMaxMyNameLen, 1, nullptr}) keeps compiling unchanged.
+  MixedTextEntryConfig(const char* t, FieldCharset cs, uint8_t maxLen, uint8_t minLen,
+                        bool (*v)(const char* candidate), const char* validatorErrMsg = nullptr)
+      : title(t), charset(cs), maxLength(maxLen), minLength(minLen), validator(v),
+        validatorErrorMessage(validatorErrMsg) {}
 };
 
 namespace MixedTextEntry {

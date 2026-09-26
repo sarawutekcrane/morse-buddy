@@ -52,6 +52,37 @@ void setMyName(const char* name);
 // under a fabricated name (Hardware Fix #4.3 issue F).
 bool hasCustomMyName();
 
+// ---- Personal Identity Color (Feature Fix #4.8) ---------------------------
+// A Morse Buddy user identity is Name + Personal Color; the color
+// distinguishes family members' sender names in the Unified Thread.
+// Persisted as a palette INDEX (never a raw RGB565 value) so the palette
+// itself can be defined once, centrally, in identity_color.h/.cpp.
+//
+// IdentityColor::kInvalidColor until a valid color has been configured --
+// never a fabricated default, matching the existing Name migration rule.
+uint8_t getMyColorIndex();
+uint16_t getMyColor565();  // IdentityColor::color565(getMyColorIndex()); safe even if not configured
+bool hasCustomMyColor();
+
+// True once BOTH a valid name and a valid color are configured -- the
+// gate main.cpp uses for the mandatory first-run identity workflow
+// (Feature Fix #4.8), replacing the old hasCustomMyName()-only check. An
+// existing valid 1..kMaxMyNameLen name from before this fix is preserved
+// and never discarded; such a device is simply asked for a color only.
+bool hasConfiguredIdentity();
+
+// Atomic identity save: validates name (non-null, length 1..kMaxMyNameLen)
+// AND colorIndex (IdentityColor::isValid()) BEFORE touching any persisted
+// or RAM state -- an invalid name is never silently truncated and an
+// invalid color index is never silently substituted. On success, persists
+// both name and color and returns true; the caller is responsible for
+// firing the settings-change notification exactly once afterward (see
+// SET_MY_NAME_CHANGED). Returns false, with NO state changed at all, if
+// either input is invalid -- a rejected save can never leave a
+// half-updated identity (e.g. new name with the old color, or vice
+// versa).
+bool setMyIdentity(const char* name, uint8_t colorIndex);
+
 // ---- Display & Sound -------------------------------------------------------
 uint8_t getBrightness();  // 0-100
 void setBrightness(uint8_t percent);

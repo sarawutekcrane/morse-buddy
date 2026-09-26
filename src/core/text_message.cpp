@@ -6,6 +6,7 @@
 #include "core/display.h"
 #include "core/hooks.h"
 #include "core/identity.h"
+#include "core/identity_color.h"
 #include "core/input.h"
 #include "core/menu.h"
 #include "core/modes.h"
@@ -433,6 +434,12 @@ struct HistoryRowInfo {
   int16_t firstBodyWidth;
   int16_t continuationX;
   int16_t continuationWidth;
+  // Feature Fix #4.8: the sender's personal color, resolved once here (via
+  // Presence::resolveColorIndex()) rather than the fixed ST77XX_CYAN every
+  // sender name used before -- already falls back to CYAN for a legacy/
+  // unknown sender so old peers stay readable. Message BODY color is
+  // untouched (always WHITE, drawn via plain printLine()).
+  uint16_t senderColor565;
 };
 
 // Loads history entry `index` and computes where its body text wraps.
@@ -441,6 +448,7 @@ struct HistoryRowInfo {
 void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
+  out->senderColor565 = ST77XX_CYAN;  // safe default; overwritten below once a sender is actually known
   char* scratch = UiScratch::ensure(UiScratch::Slot::B, kHistoryLineBufCap);
   if (scratch == nullptr) {
     // Never dereference a failed allocation (Hardware Fix #4.4b) -- degrade
@@ -466,6 +474,14 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
       MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
       MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
       if (iconFn != nullptr) out->icon = iconFn(view);
+      // Feature Fix #4.8 section 2M/2N: presentation metadata resolved at
+      // render time from the CURRENT known/personal color, never stored
+      // in the message itself -- an old message's sender color can change
+      // (e.g. after its author picks a new color) without rewriting any
+      // stored record. Falls back to the existing CYAN for a legacy/
+      // unknown sender so old peers stay readable.
+      uint8_t colorIdx = Presence::resolveColorIndex(view.envelope.group_code, view.envelope.sender_device_id);
+      out->senderColor565 = IdentityColor::isValid(colorIdx) ? IdentityColor::color565(colorIdx) : ST77XX_CYAN;
     }
   }
   // Hardware Fix #4.7b: only reserve the lock-icon cell when a message
@@ -1135,14 +1151,16 @@ void screenChat() {
           int16_t rowBodyX = (rowIdx == 0) ? info.firstBodyX : info.continuationX;
           if (rowIdx == 0) {
             // Icon cell (only reserved when an icon is actually present,
-            // Hardware Fix #4.7b Part B) + CYAN sender name appear on the
-            // message's true FIRST row only; continuation rows start at
-            // that same sender X, with no icon/sender repeated (Hardware
-            // Fix #4.7 Part E, #4.7b Part C).
+            // Hardware Fix #4.7b Part B) + sender name (Feature Fix #4.8:
+            // the sender's personal color, falling back to the original
+            // CYAN for a legacy/unknown sender) appear on the message's
+            // true FIRST row only; continuation rows start at that same
+            // sender X, with no icon/sender repeated (Hardware Fix #4.7
+            // Part E, #4.7b Part C).
             drawRowIcon(labelX, y, info.icon);
             int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
             int16_t textX = static_cast<int16_t>(labelX + iconWidth);
-            Display::printLineColored(textX, y, info.senderPrefix, ST77XX_CYAN);
+            Display::printLineColored(textX, y, info.senderPrefix, info.senderColor565);
           }
           // The marker sits on the exact focused row (g_historyRowOffset),
           // which computeHistoryViewport() always keeps inside the drawn

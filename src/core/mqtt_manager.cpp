@@ -214,8 +214,15 @@ void connectGroupIfNeeded(GroupClient& gc) {
   char willTopic[48];
   snprintf(willTopic, sizeof(willTopic), "morsebuddy/%s/presence/%s", gc.group_code, Identity::deviceId());
   char willPayload[110];
-  snprintf(willPayload, sizeof(willPayload), "MBP1|%s|%s|OFFLINE|0|%lu", Identity::deviceId(),
-           Settings::getMyName(), static_cast<unsigned long>(WifiManager::getUnixTime()));
+  // Feature Fix #4.8 section 2I: append the same optional trailing color
+  // index Presence::buildPayload() now sends on every ONLINE/OFFLINE
+  // publish, so a peer that only ever sees this device via its LWT (an
+  // unclean disconnect) still resolves its personal color the same way.
+  // Format-compatible: still tag "MBP1", still OFFLINE/radio=0, just one
+  // more optional field appended after the existing ones.
+  snprintf(willPayload, sizeof(willPayload), "MBP1|%s|%s|OFFLINE|0|%lu|%u", Identity::deviceId(),
+           Settings::getMyName(), static_cast<unsigned long>(WifiManager::getUnixTime()),
+           Settings::getMyColorIndex());
   gc.mqtt->setWill(willTopic, willPayload, /*retained=*/true, /*qos=*/1);
   gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/5000);
 

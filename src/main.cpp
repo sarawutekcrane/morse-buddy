@@ -42,12 +42,17 @@ void setup() {
     // Cancelling/failing falls back to Main Menu Offline (Phase 1 section 6).
     Menu::pushScreen(Settings::screenWifiSlots);
   }
-  if (!Settings::hasCustomMyName()) {
-    // Hardware Fix #4.7: a device with no valid 1..kMaxMyNameLen character
-    // name is not usable yet -- push this LAST so it ends up top-most,
-    // above WiFi setup if that was also pushed (required boot priority:
-    // 1. mandatory name, 2. WiFi setup if missing, 3. Main Menu). Unlike
-    // WiFi setup, this screen cannot be cancelled past; see screenSetName().
+  if (!Settings::hasConfiguredIdentity()) {
+    // Hardware Fix #4.7 / Feature Fix #4.8: a device without a complete
+    // Name + Color identity is not usable yet -- push this LAST so it
+    // ends up top-most, above WiFi setup if that was also pushed
+    // (required boot priority: 1. mandatory identity, 2. WiFi setup if
+    // missing, 3. Main Menu). Unlike WiFi setup, this screen cannot be
+    // cancelled past; see screenSetName(). hasConfiguredIdentity()
+    // (name AND color) replaces the old name-only gate, but an existing
+    // valid name from before Feature Fix #4.8 is never discarded --
+    // screenSetName() itself handles that migration case by asking only
+    // for a color.
     Menu::pushScreen(Settings::screenSetName);
   }
 

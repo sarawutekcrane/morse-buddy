@@ -251,7 +251,11 @@ void handleConfirm(const InputEvent& e) {
   } else if (e.type == InputEventType::DOT_RELEASE && Input::isMenuConfirm(e)) {
     if (g_confirmSaveSelected) {
       if (g_config.validator != nullptr && !g_config.validator(g_buffer)) {
-        g_errorMessage = "Not allowed";
+        // Feature Fix #4.8: a config may supply its own rejection wording
+        // (e.g. Identity name entry's "Name in use") instead of this
+        // generic default -- validatorErrorMessage is nullptr for every
+        // pre-existing validator config, so their behavior is unchanged.
+        g_errorMessage = (g_config.validatorErrorMessage != nullptr) ? g_config.validatorErrorMessage : "Not allowed";
         g_state = State::EMPTY;
       } else {
         g_finished = true;
