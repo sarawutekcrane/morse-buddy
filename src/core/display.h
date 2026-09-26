@@ -143,7 +143,13 @@ void drawSelectionCursor(int16_t x, int16_t rowTop);
 // the bar too, so the row reads as "name  |  body" with breathing room on
 // both sides of the divider, not just after it.
 constexpr int16_t kSenderDividerLeadGap = 2;  // gap between the sender name and the bar
-constexpr int16_t kSenderDividerWidth = 3;    // solid bar width
+// Hardware Fix #4.9e Part A: widened from 3 to 5 -- a real-hardware retest
+// found the height fix from #4.9d already reads correctly, but a 3px-wide
+// bar was thin enough to be misread as another capital "I" rather than a
+// deliberate divider. Every layout call site derives firstBodyX from this
+// constant (never a hardcoded 3), so widening it here automatically grows
+// the reserved gap everywhere without any other file needing to change.
+constexpr int16_t kSenderDividerWidth = 5;    // solid bar width
 constexpr int16_t kSenderBodyGap = 2;         // fixed gap between the bar and the WHITE message body that follows
 
 // Hardware Fix #4.9d Part B1: draws the divider bar with its left edge at

@@ -56,18 +56,24 @@ void startNtpIfNeeded() {
 
 void serviceInit() { startCycle(); }
 
+// Hardware Diagnostic #4.9e Part B4: instrumentation only, no behavior
+// change -- total tick duration, gated to >=20ms, to help rule this
+// AppService in/out as a source of the reported global UI stall.
 void serviceTick() {
-  uint32_t now = millis();
+  uint32_t tickStart = millis();
+  uint32_t now = tickStart;
 
   if (WiFi.status() == WL_CONNECTED) {
     startNtpIfNeeded();
-    return;
-  }
-
-  if (g_state == State::CONNECTING) {
+  } else if (g_state == State::CONNECTING) {
     if (now - g_stateStartMs >= kPerSlotTimeoutMs) tryNextSlotOrGiveUp();
   } else {
     if (now - g_stateStartMs >= kRetryIntervalMs) startCycle();
+  }
+
+  uint32_t tickElapsed = millis() - tickStart;
+  if (tickElapsed >= 20) {
+    Serial.printf("[PERF][WIFI] serviceTick %lu ms\n", static_cast<unsigned long>(tickElapsed));
   }
 }
 

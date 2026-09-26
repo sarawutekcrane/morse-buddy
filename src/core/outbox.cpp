@@ -23,9 +23,25 @@ bool isPendingPredicate(const MessageStore::StoredHeader& header, const PacketCo
   return (header.flags & MessageStore::FLAG_PENDING_OUTBOX) != 0;
 }
 
+// Hardware Diagnostic #4.9e Part B3: instrumentation only, no behavior
+// change. This is a strong suspect for the reported multi-second Send
+// delay -- a QoS1 MqttManager::publishBinary() can synchronously wait for
+// the broker's PUBACK within the MQTT command timeout (Part C: do not
+// assume publish/subscribe are non-blocking), and this loop can run that
+// wait up to kMaxBatch (32) times in a row for one flushPending() call, so
+// per-publish + whole-flush timing will show whether that's what's
+// actually happening on hardware.
 void flushPending() {
+  uint32_t flushStart = millis();
+
   MessageRef refs[kMaxBatch];
+  uint32_t scanStart = millis();
   uint16_t n = MessageStore::findMessagesByPredicate(nullptr, nullptr, isPendingPredicate, nullptr, refs, kMaxBatch);
+  uint32_t scanElapsed = millis() - scanStart;
+  if (scanElapsed >= 20) {
+    Serial.printf("[PERF][OUTBOX] scan %lu ms found=%u\n", static_cast<unsigned long>(scanElapsed),
+                  static_cast<unsigned>(n));
+  }
   uint16_t limit = (n < kMaxBatch) ? n : kMaxBatch;
 
   for (uint16_t i = 0; i < limit; i++) {
@@ -43,11 +59,23 @@ void flushPending() {
       suffix = suffixBuf;
     }
 
+    uint32_t publishStart = millis();
     bool ok = MqttManager::publishBinary(refs[i].group_code, suffix, view.wirePacket, view.wirePacketLen,
                                          /*retained=*/false, /*qos=*/1);
+    uint32_t publishElapsed = millis() - publishStart;
+    if (publishElapsed >= 20) {
+      Serial.printf("[PERF][OUTBOX] publish %lu ms group=%s ok=%d\n", static_cast<unsigned long>(publishElapsed),
+                    refs[i].group_code, ok ? 1 : 0);
+    }
     if (ok) {
       MessageStore::updateLocalFlags(refs[i], 0, MessageStore::FLAG_PENDING_OUTBOX);
     }
+  }
+
+  uint32_t flushElapsed = millis() - flushStart;
+  if (flushElapsed >= 20) {
+    Serial.printf("[PERF][OUTBOX] flush %lu ms attempted=%u\n", static_cast<unsigned long>(flushElapsed),
+                  static_cast<unsigned>(limit));
   }
 }
 

@@ -869,8 +869,11 @@ void handleBroadcastAudioScope(const char* group_code, const char* sender, const
 // =============================================================================
 // Background tick: claim refresh/TTL, negotiation timeout, UDP polling.
 // =============================================================================
+// Hardware Diagnostic #4.9e Part B4: instrumentation only, no behavior
+// change -- total tick duration, gated to >=20ms.
 void serviceTick() {
-  uint32_t now = millis();
+  uint32_t tickStart = millis();
+  uint32_t now = tickStart;
 
   if (g_receiverBusy.busy && (now - g_receiverBusy.lastRefreshMs) > kBusyTtlMs) {
     // Crash fallback: same stale-session risk as the explicit RELEASE
@@ -900,6 +903,11 @@ void serviceTick() {
 
   if (g_udpBegun) handleIncomingUdp();
   if (g_call.state == PrivateState::UDP_DIRECT) jitterPlayTick();
+
+  uint32_t tickElapsed = millis() - tickStart;
+  if (tickElapsed >= 20) {
+    Serial.printf("[PERF][RADIO_TRANSPORT] serviceTick %lu ms\n", static_cast<unsigned long>(tickElapsed));
+  }
 }
 
 struct Registrar {

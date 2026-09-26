@@ -46,8 +46,11 @@ void ensureMicInstalled() {
   g_micInstalled = true;
 }
 
+// Hardware Diagnostic #4.9e Part B4: instrumentation only, no behavior
+// change -- total tick duration, gated to >=20ms.
 void serviceTick() {
   if (!g_captureActive) return;
+  uint32_t tickStart = millis();
 
   int32_t raw[64];
   size_t bytesRead = 0;
@@ -62,6 +65,11 @@ void serviceTick() {
   if (g_captureFilled >= kFrameSamples) {
     if (g_captureFn != nullptr) g_captureFn(g_captureFrame, kFrameSamples);
     g_captureFilled = 0;
+  }
+
+  uint32_t tickElapsed = millis() - tickStart;
+  if (tickElapsed >= 20) {
+    Serial.printf("[PERF][RADIO_AUDIO] serviceTick %lu ms\n", static_cast<unsigned long>(tickElapsed));
   }
 }
 

@@ -101,7 +101,11 @@ void serviceInit() {
   registerSoundBackend(toneBackend, toneSequenceBackend, stopBackend);
 }
 
+// Hardware Diagnostic #4.9e Part B4: instrumentation only, no behavior
+// change -- total tick duration (covering every exit path below), gated
+// to >=20ms.
 void serviceTick() {
+  uint32_t tickStart = millis();
   if (!g_active) return;
 
   if (g_segmentSamplesDone >= g_segmentTotalSamples) {
@@ -129,6 +133,11 @@ void serviceTick() {
   // Zero timeout: never block the main loop waiting for DMA buffer space.
   i2s_write(I2S_NUM_1, buf, chunk * sizeof(int16_t), &bytesWritten, 0);
   g_segmentSamplesDone += static_cast<uint32_t>(bytesWritten / sizeof(int16_t));
+
+  uint32_t tickElapsed = millis() - tickStart;
+  if (tickElapsed >= 20) {
+    Serial.printf("[PERF][SOUND_I2S] serviceTick %lu ms\n", static_cast<unsigned long>(tickElapsed));
+  }
 }
 
 struct Registrar {

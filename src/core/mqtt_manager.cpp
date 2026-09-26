@@ -179,12 +179,16 @@ void processQueuedMessage(const QueuedMessage& q) {
 }
 
 void drainReceiveQueue() {
+  // Hardware Diagnostic #4.9e Part B2 item 4: instrumentation only.
+  uint32_t drainStart = millis();
+  uint16_t drainedCount = 0;
   while (g_queueCount > 0) {
     QueuedMessage& q = g_queue[g_queueHead];
     g_queueHead = static_cast<uint8_t>((g_queueHead + 1) % kQueueCapacity);
     g_queueCount--;
 
     processQueuedMessage(q);
+    drainedCount++;
 
     // Free exactly once, then reset the slot, no matter which path
     // processQueuedMessage took.
@@ -192,6 +196,11 @@ void drainReceiveQueue() {
     q.data = nullptr;
     q.used = false;
     q.len = 0;
+  }
+  uint32_t drainElapsed = millis() - drainStart;
+  if (drainElapsed >= 20) {
+    Serial.printf("[PERF][MQTT] drain %lu ms count=%u\n", static_cast<unsigned long>(drainElapsed),
+                  static_cast<unsigned>(drainedCount));
   }
 }
 
@@ -203,12 +212,26 @@ void buildClientId(const char* group_code, char* outBuf, size_t outBufSize) {
   snprintf(outBuf, outBufSize, "%s_%08lX", Identity::deviceId(), static_cast<unsigned long>(crc));
 }
 
+// Hardware Diagnostic #4.9e Part B2: instrumentation only, no behavior
+// change -- 256dpi/MQTT's subscribe() waits synchronously for the
+// broker's SUBACK within the configured command timeout, so if the
+// reported multi-second UI stall is actually happening here (rather than
+// in loop()/connect()), per-subscribe timing pinpoints exactly which of
+// the 13 topics (if any) is the slow one, not just that subscribeAll() as
+// a whole was slow.
 void subscribeAll(GroupClient& gc) {
+  uint32_t subscribeAllStart = millis();
   const char* dev = Identity::deviceId();
   auto sub = [&](const char* suffix, int qos) {
     char topic[80];
     snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", gc.group_code, suffix);
+    uint32_t t0 = millis();
     gc.mqtt->subscribe(topic, qos);
+    uint32_t elapsed = millis() - t0;
+    if (elapsed >= 20) {
+      Serial.printf("[PERF][MQTT] subscribe group=%s topic=%s %lu ms\n", gc.group_code, suffix,
+                    static_cast<unsigned long>(elapsed));
+    }
   };
 
   char msgSuffix[24];
@@ -233,6 +256,12 @@ void subscribeAll(GroupClient& gc) {
   sub("radio/session", 0);
   sub(audioSuffix, 0);
   sub("radio/audio/broadcast", 0);
+
+  uint32_t subscribeAllElapsed = millis() - subscribeAllStart;
+  if (subscribeAllElapsed >= 20) {
+    Serial.printf("[PERF][MQTT] subscribeAll group=%s %lu ms\n", gc.group_code,
+                  static_cast<unsigned long>(subscribeAllElapsed));
+  }
 }
 
 // Hardware Fix #4.9d Part A1: `now` is passed in (the single millis()
@@ -269,7 +298,20 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   // verified state of a bounded-connect WiFiClient override attempt.
   gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/kMqttCommandTimeoutMs);
 
-  if (gc.mqtt->connect(gc.client_id, nullptr, nullptr)) {
+  // Hardware Diagnostic #4.9e Part B2 item 2: an actual connect attempt is
+  // already rate-limited to once per kMqttReconnectIntervalMs per group
+  // (Part A1), so this can never spam -- printed unconditionally (not
+  // gated to >=20ms like the other diagnostics here) because
+  // MQTTClient::connect() is the single most-suspected blocking call for
+  // the reported multi-second stall, and even a FAST result here is
+  // useful signal to rule this call out.
+  uint32_t connectStart = millis();
+  bool connected = gc.mqtt->connect(gc.client_id, nullptr, nullptr);
+  uint32_t connectElapsed = millis() - connectStart;
+  Serial.printf("[PERF][MQTT] connect group=%s %lu ms result=%d\n", gc.group_code,
+                static_cast<unsigned long>(connectElapsed), connected ? 1 : 0);
+
+  if (connected) {
     subscribeAll(gc);
     Presence::publishOnline(gc.group_code);
     gc.nextReconnectAttemptMs = 0;  // connected -- no throttle needed until it drops again
@@ -390,8 +432,20 @@ void serviceTick() {
   // mqtt->loop() is the library's own lightweight per-connection servicing
   // (keepalive/incoming-message pump) -- cheap and non-blocking regardless
   // of connection state, so every active client still gets it every tick.
+  // Hardware Diagnostic #4.9e Part B2 item 1 / Part C: do NOT assume this
+  // is always non-blocking -- 256dpi/MQTT uses synchronous lwmqtt
+  // operations internally, so a CONNECTED client can still momentarily
+  // wait on network data within loop(). Timed individually so a single
+  // slow group is visible, not just the whole for-loop.
   for (auto& gc : g_clients) {
-    if (gc.active && gc.mqtt != nullptr) gc.mqtt->loop();
+    if (!gc.active || gc.mqtt == nullptr) continue;
+    uint32_t loopStart = millis();
+    gc.mqtt->loop();
+    uint32_t loopElapsed = millis() - loopStart;
+    if (loopElapsed >= 20) {
+      Serial.printf("[PERF][MQTT] loop group=%s %lu ms connected=%d\n", gc.group_code,
+                    static_cast<unsigned long>(loopElapsed), gc.mqtt->connected() ? 1 : 0);
+    }
   }
 
   // Hardware Fix #4.9d Part A3: the potentially-blocking reconnect

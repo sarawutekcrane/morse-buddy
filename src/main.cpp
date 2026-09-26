@@ -62,9 +62,49 @@ void setup() {
   initRegisteredServices();
 }
 
+// Hardware Diagnostic #4.9e Part B1: real-hardware testing after #4.9d
+// still showed DOT/DASH, encoder rotation/push, and menu navigation ALL
+// delayed together, globally, for 2-3 seconds -- since the independent
+// input samplers are esp_timer-driven and already validated (#4.7b/#4.8b),
+// a delay affecting every input type at once points at the Arduino main
+// task itself being blocked somewhere in loop(), before/during
+// Menu::tick(). This section-by-section timing (gated to >=20ms so normal
+// fast ticks never print) plus a loop-to-loop gap check is pure
+// instrumentation -- it changes no behavior, only whether a line is
+// printed. See mqtt_manager.cpp/outbox.cpp/wifi_manager.cpp/
+// radio_transport.cpp/radio_audio.cpp/sound_i2s.cpp for the matching
+// diagnostics one level deeper, in case the loop-level numbers alone
+// don't pinpoint which AppService is the actual offender.
+namespace {
+uint32_t g_lastLoopEntryMs = 0;
+bool g_haveLastLoopEntry = false;
+}  // namespace
+
 void loop() {
+  uint32_t loopStart = millis();
+  if (g_haveLastLoopEntry) {
+    uint32_t gap = loopStart - g_lastLoopEntryMs;
+    if (gap >= 50) {
+      Serial.printf("[PERF] LOOP GAP=%lu ms\n", static_cast<unsigned long>(gap));
+    }
+  }
+  g_lastLoopEntryMs = loopStart;
+  g_haveLastLoopEntry = true;
+
+  uint32_t t0 = millis();
   tickRegisteredServices();
+  uint32_t t1 = millis();
+  if (t1 - t0 >= 20) Serial.printf("[PERF] services=%lu ms\n", static_cast<unsigned long>(t1 - t0));
+
   Power::tick();
+  uint32_t t2 = millis();
+  if (t2 - t1 >= 20) Serial.printf("[PERF] power=%lu ms\n", static_cast<unsigned long>(t2 - t1));
+
   Menu::tick();
+  uint32_t t3 = millis();
+  if (t3 - t2 >= 20) Serial.printf("[PERF] menu=%lu ms\n", static_cast<unsigned long>(t3 - t2));
+
   Sleep::update();
+  uint32_t t4 = millis();
+  if (t4 - t3 >= 20) Serial.printf("[PERF] sleep=%lu ms\n", static_cast<unsigned long>(t4 - t3));
 }
