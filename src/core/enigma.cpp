@@ -888,6 +888,12 @@ constexpr size_t kComposePrefixCap = EnigmaCrypto::kMaxEscapedLen * (Morse::kMax
 char g_composePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_composePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
+// Hardware Fix #4.7e: true from DOT_PRESS_START until the matching
+// DOT_RELEASE -- see text_message.cpp's identical field for the full
+// rationale (real-hardware "A" == ".-" producing "ET" because the idle
+// finalizer could fire while the following DASH was still held). Driven
+// purely by semantic InputEvents, never a raw GPIO read.
+bool g_composeKeyHeld = false;
 Morse::WordGapState g_composeWordGap;
 const char* g_composeError = nullptr;
 
@@ -926,6 +932,9 @@ void clearDraft() {
   g_composeError = nullptr;
   g_currentPatternStartsNewWord = false;
   Morse::cancelWordGap(&g_composeWordGap);
+  // Hardware Fix #4.7e: reset held state here too, so a screen re-entry
+  // that calls clearDraft() on setup can never inherit a stale true.
+  g_composeKeyHeld = false;
 }
 
 // Called on every DOT_PRESS_START, before the new symbol is accepted into
@@ -1442,7 +1451,13 @@ void handleComposeEvent(const InputEvent& e) {
     // prosign discards the captured flag below instead of consuming it as
     // a space.
     captureWordBoundaryOnSymbolStart(pressMs);
+    // Hardware Fix #4.7e: mark the key held only after the catch-up
+    // finalize/word-boundary-capture above have used the pre-press state.
+    g_composeKeyHeld = true;
   } else if (e.type == InputEventType::DOT_RELEASE) {
+    // Hardware Fix #4.7e: clear held state before any early-return path
+    // below, so it can never remain stuck true after a real release.
+    g_composeKeyHeld = false;
     g_composeError = nullptr;
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       clearDraft();
@@ -1624,7 +1639,13 @@ void screenEnigmaChat() {
   // #4.1): it only happens at the next DOT_PRESS_START, in
   // handleComposeEvent() above, so idling past 7 dit before pressing Send
   // never mutates compose text on its own.
-  if (g_historyCursor == kNoHistoryCursor && g_composePatternLen > 0) {
+  //
+  // Hardware Fix #4.7e: also gated on !g_composeKeyHeld -- see
+  // text_message.cpp's identical check for the full rationale (a held
+  // DASH could otherwise age past letterGapMs() measured from the
+  // PREVIOUS release and get the pending letter wrongly finalized before
+  // the DASH's own release ever arrived).
+  if (g_historyCursor == kNoHistoryCursor && !g_composeKeyHeld && g_composePatternLen > 0) {
     if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeComposeChar();
       g_enigmaChatDirty = true;

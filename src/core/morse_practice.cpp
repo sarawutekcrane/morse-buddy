@@ -224,6 +224,12 @@ uint8_t g_answerLen = 0;
 char g_answerPattern[Morse::kMaxPatternLength + 1];
 uint8_t g_answerPatternLen = 0;
 uint32_t g_lastAnswerReleaseMs = 0;
+// Hardware Fix #4.7e: true from DOT_PRESS_START until the matching
+// DOT_RELEASE -- see text_message.cpp's identical field for the full
+// rationale (real-hardware "A" == ".-" producing "ET" because the idle
+// finalizer could fire while the following DASH was still held). Driven
+// purely by semantic InputEvents, never a raw GPIO read.
+bool g_answerKeyHeld = false;
 Morse::WordGapState g_answerWordGap;
 // True while the pattern currently being keyed (g_answerPattern) is known
 // to start a new word -- captured once, at that pattern's FIRST symbol
@@ -245,6 +251,11 @@ void resetAnswerCompose() {
   g_answerPattern[0] = '\0';
   g_answerPatternStartsNewWord = false;
   Morse::cancelWordGap(&g_answerWordGap);
+  // Hardware Fix #4.7e: reset held state here too -- resetAnswerCompose()
+  // runs both on special-command hold and at the start of every new
+  // challenge (startNewChallenge()), so no stale true can ever survive
+  // into a new challenge/session.
+  g_answerKeyHeld = false;
 }
 
 // Called on every DOT_PRESS_START, before the new symbol is accepted into
@@ -360,7 +371,13 @@ void handleAnswerEvent(const InputEvent& e) {
     // delete prosign discards the captured flag below instead of
     // consuming it as a space.
     captureAnswerWordBoundaryOnSymbolStart(pressMs);
+    // Hardware Fix #4.7e: mark the key held only after the catch-up
+    // finalize/word-boundary-capture above have used the pre-press state.
+    g_answerKeyHeld = true;
   } else if (e.type == InputEventType::DOT_RELEASE) {
+    // Hardware Fix #4.7e: clear held state before any early-return path
+    // below, so it can never remain stuck true after a real release.
+    g_answerKeyHeld = false;
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       resetAnswerCompose();
       return;
@@ -503,7 +520,13 @@ void screenPractice() {
   // #4.1): it only happens at the next DOT_PRESS_START, in
   // handleAnswerEvent() above, so idling past 7 dit before Submit never
   // mutates the answer draft on its own.
-  if (g_cursor == PracticeCursor::ANSWER && g_answerPatternLen > 0) {
+  //
+  // Hardware Fix #4.7e: also gated on !g_answerKeyHeld -- see
+  // text_message.cpp's identical check for the full rationale (a held
+  // DASH could otherwise age past letterGapMs() measured from the
+  // PREVIOUS release and get the pending letter wrongly finalized before
+  // the DASH's own release ever arrived).
+  if (g_cursor == PracticeCursor::ANSWER && !g_answerKeyHeld && g_answerPatternLen > 0) {
     if (millis() - g_lastAnswerReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeAnswerChar();
       g_practiceDirty = true;

@@ -284,6 +284,21 @@ constexpr size_t kComposePrefixCap = PacketCodec::kMaxDecodedTextLen * (Morse::k
 char g_composePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_composePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
+// Hardware Fix #4.7e: true from DOT_PRESS_START until the matching
+// DOT_RELEASE -- i.e. the physical DOT/DASH key is currently held down for
+// a symbol that hasn't finished yet. Real-hardware testing found "A" (.-)
+// usually produced "ET" instead: the per-tick IDLE finalizer only measured
+// silence since the last release, with no idea a NEW key press was already
+// in progress, so it could finalize the pending "." into "E" WHILE the
+// following DASH was still being held (its own release hadn't happened
+// yet, so nothing had told the idle check to stop). Gating the idle
+// finalizer on !g_composeKeyHeld makes finalization depend only on the
+// deliberate rules in Fix #4.7d (the physical gap BEFORE a press, or an
+// idle gap with no press in progress) -- never on a coincidence of timing
+// while a key is already down. This is state driven purely by semantic
+// InputEvents (DOT_PRESS_START/DOT_RELEASE) -- it never reads a GPIO pin
+// or any input.cpp/.h internal directly.
+bool g_composeKeyHeld = false;
 Morse::WordGapState g_composeWordGap;
 // True while the pattern currently being keyed (g_composePattern) is known
 // to start a new word -- captured once, at that pattern's FIRST symbol
@@ -306,6 +321,12 @@ void clearDraft() {
   resetComposePattern();
   g_currentPatternStartsNewWord = false;
   Morse::cancelWordGap(&g_composeWordGap);
+  // Hardware Fix #4.7e: clearDraft() is the special-command (>=2000ms
+  // hold) full-draft-clear path, entered from DOT_RELEASE -- reset here
+  // too so no stale "held" state could ever survive a screen re-entry
+  // that calls this on setup (see screenChat()'s Menu::consumeJustEntered()
+  // branch).
+  g_composeKeyHeld = false;
 }
 
 // Called on every DOT_PRESS_START, before the new symbol is accepted into
@@ -787,7 +808,16 @@ void handleComposeEvent(const InputEvent& e) {
     // prosign discards the captured flag below instead of consuming it as
     // a space.
     captureWordBoundaryOnSymbolStart(pressMs);
+    // Hardware Fix #4.7e: mark the key held only after the catch-up
+    // finalize/word-boundary-capture above have used the pre-press state --
+    // the physical gap BEFORE this press is what decides whether the
+    // previous character ended, not whether a key happens to be held.
+    g_composeKeyHeld = true;
   } else if (e.type == InputEventType::DOT_RELEASE) {
+    // Hardware Fix #4.7e: clear held state before any early-return path
+    // below, so it can never remain stuck true after a real release --
+    // special-command, normal DOT/DASH, and delete all go through here.
+    g_composeKeyHeld = false;
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       clearDraft();  // DOT/DASH >=2000ms on compose: clear full draft
       return;
@@ -967,7 +997,18 @@ void screenChat() {
   // #4.1): it only happens at the next DOT_PRESS_START, in
   // handleComposeEvent() above, so idling past 7 dit before pressing Send
   // never mutates compose text on its own.
-  if (g_historyCursor == kNoHistoryCursor && g_composePatternLen > 0) {
+  //
+  // Hardware Fix #4.7e: also gated on !g_composeKeyHeld -- without it, an
+  // intentional DASH held for ~400-500ms at low WPM could itself age past
+  // letterGapMs() measured from the PREVIOUS release, finalizing "." into
+  // "E" while the DASH was still being held, before its own release ever
+  // arrived (observed on hardware as "A" == ".-" producing "ET"). Letter
+  // finalization now only ever happens (a) at DOT_PRESS_START, from the
+  // real physical gap BEFORE that press (Fix #4.7d), or (b) here, while no
+  // DOT/DASH key is currently down -- never merely because silence since
+  // the last release happened to cross the threshold while a new press was
+  // already in progress.
+  if (g_historyCursor == kNoHistoryCursor && !g_composeKeyHeld && g_composePatternLen > 0) {
     if (millis() - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeComposeChar();
       g_chatRenderDirty = true;

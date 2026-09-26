@@ -59,6 +59,18 @@ int16_t g_previewIndex = -1;
 char g_morsePattern[Morse::kMaxPatternLength + 1];
 uint8_t g_morsePatternLen = 0;
 uint32_t g_lastMorseReleaseMs = 0;
+// Hardware Fix #4.7e: true from DOT_PRESS_START until the matching
+// DOT_RELEASE -- see text_message.cpp's identical field for the full
+// rationale (real-hardware "A" == ".-" producing "ET" because tick()'s
+// idle finalizer could fire while the following DASH was still held, with
+// no idea a new symbol press was already in progress). Set/cleared
+// centrally in tick() as each event is popped (see below), before it is
+// dispatched to whichever per-state handler processes it -- this state
+// machine moves between EMPTY/PREVIEW/MORSE/CONFIRM, and a DOT_RELEASE
+// completing an in-progress symbol must clear this regardless of which
+// state ends up handling it, so it can never survive stuck true. Driven
+// purely by semantic InputEvents, never a raw GPIO read.
+bool g_morseKeyHeld = false;
 
 bool g_confirmSaveSelected = true;
 const char* g_errorMessage = nullptr;
@@ -112,11 +124,21 @@ void finalizeMorseChar() {
   appendConfirmedChar(c);
   resetMorsePattern();
   g_state = State::EMPTY;
+  // Note (Hardware Fix #4.7e): deliberately does NOT touch g_morseKeyHeld.
+  // tick() below sets it true for a DOT_PRESS_START BEFORE dispatching to
+  // handleMorse() -- whose catch-up logic can call this very function --
+  // so resetting it here would immediately clobber that press's own held
+  // state back to false while the key is still physically down. Held
+  // state is tracked purely by tick() from the semantic event stream (see
+  // below), independent of finalization.
 }
 
 void cancelWholeEdit() {
   g_finished = true;
   g_result = MixedTextEntryResult::CANCELLED;
+  // Hardware Fix #4.7e: no stale held state should survive a cancelled
+  // edit into whatever screen runs next.
+  g_morseKeyHeld = false;
 }
 
 void handleEmpty(const InputEvent& e) {
@@ -454,6 +476,9 @@ void start(const MixedTextEntryConfig& config, const char* initialValue) {
   g_errorMessage = nullptr;
   g_finished = false;
   g_result = MixedTextEntryResult::NONE;
+  // Hardware Fix #4.7e: no stale "key held" state from a previous editor
+  // session may survive into this new one.
+  g_morseKeyHeld = false;
   g_dirty = true;
   g_needsFullRedraw = true;
   g_lastPrefix[0] = '\0';
@@ -471,6 +496,22 @@ void tick() {
   bool hadEvent = false;
   while (Input::popEvent(e)) {
     hadEvent = true;
+    // Hardware Fix #4.7e: tracks whether the physical DOT/DASH key is
+    // currently held, independent of and BEFORE the per-state dispatch
+    // below -- this widget moves between EMPTY/PREVIEW/MORSE/CONFIRM, and
+    // a DOT_RELEASE completing an in-progress symbol must clear this
+    // regardless of which state ends up handling the event, so it can
+    // never survive stuck true. Setting it true here, before handleMorse()
+    // runs its own DOT_PRESS_START catch-up finalization, is safe and
+    // explicitly permitted: that catch-up logic decides purely from the
+    // physical timestamp gap and pattern length, never from this flag, so
+    // setting held first does not prevent or alter the catch-up
+    // calculation itself.
+    if (e.type == InputEventType::DOT_PRESS_START) {
+      g_morseKeyHeld = true;
+    } else if (e.type == InputEventType::DOT_RELEASE) {
+      g_morseKeyHeld = false;
+    }
     switch (g_state) {
       case State::EMPTY:
         handleEmpty(e);
@@ -491,7 +532,17 @@ void tick() {
   // entirely, so a coarse "any event -> dirty" is correct, not just cheap.
   if (hadEvent) g_dirty = true;
 
-  if (g_state == State::MORSE && g_morsePatternLen > 0) {
+  // Hardware Fix #4.7e: also gated on !g_morseKeyHeld -- without it, an
+  // intentional DASH held for ~400-500ms at low WPM (starting the second
+  // symbol of a multi-symbol letter, e.g. "A" == .-) could itself age past
+  // letterGapMs() measured from the previous release and get the pending
+  // symbol wrongly finalized while that DASH was still being held, before
+  // its own DOT_RELEASE ever arrived (observed on hardware as "A"
+  // producing "ET"). g_morsePatternLen stays > 0 across a multi-symbol
+  // letter's own symbols (it is only reset by finalizeMorseChar() or a
+  // delete prosign), so this state machine is exposed to exactly the same
+  // hazard the compose/answer idle finalizers were.
+  if (g_state == State::MORSE && !g_morseKeyHeld && g_morsePatternLen > 0) {
     uint32_t now = millis();
     if (now - g_lastMorseReleaseMs >= Morse::letterGapMs(Settings::getWpm())) {
       finalizeMorseChar();
