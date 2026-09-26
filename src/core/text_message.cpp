@@ -387,29 +387,41 @@ constexpr size_t kHistoryLineBufCap = PacketCodec::kMaxDecodedTextLen * (Morse::
 // back to a small static "?" placeholder -- the same one already used for
 // an unloadable message -- if the pool has no memory to give it, rather
 // than ever handing any caller a null or dangling lineBuf pointer.
+// Hardware Fix #4.7: two width regimes per message instead of one. TRUE
+// ROW 0 (the compact cursor cell + optional icon cell + CYAN sender
+// prefix + WHITE body) is narrower than every row after it, which drops
+// the icon/sender entirely and starts right after the compact cursor
+// cell (continuationX == labelX), recovering almost the full screen
+// width instead of staying indented under the sender name. Every
+// consumer of a message's row layout (row counting, viewport placement,
+// focused-row stepping, historyRowY(), and actual drawing) reads these
+// same four fields off one HistoryRowInfo, so they can never disagree.
 struct HistoryRowInfo {
   const char* lineBuf;  // points into the Slot::B scratch buffer (or a static fallback); valid until the next loadHistoryRow() call
   char senderPrefix[24];
   MessageIconKind icon;
-  int16_t bodyX;
-  int16_t bodyWidth;
+  int16_t firstBodyX;
+  int16_t firstBodyWidth;
+  int16_t continuationX;
+  int16_t continuationWidth;
 };
 
 // Loads history entry `index` and computes where its body text wraps.
-// `labelX` is the fixed icon-cell X already used by every history row
-// (2 + the "> " selection-marker width); continuation rows align under
-// the message body (bodyX), not the icon or sender name.
+// `labelX` is the fixed compact-cursor-cell-relative icon-cell X already
+// used by every history row's TRUE first row (2 + Display::kCursorCellWidth).
 void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
+  out->continuationX = labelX;
+  out->continuationWidth = static_cast<int16_t>(Display::kScreenWidth - out->continuationX);
   char* scratch = UiScratch::ensure(UiScratch::Slot::B, kHistoryLineBufCap);
   if (scratch == nullptr) {
     // Never dereference a failed allocation (Hardware Fix #4.4b) -- degrade
     // to the existing "message failed to load" placeholder instead.
     out->lineBuf = "?";
     int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-    out->bodyX = textX;
-    out->bodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->bodyX);
+    out->firstBodyX = textX;
+    out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
     return;
   }
   out->lineBuf = scratch;
@@ -428,8 +440,8 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
     }
   }
   int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-  out->bodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
-  out->bodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->bodyX);
+  out->firstBodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
+  out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
 }
 
 // Streams through an already-loaded message's wrapped rows via
@@ -441,11 +453,13 @@ uint16_t countHistoryRows(const HistoryRowInfo& info) {
   if (len == 0) return 1;
   uint16_t rows = 0;
   size_t pos = 0;
+  int16_t width = info.firstBodyWidth;
   while (pos < len) {
     uint16_t s, l;
-    if (!Display::wrapLineAt(info.lineBuf, pos, info.bodyWidth, &s, &l)) break;
+    if (!Display::wrapLineAt(info.lineBuf, pos, width, &s, &l)) break;
     pos = static_cast<size_t>(s) + l;
     rows++;
+    width = info.continuationWidth;  // row 0 wraps at firstBodyWidth; every row after at continuationWidth
   }
   return (rows > 0) ? rows : 1;
 }
@@ -878,8 +892,7 @@ void screenChat() {
       // own rows (g_historyRowOffset) before moving to the next/previous
       // logical message -- identical to enigma.cpp's ENCODER_ROTATE
       // handler (Hardware Fix #4.3a issue 1).
-      int16_t rotMarkerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-      int16_t rotLabelX = static_cast<int16_t>(2 + rotMarkerW);
+      int16_t rotLabelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);
       if (g_historyCursor == kNoHistoryCursor) {
         if (e.value < 0 && g_indexTotal > 0) {
           g_historyCursor = static_cast<uint16_t>(g_indexTotal - 1);
@@ -959,9 +972,12 @@ void screenChat() {
     return;
   }
 
-  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-  int16_t labelX = static_cast<int16_t>(2 + markerW);            // history icon-cell X
-  int16_t composePrefixX = labelX;                                // compose shares the same left margin
+  // Hardware Fix #4.7: compact cursor cell (Display::kCursorCellWidth)
+  // instead of the old PRIMARY-font ">" glyph + padding, on both history
+  // and compose -- compose has no sender prefix, so its text starts right
+  // after this same cell (Part G).
+  int16_t labelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // history icon-cell X
+  int16_t composePrefixX = labelX;                                       // compose shares the same left margin
   int16_t composeWidth = static_cast<int16_t>(Display::kScreenWidth - composePrefixX);
 
   // Compose text (Hardware Fix #4.4 issue B): word-wrapped by real pixel
@@ -1031,27 +1047,32 @@ void screenChat() {
       size_t pos = 0;
       uint16_t rowIdx = 0;
       while (rowsDrawn < viewportLines) {
+        int16_t rowWidth = (rowIdx == 0) ? info.firstBodyWidth : info.continuationWidth;
         uint16_t s = 0, l = 0;
-        bool has = (len == 0) ? (rowIdx == 0) : Display::wrapLineAt(info.lineBuf, pos, info.bodyWidth, &s, &l);
+        bool has = (len == 0) ? (rowIdx == 0) : Display::wrapLineAt(info.lineBuf, pos, rowWidth, &s, &l);
         if (!has) break;
         if (rowIdx >= rowSkip) {
+          int16_t rowBodyX = (rowIdx == 0) ? info.firstBodyX : info.continuationX;
           if (rowIdx == 0) {
-            // Icon cell + sender name appear on the message's true FIRST
-            // row only; continuation rows start at the body X position.
+            // Icon cell + CYAN sender name appear on the message's true
+            // FIRST row only; continuation rows start right after the
+            // compact cursor cell, with no icon/sender indentation
+            // (Hardware Fix #4.7 Part E).
             drawRowIcon(labelX, y, info.icon);
             int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-            Display::printLine(textX, y, info.senderPrefix);
+            Display::printLineColored(textX, y, info.senderPrefix, ST77XX_CYAN);
           }
           // The marker sits on the exact focused row (g_historyRowOffset),
           // which computeHistoryViewport() always keeps inside the drawn
-          // range for the selected message.
-          if (i == g_historyCursor && rowIdx == g_historyRowOffset) Display::printLine(2, y, ">");
+          // range for the selected message. May land on a continuation
+          // row while scrolling through a stored message -- intentional.
+          if (i == g_historyCursor && rowIdx == g_historyRowOffset) Display::drawSelectionCursor(2, y);
           char lineChunk[Display::kPrintLineBufferSize];
           size_t clen = l;
           if (clen > Display::kPrintLineMaxChars) clen = Display::kPrintLineMaxChars;
           memcpy(lineChunk, info.lineBuf + s, clen);
           lineChunk[clen] = '\0';
-          Display::printLine(info.bodyX, y, lineChunk);
+          Display::printLine(rowBodyX, y, lineChunk);
           y = static_cast<int16_t>(y + lh);
           rowsDrawn++;
         }
@@ -1068,12 +1089,12 @@ void screenChat() {
     if (g_chatLastCursor != kNoHistoryCursor) {
       int16_t oldY =
           historyRowY(startIdx, startRowSkip, g_chatLastCursor, g_chatLastRowOffset, labelX, contentTop, lh);
-      Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+      Display::tft().fillRect(2, oldY, Display::kCursorCellWidth, lh, ST77XX_BLACK);
     }
     if (g_historyCursor != kNoHistoryCursor) {
       int16_t newY = historyRowY(startIdx, startRowSkip, g_historyCursor, g_historyRowOffset, labelX, contentTop, lh);
-      Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
-      Display::printLine(2, newY, ">");
+      Display::tft().fillRect(2, newY, Display::kCursorCellWidth, lh, ST77XX_BLACK);
+      Display::drawSelectionCursor(2, newY);
     }
   }
 
@@ -1095,7 +1116,11 @@ void screenChat() {
       char rowText[64];
       composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
-      if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
+      // Hardware Fix #4.7 Part F: the cursor belongs to LOGICAL compose row
+      // 0 (rowIdx == 0), never merely the first VISIBLE row (shownRow == 0)
+      // -- when skippedComposeRows > 0, logical row 0 has scrolled off and
+      // no shown row gets a cursor at all.
+      if (rowIdx == 0 && composeFocused) Display::drawSelectionCursor(2, y);
       Display::printLine(composePrefixX, y, rowText);
       strncpy(g_chatLastComposeRowText[shownRow], rowText, sizeof(g_chatLastComposeRowText[shownRow]) - 1);
       g_chatLastComposeRowText[shownRow][sizeof(g_chatLastComposeRowText[shownRow]) - 1] = '\0';
@@ -1107,16 +1132,16 @@ void screenChat() {
       composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       bool textChanged = strcmp(rowText, g_chatLastComposeRowText[shownRow]) != 0;
-      bool markerNeedsRedraw = (shownRow == 0) && composeFocusChanged;
+      bool markerNeedsRedraw = (rowIdx == 0) && composeFocusChanged;
       if (textChanged) {
         Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
-        if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
+        if (rowIdx == 0 && composeFocused) Display::drawSelectionCursor(2, y);
         Display::printLine(composePrefixX, y, rowText);
         strncpy(g_chatLastComposeRowText[shownRow], rowText, sizeof(g_chatLastComposeRowText[shownRow]) - 1);
         g_chatLastComposeRowText[shownRow][sizeof(g_chatLastComposeRowText[shownRow]) - 1] = '\0';
       } else if (markerNeedsRedraw) {
-        Display::tft().fillRect(2, y, markerW, lh, ST77XX_BLACK);
-        Display::printLine(2, y, composeFocused ? ">" : " ");
+        Display::tft().fillRect(2, y, Display::kCursorCellWidth, lh, ST77XX_BLACK);
+        if (composeFocused) Display::drawSelectionCursor(2, y);
       }
     }
   }

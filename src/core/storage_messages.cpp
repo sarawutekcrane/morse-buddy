@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "core/identity.h"
+#include "core/settings.h"
+
 namespace MessageStore {
 
 namespace {
@@ -638,7 +641,20 @@ bool isDuplicateAndRecord(const char* group_code, const char* contact_key, const
 }
 
 void buildSenderPrefix(const PacketCodec::MessageEnvelope& env, char* out, size_t outSize) {
-  const char* name = (env.sender_name_cache[0] != '\0') ? env.sender_name_cache : env.sender_device_id;
+  const char* name;
+  if (strcmp(env.sender_device_id, Identity::deviceId()) == 0) {
+    // Our own device (Hardware Fix #4.7): never trust a historical
+    // sender_name_cache for the local device -- an old stored record may
+    // still carry a name we no longer use (including the compiled "Me"
+    // placeholder pre-4.7 devices used to cache), while the CURRENT
+    // configured name is the only one that should ever be shown for
+    // messages we sent, without rewriting the stored record itself.
+    name = Settings::hasCustomMyName() ? Settings::getMyName() : Identity::deviceId();
+  } else {
+    // Other devices: unchanged -- prefer the cached display name, falling
+    // back to the raw device id when the cache is empty.
+    name = (env.sender_name_cache[0] != '\0') ? env.sender_name_cache : env.sender_device_id;
+  }
   snprintf(out, outSize, "%s: ", name);
 }
 

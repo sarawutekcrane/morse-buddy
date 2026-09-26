@@ -42,6 +42,14 @@ void setup() {
     // Cancelling/failing falls back to Main Menu Offline (Phase 1 section 6).
     Menu::pushScreen(Settings::screenWifiSlots);
   }
+  if (!Settings::hasCustomMyName()) {
+    // Hardware Fix #4.7: a device with no valid 1..kMaxMyNameLen character
+    // name is not usable yet -- push this LAST so it ends up top-most,
+    // above WiFi setup if that was also pushed (required boot priority:
+    // 1. mandatory name, 2. WiFi setup if missing, 3. Main Menu). Unlike
+    // WiFi setup, this screen cannot be cancelled past; see screenSetName().
+    Menu::pushScreen(Settings::screenSetName);
+  }
 
   // Later phases register their own background services (WiFi/MQTT/NTP in
   // Phase 2, tone/audio in Phase 3, Radio/Race in Phase 4) from their own

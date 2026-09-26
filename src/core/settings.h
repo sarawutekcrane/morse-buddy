@@ -30,15 +30,26 @@ enum class TypingDisplay : uint8_t { MORSE_ONLY = 0, LETTERS_ONLY = 1, MIXED = 2
 void init();
 
 // ---- My Name -------------------------------------------------------------
+// Single canonical maximum for the user's chosen name, shared by every UI
+// site (Set Name, My Name editor, compact conversation layout) so they can
+// never disagree (Hardware Fix #4.7). A valid configured name is 1..
+// kMaxMyNameLen characters -- there is no compiled "Me"/default placeholder.
+constexpr uint8_t kMaxMyNameLen = 4;
+
+// Empty ("") until a valid name has been configured. Never returns a
+// placeholder.
 const char* getMyName();
+// name must already be 1..kMaxMyNameLen characters (MixedTextEntry
+// enforces this while typing); persists to NVS key "myName".
 void setMyName(const char* name);
-// True once the user has actually chosen a name (setMyName() was called, or
-// NVS already had one from a previous session) -- false while getMyName()
-// is still returning the compiled "Me" placeholder for a never-configured
-// device. Callers that present this device's name to OTHER people (a
-// message sender label, a contact's resolved display name) check this
-// first so an unset device is never shown as if "Me" were its real chosen
-// name (Hardware Fix #4.3 issue F).
+// True once a VALID (1..kMaxMyNameLen character) user-selected name
+// exists, whether just set this session or loaded from NVS. False for a
+// never-configured device AND for a legacy NVS value longer than
+// kMaxMyNameLen (Hardware Fix #4.7 migration rule) -- both cases require
+// screenSetName() before normal use. Callers that present this device's
+// name to OTHER people (a message sender label, a contact's resolved
+// display name) check this first so an unconfigured device is never shown
+// under a fabricated name (Hardware Fix #4.3 issue F).
 bool hasCustomMyName();
 
 // ---- Display & Sound -------------------------------------------------------
@@ -93,5 +104,11 @@ void screenRoot();          // Settings root list
 void screenWifiSlots();     // Connectivity > WiFi
 void screenFamilyGroups();  // Connectivity > Family Groups
 void screenTrainingGame();  // Main Menu > Training Game
+// Mandatory first-run name entry (Hardware Fix #4.7). Pushed from main.cpp
+// when !hasCustomMyName() so it sits on top of the startup stack; a
+// CANCELLED MixedTextEntry session re-enters itself instead of going back,
+// so there is no way to reach whatever screen is underneath (WiFi setup or
+// Main Menu) without saving a valid name first.
+void screenSetName();
 
 }  // namespace Settings

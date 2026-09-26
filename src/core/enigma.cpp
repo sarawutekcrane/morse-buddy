@@ -998,24 +998,34 @@ constexpr size_t kHistoryLineBufCap = 251;
 // so a message's visual row count is bounded only by its own text length
 // (already capped at kHistoryLineBufCap by the source data itself), never
 // by an unrelated guessed array size.
+// Hardware Fix #4.7: two width regimes per message instead of one. TRUE
+// ROW 0 (compact cursor cell + icon cell + CYAN sender prefix + WHITE
+// body) is narrower than every row after it, which drops the icon/sender
+// entirely and starts right after the compact cursor cell
+// (continuationX == labelX). Every consumer of a message's row layout
+// (row counting, viewport placement, focused-row stepping, historyRowY(),
+// and actual drawing) reads these same four fields off one
+// HistoryRowInfo, so they can never disagree.
 struct HistoryRowInfo {
   char lineBuf[kHistoryLineBufCap];
   char senderPrefix[24];
   MessageIconKind icon;
-  int16_t bodyX;
-  int16_t bodyWidth;
+  int16_t firstBodyX;
+  int16_t firstBodyWidth;
+  int16_t continuationX;
+  int16_t continuationWidth;
 };
 
 // Loads history entry `index` and computes where its body text wraps.
-// `labelX` is the fixed icon-cell X already used by every history row
-// (2 + the "> " selection-marker width); continuation rows align under
-// the message body (bodyX), not the icon or sender name, matching the
-// canonical layout from the task spec.
+// `labelX` is the fixed compact-cursor-cell-relative icon-cell X already
+// used by every history row's TRUE first row (2 + Display::kCursorCellWidth).
 void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   out->lineBuf[0] = '?';
   out->lineBuf[1] = '\0';
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
+  out->continuationX = labelX;
+  out->continuationWidth = static_cast<int16_t>(Display::kScreenWidth - out->continuationX);
   const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(index);
   if (entry != nullptr) {
     MessageRef ref = refForIndexEntry(*entry);
@@ -1029,8 +1039,8 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
     }
   }
   int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-  out->bodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
-  out->bodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->bodyX);
+  out->firstBodyX = static_cast<int16_t>(textX + Display::textWidth(out->senderPrefix));
+  out->firstBodyWidth = static_cast<int16_t>(Display::kScreenWidth - out->firstBodyX);
 }
 
 // Streams through an already-loaded message's wrapped rows via
@@ -1042,11 +1052,13 @@ uint16_t countHistoryRows(const HistoryRowInfo& info) {
   if (len == 0) return 1;
   uint16_t rows = 0;
   size_t pos = 0;
+  int16_t width = info.firstBodyWidth;
   while (pos < len) {
     uint16_t s, l;
-    if (!Display::wrapLineAt(info.lineBuf, pos, info.bodyWidth, &s, &l)) break;
+    if (!Display::wrapLineAt(info.lineBuf, pos, width, &s, &l)) break;
     pos = static_cast<size_t>(s) + l;
     rows++;
+    width = info.continuationWidth;  // row 0 wraps at firstBodyWidth; every row after at continuationWidth
   }
   return (rows > 0) ? rows : 1;
 }
@@ -1547,8 +1559,7 @@ void screenEnigmaChat() {
       // message the whole time a multi-row message is being read, and
       // every one of its rows becomes reachable this way, never just the
       // first few.
-      int16_t rotMarkerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-      int16_t rotLabelX = static_cast<int16_t>(2 + rotMarkerW);
+      int16_t rotLabelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);
       if (g_historyCursor == kNoHistoryCursor) {
         if (e.value < 0 && g_indexTotal > 0) {
           g_historyCursor = static_cast<uint16_t>(g_indexTotal - 1);
@@ -1624,9 +1635,12 @@ void screenEnigmaChat() {
     return;
   }
 
-  int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
-  int16_t labelX = static_cast<int16_t>(2 + markerW);            // history icon-cell X
-  int16_t composePrefixX = labelX;                                // compose shares the same left margin
+  // Hardware Fix #4.7: compact cursor cell (Display::kCursorCellWidth)
+  // instead of the old PRIMARY-font ">" glyph + padding, on both history
+  // and compose -- compose has no sender prefix, so its text starts right
+  // after this same cell (Part G).
+  int16_t labelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // history icon-cell X
+  int16_t composePrefixX = labelX;                                       // compose shares the same left margin
   int16_t composeWidth = static_cast<int16_t>(Display::kScreenWidth - composePrefixX);
 
   // Compose text (Hardware Fix #4.3 issue E): word-wrapped by real pixel
@@ -1698,23 +1712,27 @@ void screenEnigmaChat() {
       size_t pos = 0;
       uint16_t rowIdx = 0;
       while (rowsDrawn < viewportLines) {
+        int16_t rowWidth = (rowIdx == 0) ? info.firstBodyWidth : info.continuationWidth;
         uint16_t s = 0, l = 0;
-        bool has = (len == 0) ? (rowIdx == 0) : Display::wrapLineAt(info.lineBuf, pos, info.bodyWidth, &s, &l);
+        bool has = (len == 0) ? (rowIdx == 0) : Display::wrapLineAt(info.lineBuf, pos, rowWidth, &s, &l);
         if (!has) break;
         if (rowIdx >= rowSkip) {
+          int16_t rowBodyX = (rowIdx == 0) ? info.firstBodyX : info.continuationX;
           if (rowIdx == 0) {
-            // Icon cell + sender name appear on the message's true FIRST
-            // row only; continuation rows start at the body X position
-            // (Hardware Fix #4 issues 2/5, extended for issue E/4.3a).
+            // Icon cell + CYAN sender name appear on the message's true
+            // FIRST row only; continuation rows start right after the
+            // compact cursor cell, with no icon/sender indentation
+            // (Hardware Fix #4 issues 2/5, extended for issue E/4.3a,
+            // Hardware Fix #4.7 Part E).
             drawRowIcon(labelX, y, info.icon);
             int16_t textX = static_cast<int16_t>(labelX + Display::kLockIconCellWidth);
-            Display::printLine(textX, y, info.senderPrefix);
+            Display::printLineColored(textX, y, info.senderPrefix, ST77XX_CYAN);
           }
           // The marker sits on the exact focused row (g_historyRowOffset),
           // which computeHistoryViewport() always keeps inside the drawn
           // range for the selected message -- it may be a continuation row
           // when that message's true row 0 has been scrolled off.
-          if (i == g_historyCursor && rowIdx == g_historyRowOffset) Display::printLine(2, y, ">");
+          if (i == g_historyCursor && rowIdx == g_historyRowOffset) Display::drawSelectionCursor(2, y);
           // Hardware Fix #4.4 issue F: Display::wrapLineAt() guarantees
           // l <= kPrintLineMaxChars for any span it returns, so this clamp
           // can never actually trigger -- kept only as defense-in-depth,
@@ -1724,7 +1742,7 @@ void screenEnigmaChat() {
           if (clen > Display::kPrintLineMaxChars) clen = Display::kPrintLineMaxChars;
           memcpy(lineChunk, info.lineBuf + s, clen);
           lineChunk[clen] = '\0';
-          Display::printLine(info.bodyX, y, lineChunk);
+          Display::printLine(rowBodyX, y, lineChunk);
           y = static_cast<int16_t>(y + lh);
           rowsDrawn++;
         }
@@ -1742,12 +1760,12 @@ void screenEnigmaChat() {
     if (g_enigmaChatLastCursor != kNoHistoryCursor) {
       int16_t oldY = historyRowY(startIdx, startRowSkip, g_enigmaChatLastCursor, g_enigmaChatLastRowOffset, labelX,
                                  contentTop, lh);
-      Display::tft().fillRect(2, oldY, markerW, lh, ST77XX_BLACK);
+      Display::tft().fillRect(2, oldY, Display::kCursorCellWidth, lh, ST77XX_BLACK);
     }
     if (g_historyCursor != kNoHistoryCursor) {
       int16_t newY = historyRowY(startIdx, startRowSkip, g_historyCursor, g_historyRowOffset, labelX, contentTop, lh);
-      Display::tft().fillRect(2, newY, markerW, lh, ST77XX_BLACK);
-      Display::printLine(2, newY, ">");
+      Display::tft().fillRect(2, newY, Display::kCursorCellWidth, lh, ST77XX_BLACK);
+      Display::drawSelectionCursor(2, newY);
     }
   }
 
@@ -1785,7 +1803,11 @@ void screenEnigmaChat() {
       char rowText[64];
       composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
-      if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
+      // Hardware Fix #4.7 Part F: the cursor belongs to LOGICAL compose row
+      // 0 (rowIdx == 0), never merely the first VISIBLE row (shownRow == 0)
+      // -- when skippedComposeRows > 0, logical row 0 has scrolled off and
+      // no shown row gets a cursor at all.
+      if (rowIdx == 0 && composeFocused) Display::drawSelectionCursor(2, y);
       Display::printLine(composePrefixX, y, rowText);
       strncpy(g_enigmaChatLastComposeRowText[shownRow], rowText, sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1);
       g_enigmaChatLastComposeRowText[shownRow][sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1] = '\0';
@@ -1797,16 +1819,16 @@ void screenEnigmaChat() {
       composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       bool textChanged = strcmp(rowText, g_enigmaChatLastComposeRowText[shownRow]) != 0;
-      bool markerNeedsRedraw = (shownRow == 0) && composeFocusChanged;
+      bool markerNeedsRedraw = (rowIdx == 0) && composeFocusChanged;
       if (textChanged) {
         Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
-        if (shownRow == 0) Display::printLine(2, y, composeFocused ? ">" : " ");
+        if (rowIdx == 0 && composeFocused) Display::drawSelectionCursor(2, y);
         Display::printLine(composePrefixX, y, rowText);
         strncpy(g_enigmaChatLastComposeRowText[shownRow], rowText, sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1);
         g_enigmaChatLastComposeRowText[shownRow][sizeof(g_enigmaChatLastComposeRowText[shownRow]) - 1] = '\0';
       } else if (markerNeedsRedraw) {
-        Display::tft().fillRect(2, y, markerW, lh, ST77XX_BLACK);
-        Display::printLine(2, y, composeFocused ? ">" : " ");
+        Display::tft().fillRect(2, y, Display::kCursorCellWidth, lh, ST77XX_BLACK);
+        if (composeFocused) Display::drawSelectionCursor(2, y);
       }
     }
   }

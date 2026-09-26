@@ -181,6 +181,12 @@ void printLine(int16_t x, int16_t topY, const char* text) {
   g_tft.print(buf);
 }
 
+void printLineColored(int16_t x, int16_t topY, const char* text, uint16_t color565) {
+  g_tft.setTextColor(color565);
+  printLine(x, topY, text);
+  g_tft.setTextColor(ST77XX_WHITE);
+}
+
 bool wrapLineAt(const char* text, size_t from, int16_t maxWidthPx, uint16_t* outStart, uint16_t* outLen) {
   if (text == nullptr || maxWidthPx <= 0) return false;
   size_t len = strlen(text);
@@ -282,6 +288,13 @@ void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565) {
   int16_t shackleY = y;
   g_tft.drawRoundRect(shackleX, shackleY, kShackleW, kShackleH, 2, color565);
   g_tft.fillRoundRect(bodyX, bodyY, kBodyW, kBodyH, 1, color565);
+}
+
+void drawSelectionCursor(int16_t x, int16_t rowTop) {
+  int16_t centerY = static_cast<int16_t>(rowTop + lineHeight() / 2);
+  constexpr int16_t kHalfHeight = kCursorTriangleHeight / 2;  // 3: apex-to-base half-span
+  g_tft.fillTriangle(x, static_cast<int16_t>(centerY - kHalfHeight), x, static_cast<int16_t>(centerY + kHalfHeight),
+                     static_cast<int16_t>(x + kCursorTriangleWidth), centerY, ST77XX_RED);
 }
 
 }  // namespace Display

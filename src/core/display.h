@@ -79,6 +79,12 @@ constexpr size_t kPrintLineMaxChars = kPrintLineBufferSize - 1;
 // actually be drawn (see kPrintLineMaxChars above).
 void printLine(int16_t x, int16_t topY, const char* text);
 
+// Same as printLine(), but prints in `color565` and then immediately
+// restores ST77XX_WHITE, so callers never need to track/restore text
+// color themselves (Hardware Fix #4.7: e.g. a CYAN sender-name prefix
+// immediately followed by WHITE message body drawn via plain printLine()).
+void printLineColored(int16_t x, int16_t topY, const char* text, uint16_t color565);
+
 // Pixel width `text` would occupy in the currently active font -- for
 // screens that need to right-align or fit-check before drawing.
 int16_t textWidth(const char* text);
@@ -93,6 +99,23 @@ int16_t textWidth(const char* text);
 constexpr int16_t kLockIconCellWidth = 12;
 constexpr int16_t kLockIconCellHeight = 12;
 void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
+
+// Compact selection/focus cursor for space-constrained conversation UI
+// (Hardware Fix #4.7): a small solid RED right-pointing triangle primitive
+// instead of the PRIMARY-font ">" glyph, so the Text/Enigma/Friend Unified
+// Thread history and compose rows can recover most of the width the old
+// glyph+padding cell wasted. This is NOT a general menu-cursor replacement
+// -- ordinary ListMenu screens keep their existing "> " marker.
+constexpr int16_t kCursorCellWidth = 6;      // fixed horizontal budget callers reserve for this cursor's cell
+constexpr int16_t kCursorTriangleWidth = 4;  // point-to-base width
+constexpr int16_t kCursorTriangleHeight = 7; // base height
+
+// Draws the triangle with its leftmost (base) edge at x, vertically
+// centered within the PRIMARY text row that starts at rowTop (using the
+// currently active font's lineHeight()). Pure TFT-primitive drawing --
+// never touches text color/font state, so it's safe to call between any
+// printLine()/printLineColored() calls with nothing to restore afterward.
+void drawSelectionCursor(int16_t x, int16_t rowTop);
 
 // Greedy word-wrap of `text` into visual lines that each fit within
 // `maxWidthPx` in the currently active font (Hardware Fix #4.3 issue E).

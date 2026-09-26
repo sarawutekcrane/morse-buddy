@@ -24,7 +24,7 @@ Settings::WifiSlot g_wifiSlots[Settings::kMaxWifiSlots];
 Settings::FamilyGroup g_groups[Settings::kMaxGroups];
 uint8_t g_groupCount = 0;
 
-char g_myName[17] = "Me";
+char g_myName[Settings::kMaxMyNameLen + 1] = "";
 bool g_hasCustomMyName = false;
 uint8_t g_brightness = 100;
 uint8_t g_speakerVolume = 80;
@@ -70,13 +70,24 @@ void init() {
   g_wpm = p.isKey("wpm") ? p.getUChar("wpm") : 15;
   g_sleepTimeoutMinutes = p.isKey("sleepMin") ? p.getUChar("sleepMin") : 5;
   g_practiceLevel = p.isKey("practLvl") ? p.getUChar("practLvl") : 1;
+  // Hardware Fix #4.7 migration rule: a stored "myName" only counts as
+  // configured if its length is exactly 1..kMaxMyNameLen. A never-
+  // configured device (no key) and a legacy value longer than
+  // kMaxMyNameLen (from before this fix, when up to 16 chars were
+  // allowed) are both treated as NOT configured -- forcing screenSetName()
+  // -- without truncating or overwriting whatever is still in NVS. Reading
+  // via the String overload first (rather than getString(key, buf, len))
+  // is required so a too-long legacy value's TRUE length is seen instead
+  // of being silently clipped to fit g_myName's small buffer.
+  g_myName[0] = '\0';
+  g_hasCustomMyName = false;
   if (p.isKey("myName")) {
-    p.getString("myName", g_myName, sizeof(g_myName));
-    g_hasCustomMyName = true;
-  } else {
-    strncpy(g_myName, "Me", sizeof(g_myName) - 1);
-    g_myName[sizeof(g_myName) - 1] = '\0';
-    g_hasCustomMyName = false;
+    String stored = p.getString("myName", "");
+    if (stored.length() >= 1 && stored.length() <= Settings::kMaxMyNameLen) {
+      strncpy(g_myName, stored.c_str(), sizeof(g_myName) - 1);
+      g_myName[sizeof(g_myName) - 1] = '\0';
+      g_hasCustomMyName = true;
+    }
   }
 
   loadWifiSlots();
@@ -476,7 +487,8 @@ void screenSpeedPower() {
 // ---- My Name ----------------------------------------------------------------
 void screenEditMyName() {
   if (Menu::consumeJustEntered()) {
-    static const MixedTextEntryConfig cfg = {"My Name", FieldCharset::GENERAL_NAME, 16, 1, nullptr};
+    static const MixedTextEntryConfig cfg = {"My Name", FieldCharset::GENERAL_NAME, Settings::kMaxMyNameLen, 1,
+                                              nullptr};
     MixedTextEntry::start(cfg, Settings::getMyName());
   }
   MixedTextEntry::tick();
@@ -983,5 +995,32 @@ void screenTrainingGame() {
 }
 
 void registerMorsePracticeStartHandler(ScreenHandlerFn fn) { g_morsePracticeStartHandler = fn; }
+
+// Hardware Fix #4.7: mandatory first-run name entry. Reuses the same
+// MixedTextEntry infrastructure and GENERAL_NAME charset as the regular
+// "My Name" editor above, but is pushed from main.cpp before Main Menu is
+// ever reachable, and a CANCELLED session re-enters itself instead of
+// calling Menu::goBack() -- so there is no gesture that exposes whatever
+// screen is underneath (WiFi setup or Main Menu) without saving a valid
+// 1..kMaxMyNameLen character name first.
+void screenSetName() {
+  static const MixedTextEntryConfig cfg = {"Set Name", FieldCharset::GENERAL_NAME, kMaxMyNameLen, 1, nullptr};
+  if (Menu::consumeJustEntered()) {
+    MixedTextEntry::start(cfg, "");
+  }
+  MixedTextEntry::tick();
+  if (MixedTextEntry::isFinished()) {
+    if (MixedTextEntry::result() == MixedTextEntryResult::SAVED) {
+      setMyName(MixedTextEntry::getValue());
+      SettingsChangeInfo info{SET_MY_NAME_CHANGED, 0, {0}};
+      fireSettingsChangeHooks(info);
+      Menu::goBack();
+    } else {
+      // Mandatory screen: cancellation must not reveal whatever is
+      // beneath it on the navigation stack.
+      MixedTextEntry::start(cfg, "");
+    }
+  }
+}
 
 }  // namespace Settings
