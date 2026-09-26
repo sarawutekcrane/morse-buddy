@@ -315,10 +315,15 @@ void clearDraft() {
 // character (e.g. W = .--) must never re-resolve or overwrite this flag,
 // or the boundary decision would be lost partway through composing the
 // letter. Never mutates compose text itself -- see finalizeComposeChar().
-void captureWordBoundaryOnSymbolStart() {
+//
+// Hardware Fix #4.7d: takes the physical DOT_PRESS_START event timestamp
+// (pressMs) instead of reading millis() itself, so the word-boundary
+// decision reflects the user's real key rhythm rather than whenever the
+// main loop got around to processing this event.
+void captureWordBoundaryOnSymbolStart(uint32_t pressMs) {
   if (g_composePatternLen != 0) return;
   g_currentPatternStartsNewWord =
-      Morse::consumeWordBoundaryOnSymbolStart(&g_composeWordGap, Settings::getWpm(), millis());
+      Morse::consumeWordBoundaryOnSymbolStart(&g_composeWordGap, Settings::getWpm(), pressMs);
 }
 
 MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
@@ -759,12 +764,29 @@ void buildComposePrefixSuffix(char* prefix, size_t prefixSize, char* suffix, siz
 
 void handleComposeEvent(const InputEvent& e) {
   if (e.type == InputEventType::DOT_PRESS_START) {
+    // Hardware Fix #4.7d Parts A-C: use the physical accepted press time,
+    // not whenever this event happens to be processed.
+    uint32_t pressMs = e.eventMs != 0 ? e.eventMs : millis();
+    // Catch-up finalization: Fix #4.7b's reliable edge capture means a
+    // busy main loop can now drain "release old letter / >=3dit physical
+    // gap / press new letter" all in one tick -- the old idle check only
+    // ran AFTER the whole event-drain loop, so the previous letter would
+    // still be sitting in g_composePattern when this new symbol arrived,
+    // merging two genuinely separate physical letters into one. Finalize
+    // the pending letter here, using the real physical gap, BEFORE this
+    // new symbol is accepted -- and BEFORE capturing the word boundary
+    // below, since finalizeComposeChar() arms the word-gap timer from the
+    // previous letter's real release time, which this new pressMs must be
+    // compared against.
+    if (g_composePatternLen > 0 && (pressMs - g_lastMorseReleaseMs) >= Morse::letterGapMs(Settings::getWpm())) {
+      finalizeComposeChar();
+    }
     // Only captures whether this new pattern starts a new word (Hardware
     // Fix #4.2) -- never mutates compose text itself. The space (if any)
     // is committed later, only at NORMAL letter finalization; a delete
     // prosign discards the captured flag below instead of consuming it as
     // a space.
-    captureWordBoundaryOnSymbolStart();
+    captureWordBoundaryOnSymbolStart(pressMs);
   } else if (e.type == InputEventType::DOT_RELEASE) {
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       clearDraft();  // DOT/DASH >=2000ms on compose: clear full draft
@@ -775,7 +797,10 @@ void handleComposeEvent(const InputEvent& e) {
       g_composePattern[g_composePatternLen++] = (sc == Morse::SymbolClass::DOT) ? '.' : '-';
       g_composePattern[g_composePatternLen] = '\0';
     }
-    g_lastMorseReleaseMs = millis();
+    // Hardware Fix #4.7d: store the physical accepted release time, not
+    // processing-time millis(), so the next DOT_PRESS_START's catch-up
+    // check and the idle finalizer below both measure the real gap.
+    g_lastMorseReleaseMs = e.eventMs != 0 ? e.eventMs : millis();
 
     if (Morse::isDeletePattern(g_composePattern)) {
       // A delete prosign never commits a word separator -- even if it was

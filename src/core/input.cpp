@@ -20,15 +20,26 @@ constexpr uint32_t kCombinedRevealMs = Morse::kSpecialCommandMs;  // 2000ms
 // ---------------------------------------------------------------------------
 // Event queue.
 // ---------------------------------------------------------------------------
-constexpr uint8_t kQueueSize = 8;
+// Hardware Fix #4.7d Part H: raised from 8 to 32. Fix #4.7b's independent
+// DOT/DASH timer can now accumulate up to kButtonEdgeQueueCap (16) accepted
+// edges before drainButtonEdges() converts them into semantic InputEvents
+// in a single Input::update() call, plus whatever ENCODER_ROTATE/encoder-
+// switch activity also occurred during the same busy interval -- an 8-slot
+// semantic queue could silently drop the tail of that backlog right here,
+// even though every physical edge had already been captured reliably.
+// 32 comfortably covers the full 16-edge DOT backlog plus normal
+// concurrent encoder activity, at a small, acceptable RAM cost, without
+// touching kButtonEdgeQueueCap or the DOT capture/debounce algorithm
+// itself.
+constexpr uint8_t kQueueSize = 32;
 InputEvent g_queue[kQueueSize];
 uint8_t g_queueHead = 0;
 uint8_t g_queueTail = 0;
 uint8_t g_queueCount = 0;
 
-void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0) {
+void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0, uint32_t eventMs = 0) {
   if (g_queueCount >= kQueueSize) return;  // drop if the consumer is not draining fast enough
-  g_queue[g_queueTail] = InputEvent{type, value, durationMs};
+  g_queue[g_queueTail] = InputEvent{type, value, durationMs, eventMs};
   g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueSize);
   g_queueCount++;
 }
@@ -441,6 +452,15 @@ void endCombined(uint32_t now) {
 // a redundant same-level edge (pressed while already INDIVIDUAL, or a
 // release outside INDIVIDUAL/COMBINED) is simply not observed here in the
 // first place, since only genuine accepted transitions are ever queued.
+//
+// Hardware Fix #4.7d Part A: atMs -- the same physical accepted-edge
+// timestamp Fix #4.7b already captured in ButtonEdgeRecord and used here
+// for duration/combined-gesture arithmetic -- is now also carried into the
+// DOT_PRESS_START/DOT_RELEASE InputEvents' eventMs field, so screen code
+// consuming these events later (possibly several edges in one drained
+// batch, after a busy main loop) can still reconstruct the user's real key
+// rhythm instead of substituting its own processing-time millis(). No
+// GPIO is re-sampled and atMs is never replaced with millis() here.
 void processDotEdge(bool pressed, uint32_t atMs) {
   if (pressed) {
     if (g_dotPressState == PressState::IDLE) {
@@ -450,7 +470,7 @@ void processDotEdge(bool pressed, uint32_t atMs) {
         enterCombined(atMs);
       } else {
         g_dotPressState = PressState::INDIVIDUAL;
-        pushEvent(InputEventType::DOT_PRESS_START);
+        pushEvent(InputEventType::DOT_PRESS_START, 0, 0, atMs);
       }
     }
     return;
@@ -458,7 +478,7 @@ void processDotEdge(bool pressed, uint32_t atMs) {
 
   if (g_dotPressState == PressState::INDIVIDUAL) {
     uint32_t duration = atMs - g_dotDownMs;
-    pushEvent(InputEventType::DOT_RELEASE, 0, duration);
+    pushEvent(InputEventType::DOT_RELEASE, 0, duration, atMs);
     g_dotPressState = PressState::IDLE;
     return;
   }

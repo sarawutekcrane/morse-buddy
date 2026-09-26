@@ -20,7 +20,21 @@ uint16_t wordGapMs(uint8_t wpm) {
 
 SymbolClass classifyPress(uint32_t pressDurationMs, uint8_t wpm) {
   if (pressDurationMs >= kSpecialCommandMs) return SymbolClass::SPECIAL_COMMAND;
-  if (pressDurationMs < ditMs(wpm)) return SymbolClass::DOT;
+
+  // Hardware Fix #4.7d Part G: the DOT/DASH boundary is the midpoint
+  // between the nominal 1-dit DOT and 3-dit DASH (2 dit), not 1 dit --
+  // real-hardware testing at WPM 8 (dit = 150ms) found an ordinary human
+  // short tap (~150-200ms) was already landing past a 1-dit boundary and
+  // being misclassified as DASH. Bounded to at most 75% of
+  // kSpecialCommandMs so this more forgiving DOT range can never eat into
+  // (or eliminate) the DASH range that must still exist below the fixed
+  // 2000ms special-command threshold, even at very low WPM where 2 dit
+  // alone could otherwise approach or exceed it.
+  uint32_t threshold = static_cast<uint32_t>(2 * ditMs(wpm));
+  uint32_t maxThreshold = (static_cast<uint32_t>(kSpecialCommandMs) * 3u) / 4u;
+  if (threshold > maxThreshold) threshold = maxThreshold;
+
+  if (pressDurationMs < threshold) return SymbolClass::DOT;
   return SymbolClass::DASH;
 }
 

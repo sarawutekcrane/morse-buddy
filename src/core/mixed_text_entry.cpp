@@ -142,7 +142,11 @@ void handleEmpty(const InputEvent& e) {
       g_morsePattern[0] = (sc == Morse::SymbolClass::DOT) ? '.' : '-';
       g_morsePattern[1] = '\0';
       g_morsePatternLen = 1;
-      g_lastMorseReleaseMs = millis();
+      // Hardware Fix #4.7d: store the physical accepted release time, not
+      // processing-time millis() -- this seeds the same g_lastMorseReleaseMs
+      // handleMorse()'s catch-up check and tick()'s idle finalizer both
+      // measure against.
+      g_lastMorseReleaseMs = e.eventMs != 0 ? e.eventMs : millis();
       g_state = State::MORSE;
     }
     // else: at max length and this is a normal (non-delete) press -- no
@@ -179,6 +183,23 @@ void handlePreview(const InputEvent& e) {
 }
 
 void handleMorse(const InputEvent& e) {
+  if (e.type == InputEventType::DOT_PRESS_START) {
+    // Hardware Fix #4.7d Part F: catch-up finalization using the physical
+    // accepted press time. Fix #4.7b's reliable edge capture means a busy
+    // main loop can now drain "release / >=3dit physical gap / press" all
+    // in one tick; without this check the new press would just keep
+    // accumulating symbols onto the character the user considered already
+    // finished. The later DOT_RELEASE in the same drained batch is then
+    // processed under the NEW current state (g_state == EMPTY once
+    // finalizeMorseChar() runs) and begins the next character normally --
+    // MixedTextEntry has no natural-text word-gap insertion, so nothing
+    // else is needed here.
+    uint32_t pressMs = e.eventMs != 0 ? e.eventMs : millis();
+    if (g_morsePatternLen > 0 && (pressMs - g_lastMorseReleaseMs) >= Morse::letterGapMs(Settings::getWpm())) {
+      finalizeMorseChar();
+    }
+    return;
+  }
   if (e.type == InputEventType::DOT_RELEASE) {
     Morse::SymbolClass sc = Morse::classifyPress(e.durationMs, Settings::getWpm());
     if (sc == Morse::SymbolClass::SPECIAL_COMMAND) {
@@ -189,7 +210,9 @@ void handleMorse(const InputEvent& e) {
       g_morsePattern[g_morsePatternLen++] = (sc == Morse::SymbolClass::DOT) ? '.' : '-';
       g_morsePattern[g_morsePatternLen] = '\0';
     }
-    g_lastMorseReleaseMs = millis();
+    // Hardware Fix #4.7d: store the physical accepted release time, not
+    // processing-time millis().
+    g_lastMorseReleaseMs = e.eventMs != 0 ? e.eventMs : millis();
     if (Morse::isDeletePattern(g_morsePattern)) {
       deletePreviousConfirmedChar();
       resetMorsePattern();

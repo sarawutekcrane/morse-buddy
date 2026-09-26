@@ -258,10 +258,14 @@ void resetAnswerCompose() {
 // never merely because the user paused before Submit (which would
 // otherwise turn a correct "CAT" answer into "CAT " and fail
 // submitAnswer()'s exact strcmp()), and never for a delete prosign.
-void captureAnswerWordBoundaryOnSymbolStart() {
+//
+// Hardware Fix #4.7d: takes the physical DOT_PRESS_START event timestamp
+// (pressMs) instead of reading millis() itself -- same invariant as
+// text_message.cpp/enigma.cpp's identical helpers.
+void captureAnswerWordBoundaryOnSymbolStart(uint32_t pressMs) {
   if (g_answerPatternLen != 0) return;
   g_answerPatternStartsNewWord =
-      Morse::consumeWordBoundaryOnSymbolStart(&g_answerWordGap, Settings::getWpm(), millis());
+      Morse::consumeWordBoundaryOnSymbolStart(&g_answerWordGap, Settings::getWpm(), pressMs);
 }
 
 void startNewChallenge() {
@@ -339,12 +343,23 @@ void submitAnswer() {
 
 void handleAnswerEvent(const InputEvent& e) {
   if (e.type == InputEventType::DOT_PRESS_START) {
+    // Hardware Fix #4.7d: use the physical accepted press time, not
+    // whenever this event happens to be processed -- same catch-up
+    // finalization invariant as text_message.cpp's identical handler.
+    // Order matters: finalizeAnswerChar() arms the word-gap timer from the
+    // previous letter's real release time, which this new pressMs must be
+    // compared against, so catch-up finalization must happen BEFORE
+    // capturing the word boundary for the newly starting letter.
+    uint32_t pressMs = e.eventMs != 0 ? e.eventMs : millis();
+    if (g_answerPatternLen > 0 && (pressMs - g_lastAnswerReleaseMs) >= Morse::letterGapMs(Settings::getWpm())) {
+      finalizeAnswerChar();
+    }
     // Only captures whether this new pattern starts a new word (Hardware
     // Fix #4.2) -- never mutates the answer draft itself. The space (if
     // any) is committed later, only at NORMAL letter finalization; a
     // delete prosign discards the captured flag below instead of
     // consuming it as a space.
-    captureAnswerWordBoundaryOnSymbolStart();
+    captureAnswerWordBoundaryOnSymbolStart(pressMs);
   } else if (e.type == InputEventType::DOT_RELEASE) {
     if (e.durationMs >= Morse::kSpecialCommandMs) {
       resetAnswerCompose();
@@ -355,7 +370,9 @@ void handleAnswerEvent(const InputEvent& e) {
       g_answerPattern[g_answerPatternLen++] = (sc == Morse::SymbolClass::DOT) ? '.' : '-';
       g_answerPattern[g_answerPatternLen] = '\0';
     }
-    g_lastAnswerReleaseMs = millis();
+    // Hardware Fix #4.7d: store the physical accepted release time, not
+    // processing-time millis().
+    g_lastAnswerReleaseMs = e.eventMs != 0 ? e.eventMs : millis();
     if (Morse::isDeletePattern(g_answerPattern)) {
       // A delete prosign never commits a word separator -- it must remove
       // the previous REAL confirmed character, not an auto-inserted space

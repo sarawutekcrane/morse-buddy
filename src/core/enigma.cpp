@@ -934,10 +934,14 @@ void clearDraft() {
 // symbol (g_composePatternLen == 0); symbol 2/3/... of a multi-symbol
 // character (e.g. W = .--) must never re-resolve or overwrite this flag.
 // Never mutates compose text itself -- see finalizeComposeChar().
-void captureWordBoundaryOnSymbolStart() {
+//
+// Hardware Fix #4.7d: takes the physical DOT_PRESS_START event timestamp
+// (pressMs) instead of reading millis() itself -- same invariant as
+// text_message.cpp's identical helper.
+void captureWordBoundaryOnSymbolStart(uint32_t pressMs) {
   if (g_composePatternLen != 0) return;
   g_currentPatternStartsNewWord =
-      Morse::consumeWordBoundaryOnSymbolStart(&g_composeWordGap, Settings::getWpm(), millis());
+      Morse::consumeWordBoundaryOnSymbolStart(&g_composeWordGap, Settings::getWpm(), pressMs);
 }
 
 MessageRef refForIndexEntry(const MessageStore::ConversationIndexEntry& entry) {
@@ -1420,12 +1424,24 @@ void buildComposePrefixSuffix(char* prefix, size_t prefixSize, char* suffix, siz
 
 void handleComposeEvent(const InputEvent& e) {
   if (e.type == InputEventType::DOT_PRESS_START) {
+    // Hardware Fix #4.7d: use the physical accepted press time, not
+    // whenever this event happens to be processed -- same catch-up
+    // finalization invariant as text_message.cpp's identical handler
+    // (see that comment for the full rationale). Order matters:
+    // finalizeComposeChar() arms the word-gap timer from the previous
+    // letter's real release time, which this new pressMs must be compared
+    // against, so catch-up finalization must happen BEFORE capturing the
+    // word boundary for the newly starting letter.
+    uint32_t pressMs = e.eventMs != 0 ? e.eventMs : millis();
+    if (g_composePatternLen > 0 && (pressMs - g_lastMorseReleaseMs) >= Morse::letterGapMs(Settings::getWpm())) {
+      finalizeComposeChar();
+    }
     // Only captures whether this new pattern starts a new word (Hardware
     // Fix #4.2) -- never mutates compose text itself. The space (if any)
     // is committed later, only at NORMAL letter finalization; a delete
     // prosign discards the captured flag below instead of consuming it as
     // a space.
-    captureWordBoundaryOnSymbolStart();
+    captureWordBoundaryOnSymbolStart(pressMs);
   } else if (e.type == InputEventType::DOT_RELEASE) {
     g_composeError = nullptr;
     if (e.durationMs >= Morse::kSpecialCommandMs) {
@@ -1437,7 +1453,9 @@ void handleComposeEvent(const InputEvent& e) {
       g_composePattern[g_composePatternLen++] = (sc == Morse::SymbolClass::DOT) ? '.' : '-';
       g_composePattern[g_composePatternLen] = '\0';
     }
-    g_lastMorseReleaseMs = millis();
+    // Hardware Fix #4.7d: store the physical accepted release time, not
+    // processing-time millis().
+    g_lastMorseReleaseMs = e.eventMs != 0 ? e.eventMs : millis();
     if (Morse::isDeletePattern(g_composePattern)) {
       // A delete prosign never commits a word separator -- it must remove
       // the previous REAL confirmed character, not an auto-inserted space

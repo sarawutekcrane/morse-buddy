@@ -21,13 +21,28 @@ struct InputEvent {
   InputEventType type;
   int8_t value;
   uint32_t durationMs;
+  // Hardware Fix #4.7d: the physical/debounced accepted event time
+  // (millis()) at the moment this event's edge was actually accepted --
+  // NOT when Input::popEvent() happened to be called for it. Fix #4.7b's
+  // independent DOT/DASH timer already captures this instant in
+  // ButtonEdgeRecord::atMs; this field is how it survives into the
+  // semantic InputEvent so a busy main loop that only gets around to
+  // draining several queued edges later can still reconstruct the user's
+  // real key rhythm instead of the loop's own processing time. 0 means
+  // "no physical time known" (e.g. a non-DOT/DASH event, or one synthesized
+  // without one) -- every Morse-timing consumer must fall back to
+  // millis() in that case (eventMs != 0 ? eventMs : millis()) so
+  // synthetic/legacy/default-constructed events stay safe.
+  uint32_t eventMs;
 
   // Default member initializers would make this a non-aggregate under
   // C++11 (the standard PlatformIO's arduino-esp32 core builds with),
   // breaking brace-init call sites like InputEvent{type, value, dur} — so
-  // this is a plain constructor instead.
-  InputEvent(InputEventType t = InputEventType::NONE, int8_t v = 0, uint32_t d = 0)
-      : type(t), value(v), durationMs(d) {}
+  // this is a plain constructor instead. The new eventMs parameter is
+  // appended last with a 0 default so every existing 1/2/3-argument
+  // construction/brace-init call site keeps compiling unchanged.
+  InputEvent(InputEventType t = InputEventType::NONE, int8_t v = 0, uint32_t d = 0, uint32_t when = 0)
+      : type(t), value(v), durationMs(d), eventMs(when) {}
 };
 
 namespace Input {

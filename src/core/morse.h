@@ -18,10 +18,22 @@ uint16_t wordGapMs(uint8_t wpm);
 
 enum class SymbolClass : uint8_t { DOT, DASH, SPECIAL_COMMAND };
 
-// Classifies a DOT/DASH press duration in a Morse-entry context:
-//   < ditMs           -> DOT
-//   ditMs .. <2000ms  -> DASH   (no fixed 600ms ceiling)
-//   >= 2000ms         -> SPECIAL_COMMAND
+// Classifies a DOT/DASH press duration in a Morse-entry context. The
+// DOT/DASH boundary (Hardware Fix #4.7d) is the midpoint between the
+// nominal 1-dit DOT and 3-dit DASH -- 2 dit -- rather than 1 dit, since a
+// 1-dit boundary proved too aggressive for ordinary human short taps at
+// low WPM (e.g. WPM 8: dit=150ms, so a normal ~150-200ms tap was already
+// landing past 1 dit and being misclassified as DASH). That 2-dit
+// threshold is capped at 75% of kSpecialCommandMs so it can never
+// encroach on (or exceed) kSpecialCommandMs itself, guaranteeing some
+// DASH range still exists below the fixed special-command threshold even
+// at very low WPM:
+//   >= 2000ms                          -> SPECIAL_COMMAND (fixed, always wins)
+//   < min(2*ditMs, 0.75*2000ms)        -> DOT
+//   otherwise (up to <2000ms)          -> DASH
+//
+// Example at WPM 8 (dit = 150ms): threshold = 300ms, so a tap under 300ms
+// is DOT, 300ms..<2000ms is DASH, >=2000ms is SPECIAL_COMMAND.
 SymbolClass classifyPress(uint32_t pressDurationMs, uint8_t wpm);
 
 // Longest supported pattern (a-z/0-9/punctuation) is 6 symbols; the delete
