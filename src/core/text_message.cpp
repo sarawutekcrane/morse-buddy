@@ -416,12 +416,15 @@ constexpr size_t kHistoryLineBufCap = PacketCodec::kMaxDecodedTextLen * (Morse::
 // Hardware Fix #4.7: two width regimes per message instead of one. TRUE
 // ROW 0 (the compact cursor cell + optional icon cell + CYAN sender
 // prefix + WHITE body) is narrower than every row after it, which drops
-// the icon/sender entirely and starts right after the compact cursor
-// cell (continuationX == labelX), recovering almost the full screen
-// width instead of staying indented under the sender name. Every
-// consumer of a message's row layout (row counting, viewport placement,
-// focused-row stepping, historyRowY(), and actual drawing) reads these
-// same four fields off one HistoryRowInfo, so they can never disagree.
+// the icon/sender entirely. Hardware Fix #4.7b Part C: continuation rows
+// start at the same X as the sender name on row 0 (continuationX ==
+// senderX, i.e. labelX plus whatever icon width that message actually
+// reserved), not merely past the cursor cell -- this keeps the history
+// cursor's own cell clear and gives row 0 and its continuations a
+// consistent visual left edge. Every consumer of a message's row layout
+// (row counting, viewport placement, focused-row stepping, historyRowY(),
+// and actual drawing) reads these same four fields off one HistoryRowInfo,
+// so they can never disagree.
 struct HistoryRowInfo {
   const char* lineBuf;  // points into the Slot::B scratch buffer (or a static fallback); valid until the next loadHistoryRow() call
   char senderPrefix[24];

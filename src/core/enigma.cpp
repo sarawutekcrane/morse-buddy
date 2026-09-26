@@ -1014,11 +1014,15 @@ constexpr size_t kHistoryLineBufCap = 251;
 // Hardware Fix #4.7: two width regimes per message instead of one. TRUE
 // ROW 0 (compact cursor cell + icon cell + CYAN sender prefix + WHITE
 // body) is narrower than every row after it, which drops the icon/sender
-// entirely and starts right after the compact cursor cell
-// (continuationX == labelX). Every consumer of a message's row layout
-// (row counting, viewport placement, focused-row stepping, historyRowY(),
-// and actual drawing) reads these same four fields off one
-// HistoryRowInfo, so they can never disagree.
+// entirely. Hardware Fix #4.7b Part C: continuation rows start at the
+// same X as the sender name on row 0 (continuationX == senderX, i.e.
+// labelX plus whatever icon width that message actually reserved), not
+// merely past the cursor cell -- this keeps the history cursor's own
+// cell clear and gives row 0 and its continuations a consistent visual
+// left edge. Every consumer of a message's row layout (row counting,
+// viewport placement, focused-row stepping, historyRowY(), and actual
+// drawing) reads these same four fields off one HistoryRowInfo, so they
+// can never disagree.
 struct HistoryRowInfo {
   char lineBuf[kHistoryLineBufCap];
   char senderPrefix[24];
