@@ -49,7 +49,11 @@ char charsetAt(FieldCharset cs, int16_t index) {
   return '?';
 }
 
-MixedTextEntryConfig g_config;
+// Compile Fix #4.9b: MixedTextEntryConfig has a user-declared constructor
+// (see mixed_text_entry.h), so the implicit zero-argument constructor no
+// longer exists -- this is only safe initial storage; start() immediately
+// replaces it with `g_config = config` before any editing session uses it.
+MixedTextEntryConfig g_config{"", FieldCharset::GENERAL_NAME, 0, 0, nullptr};
 char g_buffer[65];
 uint8_t g_length = 0;
 
