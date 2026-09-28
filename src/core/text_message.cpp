@@ -763,10 +763,46 @@ void composeRowText(const ComposeLayout& layout, const char* prefix, uint8_t row
   out[l] = '\0';
 }
 
+// Hardware Diagnostic #4.9n: instrumentation only -- every existing call,
+// its arguments, and its position in the sequence below are unchanged;
+// this only wraps each already-existing phase in millis()-delta timing
+// and captures already-existing return values (publishBinary()'s bool,
+// and appendStoredMessage()'s bool) -- previously discarded, now captured
+// into storeOk for this diagnostic ONLY: clearDraft()/markIndexDirty()
+// below still run unconditionally afterward exactly as before, so a
+// failed store still silently clears the draft as it already did. That
+// is an existing, separate correctness gap this commit deliberately does
+// NOT fix -- see the exit=completion log line's storeOk field, which now
+// makes that gap directly observable on hardware for a future corrective
+// commit.
+//
+// Each phase's window is disjoint from the others (sequential, never
+// nested) except for one unavoidable overlap: this function's own
+// [PERF][CHAT_SEND] print happens after every value it reports has
+// already been captured, so its own Serial.printf() cost is never
+// included in any reported duration -- but the OUTER CHAT_SCREEN
+// diagnostic that calls into handleComposeEvent() -> sendComposedMessage()
+// during its own input-processing window does include this whole
+// function's total (and this print's own cost) inside its own
+// unattributed "other" remainder. CHAT_SEND's total must therefore never
+// be added on top of CHAT_SCREEN's total -- it is already nested inside
+// it, not a separate cost.
+//
+// kUnmeasuredMs marks a phase that was never reached/attempted this call
+// (an early return before it, or -- for publish specifically -- simply
+// not attempted because the group was offline) -- deliberately far
+// outside any real millis() delta this function could ever measure, so a
+// skipped phase can never be misread as "ran and took 0 ms."
 void sendComposedMessage() {
+  constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
+  uint32_t totalStart = millis();
+
+  uint32_t identityStart = millis();
   char messageId[PacketCodec::kMessageIdLen];
   Identity::nextId(messageId, sizeof(messageId));
+  uint32_t identityElapsed = millis() - identityStart;
 
+  uint32_t envelopeStart = millis();
   PacketCodec::MessageEnvelope env;
   memset(&env, 0, sizeof(env));
   strncpy(env.message_id, messageId, sizeof(env.message_id) - 1);
@@ -787,13 +823,37 @@ void sendComposedMessage() {
 
   uint8_t textPayload[PacketCodec::kMaxDecodedTextLen + 2];
   size_t textPayloadLen = PacketCodec::encodeTextPayload(g_composeText, textPayload, sizeof(textPayload));
-  if (textPayloadLen == 0 && g_composeLen > 0) return;  // encoding failure; leave draft intact
+  if (textPayloadLen == 0 && g_composeLen > 0) {  // encoding failure; leave draft intact
+    uint32_t envelopeElapsed = millis() - envelopeStart;
+    uint32_t totalElapsed = millis() - totalStart;
+    Serial.printf(
+        "[PERF][CHAT_SEND] total=%lu ms exit=text-encode-fail identity=%lu ms envelope=%lu ms topic=%lu ms "
+        "publish=%lu ms store=%lu ms clear=%lu ms publishAttempted=0 publishOk=0 storeAttempted=0 storeOk=0\n",
+        static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(identityElapsed),
+        static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(kUnmeasuredMs),
+        static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
+        static_cast<unsigned long>(kUnmeasuredMs));
+    return;
+  }
 
   static uint8_t wireBuf[PacketCodec::kHeaderSize + 400];
   size_t wireLen = PacketCodec::encodeMessagePacket(env, textPayload, static_cast<uint16_t>(textPayloadLen), wireBuf,
                                                     sizeof(wireBuf));
-  if (wireLen == 0) return;
+  if (wireLen == 0) {
+    uint32_t envelopeElapsed = millis() - envelopeStart;
+    uint32_t totalElapsed = millis() - totalStart;
+    Serial.printf(
+        "[PERF][CHAT_SEND] total=%lu ms exit=wire-encode-fail identity=%lu ms envelope=%lu ms topic=%lu ms "
+        "publish=%lu ms store=%lu ms clear=%lu ms publishAttempted=0 publishOk=0 storeAttempted=0 storeOk=0\n",
+        static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(identityElapsed),
+        static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(kUnmeasuredMs),
+        static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
+        static_cast<unsigned long>(kUnmeasuredMs));
+    return;
+  }
+  uint32_t envelopeElapsed = millis() - envelopeStart;
 
+  uint32_t topicStart = millis();
   bool isEveryone = strcmp(g_selectedContactKey, MessageStore::kEveryone) == 0;
   char topicSuffix[24];
   if (isEveryone) {
@@ -803,19 +863,42 @@ void sendComposedMessage() {
   }
 
   bool online = MqttManager::isGroupConnected(g_selectedGroupCode);
+  uint32_t topicElapsed = millis() - topicStart;
+
+  uint32_t publishElapsed = kUnmeasuredMs;
   bool published = false;
   if (online) {
+    uint32_t publishStart = millis();
     published = MqttManager::publishBinary(g_selectedGroupCode, topicSuffix, wireBuf, static_cast<uint16_t>(wireLen),
                                            false, 1);
+    publishElapsed = millis() - publishStart;
   }
   uint16_t flags = published ? 0 : MessageStore::FLAG_PENDING_OUTBOX;
 
+  uint32_t storeStart = millis();
   MessageRef outRef;
-  MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey, MessageStore::Direction::SENT, flags,
-                                    env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), nullptr, 0, &outRef);
+  // Hardware Diagnostic #4.9n: storeOk captures appendStoredMessage()'s
+  // existing return value for this diagnostic's own log line only -- see
+  // this function's top comment. clearDraft()/markIndexDirty() below are
+  // unconditional, exactly as before; storeOk does not gate them.
+  bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
+                                                   MessageStore::Direction::SENT, flags, env.timestamp, wireBuf,
+                                                   static_cast<uint16_t>(wireLen), nullptr, 0, &outRef);
+  uint32_t storeElapsed = millis() - storeStart;
 
+  uint32_t clearStart = millis();
   clearDraft();
   markIndexDirty();
+  uint32_t clearElapsed = millis() - clearStart;
+
+  uint32_t totalElapsed = millis() - totalStart;
+  Serial.printf(
+      "[PERF][CHAT_SEND] total=%lu ms exit=completion identity=%lu ms envelope=%lu ms topic=%lu ms publish=%lu ms "
+      "store=%lu ms clear=%lu ms publishAttempted=%d publishOk=%d storeAttempted=1 storeOk=%d\n",
+      static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(identityElapsed),
+      static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(topicElapsed),
+      static_cast<unsigned long>(publishElapsed), static_cast<unsigned long>(storeElapsed),
+      static_cast<unsigned long>(clearElapsed), online ? 1 : 0, published ? 1 : 0, storeOk ? 1 : 0);
 }
 
 void finalizeComposeChar() {
