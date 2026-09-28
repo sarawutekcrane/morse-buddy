@@ -98,6 +98,19 @@ constexpr uint32_t kMqttCommandTimeoutMs = 500;
 // non-blocking -- it can only make a single blocking attempt take longer.
 constexpr uint32_t kMqttSetupTimeoutMsExperiment = 1500;
 
+// Hardware Diagnostic #4.9t: TEMPORARY synchronous experiment, not a
+// non-blocking fix -- a separate constant from kMqttSetupTimeoutMsExperiment
+// above (never reused/renamed), scoped only to one QoS1 publishBinary()
+// call at a time. Hardware evidence shows QoS1 binary publishes
+// repeatedly returning false at ~507ms with lastError=-9 and
+// connectedAfter=0, while a later publish succeeds at ~466ms -- this
+// widens the wait for that one publish()'s PUBACK to see whether more
+// time changes the outcome; it does not by itself prove broker fault or
+// establish the exact packet-level cause. Restored to
+// kMqttCommandTimeoutMs immediately after that one call, on every
+// success/failure path, exactly like #4.9g's own restore pattern.
+constexpr uint32_t kMqttPublishTimeoutMsExperiment = 1500;
+
 // Hardware Fix #4.9f: single source of truth for computing the next
 // allowed reconnect deadline, used after every actual connection/setup
 // attempt (see connectGroupIfNeeded()) regardless of where it stopped
@@ -390,8 +403,11 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   // MQTTClient was last given via setOptions()/setTimeout(), so this one
   // call covers all three stages. Restored to kMqttCommandTimeoutMs
   // immediately after setup finishes, below, on every success/failure
-  // path -- a healthy connected client's normal loop()/publish() calls
-  // after this function returns always use the original 500ms.
+  // path -- a healthy connected client's normal loop() calls after this
+  // function returns always use the original 500ms. Hardware Diagnostic
+  // #4.9t: QoS1 publishBinary() is the one exception, briefly widening the
+  // timeout to its own separate kMqttPublishTimeoutMsExperiment for the
+  // duration of one publish() call only, then restoring it the same way.
   gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/kMqttSetupTimeoutMsExperiment);
 
   // Hardware Diagnostic #4.9e Part B2 item 2, extended by #4.9f Part C: an
@@ -438,9 +454,11 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   // Hardware Diagnostic #4.9g: restore the original command timeout right
   // after setup finishes, on every success/failure path above -- this is
   // NOT gated on setupOk/failStage, so it always runs regardless of where
-  // (or whether) setup stopped early. Every normal mqtt->loop()/publish()
-  // call this client makes from here on (until its next disconnect-and-
-  // reconnect-attempt cycle) uses kMqttCommandTimeoutMs again.
+  // (or whether) setup stopped early. Every normal mqtt->loop() call this
+  // client makes from here on (until its next disconnect-and-reconnect-
+  // attempt cycle) uses kMqttCommandTimeoutMs again -- #4.9t's own QoS1
+  // publishBinary() experiment briefly overrides and restores this same
+  // timeout again later, independently of this restore.
   gc.mqtt->setTimeout(kMqttCommandTimeoutMs);
 
   // Hardware Fix #4.9f Part A, corrected by #4.9f follow-up: after EVERY
@@ -727,6 +745,19 @@ bool publishRaw(const char* group_code, const char* topic_suffix, const char* pa
 // log it. returnCode() is deliberately NOT read here: it is
 // connection-related, not the current publish's own error. Logged only
 // on failure or when the call took >=20ms.
+//
+// Hardware Diagnostic #4.9t: TEMPORARY synchronous experiment, not a
+// non-blocking fix -- see kMqttPublishTimeoutMsExperiment's own comment.
+// Audited: publishBinary() is never called from within
+// connectGroupIfNeeded()'s own widened-timeout window (that window only
+// covers connect()/subscribeAll()/Presence::publishOnline(), and
+// publishOnline() uses publishRaw(), not this function) and never
+// reentrantly from the MQTT callback (onMessageAdvanced's onMqttMessage()
+// only enqueues; dispatch to any handler that might call this happens
+// later, via drainReceiveQueue(), which serviceTick() always calls after
+// connectGroupIfNeeded() has already restored the normal timeout for
+// that tick) -- so this function can safely assume it is always entered
+// with kMqttCommandTimeoutMs already in effect.
 bool publishBinary(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                    bool retained, int qos) {
   GroupClient* gc = findClientSlot(group_code);
@@ -734,17 +765,21 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
   char topic[80];
   snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", group_code, topic_suffix);
   if (qos == 1) {
+    gc->mqtt->setTimeout(kMqttPublishTimeoutMsExperiment);
     uint32_t publishStart = millis();
     bool result = gc->mqtt->publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
     uint32_t publishElapsed = millis() - publishStart;
     int lastErr = static_cast<int>(gc->mqtt->lastError());
     bool connectedAfter = gc->mqtt->connected();
+    // Restore before any logging/return, on both success and failure.
+    gc->mqtt->setTimeout(kMqttCommandTimeoutMs);
     if (!result || publishElapsed >= 20) {
       Serial.printf(
           "[PERF][MQTT] publish group=%s qos=%d retained=%d bytes=%u %lu ms result=%d lastError=%d "
-          "connectedBefore=1 connectedAfter=%d\n",
+          "connectedBefore=1 connectedAfter=%d publishTimeoutMs=%lu\n",
           group_code, qos, retained ? 1 : 0, static_cast<unsigned>(len),
-          static_cast<unsigned long>(publishElapsed), result ? 1 : 0, lastErr, connectedAfter ? 1 : 0);
+          static_cast<unsigned long>(publishElapsed), result ? 1 : 0, lastErr, connectedAfter ? 1 : 0,
+          static_cast<unsigned long>(kMqttPublishTimeoutMsExperiment));
     }
     return result;
   }
