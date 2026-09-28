@@ -589,11 +589,27 @@ bool indexEntryAfter(const ConversationIndexEntry& a, const ConversationIndexEnt
 }
 }  // namespace
 
+// Hardware Diagnostic #4.9i: instrumentation only -- every existing return
+// value, record limit, ordering rule, filtering condition, and error path
+// (a record that fails readHeaderOnly()/readMessageIdFromFile() is still
+// silently excluded from the index exactly as before) is unchanged. Four
+// uint32_t durations are accumulated with plain millis()-delta subtraction
+// (the same rollover-safe convention already used elsewhere in this
+// codebase, e.g. outbox.cpp's scan/publish/flush timing -- unsigned
+// wraparound arithmetic gives the correct elapsed value even across a
+// millis() rollover) and only printed, as one line, after everything is
+// done, so the diagnostic Serial.printf() call itself is never included in
+// any of the four measured windows.
 uint16_t loadConversationIndex(const char* group_code, const char* contact_key) {
+  uint32_t totalStart = millis();
+
   static uint32_t seqs[kMaxMessagesPerThread];
+  uint32_t listStart = millis();
   uint16_t n = listSequences(group_code, contact_key, seqs, kMaxMessagesPerThread);
+  uint32_t listElapsed = millis() - listStart;
 
   g_indexCount = 0;
+  uint32_t readStart = millis();
   for (uint16_t i = 0; i < n && g_indexCount < kMaxMessagesPerThread; i++) {
     StoredHeader hdr;
     char mid[PacketCodec::kMessageIdLen];
@@ -607,7 +623,9 @@ uint16_t loadConversationIndex(const char* group_code, const char* contact_key) 
       e.flags = hdr.flags;
     }
   }
+  uint32_t readElapsed = millis() - readStart;
 
+  uint32_t sortStart = millis();
   for (uint16_t i = 1; i < g_indexCount; i++) {
     ConversationIndexEntry key = g_index[i];
     int32_t j = static_cast<int32_t>(i) - 1;
@@ -616,6 +634,15 @@ uint16_t loadConversationIndex(const char* group_code, const char* contact_key) 
       j--;
     }
     g_index[j + 1] = key;
+  }
+  uint32_t sortElapsed = millis() - sortStart;
+
+  uint32_t totalElapsed = millis() - totalStart;
+  if (totalElapsed >= 20) {
+    Serial.printf("[PERF][CHAT_INDEX] total=%lu ms list=%lu ms read=%lu ms sort=%lu ms enumerated=%u indexed=%u\n",
+                  static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(listElapsed),
+                  static_cast<unsigned long>(readElapsed), static_cast<unsigned long>(sortElapsed),
+                  static_cast<unsigned>(n), static_cast<unsigned>(g_indexCount));
   }
   return g_indexCount;
 }

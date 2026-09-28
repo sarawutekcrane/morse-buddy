@@ -976,7 +976,61 @@ uint8_t g_chatLastComposeSkipped = 0xFF;
 char g_chatLastComposeRowText[kMaxShownComposeRows][64] = {{0}};
 
 void screenChat() {
-  if (Menu::consumeJustEntered()) {
+  // Hardware Diagnostic #4.9i: instrumentation only -- every existing input
+  // path, call order, early return, dirty flag, and redraw decision below
+  // is unchanged; this only adds timing capture and one diagnostic
+  // Serial.printf() emitted after everything (including the return
+  // decision) is already determined. `justEntered` is the SAME
+  // Menu::consumeJustEntered() result the entry-setup block below already
+  // consumed -- captured into a local instead of called a second time, per
+  // requirement. The five *Elapsed accumulators below cover strictly
+  // sequential (never nested in each other) stretches of this function's
+  // linear flow -- input-loop index refreshes, then the final index
+  // refresh, then (only on the full-render path) compose-layout prep,
+  // history-viewport computation, history rendering, and compose
+  // rendering -- so summing them and subtracting from the total measured
+  // at each return point yields an accurate "other" remainder (Input::
+  // update()/event popping outside a refresh, Display::drawStatusBar(),
+  // the UiScratch claim, and other small fixed per-tick work), never an
+  // invented estimate. One exception is genuinely nested: when
+  // refreshIndexIfNeeded() actually reloads, MessageStore::
+  // loadConversationIndex() may itself emit its own [PERF][CHAT_INDEX]
+  // line (storage_messages.cpp) -- that nested call's own Serial.printf()
+  // overhead falls inside indexRefresh below, not before this function's
+  // totalStart capture, so it is correctly included in indexRefresh/total
+  // rather than double-counted as a separate top-level segment. This
+  // function's own [PERF][CHAT_SCREEN] print always happens after every
+  // elapsed value it reports has already been captured, so its own
+  // Serial.printf() cost is never included in any reported number.
+  uint32_t totalStart = millis();
+  uint32_t indexRefreshElapsed = 0;
+  bool indexReloadOccurred = false;
+  uint32_t composeLayoutElapsed = 0;
+  uint32_t historyViewportElapsed = 0;
+  uint32_t historyRenderElapsed = 0;
+  uint32_t composeRenderElapsed = 0;
+  // `justEntered` must be declared before the lambda below so its by-
+  // reference capture is valid (a lambda can only capture names already in
+  // scope at its own definition point) -- it is still the SAME
+  // Menu::consumeJustEntered() result the entry-setup block right after it
+  // consumes, just captured into a named local instead of a second call.
+  bool justEntered = Menu::consumeJustEntered();
+  auto emitChatScreenPerf = [&](const char* path) {
+    uint32_t totalElapsed = millis() - totalStart;
+    if (totalElapsed < 20) return;
+    uint32_t measured = indexRefreshElapsed + composeLayoutElapsed + historyViewportElapsed +
+                        historyRenderElapsed + composeRenderElapsed;
+    uint32_t other = (totalElapsed > measured) ? (totalElapsed - measured) : 0;
+    Serial.printf(
+        "[PERF][CHAT_SCREEN] total=%lu ms path=%s entry=%d indexReload=%d indexRefresh=%lu ms "
+        "composeLayout=%lu ms historyViewport=%lu ms historyRender=%lu ms composeRender=%lu ms other=%lu ms\n",
+        static_cast<unsigned long>(totalElapsed), path, justEntered ? 1 : 0, indexReloadOccurred ? 1 : 0,
+        static_cast<unsigned long>(indexRefreshElapsed), static_cast<unsigned long>(composeLayoutElapsed),
+        static_cast<unsigned long>(historyViewportElapsed), static_cast<unsigned long>(historyRenderElapsed),
+        static_cast<unsigned long>(composeRenderElapsed), static_cast<unsigned long>(other));
+  };
+
+  if (justEntered) {
     clearDraft();
     g_historyCursor = kNoHistoryCursor;
     g_historyRowOffset = 0;
@@ -1001,7 +1055,11 @@ void screenChat() {
   while (Input::popEvent(e)) {
     hadEvent = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
+      bool rotateRefreshWasDirty = g_indexDirty;
+      uint32_t rotateRefreshStart = millis();
       refreshIndexIfNeeded();
+      indexRefreshElapsed += millis() - rotateRefreshStart;
+      if (rotateRefreshWasDirty) indexReloadOccurred = true;
       // Hardware Fix #4.4 issue C: a logical message can span more visual
       // rows than the viewport, so rotating steps through THAT message's
       // own rows (g_historyRowOffset) before moving to the next/previous
@@ -1065,11 +1123,19 @@ void screenChat() {
   }
 
   bool wasIndexDirty = g_indexDirty;
+  uint32_t finalRefreshStart = millis();
   refreshIndexIfNeeded();
-  if (wasIndexDirty) g_chatRenderDirty = true;  // index actually reloaded: content may have changed
+  indexRefreshElapsed += millis() - finalRefreshStart;
+  if (wasIndexDirty) {
+    g_chatRenderDirty = true;  // index actually reloaded: content may have changed
+    indexReloadOccurred = true;
+  }
 
   Display::drawStatusBar();
-  if (!g_chatRenderDirty) return;
+  if (!g_chatRenderDirty) {
+    emitChatScreenPerf("no-render");
+    return;
+  }
   g_chatRenderDirty = false;
 
   // Font was already set to PRIMARY above (before input handling); still
@@ -1095,6 +1161,7 @@ void screenChat() {
     Display::clearContentArea();
     Display::printLine(2, contentTop, "Memory Low");
     g_chatNeedsFullRedraw = true;  // force a full redraw once a later pass succeeds
+    emitChatScreenPerf("mem-low");
     return;
   }
 
@@ -1114,11 +1181,13 @@ void screenChat() {
   // Display still controls COMPOSE only (buildComposePrefixSuffix() itself
   // is untouched).
   char composeSuffix[Morse::kMaxPatternLength + 2];
+  uint32_t composeLayoutStart = millis();
   buildComposePrefixSuffix(composePrefixBuf, kComposePrefixCap, composeSuffix, sizeof(composeSuffix));
   bool composeFocused = (g_historyCursor == kNoHistoryCursor);
 
   ComposeLayout layout;
   buildComposeLayout(composePrefixBuf, composeSuffix, composeWidth, &layout);
+  composeLayoutElapsed = millis() - composeLayoutStart;
 
   // No separate error row in this screen (unlike Enigma) -- the whole
   // budget below the history viewport is compose's own.
@@ -1135,7 +1204,9 @@ void screenChat() {
 
   uint16_t startIdx = 0;
   uint16_t startRowSkip = 0;
+  uint32_t historyViewportStart = millis();
   computeHistoryViewport(viewportLines, labelX, &startIdx, &startRowSkip);
+  historyViewportElapsed = millis() - historyViewportStart;
   int16_t composeY = static_cast<int16_t>(contentTop + viewportLines * lh);
 
   bool firstDraw = g_chatNeedsFullRedraw;
@@ -1150,6 +1221,7 @@ void screenChat() {
   bool selectionOnlyChanged = !historyLayoutChanged && !contentChanged && !scrolled &&
                               (g_historyCursor != g_chatLastCursor || g_historyRowOffset != g_chatLastRowOffset);
 
+  uint32_t historyRenderStart = millis();
   if (historyLayoutChanged || contentChanged || scrolled) {
     if (historyLayoutChanged) {
       Display::clearContentArea();
@@ -1235,6 +1307,7 @@ void screenChat() {
       Display::drawSelectionCursor(2, newY);
     }
   }
+  historyRenderElapsed = millis() - historyRenderStart;
 
   // Compose row(s) are diffed independently of the history rows above them
   // (Hardware Fix #3, Section F; extended for multi-row in Hardware Fix
@@ -1273,6 +1346,7 @@ void screenChat() {
   // therefore survive a shrink without already going through a full clear.
   bool composeBlockChanged = historyLayoutChanged || composeWindowChanged || composeFocusChanged;
 
+  uint32_t composeRenderStart = millis();
   if (composeBlockChanged) {
     if (!historyLayoutChanged) {
       int16_t blockH = static_cast<int16_t>(shownComposeRows * lh);
@@ -1312,6 +1386,7 @@ void screenChat() {
       }
     }
   }
+  composeRenderElapsed = millis() - composeRenderStart;
 
   g_chatLastComposeFocused = composeFocused;
   g_chatLastComposeSkipped = skippedComposeRows;
@@ -1320,6 +1395,8 @@ void screenChat() {
   g_chatLastStartRowSkip = static_cast<int16_t>(startRowSkip);
   g_chatLastCursor = g_historyCursor;
   g_chatLastRowOffset = g_historyRowOffset;
+
+  emitChatScreenPerf("render");
 }
 
 // =============================================================================
