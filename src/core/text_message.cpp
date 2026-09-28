@@ -451,7 +451,22 @@ struct HistoryRowInfo {
 // Loads history entry `index` and computes where its body text wraps.
 // `labelX` is the fixed compact-cursor-cell-relative icon-cell X already
 // used by every history row's TRUE first row (2 + Display::kCursorCellWidth).
-void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
+//
+// Hardware Diagnostic #4.9l: optional trailing output, defaulted to
+// nullptr so every existing call site is unaffected. When non-null, set
+// false the moment this specific row is known to have fallen back to a
+// placeholder instead of the real message: a failed scratch acquisition,
+// a missing index entry, a failed loadMessage(), or a message type with
+// no registered RenderFn. This does NOT and cannot detect a renderFn that
+// runs and returns normally but decodes/formats its content wrong
+// internally (e.g. a corrupt-but-parseable payload) -- RenderFn is
+// `void`, so it has no success/failure signal for this function to
+// observe; that residual gap is accepted and documented here, not
+// silently claimed to be covered. Never changes out's placeholder
+// content/geometry itself -- purely an additional observation alongside
+// the existing behavior.
+void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out, bool* outReliable = nullptr) {
+  if (outReliable != nullptr) *outReliable = true;
   out->senderPrefix[0] = '\0';
   out->icon = MessageIconKind::NONE;
   out->senderColor565 = ST77XX_CYAN;  // safe default; overwritten below once a sender is actually known
@@ -460,6 +475,7 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
     // Never dereference a failed allocation (Hardware Fix #4.4b) -- degrade
     // to the existing "message failed to load" placeholder instead. icon
     // is NONE here, so the icon cell is correctly not reserved either.
+    if (outReliable != nullptr) *outReliable = false;
     out->lineBuf = "?";
     out->dividerX = labelX;
     out->firstBodyX = labelX;
@@ -477,7 +493,11 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
     StoredMessageView view;
     if (MessageStore::loadMessage(ref, &view)) {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
-      if (renderFn != nullptr) renderFn(view, scratch, kHistoryLineBufCap);
+      if (renderFn != nullptr) {
+        renderFn(view, scratch, kHistoryLineBufCap);
+      } else if (outReliable != nullptr) {
+        *outReliable = false;  // message type has no registered renderer -- "?" placeholder stands
+      }
       MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
       MessageIconFn iconFn = getMessageIconFn(view.envelope.message_type);
       if (iconFn != nullptr) out->icon = iconFn(view);
@@ -489,7 +509,11 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
       // unknown sender so old peers stay readable.
       uint8_t colorIdx = Presence::resolveColorIndex(view.envelope.group_code, view.envelope.sender_device_id);
       out->senderColor565 = IdentityColor::isValid(colorIdx) ? IdentityColor::color565(colorIdx) : ST77XX_CYAN;
+    } else if (outReliable != nullptr) {
+      *outReliable = false;  // record listed by the index failed to load -- "?" placeholder stands
     }
+  } else if (outReliable != nullptr) {
+    *outReliable = false;  // index entry missing for this position
   }
   // Hardware Fix #4.7b: only reserve the lock-icon cell when a message
   // actually has one -- MessageIconKind::NONE (the overwhelming majority
@@ -534,9 +558,13 @@ uint16_t countHistoryRows(const HistoryRowInfo& info) {
   return (rows > 0) ? rows : 1;
 }
 
-uint16_t countHistoryRowsFor(uint16_t index, int16_t labelX) {
+// Hardware Diagnostic #4.9l: optional trailing output, defaulted to
+// nullptr so every existing call site (ENCODER_ROTATE row-navigation in
+// screenChat(), computeHistoryViewport() below) is unaffected. Simply
+// forwards loadHistoryRow()'s own reliability signal for this one row.
+uint16_t countHistoryRowsFor(uint16_t index, int16_t labelX, bool* outReliable = nullptr) {
   HistoryRowInfo info;
-  loadHistoryRow(index, labelX, &info);
+  loadHistoryRow(index, labelX, &info, outReliable);
   return countHistoryRows(info);
 }
 
@@ -551,8 +579,22 @@ uint16_t countHistoryRowsFor(uint16_t index, int16_t labelX) {
 // partial redraw), and is shifted the minimum amount otherwise so the
 // focused row becomes visible. Identical algorithm to enigma.cpp's
 // computeHistoryViewport() (Hardware Fix #4.3a issue 1).
-void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* outStartIdx,
-                            uint16_t* outStartRowSkip) {
+//
+// Hardware Diagnostic #4.9l: optional trailing output, defaulted to
+// nullptr so the existing caller (screenChat()) is unaffected unless it
+// explicitly asks. When non-null, set true up front and only ever
+// downgraded (sticky-false) by a countHistoryRowsFor()/loadHistoryRow()
+// call along the way reporting its OWN row was a fallback placeholder --
+// see those functions' comments for exactly what that does and doesn't
+// catch. The algorithm, wrap rules, and returned (startIdx, startRowSkip)
+// are completely unchanged by this; it only observes whether the answer
+// is trustworthy enough to reuse on a LATER call rather than recomputed.
+// A conversation with zero messages returns immediately with reliable
+// left true (nothing was read, so there is nothing to distrust) --
+// "successful empty-history handling" stays cacheable by its caller.
+void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* outStartIdx, uint16_t* outStartRowSkip,
+                            bool* outReliable = nullptr) {
+  if (outReliable != nullptr) *outReliable = true;
   *outStartIdx = 0;
   *outStartRowSkip = 0;
   if (g_indexTotal == 0) return;
@@ -564,7 +606,9 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
   bool placedAny = false;
   while (idx > 0) {
     idx--;
-    uint16_t rows = countHistoryRowsFor(idx, labelX);
+    bool rowReliable = true;
+    uint16_t rows = countHistoryRowsFor(idx, labelX, &rowReliable);
+    if (!rowReliable && outReliable != nullptr) *outReliable = false;
     if (static_cast<int32_t>(rows) <= budget) {
       budget -= rows;
       defIdx = idx;
@@ -598,13 +642,17 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
   int32_t rowsBefore;
   {
     HistoryRowInfo first;
-    loadHistoryRow(defIdx, labelX, &first);
+    bool firstReliable = true;
+    loadHistoryRow(defIdx, labelX, &first, &firstReliable);
+    if (!firstReliable && outReliable != nullptr) *outReliable = false;
     if (defIdx == g_historyCursor) {
       rowsBefore = static_cast<int32_t>(g_historyRowOffset) - static_cast<int32_t>(defSkip);
     } else {
       rowsBefore = static_cast<int32_t>(countHistoryRows(first)) - static_cast<int32_t>(defSkip);
       for (uint16_t i = static_cast<uint16_t>(defIdx + 1); i < g_historyCursor; i++) {
-        rowsBefore += countHistoryRowsFor(i, labelX);
+        bool rowReliable = true;
+        rowsBefore += countHistoryRowsFor(i, labelX, &rowReliable);
+        if (!rowReliable && outReliable != nullptr) *outReliable = false;
       }
       rowsBefore += g_historyRowOffset;
     }
@@ -619,7 +667,9 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
   uint16_t curIdx = defIdx;
   uint16_t curSkip = defSkip;
   while (rowsBefore >= static_cast<int32_t>(viewportLines)) {
-    uint16_t rows = countHistoryRowsFor(curIdx, labelX);
+    bool rowReliable = true;
+    uint16_t rows = countHistoryRowsFor(curIdx, labelX, &rowReliable);
+    if (!rowReliable && outReliable != nullptr) *outReliable = false;
     if (static_cast<uint16_t>(curSkip + 1) < rows) {
       curSkip++;
     } else {
@@ -975,6 +1025,27 @@ constexpr uint8_t kMaxShownComposeRows = 10;
 uint8_t g_chatLastComposeSkipped = 0xFF;
 char g_chatLastComposeRowText[kMaxShownComposeRows][64] = {{0}};
 
+// Hardware Diagnostic #4.9l: reuse of the previously computed history
+// viewport (startIdx, startRowSkip) across compose-only render passes.
+// Only the two numeric results plus a conservative snapshot of everything
+// that could change what computeHistoryViewport() would return -- never a
+// pointer into UiScratch, StoredMessageView, or any shared storage buffer
+// (see loadHistoryRow()'s own scratch/view, which are never retained past
+// one call). See screenChat()'s own comment at its viewport-reuse check
+// for the exact eligibility and invalidation rules; g_chatViewportCacheValid
+// starts false and is explicitly cleared on screen entry, the memory-low
+// path, and any recompute that isn't itself eligible to be published.
+bool g_chatViewportCacheValid = false;
+uint16_t g_chatViewportCacheStartIdx = 0;
+uint16_t g_chatViewportCacheStartRowSkip = 0;
+char g_chatViewportCacheGroup[33] = {0};
+char g_chatViewportCacheContact[MessageStore::kContactKeyLen] = {0};
+uint16_t g_chatViewportCacheIndexTotal = 0;
+uint32_t g_chatViewportCacheGeneration = 0;
+uint16_t g_chatViewportCacheViewportLines = 0;
+int16_t g_chatViewportCacheLabelX = 0;
+int16_t g_chatViewportCacheLineHeight = 0;
+
 void screenChat() {
   // Hardware Diagnostic #4.9i: instrumentation only -- every existing input
   // path, call order, early return, dirty flag, and redraw decision below
@@ -1009,6 +1080,18 @@ void screenChat() {
   uint32_t historyViewportElapsed = 0;
   uint32_t historyRenderElapsed = 0;
   uint32_t composeRenderElapsed = 0;
+  // Hardware Diagnostic #4.9l: true the moment ANY history-focus
+  // interaction or focus transition happens during THIS pass -- checked
+  // after every popped event below (not just once at the end), so a
+  // batch that enters history and then leaves it again before the loop
+  // finishes still gets caught, per the requirement that multiple queued
+  // events cannot hide an intermediate invalidation.
+  bool historyFocusTouchedThisPass = false;
+  // Hardware Diagnostic #4.9l: whether the history-viewport (startIdx,
+  // startRowSkip) computed below actually came from the reused cache
+  // rather than a real recompute -- see the viewport-reuse check further
+  // down for the full eligibility/invalidation rules.
+  bool viewportReused = false;
   // `justEntered` must be declared before the lambda below so its by-
   // reference capture is valid (a lambda can only capture names already in
   // scope at its own definition point) -- it is still the SAME
@@ -1022,12 +1105,13 @@ void screenChat() {
                         historyRenderElapsed + composeRenderElapsed;
     uint32_t other = (totalElapsed > measured) ? (totalElapsed - measured) : 0;
     Serial.printf(
-        "[PERF][CHAT_SCREEN] total=%lu ms path=%s entry=%d indexReload=%d indexRefresh=%lu ms "
+        "[PERF][CHAT_SCREEN] total=%lu ms path=%s entry=%d indexReload=%d viewportReused=%d indexRefresh=%lu ms "
         "composeLayout=%lu ms historyViewport=%lu ms historyRender=%lu ms composeRender=%lu ms other=%lu ms\n",
         static_cast<unsigned long>(totalElapsed), path, justEntered ? 1 : 0, indexReloadOccurred ? 1 : 0,
-        static_cast<unsigned long>(indexRefreshElapsed), static_cast<unsigned long>(composeLayoutElapsed),
-        static_cast<unsigned long>(historyViewportElapsed), static_cast<unsigned long>(historyRenderElapsed),
-        static_cast<unsigned long>(composeRenderElapsed), static_cast<unsigned long>(other));
+        viewportReused ? 1 : 0, static_cast<unsigned long>(indexRefreshElapsed),
+        static_cast<unsigned long>(composeLayoutElapsed), static_cast<unsigned long>(historyViewportElapsed),
+        static_cast<unsigned long>(historyRenderElapsed), static_cast<unsigned long>(composeRenderElapsed),
+        static_cast<unsigned long>(other));
   };
 
   if (justEntered) {
@@ -1042,6 +1126,11 @@ void screenChat() {
     markIndexDirty();
     g_chatRenderDirty = true;
     g_chatNeedsFullRedraw = true;
+    // Hardware Diagnostic #4.9l: a fresh entry (including switching to a
+    // different conversation, which always re-enters via this same path)
+    // invalidates any previously cached viewport outright -- never reused
+    // across entries.
+    g_chatViewportCacheValid = false;
   }
 
   // Needed before input handling below: deciding how far ENCODER_ROTATE can
@@ -1097,6 +1186,11 @@ void screenChat() {
     } else {
       handleComposeEvent(e);
     }
+    // Hardware Diagnostic #4.9l: checked after EVERY popped event, not
+    // just once after the whole loop -- catches entering history focus
+    // and leaving it again within the same batch (e.g. two ENCODER_ROTATE
+    // events in one tick), which a single end-of-loop check would miss.
+    if (g_historyCursor != kNoHistoryCursor) historyFocusTouchedThisPass = true;
   }
   if (hadEvent) g_chatRenderDirty = true;
 
@@ -1161,6 +1255,11 @@ void screenChat() {
     Display::clearContentArea();
     Display::printLine(2, contentTop, "Memory Low");
     g_chatNeedsFullRedraw = true;  // force a full redraw once a later pass succeeds
+    // Hardware Diagnostic #4.9l: a scratch failure this pass means any
+    // history row this pass WOULD have measured could itself have degraded
+    // to a placeholder -- never leave a stale viewport cache valid across
+    // this recovery path.
+    g_chatViewportCacheValid = false;
     emitChatScreenPerf("mem-low");
     return;
   }
@@ -1202,14 +1301,98 @@ void screenChat() {
   // needed"); can reach 0 when compose alone fills the screen.
   uint16_t viewportLines = static_cast<uint16_t>(totalLines - shownComposeRows);
 
+  // Moved up from immediately after the viewport call (its value doesn't
+  // change between here and there) so the reuse check below can consult
+  // it before deciding whether to skip that call entirely.
+  bool firstDraw = g_chatNeedsFullRedraw;
+
   uint16_t startIdx = 0;
   uint16_t startRowSkip = 0;
   uint32_t historyViewportStart = millis();
-  computeHistoryViewport(viewportLines, labelX, &startIdx, &startRowSkip);
+  // Hardware Diagnostic #4.9l: reuse the previously cached (startIdx,
+  // startRowSkip) instead of recomputing when EVERY one of these holds --
+  // deliberately conservative; any single condition failing falls back to
+  // the original, unmodified computeHistoryViewport() call below, exactly
+  // as before this diagnostic:
+  //  - not the first pass after entry (!justEntered) and no full redraw
+  //    is already pending (!firstDraw, which covers the entry/memory-low/
+  //    viewportLines-changed cases too, since those all set or imply it);
+  //  - the render this cache was published from, AND this pass, are both
+  //    compose-focused (g_chatLastComposeFocused, composeFocused) -- a
+  //    history-focused pass (or one transitioning into/out of it) never
+  //    qualifies, on either side;
+  //  - no history-focus interaction/transition happened anywhere in this
+  //    pass's input batch (!historyFocusTouchedThisPass), including a
+  //    transient enter-then-leave -- this is also what protects against
+  //    Enigma's and this file's own per-type "held" reveal toggle
+  //    (g_holdActive/g_heldRef in enigma.cpp and in this file), which can
+  //    change a message's rendered row height with no storage write: both
+  //    are only ever set from a history-focused DOT_PRESS_START/RELEASE
+  //    dispatch (dispatchHistoryMessageEvent() -> handleHistoryFocusEvent()
+  //    only), so a hold state can never change during a pass this check
+  //    already excludes, and the very next compose-focused pass after
+  //    leaving history is itself excluded too (g_chatLastComposeFocused
+  //    was false for it), forcing one fresh, correct recompute before any
+  //    later reuse resumes;
+  //  - no index refresh was requested/performed anywhere in this pass
+  //    (!indexReloadOccurred, which already covers the ENCODER_ROTATE-
+  //    triggered refresh inside the input loop above, not only the final
+  //    refreshIndexIfNeeded() call);
+  //  - identity, index count, storage generation, viewportLines, and the
+  //    font/layout geometry (line height, labelX) all match exactly what
+  //    was true when the cached result was published.
+  // Game message rendering (number_guessing_friend.cpp) was inspected too
+  // (read-only) and found to carry no comparable transient toggle -- its
+  // text is derived purely from stored localPayload/direction, already
+  // covered by the storage-generation check.
+  bool viewportReuseEligible = g_chatViewportCacheValid && !justEntered && !firstDraw && g_chatLastComposeFocused &&
+                               composeFocused && !historyFocusTouchedThisPass && !indexReloadOccurred &&
+                               strcmp(g_chatViewportCacheGroup, g_selectedGroupCode) == 0 &&
+                               strcmp(g_chatViewportCacheContact, g_selectedContactKey) == 0 &&
+                               g_chatViewportCacheIndexTotal == g_indexTotal &&
+                               g_chatViewportCacheGeneration == MessageStore::getStorageChangeGeneration() &&
+                               g_chatViewportCacheViewportLines == viewportLines &&
+                               g_chatViewportCacheLabelX == labelX && g_chatViewportCacheLineHeight == lh;
+  if (viewportReuseEligible) {
+    startIdx = g_chatViewportCacheStartIdx;
+    startRowSkip = g_chatViewportCacheStartRowSkip;
+    viewportReused = true;
+  } else {
+    // Hardware Diagnostic #4.9l: reliability threaded through unchanged --
+    // see computeHistoryViewport()'s own comment. A result derived from
+    // any fallback placeholder (missing index entry, failed loadMessage(),
+    // failed scratch acquisition, or an unavailable renderer) is still
+    // returned and used for THIS pass's rendering exactly as before, but
+    // is never published below as reusable.
+    bool viewportReliable = true;
+    computeHistoryViewport(viewportLines, labelX, &startIdx, &startRowSkip, &viewportReliable);
+    // Only a reliable result computed on a pass that is ITSELF a stable
+    // compose-focused, non-full-redraw baseline is worth publishing -- one
+    // computed while history-focused, or mid-transition, or forced by a
+    // full redraw, must not become the seed for a later reuse.
+    if (viewportReliable && composeFocused && !firstDraw) {
+      strncpy(g_chatViewportCacheGroup, g_selectedGroupCode, sizeof(g_chatViewportCacheGroup) - 1);
+      g_chatViewportCacheGroup[sizeof(g_chatViewportCacheGroup) - 1] = '\0';
+      strncpy(g_chatViewportCacheContact, g_selectedContactKey, sizeof(g_chatViewportCacheContact) - 1);
+      g_chatViewportCacheContact[sizeof(g_chatViewportCacheContact) - 1] = '\0';
+      g_chatViewportCacheIndexTotal = g_indexTotal;
+      g_chatViewportCacheGeneration = MessageStore::getStorageChangeGeneration();
+      g_chatViewportCacheViewportLines = viewportLines;
+      g_chatViewportCacheLabelX = labelX;
+      g_chatViewportCacheLineHeight = lh;
+      g_chatViewportCacheStartIdx = startIdx;
+      g_chatViewportCacheStartRowSkip = startRowSkip;
+      g_chatViewportCacheValid = true;
+    } else {
+      g_chatViewportCacheValid = false;
+    }
+  }
+  // Measures only the reuse check above, or the real recompute -- never a
+  // stale duration left over from any earlier pass, since this whole
+  // block (and historyViewportStart itself) runs fresh every call.
   historyViewportElapsed = millis() - historyViewportStart;
   int16_t composeY = static_cast<int16_t>(contentTop + viewportLines * lh);
 
-  bool firstDraw = g_chatNeedsFullRedraw;
   // Any change to how many rows the history viewport has means every Y
   // coordinate below the status bar shifted, so history and compose both
   // need a full repaint together (Hardware Fix #4.4 issues B/C).
