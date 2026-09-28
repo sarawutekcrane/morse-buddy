@@ -59,7 +59,13 @@ void scanAndFlush() {
 
   MessageRef refs[kMaxBatch];
   uint32_t scanStart = millis();
-  uint16_t n = MessageStore::findMessagesByPredicate(nullptr, nullptr, isPendingPredicate, nullptr, refs, kMaxBatch);
+  // Hardware Diagnostic #4.9h follow-up: conservatively initialized false
+  // before the call, matching findMessagesByPredicate()'s own "initialize
+  // conservatively" guarantee -- only that call setting it true means the
+  // scan (including a zero result) can be trusted as complete.
+  bool scanReliable = false;
+  uint16_t n = MessageStore::findMessagesByPredicate(nullptr, nullptr, isPendingPredicate, nullptr, refs, kMaxBatch,
+                                                      &scanReliable);
   uint32_t scanElapsed = millis() - scanStart;
   if (scanElapsed >= 20) {
     Serial.printf("[PERF][OUTBOX] scan %lu ms found=%u\n", static_cast<unsigned long>(scanElapsed),
@@ -96,11 +102,18 @@ void scanAndFlush() {
                     refs[i].group_code, ok ? 1 : 0);
     }
     if (ok) {
-      // If this rewrite itself fails, the flag simply stays set on disk --
-      // the NEXT scan's predicate re-reads the real on-disk flags (it
-      // never trusts "we asked it to clear" as fact), so that message
-      // correctly shows up as still-pending again rather than being
-      // silently lost to a falsely-cached empty result.
+      // Hardware Diagnostic #4.9h follow-up: correcting an earlier,
+      // inaccurate claim here -- atomicRewrite() does NOT guarantee the
+      // flag "stays set on disk" if this call fails; it removes the
+      // existing final file before renaming the new one into place, so a
+      // failure partway through can leave the record's on-disk state
+      // genuinely uncertain (unchanged, gone, or a partial write), not
+      // simply "still pending." What IS guaranteed is that atomicRewrite()
+      // bumps the storage generation unconditionally before attempting
+      // this, whether it succeeds or fails, so the empty-scan cache below
+      // is never left trusting a stale answer regardless of the outcome --
+      // see storage_messages.cpp's atomicRewrite()/g_storageChangeGeneration
+      // comments for that invariant, which this file does not alter.
       MessageStore::updateLocalFlags(refs[i], 0, MessageStore::FLAG_PENDING_OUTBOX);
     }
   }
@@ -111,17 +124,23 @@ void scanAndFlush() {
                   static_cast<unsigned>(limit));
   }
 
-  // Hardware Diagnostic #4.9h: only a scan that found ZERO matches AND saw
-  // the storage generation unchanged across its own duration may
-  // establish the empty-scan cache -- any mutation this scan itself made
-  // (there are none when n==0, since the loop body above never ran) or
-  // that happened elsewhere during the scan invalidates it instead.
-  // Every other outcome (n != 0, or the generation moved for any reason)
-  // conservatively marks the cache invalid rather than leaving it
-  // ambiguous, so a later real change can never be masked by a stale
-  // "empty" belief.
+  // Hardware Diagnostic #4.9h, corrected by the #4.9h follow-up: only a
+  // scan that found ZERO matches AND was itself reliable (no detected
+  // directory-open or record-load/decode failure -- see
+  // findMessagesByPredicate()'s outScanReliable) AND saw the storage
+  // generation unchanged across its own duration may establish the
+  // empty-scan cache. A zero result from an UNRELIABLE scan (a transient
+  // read/open failure hid a record rather than one genuinely not
+  // existing) must NOT be cached -- caching it would hide a pending
+  // message until some unrelated mutation or a reboot instead of being
+  // retried on the next scheduled scan, which is exactly the regression
+  // this follow-up closes. Every other outcome (n != 0, scanReliable ==
+  // false, or the generation moved for any reason) conservatively marks
+  // the cache invalid rather than leaving it ambiguous, so a later real
+  // change -- or a later successful retry of a failed scan -- can never
+  // be masked by a stale "empty" belief.
   uint32_t generationAfter = MessageStore::getStorageChangeGeneration();
-  if (n == 0 && generationAfter == generationBefore) {
+  if (n == 0 && scanReliable && generationAfter == generationBefore) {
     g_emptyScanCacheValid = true;
     g_emptyScanCacheGeneration = generationAfter;
   } else {

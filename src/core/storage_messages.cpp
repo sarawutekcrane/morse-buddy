@@ -79,13 +79,35 @@ const char* baseName(const char* path) {
 // ---------------------------------------------------------------------------
 // Low-level record I/O
 // ---------------------------------------------------------------------------
-uint16_t listSequences(const char* group_code, const char* contact_key, uint32_t* outSeqs, uint16_t capacity) {
+// Hardware Diagnostic #4.9h follow-up: optional trailing output, defaulted
+// to nullptr in the header declaration so every existing call site (there
+// are several -- findMaxSequence(), countMessages(),
+// findOldestNonPendingSequence(), rebuildRingFromStorage(),
+// findGlobalOldestNonPending(), loadConversationIndex(),
+// findMessageById()) compiles and behaves exactly as before, unaware this
+// parameter exists. When non-null, set true only if this specific
+// directory could not be opened/confirmed as a directory at all (a real
+// I/O anomaly on a path already known to exist by the caller -- see
+// findMessagesByPredicate()'s scanConversation lambda, its one consumer,
+// which only ever calls this for a contact_key directory it just finished
+// enumerating as present); left false for a directory that opened fine
+// and simply contained zero (or more) message files, which is not a
+// failure. Residual limitation: the underlying Arduino FS API's
+// openNextFile() returns the same falsy File whether a directory listing
+// reached a genuinely clean end or was cut short by an underlying error
+// partway through -- there is no distinct signal for that case, so a
+// mid-iteration failure here is NOT detected or reported, only a failure
+// to open the directory in the first place.
+uint16_t listSequences(const char* group_code, const char* contact_key, uint32_t* outSeqs, uint16_t capacity,
+                       bool* outOpenFailed = nullptr) {
+  if (outOpenFailed != nullptr) *outOpenFailed = false;
   char dirPath[80];
   buildConversationDir(group_code, contact_key, dirPath, sizeof(dirPath));
   uint16_t count = 0;
   File dir = LittleFS.open(dirPath);
   if (!dir || !dir.isDirectory()) {
     if (dir) dir.close();
+    if (outOpenFailed != nullptr) *outOpenFailed = true;
     return 0;
   }
   File f = dir.openNextFile();
@@ -200,14 +222,28 @@ bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t 
 // Walks every conversation directory under /messages, invoking `fn(group,
 // contact)` for each. Shared by the global low-space scan and by
 // findMessagesByPredicate's "scan everything"/"scan one group" modes.
+//
+// Hardware Diagnostic #4.9h follow-up: optional trailing output, defaulted
+// to nullptr so the one existing caller (findGlobalOldestNonPending(), via
+// the low-space eviction path) compiles and behaves exactly as before,
+// unaware this parameter exists. When non-null, only ever set to false on
+// a detected anomaly (sticky -- never reset back to true here, so a
+// caller threading the same pointer through a whole scan gets the OR of
+// every failure along the way); a group/root directory that simply has
+// never been created (no conversation ever stored there) is a normal,
+// reliable "zero conversations" result and does NOT set it -- only an
+// existing-but-unopenable path (per LittleFS.exists()) is a genuine
+// anomaly. Not touched at all for the common "opened fine" path, leaving
+// it exactly as the caller initialized it.
 template <typename Fn>
-void forEachConversation(const char* onlyGroup, Fn&& fn) {
+void forEachConversation(const char* onlyGroup, Fn&& fn, bool* outReliable = nullptr) {
   char groupPath[40];
   if (onlyGroup != nullptr) {
     buildGroupDir(onlyGroup, groupPath, sizeof(groupPath));
     File gdir = LittleFS.open(groupPath);
     if (!gdir || !gdir.isDirectory()) {
       if (gdir) gdir.close();
+      if (outReliable != nullptr && LittleFS.exists(groupPath)) *outReliable = false;
       return;
     }
     File contactDir = gdir.openNextFile();
@@ -230,6 +266,7 @@ void forEachConversation(const char* onlyGroup, Fn&& fn) {
   File root = LittleFS.open("/messages");
   if (!root || !root.isDirectory()) {
     if (root) root.close();
+    if (outReliable != nullptr && LittleFS.exists("/messages")) *outReliable = false;
     return;
   }
   File groupDir = root.openNextFile();
@@ -239,7 +276,7 @@ void forEachConversation(const char* onlyGroup, Fn&& fn) {
       strncpy(gnameBuf, baseName(groupDir.path()), sizeof(gnameBuf) - 1);
       gnameBuf[sizeof(gnameBuf) - 1] = '\0';
       groupDir.close();
-      forEachConversation(gnameBuf, fn);
+      forEachConversation(gnameBuf, fn, outReliable);
     } else {
       groupDir.close();
     }
@@ -623,12 +660,31 @@ bool findMessageById(const char* group_code, const char* contact_key, const char
 }
 
 uint16_t findMessagesByPredicate(const char* group_code, const char* contact_key, MessagePredicate pred, void* ctx,
-                                 MessageRef* outRefs, uint16_t outRefsCapacity) {
+                                 MessageRef* outRefs, uint16_t outRefsCapacity, bool* outScanReliable) {
+  // Hardware Diagnostic #4.9h follow-up: initialized conservatively before
+  // any scanning happens, so even a hypothetical future early-return added
+  // here later would leave the caller with a safe "unreliable" answer
+  // rather than an uninitialized or accidentally-optimistic one. The real
+  // computed value is written once, at this function's one true exit
+  // below.
+  if (outScanReliable != nullptr) *outScanReliable = false;
+
   uint16_t matchCount = 0;
+  // Sticky-false: starts true, and is only ever downgraded by a detected
+  // directory-open failure (propagated from listSequences()/
+  // forEachConversation()) or a record that listSequences() found but
+  // loadMessage() then failed to read/decode. Either kind of failure means
+  // this scan's zero/nonzero result can't be trusted as complete, even
+  // though every record that WAS successfully loaded is still fully
+  // matched/counted below -- a read failure never skips or discards an
+  // otherwise-good result elsewhere in the same scan.
+  bool reliable = true;
 
   auto scanConversation = [&](const char* g, const char* c) {
     static uint32_t seqs[kMaxMessagesPerThread];
-    uint16_t n = listSequences(g, c, seqs, kMaxMessagesPerThread);
+    bool openFailed = false;
+    uint16_t n = listSequences(g, c, seqs, kMaxMessagesPerThread, &openFailed);
+    if (openFailed) reliable = false;
     for (uint16_t i = 0; i < n; i++) {
       MessageRef ref;
       strncpy(ref.group_code, g, sizeof(ref.group_code) - 1);
@@ -638,21 +694,32 @@ uint16_t findMessagesByPredicate(const char* group_code, const char* contact_key
       ref.sequence = seqs[i];
 
       StoredMessageView view;
-      if (loadMessage(ref, &view) && pred(view.header, view.envelope, ctx)) {
-        if (matchCount < outRefsCapacity) outRefs[matchCount] = ref;
-        matchCount++;
+      if (loadMessage(ref, &view)) {
+        if (pred(view.header, view.envelope, ctx)) {
+          if (matchCount < outRefsCapacity) outRefs[matchCount] = ref;
+          matchCount++;
+        }
+      } else {
+        // A record listSequences() just found on disk but that then
+        // failed to load/decode is a genuine anomaly -- this scan's
+        // result (even a subsequent zero) can no longer be trusted as
+        // complete. Every OTHER record this scan does successfully read
+        // is still matched/counted normally above; this only poisons
+        // reliability, it never stops or unwinds the scan.
+        reliable = false;
       }
     }
   };
 
   if (group_code == nullptr) {
-    forEachConversation(nullptr, scanConversation);
+    forEachConversation(nullptr, scanConversation, &reliable);
   } else if (contact_key == nullptr) {
-    forEachConversation(group_code, scanConversation);
+    forEachConversation(group_code, scanConversation, &reliable);
   } else {
     scanConversation(group_code, contact_key);
   }
 
+  if (outScanReliable != nullptr) *outScanReliable = reliable;
   return matchCount;
 }
 

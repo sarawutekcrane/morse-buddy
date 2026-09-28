@@ -125,8 +125,25 @@ using MessagePredicate = bool (*)(const StoredHeader& header, const PacketCodec:
 // group_code given) scans every conversation in that group. Matches are
 // appended to outRefs up to outRefsCapacity; returns the match count
 // found (which may exceed outRefsCapacity if it was too small).
+//
+// Hardware Diagnostic #4.9h follow-up: optional trailing output, defaulted
+// to nullptr so every existing call site (outbox.cpp, enigma.cpp) compiles
+// and behaves exactly as before, unaware this parameter exists. When
+// non-null, set true only if the scan completed without any detected
+// directory-open failure and without any on-disk record it found but
+// could not load/decode -- i.e. only when the returned count (including a
+// zero count) can be trusted as the true, complete answer. A caller MUST
+// NOT treat a zero return as "definitely nothing found" for caching/
+// skip-future-work purposes unless this is also true; matched/loaded
+// records themselves are always fully valid and counted regardless of
+// this flag. Residual limitation: the underlying Arduino FS API provides
+// no way to distinguish a directory listing that reached a genuine clean
+// end from one cut short by a mid-iteration I/O error, so that specific
+// failure mode is not detected -- see listSequences()'s own comment in
+// storage_messages.cpp for the exact boundary of what is and isn't
+// caught.
 uint16_t findMessagesByPredicate(const char* group_code, const char* contact_key, MessagePredicate pred, void* ctx,
-                                 MessageRef* outRefs, uint16_t outRefsCapacity);
+                                 MessageRef* outRefs, uint16_t outRefsCapacity, bool* outScanReliable = nullptr);
 
 // Low-level primitive used by every mutator above (temp-write, flush,
 // rename); exposed for a future phase's type-specific full-record replace.
