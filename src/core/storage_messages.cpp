@@ -229,12 +229,19 @@ bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t 
 // unaware this parameter exists. When non-null, only ever set to false on
 // a detected anomaly (sticky -- never reset back to true here, so a
 // caller threading the same pointer through a whole scan gets the OR of
-// every failure along the way); a group/root directory that simply has
-// never been created (no conversation ever stored there) is a normal,
-// reliable "zero conversations" result and does NOT set it -- only an
-// existing-but-unopenable path (per LittleFS.exists()) is a genuine
-// anomaly. Not touched at all for the common "opened fine" path, leaving
-// it exactly as the caller initialized it.
+// every failure along the way): any failed root/group directory open, or
+// a root/group path that opened but was not actually a directory, makes
+// the scan unsafe to cache as empty. A genuinely absent path may
+// conservatively be retried later rather than trusted as "confirmed
+// empty" now. Successfully opened directories -- including ones that
+// simply contain zero conversations -- remain cacheable and do not set
+// this. Corrected per verified Arduino-ESP32 2.0.17 FS framework evidence
+// (libraries/FS/src/vfs_api.cpp): LittleFS.exists() itself opens the path
+// in read mode and returns false on that open's failure, so it cannot
+// reliably distinguish "this path was never created" from "this path
+// exists but couldn't be opened" -- it must NOT be used here to try to
+// downgrade a failed open to a non-anomaly; every failed open is treated
+// as unreliable, full stop.
 template <typename Fn>
 void forEachConversation(const char* onlyGroup, Fn&& fn, bool* outReliable = nullptr) {
   char groupPath[40];
@@ -243,7 +250,7 @@ void forEachConversation(const char* onlyGroup, Fn&& fn, bool* outReliable = nul
     File gdir = LittleFS.open(groupPath);
     if (!gdir || !gdir.isDirectory()) {
       if (gdir) gdir.close();
-      if (outReliable != nullptr && LittleFS.exists(groupPath)) *outReliable = false;
+      if (outReliable != nullptr) *outReliable = false;
       return;
     }
     File contactDir = gdir.openNextFile();
@@ -266,7 +273,7 @@ void forEachConversation(const char* onlyGroup, Fn&& fn, bool* outReliable = nul
   File root = LittleFS.open("/messages");
   if (!root || !root.isDirectory()) {
     if (root) root.close();
-    if (outReliable != nullptr && LittleFS.exists("/messages")) *outReliable = false;
+    if (outReliable != nullptr) *outReliable = false;
     return;
   }
   File groupDir = root.openNextFile();
