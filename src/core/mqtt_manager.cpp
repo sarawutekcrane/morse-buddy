@@ -41,20 +41,49 @@ struct GroupClient {
   // entire command timeout, repeatedly. 0 means "never attempted yet /
   // eligible immediately"; otherwise the millis() deadline before which no
   // further attempt is made.
+  //
+  // Hardware Fix #4.9f: Part A1's ORIGINAL implementation reset this back
+  // to 0 the moment MQTTClient::connect() returned true, before
+  // subscribeAll()/Presence::publishOnline() had even run -- so a
+  // connection lost during that setup window (a real, observed failure
+  // mode: subscribeAll() ignored every subscribe() result, and 256dpi/MQTT
+  // v2.5.2 closes the connection on a subscribe error) let the very next
+  // serviceTick() retry immediately, completely bypassing this cooldown.
+  // connectGroupIfNeeded() now sets this to a fresh deadline after EVERY
+  // actual attempt -- success or any failure stage -- never back to 0.
+  // This field only ever gates connectGroupIfNeeded() itself; a client
+  // that IS connected returns from that function before this is even
+  // read, so normal mqtt->loop() servicing in serviceTick() is never
+  // affected by it.
   uint32_t nextReconnectAttemptMs = 0;
 };
 
 GroupClient g_clients[Settings::kMaxGroups];
 bool g_maintenanceMode = false;
 
-// Hardware Fix #4.9d Part A1/A2: a disconnected group may retry at most
-// once every 5000ms (rather than once per tick), and any single connect
-// attempt is now bounded to 500ms instead of the old 5000ms -- both
-// necessary together, since MQTTClient::connect() is still fully
+// Hardware Fix #4.9d Part A1/A2, corrected by #4.9f: a disconnected group
+// may retry at most once every 5000ms (rather than once per tick), and any
+// single connect attempt is bounded to 500ms instead of the old 5000ms --
+// both necessary together, since MQTTClient::connect() is still fully
 // synchronous: throttling alone would still let one attempt block the UI
 // task for up to the old 5-second timeout when its turn came up.
 constexpr uint32_t kMqttReconnectIntervalMs = 5000;
 constexpr uint32_t kMqttCommandTimeoutMs = 500;
+
+// Hardware Fix #4.9f: single source of truth for computing the next
+// allowed reconnect deadline, used after every actual connection/setup
+// attempt (see connectGroupIfNeeded()) regardless of where it stopped
+// (connect failure, subscribe failure, publishOnline leaving the
+// connection down, or full success). 0 is reserved as
+// GroupClient::nextReconnectAttemptMs's "eligible immediately" sentinel
+// (the pre-first-attempt default) -- on the vanishingly rare millis()
+// rollover tick where now + kMqttReconnectIntervalMs would wrap to exactly
+// 0, this nudges the deadline to 1 instead, so a just-finished attempt can
+// never be silently reinterpreted as "never attempted yet".
+uint32_t computeNextReconnectDeadline(uint32_t now) {
+  uint32_t deadline = now + kMqttReconnectIntervalMs;
+  return (deadline == 0) ? 1 : deadline;
+}
 
 // Hardware Fix #4.9d Part A3: round-robin cursor so that, across
 // consecutive ticks, every disconnected group eventually gets its turn to
@@ -212,27 +241,27 @@ void buildClientId(const char* group_code, char* outBuf, size_t outBufSize) {
   snprintf(outBuf, outBufSize, "%s_%08lX", Identity::deviceId(), static_cast<unsigned long>(crc));
 }
 
-// Hardware Diagnostic #4.9e Part B2: instrumentation only, no behavior
-// change -- 256dpi/MQTT's subscribe() waits synchronously for the
-// broker's SUBACK within the configured command timeout, so if the
-// reported multi-second UI stall is actually happening here (rather than
-// in loop()/connect()), per-subscribe timing pinpoints exactly which of
-// the 13 topics (if any) is the slow one, not just that subscribeAll() as
-// a whole was slow.
-void subscribeAll(GroupClient& gc) {
+// Hardware Fix #4.9f Part B: subscribeAll() used to ignore every
+// subscribe() result and always report success by construction (a void
+// return). Verified against real hardware logs and 256dpi/MQTT v2.5.2's
+// own behavior (a subscribe error CLOSES the connection), a failed
+// subscribe silently left later topics never subscribed AND the
+// connection potentially already dead, while connectGroupIfNeeded() still
+// went on to call Presence::publishOnline() and treat setup as fully
+// successful. Now returns bool, checks each ACTUAL subscribe() result,
+// and stops issuing further subscribes the moment one fails -- the 13
+// topics, their exact order, and their existing QoS are unchanged; only
+// whether a failure is noticed and stops the sequence is new.
+//
+// Hardware Diagnostic #4.9e Part B2, extended by #4.9f Part C: 256dpi/MQTT's
+// subscribe() waits synchronously for the broker's SUBACK within the
+// configured command timeout, so per-subscribe timing (now also carrying
+// the actual result, lastError(), and current connection state, snapshotted
+// immediately after the call) pinpoints exactly which of the 13 topics (if
+// any) is slow or failing, not just that subscribeAll() as a whole was.
+bool subscribeAll(GroupClient& gc) {
   uint32_t subscribeAllStart = millis();
   const char* dev = Identity::deviceId();
-  auto sub = [&](const char* suffix, int qos) {
-    char topic[80];
-    snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", gc.group_code, suffix);
-    uint32_t t0 = millis();
-    gc.mqtt->subscribe(topic, qos);
-    uint32_t elapsed = millis() - t0;
-    if (elapsed >= 20) {
-      Serial.printf("[PERF][MQTT] subscribe group=%s topic=%s %lu ms\n", gc.group_code, suffix,
-                    static_cast<unsigned long>(elapsed));
-    }
-  };
 
   char msgSuffix[24];
   snprintf(msgSuffix, sizeof(msgSuffix), "msg/%s", dev);
@@ -243,25 +272,45 @@ void subscribeAll(GroupClient& gc) {
   char audioSuffix[24];
   snprintf(audioSuffix, sizeof(audioSuffix), "radio/audio/%s", dev);
 
-  sub("presence/+", 1);
-  sub(msgSuffix, 1);
-  sub("broadcast", 1);
-  sub("race/invite", 1);
-  sub("race/join", 1);
-  sub("race/round", 1);
-  sub("race/solved", 1);
-  sub("race/reset", 1);
-  sub(busySuffix, 0);
-  sub(busyReplySuffix, 0);
-  sub("radio/session", 0);
-  sub(audioSuffix, 0);
-  sub("radio/audio/broadcast", 0);
+  struct TopicSpec {
+    const char* suffix;
+    int qos;
+  };
+  // Exact same 13 topics, same order, same QoS as before this fix.
+  const TopicSpec kTopics[] = {
+      {"presence/+", 1},   {msgSuffix, 1},       {"broadcast", 1},          {"race/invite", 1},
+      {"race/join", 1},    {"race/round", 1},    {"race/solved", 1},        {"race/reset", 1},
+      {busySuffix, 0},     {busyReplySuffix, 0}, {"radio/session", 0},      {audioSuffix, 0},
+      {"radio/audio/broadcast", 0},
+  };
+  constexpr size_t kTopicCount = sizeof(kTopics) / sizeof(kTopics[0]);
+
+  bool allOk = true;
+  for (size_t i = 0; i < kTopicCount; i++) {
+    char topic[80];
+    snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", gc.group_code, kTopics[i].suffix);
+    uint32_t t0 = millis();
+    bool ok = gc.mqtt->subscribe(topic, kTopics[i].qos);
+    uint32_t elapsed = millis() - t0;
+    // Part C: log on failure OR duration >=20ms; lastError()/connected()
+    // snapshotted immediately after the call, before anything else runs.
+    if (!ok || elapsed >= 20) {
+      Serial.printf("[PERF][MQTT] subscribe group=%s topic=%s %lu ms result=%d lastError=%d connected=%d\n",
+                    gc.group_code, kTopics[i].suffix, static_cast<unsigned long>(elapsed), ok ? 1 : 0,
+                    static_cast<int>(gc.mqtt->lastError()), gc.mqtt->connected() ? 1 : 0);
+    }
+    if (!ok) {
+      allOk = false;
+      break;  // Part B: stop at the first failure -- remaining topics are never subscribed this attempt.
+    }
+  }
 
   uint32_t subscribeAllElapsed = millis() - subscribeAllStart;
   if (subscribeAllElapsed >= 20) {
-    Serial.printf("[PERF][MQTT] subscribeAll group=%s %lu ms\n", gc.group_code,
-                  static_cast<unsigned long>(subscribeAllElapsed));
+    Serial.printf("[PERF][MQTT] subscribeAll group=%s %lu ms result=%d\n", gc.group_code,
+                  static_cast<unsigned long>(subscribeAllElapsed), allOk ? 1 : 0);
   }
+  return allOk;
 }
 
 // Hardware Fix #4.9d Part A1: `now` is passed in (the single millis()
@@ -269,6 +318,13 @@ void subscribeAll(GroupClient& gc) {
 // read again here, and a synchronous connect attempt is only actually
 // made once every kMqttReconnectIntervalMs -- a disconnected/unreachable
 // group can no longer consume the UI loop on every single tick.
+//
+// Hardware Fix #4.9f: that per-group throttle governs how often a NEW
+// attempt may START, but it does not by itself guarantee every attempt
+// finishes cleanly -- see gc.nextReconnectAttemptMs's own field comment
+// and the cooldown logic at the bottom of this function for the specific
+// gap (a connection lost partway through setup) real hardware evidence
+// found and this fix closes.
 void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   if (gc.mqtt->connected()) return;
   // Rollover-safe "deadline not yet reached" check (same idiom already
@@ -298,26 +354,63 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   // verified state of a bounded-connect WiFiClient override attempt.
   gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/kMqttCommandTimeoutMs);
 
-  // Hardware Diagnostic #4.9e Part B2 item 2: an actual connect attempt is
-  // already rate-limited to once per kMqttReconnectIntervalMs per group
-  // (Part A1), so this can never spam -- printed unconditionally (not
-  // gated to >=20ms like the other diagnostics here) because
-  // MQTTClient::connect() is the single most-suspected blocking call for
-  // the reported multi-second stall, and even a FAST result here is
-  // useful signal to rule this call out.
+  // Hardware Diagnostic #4.9e Part B2 item 2, extended by #4.9f Part C: an
+  // actual connect attempt is rate-limited to once per
+  // kMqttReconnectIntervalMs per group (Part A1) -- this can never spam --
+  // so it's printed unconditionally (not gated to >=20ms like the other
+  // diagnostics here), because MQTTClient::connect() is the single
+  // most-suspected blocking call for the reported multi-second stall, and
+  // even a FAST result here is useful signal. lastError()/returnCode()
+  // (a CONNECT result, not a SUBACK result) are snapshotted immediately
+  // after the call.
   uint32_t connectStart = millis();
   bool connected = gc.mqtt->connect(gc.client_id, nullptr, nullptr);
   uint32_t connectElapsed = millis() - connectStart;
-  Serial.printf("[PERF][MQTT] connect group=%s %lu ms result=%d\n", gc.group_code,
-                static_cast<unsigned long>(connectElapsed), connected ? 1 : 0);
+  Serial.printf("[PERF][MQTT] connect group=%s startMs=%lu %lu ms result=%d lastError=%d returnCode=%d\n",
+                gc.group_code, static_cast<unsigned long>(connectStart),
+                static_cast<unsigned long>(connectElapsed), connected ? 1 : 0,
+                static_cast<int>(gc.mqtt->lastError()), static_cast<int>(gc.mqtt->returnCode()));
+
+  // Hardware Fix #4.9f Part B: setup only counts as successful once EVERY
+  // stage below has actually succeeded, in order -- connect, then all 13
+  // subscribes, then Presence::publishOnline() with the connection still
+  // up afterward. Any earlier stage failing (or the connection dropping
+  // out from under a later one) stops setup right there; failStage
+  // records exactly where, for the summary log below.
+  bool setupOk = false;
+  const char* failStage = "connect";
 
   if (connected) {
-    subscribeAll(gc);
-    Presence::publishOnline(gc.group_code);
-    gc.nextReconnectAttemptMs = 0;  // connected -- no throttle needed until it drops again
-  } else {
-    gc.nextReconnectAttemptMs = now + kMqttReconnectIntervalMs;
+    failStage = "subscribe";
+    // Part B: publishOnline() only runs once ALL subscriptions succeeded
+    // AND the client is still connected (subscribeAll() itself can leave
+    // the connection dead partway through -- 256dpi/MQTT v2.5.2 closes the
+    // connection on a subscribe error).
+    if (subscribeAll(gc) && gc.mqtt->connected()) {
+      failStage = "publishOnline";
+      Presence::publishOnline(gc.group_code);
+      // Part B: check connection state again after publishOnline -- a
+      // publish can also fail/close the connection.
+      if (gc.mqtt->connected()) setupOk = true;
+    }
   }
+
+  // Hardware Fix #4.9f Part A: after EVERY actual attempt above -- full
+  // success or a failure at any stage -- establish a FRESH cooldown
+  // deadline from a fresh millis() reading. Never reset back to 0 on
+  // success: while this client stays connected, gc.mqtt->connected() at
+  // the top of this function always returns before this deadline is even
+  // read, so a healthy connection's normal mqtt->loop() servicing is
+  // completely unaffected by it; the deadline only takes effect the next
+  // time THIS connection is lost, closing the exact gap the hardware
+  // evidence found (a connection lost during setup could previously
+  // reconnect on the very next tick, bypassing this cooldown entirely).
+  gc.nextReconnectAttemptMs = computeNextReconnectDeadline(now);
+
+  // Part C: one setup summary per actual attempt.
+  Serial.printf("[PERF][MQTT] setup group=%s result=%d stage=%s connected=%d nextRetryMs=%lu\n", gc.group_code,
+                setupOk ? 1 : 0, setupOk ? "none" : failStage, gc.mqtt->connected() ? 1 : 0,
+                static_cast<unsigned long>(gc.nextReconnectAttemptMs));
 }
 
 GroupClient* findOrCreateClientSlot(const char* group_code) {
@@ -429,22 +522,37 @@ void serviceTick() {
 
   uint32_t now = millis();
 
-  // mqtt->loop() is the library's own lightweight per-connection servicing
-  // (keepalive/incoming-message pump) -- cheap and non-blocking regardless
-  // of connection state, so every active client still gets it every tick.
-  // Hardware Diagnostic #4.9e Part B2 item 1 / Part C: do NOT assume this
-  // is always non-blocking -- 256dpi/MQTT uses synchronous lwmqtt
-  // operations internally, so a CONNECTED client can still momentarily
-  // wait on network data within loop(). Timed individually so a single
-  // slow group is visible, not just the whole for-loop.
+  // mqtt->loop() is the library's own per-connection servicing (keepalive/
+  // incoming-message pump). Hardware Diagnostic #4.9e Part B2 item 1 /
+  // Part C, reaffirmed by #4.9f: do NOT assume this is always
+  // non-blocking, and do NOT assume every reconnect path is already fully
+  // throttled just because Part A1 rate-limits connectGroupIfNeeded() --
+  // 256dpi/MQTT uses synchronous lwmqtt operations internally, so a
+  // CONNECTED client can still momentarily wait on network data within
+  // loop(), and #4.9f found a real gap where a connection lost during
+  // setup could bypass the cooldown entirely (see connectGroupIfNeeded()).
+  // Timed individually so a single slow group is visible, not just the
+  // whole for-loop; an already-disconnected client that returns fast never
+  // prints here (Part B2's "do not print for every disconnected client on
+  // every tick"), but one that WAS connected and comes back from loop()
+  // either erroring or no longer connected always does, regardless of
+  // duration, since that's a real connectivity event worth seeing.
   for (auto& gc : g_clients) {
     if (!gc.active || gc.mqtt == nullptr) continue;
+    bool connectedBefore = gc.mqtt->connected();
     uint32_t loopStart = millis();
-    gc.mqtt->loop();
+    bool loopOk = gc.mqtt->loop();
     uint32_t loopElapsed = millis() - loopStart;
-    if (loopElapsed >= 20) {
+    bool connectedAfter = gc.mqtt->connected();
+
+    if (connectedBefore && (!loopOk || !connectedAfter)) {
+      Serial.printf(
+          "[PERF][MQTT] loop-error group=%s %lu ms loopResult=%d connectedBefore=1 connectedAfter=%d lastError=%d\n",
+          gc.group_code, static_cast<unsigned long>(loopElapsed), loopOk ? 1 : 0, connectedAfter ? 1 : 0,
+          static_cast<int>(gc.mqtt->lastError()));
+    } else if (loopElapsed >= 20) {
       Serial.printf("[PERF][MQTT] loop group=%s %lu ms connected=%d\n", gc.group_code,
-                    static_cast<unsigned long>(loopElapsed), gc.mqtt->connected() ? 1 : 0);
+                    static_cast<unsigned long>(loopElapsed), connectedAfter ? 1 : 0);
     }
   }
 
