@@ -587,12 +587,59 @@ bool indexEntryAfter(const ConversationIndexEntry& a, const ConversationIndexEnt
   }
   return strcmp(a.message_id, b.message_id) > 0;
 }
+
+// Hardware Diagnostic #4.9j: loadConversationIndex() previously called
+// readHeaderOnly() and readMessageIdFromFile() back to back for the same
+// record, which opens, reads, and closes the same file twice (hardware
+// evidence: read=2072 ms across 26 records). This helper reads both
+// pieces of metadata through a single LittleFS.open() instead -- same
+// path built with the existing buildRecordPath(), same header byte
+// layout/offsets and same explicit little-endian decoding as
+// readHeaderOnly() (no direct struct read), same absolute
+// kMessageIdOffsetInFile seek and same trailing NUL termination as
+// readMessageIdFromFile(). It invents no new offsets, disk layout, packet
+// decoding, or validation rules -- it only reuses the two existing
+// helpers' own logic against one open file handle. readHeaderOnly() and
+// readMessageIdFromFile() themselves are untouched and still used exactly
+// as before by every other caller (eviction, dedup, findMessageById()).
+bool readIndexMetadata(const char* group_code, const char* contact_key, uint32_t seq, StoredHeader* outHdr,
+                       char outId[PacketCodec::kMessageIdLen]) {
+  char path[96];
+  buildRecordPath(group_code, contact_key, seq, path, sizeof(path));
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  uint8_t hdrBuf[kStoredHeaderDiskSize];
+  size_t hdrRead = f.read(hdrBuf, sizeof(hdrBuf));
+  if (hdrRead != sizeof(hdrBuf)) {
+    f.close();
+    return false;
+  }
+
+  bool seekOk = f.seek(kMessageIdOffsetInFile);
+  char idBuf[PacketCodec::kMessageIdLen];
+  size_t idRead = 0;
+  if (seekOk) idRead = f.read(reinterpret_cast<uint8_t*>(idBuf), PacketCodec::kMessageIdLen);
+  f.close();
+  if (!seekOk || idRead != PacketCodec::kMessageIdLen) return false;
+  idBuf[PacketCodec::kMessageIdLen - 1] = '\0';
+
+  // Both reads succeeded -- only now write the caller's output.
+  outHdr->direction = static_cast<Direction>(hdrBuf[0]);
+  outHdr->flags = readU16LE(&hdrBuf[1]);
+  outHdr->local_write_sequence = readU32LE(&hdrBuf[3]);
+  outHdr->effective_sort_timestamp = readU32LE(&hdrBuf[7]);
+  memcpy(outId, idBuf, PacketCodec::kMessageIdLen);
+  return true;
+}
 }  // namespace
 
 // Hardware Diagnostic #4.9i: instrumentation only -- every existing return
 // value, record limit, ordering rule, filtering condition, and error path
-// (a record that fails readHeaderOnly()/readMessageIdFromFile() is still
-// silently excluded from the index exactly as before) is unchanged. Four
+// (a record whose metadata can't be fully read is still silently excluded
+// from the index exactly as before -- see readIndexMetadata(), added by
+// the #4.9j follow-up to read it through one file handle instead of the
+// original two-helper pair this comment used to name) is unchanged. Four
 // uint32_t durations are accumulated with plain millis()-delta subtraction
 // (the same rollover-safe convention already used elsewhere in this
 // codebase, e.g. outbox.cpp's scan/publish/flush timing -- unsigned
@@ -613,8 +660,7 @@ uint16_t loadConversationIndex(const char* group_code, const char* contact_key) 
   for (uint16_t i = 0; i < n && g_indexCount < kMaxMessagesPerThread; i++) {
     StoredHeader hdr;
     char mid[PacketCodec::kMessageIdLen];
-    if (readHeaderOnly(group_code, contact_key, seqs[i], &hdr) &&
-        readMessageIdFromFile(group_code, contact_key, seqs[i], mid)) {
+    if (readIndexMetadata(group_code, contact_key, seqs[i], &hdr, mid)) {
       ConversationIndexEntry& e = g_index[g_indexCount++];
       e.sequence = seqs[i];
       e.effective_sort_timestamp = hdr.effective_sort_timestamp;
