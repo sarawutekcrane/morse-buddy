@@ -40,6 +40,20 @@ constexpr size_t kMessageIdOffsetInFile = kStoredHeaderDiskSize + 2 + PacketCode
 
 EvictedCallback g_onEvicted = nullptr;
 
+// Hardware Diagnostic #4.9h: see getStorageChangeGeneration()'s header
+// comment in storage_messages.h. Bumped at the two low-level primitives
+// every actual message-record mutation in this file funnels through --
+// atomicRewrite() (append, flag changes, local-payload rewrites all call
+// it) and removeRecordFile() (both eviction paths call it) -- BEFORE
+// their own destructive filesystem work begins. This is deliberately
+// unconditional, even on a path that goes on to fail/return false: a
+// failed atomicRewrite() can still have already removed the old final
+// file before its rename failed (see atomicRewrite() below), so the safe
+// rule is "the mutation may have touched disk the moment it was
+// attempted," not "only once it's confirmed to have succeeded." Never
+// decremented or reset except by reboot (0 at cold start).
+uint32_t g_storageChangeGeneration = 0;
+
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
@@ -157,6 +171,15 @@ bool findOldestNonPendingSequence(const char* group_code, const char* contact_ke
 }
 
 bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t seq, bool notifyIfUnread) {
+  // Hardware Diagnostic #4.9h: bumped unconditionally, before the
+  // LittleFS.remove() below -- both eviction paths (findOldestNonPending-
+  // Sequence()-driven per-thread FIFO eviction via evictOldest(), and
+  // findGlobalOldestNonPending()-driven low-space eviction via
+  // ensureFreeSpaceForWrite()) funnel through here, so this one call site
+  // covers deletion for both. See g_storageChangeGeneration's own comment
+  // above for why unconditional-before-the-attempt is the safe rule.
+  g_storageChangeGeneration++;
+
   StoredHeader hdr;
   bool haveHdr = readHeaderOnly(group_code, contact_key, seq, &hdr);
   char path[96];
@@ -345,6 +368,8 @@ DedupRing* getOrCreateRing(const char* group_code, const char* contact_key) {
 
 void setOnEvictedCallback(EvictedCallback cb) { g_onEvicted = cb; }
 
+uint32_t getStorageChangeGeneration() { return g_storageChangeGeneration; }
+
 void init() {
   ensureDirExists("/messages");
   // Dedup rings are rebuilt lazily per-conversation on first touch
@@ -354,6 +379,15 @@ void init() {
 
 bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
                    uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen) {
+  // Hardware Diagnostic #4.9h: bumped unconditionally, before any of this
+  // function's own filesystem work -- see g_storageChangeGeneration's own
+  // comment above for why this must happen even on a path that goes on to
+  // fail/return false (the remove(finalPath)-then-rename(tempPath,
+  // finalPath) sequence below can leave finalPath gone if the rename
+  // fails, which is itself a real change to what a later scan would find,
+  // even though this function reports failure).
+  g_storageChangeGeneration++;
+
   static uint8_t scratch[kMaxRecordFileSize];
   size_t needed = kStoredHeaderDiskSize + 2 + wirePacketLen + 2 + localPayloadLen;
   if (needed > sizeof(scratch)) return false;

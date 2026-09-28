@@ -82,6 +82,19 @@ void setOnEvictedCallback(EvictedCallback cb);
 
 void init();
 
+// Hardware Diagnostic #4.9h: a RAM-only, monotonically increasing counter
+// bumped on every storage mutation that could change what a
+// findMessagesByPredicate() scan would find -- append, any flag change
+// (including Outbox's own pending-flag clear after a successful publish),
+// a local-payload rewrite, and eviction. NOT persisted to NVS/disk and
+// carries no meaning across a reboot (starts at 0 every boot); callers
+// only ever compare two readings taken within the same boot session to
+// detect "did storage possibly change since I last scanned," never store
+// it as a message count or version number in its own right. See
+// atomicRewrite()'s and the eviction path's own comments in
+// storage_messages.cpp for exactly where and why this is bumped.
+uint32_t getStorageChangeGeneration();
+
 // Appends a new record. wirePacket/wirePacketLen is the exact bytes
 // sent/received; localPayload may be nullptr/0 (TEXT needs none).
 // Enforces per-thread 300 FIFO + global low-space eviction first; returns

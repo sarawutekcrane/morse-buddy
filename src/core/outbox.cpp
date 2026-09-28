@@ -16,6 +16,21 @@ constexpr uint32_t kScanIntervalMs = 5000;
 constexpr uint16_t kMaxBatch = 32;
 uint32_t g_lastScanMs = 0;
 
+// Hardware Diagnostic #4.9h: caches "the last COMPLETE scan found ZERO
+// pending messages, and storage hasn't changed since" so repeated empty
+// scans (hardware evidence: ~1575-1577ms each, blocking the main loop
+// every kScanIntervalMs with nothing to actually send) can be skipped
+// entirely instead of re-walking and re-decoding every stored message on
+// every tick. Starts INVALID on every boot -- the first scan after boot,
+// and every scan immediately after a real storage mutation, always runs
+// for real; this only removes the redundant repeats of an already-known
+// answer. See scanAndFlush() for exactly how this is established/
+// invalidated, and serviceTick() for the only place it's consulted to
+// skip work (tryFlushNow() never skips -- an explicit manual flush
+// request always performs a real scan).
+bool g_emptyScanCacheValid = false;
+uint32_t g_emptyScanCacheGeneration = 0;
+
 bool isPendingPredicate(const MessageStore::StoredHeader& header, const PacketCodec::MessageEnvelope& envelope,
                         void* ctx) {
   (void)envelope;
@@ -23,15 +38,23 @@ bool isPendingPredicate(const MessageStore::StoredHeader& header, const PacketCo
   return (header.flags & MessageStore::FLAG_PENDING_OUTBOX) != 0;
 }
 
-// Hardware Diagnostic #4.9e Part B3: instrumentation only, no behavior
-// change. This is a strong suspect for the reported multi-second Send
-// delay -- a QoS1 MqttManager::publishBinary() can synchronously wait for
-// the broker's PUBACK within the MQTT command timeout (Part C: do not
+// Hardware Diagnostic #4.9e Part B3, extended by #4.9h: instrumentation
+// only in the scan/publish/flush timings themselves -- no change to their
+// behavior. A QoS1 MqttManager::publishBinary() can synchronously wait
+// for the broker's PUBACK within the MQTT command timeout (Part C: do not
 // assume publish/subscribe are non-blocking), and this loop can run that
-// wait up to kMaxBatch (32) times in a row for one flushPending() call, so
-// per-publish + whole-flush timing will show whether that's what's
-// actually happening on hardware.
-void flushPending() {
+// wait up to kMaxBatch (32) times in a row for one call, so per-publish +
+// whole-flush timing shows whether that's actually happening on hardware.
+//
+// #4.9h also establishes/invalidates the empty-scan cache here, in the
+// one place an actual scan happens, so serviceTick() and tryFlushNow()
+// (both call this) can never disagree about what a real scan found.
+void scanAndFlush() {
+  // Snapshot the generation BEFORE scanning: only if nothing bumps it
+  // between here and the scan's completion is a zero-result scan safe to
+  // trust as "still true" going forward.
+  uint32_t generationBefore = MessageStore::getStorageChangeGeneration();
+
   uint32_t flushStart = millis();
 
   MessageRef refs[kMaxBatch];
@@ -42,6 +65,11 @@ void flushPending() {
     Serial.printf("[PERF][OUTBOX] scan %lu ms found=%u\n", static_cast<unsigned long>(scanElapsed),
                   static_cast<unsigned>(n));
   }
+  // n is findMessagesByPredicate()'s TRUE total match count across every
+  // conversation -- it keeps counting past outRefsCapacity (kMaxBatch)
+  // rather than capping there (see its own header comment) -- so `n == 0`
+  // below means "genuinely nothing pending anywhere," never "the first
+  // kMaxBatch happened to be empty" while more exist beyond the batch.
   uint16_t limit = (n < kMaxBatch) ? n : kMaxBatch;
 
   for (uint16_t i = 0; i < limit; i++) {
@@ -68,6 +96,11 @@ void flushPending() {
                     refs[i].group_code, ok ? 1 : 0);
     }
     if (ok) {
+      // If this rewrite itself fails, the flag simply stays set on disk --
+      // the NEXT scan's predicate re-reads the real on-disk flags (it
+      // never trusts "we asked it to clear" as fact), so that message
+      // correctly shows up as still-pending again rather than being
+      // silently lost to a falsely-cached empty result.
       MessageStore::updateLocalFlags(refs[i], 0, MessageStore::FLAG_PENDING_OUTBOX);
     }
   }
@@ -77,6 +110,23 @@ void flushPending() {
     Serial.printf("[PERF][OUTBOX] flush %lu ms attempted=%u\n", static_cast<unsigned long>(flushElapsed),
                   static_cast<unsigned>(limit));
   }
+
+  // Hardware Diagnostic #4.9h: only a scan that found ZERO matches AND saw
+  // the storage generation unchanged across its own duration may
+  // establish the empty-scan cache -- any mutation this scan itself made
+  // (there are none when n==0, since the loop body above never ran) or
+  // that happened elsewhere during the scan invalidates it instead.
+  // Every other outcome (n != 0, or the generation moved for any reason)
+  // conservatively marks the cache invalid rather than leaving it
+  // ambiguous, so a later real change can never be masked by a stale
+  // "empty" belief.
+  uint32_t generationAfter = MessageStore::getStorageChangeGeneration();
+  if (n == 0 && generationAfter == generationBefore) {
+    g_emptyScanCacheValid = true;
+    g_emptyScanCacheGeneration = generationAfter;
+  } else {
+    g_emptyScanCacheValid = false;
+  }
 }
 
 void serviceTick() {
@@ -84,7 +134,24 @@ void serviceTick() {
   if (now - g_lastScanMs < kScanIntervalMs) return;
   g_lastScanMs = now;
   if (!MqttManager::isAnyGroupConnected()) return;
-  flushPending();
+
+  // Hardware Diagnostic #4.9h: skip the expensive scan+decode work only
+  // when a previous COMPLETE scan already found zero pending messages and
+  // storage has not changed since (same generation) -- this removes the
+  // repeated ~1575ms empty scan the hardware evidence showed happening
+  // every kScanIntervalMs with nothing to actually send, without touching
+  // the 5000ms cadence itself (g_lastScanMs above is updated exactly as
+  // before, on every eligible tick, whether this ends up skipping or
+  // not). The very first scan after boot is never skipped
+  // (g_emptyScanCacheValid starts false), and any tick following a real
+  // storage mutation (a new pending append, a flag change, an eviction)
+  // is never skipped either, since that mutation already moved the
+  // generation this cached value no longer matches.
+  if (g_emptyScanCacheValid && MessageStore::getStorageChangeGeneration() == g_emptyScanCacheGeneration) {
+    return;
+  }
+
+  scanAndFlush();
 }
 
 struct Registrar {
@@ -99,6 +166,12 @@ Registrar g_registrar;
 
 }  // namespace
 
-void tryFlushNow() { flushPending(); }
+// Hardware Diagnostic #4.9h: always performs a real scan -- deliberately
+// bypasses the empty-scan cache serviceTick() consults, since an explicit
+// manual flush request should never be silently skipped by a possibly
+// stale-feeling cache. scanAndFlush() still updates that cache correctly
+// at the end (same bookkeeping either caller reaches it through), so this
+// never leaves the cache in a state serviceTick() would misread.
+void tryFlushNow() { scanAndFlush(); }
 
 }  // namespace Outbox
