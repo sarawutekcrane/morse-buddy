@@ -386,12 +386,15 @@ void buildPayload(char* out, size_t outSize, const char* status) {
            static_cast<unsigned long>(ts), Settings::getMyColorIndex());
 }
 
-void publishStatus(const char* group_code, const char* status) {
+// Fix Phase 1B: returns MqttManager::publishRaw()'s own result directly --
+// payload bytes, topic construction, retained/QoS, and call count/order are
+// all unchanged from before this fix.
+bool publishStatus(const char* group_code, const char* status) {
   char payload[110];
   buildPayload(payload, sizeof(payload), status);
   char topic[48];
   snprintf(topic, sizeof(topic), "presence/%s", Identity::deviceId());
-  MqttManager::publishRaw(group_code, topic, payload, /*retained=*/true, /*qos=*/1);
+  return MqttManager::publishRaw(group_code, topic, payload, /*retained=*/true, /*qos=*/1);
 }
 
 void onSettingsChanged(const SettingsChangeInfo& info) {
@@ -522,7 +525,10 @@ void handleIncoming(const char* group_code, const char* payload, uint16_t len) {
   }
 }
 
-void publishOnline(const char* group_code) { publishStatus(group_code, "ONLINE"); }
+bool publishOnline(const char* group_code) { return publishStatus(group_code, "ONLINE"); }
+// Result intentionally ignored: publishOffline() stays void -- no caller
+// (BeforeSleep hook, group deletion, Maintenance Mode entry) currently acts
+// on an OFFLINE publish's outcome, and this fix does not add one.
 void publishOffline(const char* group_code) { publishStatus(group_code, "OFFLINE"); }
 
 bool isContactOnline(const char* group_code, const char* device_id) {

@@ -13,7 +13,16 @@ namespace Presence {
 void handleIncoming(const char* group_code, const char* payload, uint16_t len);
 
 // Publishes our own ONLINE/OFFLINE presence to one group (retained, QoS1).
-void publishOnline(const char* group_code);
+//
+// Fix Phase 1B: publishOnline() now returns MqttManager::publishRaw()'s own
+// result. This reports only whether that one local publish call itself
+// succeeded (i.e. a live, connected transport accepted it) -- it is NOT
+// confirmation that any peer received the update, and NOT confirmation
+// that the update has reached the UI of anyone viewing this device's
+// presence. A caller that needs stronger delivery guarantees than "the
+// local publish call reported success" must not treat this return value as
+// providing them. Existing callers may continue to ignore it.
+bool publishOnline(const char* group_code);
 void publishOffline(const char* group_code);
 
 // Addendum section 6.4 API, exposed now for Phase 4.
