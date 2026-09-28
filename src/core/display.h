@@ -87,6 +87,18 @@ void printLineColored(int16_t x, int16_t topY, const char* text, uint16_t color5
 
 // Pixel width `text` would occupy in the currently active font -- for
 // screens that need to right-align or fit-check before drawing.
+//
+// Hardware Diagnostic #4.9m: this is the ink bounding-box width only --
+// it does not include the ink's own left-side bearing (getTextBounds()'s
+// x1), so `origin_x + textWidth(text)` is NOT a reliable upper bound on
+// where the drawn ink's rightmost pixel actually ends up when drawn at a
+// nonzero origin_x; a font with a positive left bearing needs slightly
+// more room than that. printLine() clips its own single-line draws using
+// a stricter internal measurement precisely because of this gap -- a
+// caller doing its OWN fit/clip check against a nonzero drawing origin
+// (rather than pure right-alignment/centering math, where this ink-width
+// value is what's wanted) should budget a few extra pixels of margin
+// rather than treating textWidth() as an exact drawn-extent guarantee.
 int16_t textWidth(const char* text);
 
 // Fixed-size (kLockIconCellWidth x kLockIconCellHeight) status icon: a tiny

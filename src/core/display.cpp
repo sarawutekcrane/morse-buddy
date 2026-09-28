@@ -80,6 +80,33 @@ void computePrimaryMetrics() {
   g_tft.setFont(nullptr);  // restore built-in font as the driver's default
 }
 
+// Hardware Diagnostic #4.9m: how much horizontal space `text` actually
+// occupies from its OWN drawing origin (x=0 here) -- the X coordinate of
+// its rightmost ink pixel, not Display::textWidth()'s plain ink
+// bounding-box width alone. getTextBounds(text, 0, y, &x1, &y1, &w, &h)
+// already reports x1, the X coordinate of the LEFTMOST ink pixel relative
+// to that same x=0 origin; per Adafruit_GFX's own charBounds() (the same
+// per-glyph math backing both getTextBounds() and the driver's write()
+// wrap-trigger check), a glyph's positive left-side bearing makes x1 > 0,
+// so the true rightmost-ink extent is x1 + w, not w. Ignoring x1 (as
+// Display::textWidth() intentionally still does, for its own existing
+// ink-bounding-box-width consumers -- see textWidth()'s own comment)
+// under-reports how much room text needs when about to be drawn at a
+// nonzero X, which is exactly what let a string pass printLine()'s old
+// fit check while its actual drawn ink still reached past kScreenWidth,
+// triggering the driver's own auto-wrap for the last glyph(s) (Hardware
+// Diagnostic #4.9m's reported artifact). Used ONLY internally, by
+// printLine()'s clip loop and wrapLineAt()'s own fit check below -- never
+// exposed outside this file, so it cannot change any existing
+// Display::textWidth() consumer's behavior (sender-divider placement,
+// menu marker/badge widths, dirty-diff old/new width comparisons, etc.).
+int16_t measureFitWidth(const char* text) {
+  int16_t x1, y1;
+  uint16_t w, h;
+  g_tft.getTextBounds(text, 0, (g_currentFont == Display::Font::PRIMARY) ? 50 : 0, &x1, &y1, &w, &h);
+  return static_cast<int16_t>(x1 + static_cast<int16_t>(w));
+}
+
 }  // namespace
 
 namespace Display {
@@ -101,6 +128,24 @@ void init() {
   // retest reports a concrete edge/offset symptom.
   g_tft.setRotation(1);
   g_tft.fillScreen(ST77XX_BLACK);
+
+  // Hardware Diagnostic #4.9m: Adafruit_GFX defaults text wrap to ON, and
+  // this codebase does all of its own manual row layout (printLine()'s own
+  // clip loop, plus wrapLineAt()/wrapText()'s explicit word-wrap) -- no
+  // call site anywhere in this repo (verified by a repo-wide search) ever
+  // intends or relies on the driver silently wrapping text of its own
+  // accord. Left enabled, a single-line draw whose true ink extent turns
+  // out (even slightly) wider than the caller expected can have the
+  // driver itself reset cursor_x to 0 and advance cursor_y mid-string --
+  // landing trailing glyphs in another row's position, including this
+  // codebase's reserved left cursor-cell column (Hardware Diagnostic
+  // #4.9m's reported "white horizontal stroke in the left cursor column
+  // beside the second compose row"). Disabling driver wrap here removes
+  // that failure mode structurally; it is paired below with an accurate
+  // fit measurement (measureFitWidth()) so text that doesn't fit is still
+  // deliberately clipped by this app's own printLine()/wrapLineAt() logic
+  // -- never silently dropped off-screen as the sole fix.
+  g_tft.setTextWrap(false);
 
   pinMode(Pins::kTftBacklight, OUTPUT);
   ledcSetup(kBacklightLedcChannel, kBacklightFreqHz, kBacklightResolutionBits);
@@ -163,6 +208,22 @@ Font currentFont() { return g_currentFont; }
 
 int16_t lineHeight() { return (g_currentFont == Font::PRIMARY) ? g_primaryLineHeight : kCompactLineHeight; }
 
+// Hardware Diagnostic #4.9m: this is the glyph ink BOUNDING-BOX width only
+// (getTextBounds()'s `w`) -- it deliberately does NOT include the ink's
+// own left-side bearing (`x1`), so it is NOT the same as "how much room
+// this text needs from a nonzero drawing origin before its rightmost ink
+// pixel could reach past kScreenWidth." Existing callers rely on exactly
+// this ink-width semantics for alignment/positioning (sender-divider
+// placement, menu marker/badge widths, right-aligned old/new dirty-diff
+// clearing) and were audited before this diagnostic to confirm none of
+// them are fit/clip checks against a nonzero draw origin -- so this
+// function's return value and every one of those call sites are
+// unchanged by this diagnostic. printLine()'s own clip loop and
+// wrapLineAt()'s fit check use the separate, stricter measureFitWidth()
+// instead (see its own comment) precisely because THEY are fit/clip
+// decisions against a nonzero origin, where the left-bearing gap this
+// function ignores previously let text through whose actual drawn ink
+// could still reach the display edge and trigger the driver's own wrap.
 int16_t textWidth(const char* text) {
   int16_t x1, y1;
   uint16_t w, h;
@@ -176,10 +237,15 @@ void printLine(int16_t x, int16_t topY, const char* text) {
   buf[sizeof(buf) - 1] = '\0';
 
   // Clip (never wrap) so drawn text can never extend past kScreenWidth,
-  // regardless of font or how long the caller's string is.
+  // regardless of font or how long the caller's string is. Hardware
+  // Diagnostic #4.9m: measureFitWidth(), not textWidth(), so the fit check
+  // accounts for the actual rightmost ink pixel (including a positive left
+  // bearing on the first glyph) rather than the plain ink bounding-box
+  // width alone -- see measureFitWidth()'s own comment for why the
+  // distinction matters here specifically.
   int16_t maxWidth = kScreenWidth - x;
   if (maxWidth > 0) {
-    while (buf[0] != '\0' && textWidth(buf) > maxWidth) {
+    while (buf[0] != '\0' && measureFitWidth(buf) > maxWidth) {
       buf[strlen(buf) - 1] = '\0';
     }
   } else {
@@ -221,11 +287,20 @@ bool wrapLineAt(const char* text, size_t from, int16_t maxWidthPx, uint16_t* out
   // and calls printLine() can never have any of those bytes clipped.
   constexpr size_t kScratch = kPrintLineBufferSize;
   char scratch[kScratch];
+  // Hardware Diagnostic #4.9m: measureFitWidth(), not textWidth() -- a
+  // span this function accepts as fitting maxWidthPx is later drawn by the
+  // caller via printLine() at that row's own nonzero X origin (e.g.
+  // compose/history bodyX past the cursor cell and, on a first row, the
+  // sender divider). Using the same fit measurement printLine() itself
+  // uses keeps the two consistent: a span wrapLineAt() hands back is
+  // guaranteed to be exactly what printLine() will also judge as fitting,
+  // so nothing assigned to this row is later silently clipped by
+  // printLine() or wrapped by the driver into another row's position.
   auto widthOf = [&](size_t start, size_t count) -> int16_t {
     if (count > kScratch - 1) return INT16_MAX;  // can't measure the whole span -- never claim it fits
     memcpy(scratch, text + start, count);
     scratch[count] = '\0';
-    return textWidth(scratch);
+    return measureFitWidth(scratch);
   };
 
   size_t lineStart = pos;
