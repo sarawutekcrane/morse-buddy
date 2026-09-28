@@ -79,6 +79,25 @@ bool g_maintenanceMode = false;
 constexpr uint32_t kMqttReconnectIntervalMs = 5000;
 constexpr uint32_t kMqttCommandTimeoutMs = 500;
 
+// Hardware Diagnostic #4.9g: TEMPORARY experiment only, not a final
+// latency fix. Hardware evidence shows msg/<device_id> repeatedly failing
+// to subscribe at 504-507ms with lastError=-9 (LWMQTT_MISSING_OR_WRONG_
+// PACKET, returned when lwmqtt_subscribe()'s wait finishes without a
+// SUBACK) while presence/+ succeeds -- this narrows the failure to "no
+// SUBACK arrived for this one topic within kMqttCommandTimeoutMs (500ms)"
+// but does NOT by itself establish WHY (broker-side delay, packet loss,
+// or something else). This wider timeout is applied ONLY for the
+// duration of one setup attempt (connect + subscribeAll + publishOnline)
+// to see whether msg/<device_id> succeeds given more time to wait for its
+// SUBACK -- it is restored to kMqttCommandTimeoutMs immediately after
+// setup finishes, on every success/failure path, so healthy connected
+// clients' normal loop()/publish() servicing is never affected. A
+// success here would narrow the cause further (a slow-but-eventually-
+// answering SUBACK) but would NOT itself prove the broker was at fault,
+// and a longer timeout does not make the UI-blocking synchronous call
+// non-blocking -- it can only make a single blocking attempt take longer.
+constexpr uint32_t kMqttSetupTimeoutMsExperiment = 1500;
+
 // Hardware Fix #4.9f: single source of truth for computing the next
 // allowed reconnect deadline, used after every actual connection/setup
 // attempt (see connectGroupIfNeeded()) regardless of where it stopped
@@ -364,7 +383,16 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   // kMqttReconnectIntervalMs throttle above is mandatory too, not
   // optional -- see this file's header comment / the final report for the
   // verified state of a bounded-connect WiFiClient override attempt.
-  gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/kMqttCommandTimeoutMs);
+  //
+  // Hardware Diagnostic #4.9g: TEMPORARILY uses kMqttSetupTimeoutMsExperiment
+  // (1500ms) instead of kMqttCommandTimeoutMs for this whole setup attempt
+  // -- connect, subscribeAll, and publishOnline all share whatever timeout
+  // MQTTClient was last given via setOptions()/setTimeout(), so this one
+  // call covers all three stages. Restored to kMqttCommandTimeoutMs
+  // immediately after setup finishes, below, on every success/failure
+  // path -- a healthy connected client's normal loop()/publish() calls
+  // after this function returns always use the original 500ms.
+  gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/kMqttSetupTimeoutMsExperiment);
 
   // Hardware Diagnostic #4.9e Part B2 item 2, extended by #4.9f Part C: an
   // actual connect attempt is rate-limited to once per
@@ -407,6 +435,14 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
     }
   }
 
+  // Hardware Diagnostic #4.9g: restore the original command timeout right
+  // after setup finishes, on every success/failure path above -- this is
+  // NOT gated on setupOk/failStage, so it always runs regardless of where
+  // (or whether) setup stopped early. Every normal mqtt->loop()/publish()
+  // call this client makes from here on (until its next disconnect-and-
+  // reconnect-attempt cycle) uses kMqttCommandTimeoutMs again.
+  gc.mqtt->setTimeout(kMqttCommandTimeoutMs);
+
   // Hardware Fix #4.9f Part A, corrected by #4.9f follow-up: after EVERY
   // actual attempt above -- full success or a failure at any stage --
   // establish a FRESH cooldown deadline from a FRESH millis() reading
@@ -425,10 +461,13 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
   // very next tick, bypassing this cooldown entirely).
   gc.nextReconnectAttemptMs = computeNextReconnectDeadline(millis());
 
-  // Part C: one setup summary per actual attempt.
-  Serial.printf("[PERF][MQTT] setup group=%s result=%d stage=%s connected=%d nextRetryMs=%lu\n", gc.group_code,
-                setupOk ? 1 : 0, setupOk ? "none" : failStage, gc.mqtt->connected() ? 1 : 0,
-                static_cast<unsigned long>(gc.nextReconnectAttemptMs));
+  // Part C, extended by #4.9g: one setup summary per actual attempt, now
+  // also recording the experimental setup timeout used for this attempt
+  // for traceability.
+  Serial.printf("[PERF][MQTT] setup group=%s result=%d stage=%s connected=%d nextRetryMs=%lu setupTimeoutMs=%lu\n",
+                gc.group_code, setupOk ? 1 : 0, setupOk ? "none" : failStage, gc.mqtt->connected() ? 1 : 0,
+                static_cast<unsigned long>(gc.nextReconnectAttemptMs),
+                static_cast<unsigned long>(kMqttSetupTimeoutMsExperiment));
 }
 
 GroupClient* findOrCreateClientSlot(const char* group_code) {
