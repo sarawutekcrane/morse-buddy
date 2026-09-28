@@ -133,9 +133,29 @@ uint32_t findMaxSequence(const char* group_code, const char* contact_key) {
   return maxSeq;
 }
 
-uint16_t countMessages(const char* group_code, const char* contact_key) {
+// Hardware Diagnostic #4.9p: optional trailing outputs, both defaulted to
+// nullptr so the (currently single) existing call site compiles and
+// behaves exactly as before if left unspecified, and the uint16_t count
+// return is unchanged. Reuses the SAME single listSequences() call and
+// static seqs[] buffer this function already had -- no second 300-entry
+// buffer, no change to filename parsing, enumeration limits, ordering, or
+// listSequences() semantics. outMaxSeq, when non-null, is computed with
+// the identical comparison and initial value (0) findMaxSequence() uses,
+// over exactly the n entries listSequences() returned -- not a separate
+// scan. outOpenFailed is passed straight through to listSequences()'s own
+// existing parameter of the same name/meaning.
+uint16_t countMessages(const char* group_code, const char* contact_key, uint32_t* outMaxSeq = nullptr,
+                       bool* outOpenFailed = nullptr) {
   static uint32_t seqs[kMaxMessagesPerThread];
-  return listSequences(group_code, contact_key, seqs, kMaxMessagesPerThread);
+  uint16_t n = listSequences(group_code, contact_key, seqs, kMaxMessagesPerThread, outOpenFailed);
+  if (outMaxSeq != nullptr) {
+    uint32_t maxSeq = 0;
+    for (uint16_t i = 0; i < n; i++) {
+      if (seqs[i] > maxSeq) maxSeq = seqs[i];
+    }
+    *outMaxSeq = maxSeq;
+  }
+  return n;
 }
 
 bool readHeaderOnly(const char* group_code, const char* contact_key, uint32_t seq, StoredHeader* outHdr) {
@@ -516,18 +536,60 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
 // nested inside CHAT_SCREEN's own input-processing window (text_message.cpp,
 // #4.9i/#4.9l). STORE_APPEND's own total is therefore nested inside both
 // CHAT_SEND.store and CHAT_SCREEN's total -- never added on top of either.
+//
+// Hardware Diagnostic #4.9p: avoids the second directory enumeration
+// findMaxSequence() used to perform immediately after this function's own
+// countMessages() call, by reusing countMessages()'s own maximum-sequence
+// output when it is safe to. Reuse requires ALL of:
+//   - countMessages()'s own listSequences() call opened this exact
+//     conversation directory successfully (countDirOpenFailed == false);
+//   - no per-thread eviction was attempted this call (msgCount was below
+//     kMaxMessagesPerThread, i.e. the eviction `if` above was never
+//     entered -- the eviction path always falls back to a fresh
+//     findMaxSequence() scan below, since evictOldest() can change which
+//     sequence is now oldest/newest and this function does not attempt to
+//     track that);
+//   - g_storageChangeGeneration is unchanged between the generation
+//     snapshot taken immediately before countMessages()'s enumeration and
+//     the reuse decision below.
+// Audit (source-only, this commit): countMessages() and findMaxSequence()
+// are both file-local (anonymous-namespace) helpers with exactly one call
+// site each, both inside this function, so no other caller's behavior is
+// affected by extending countMessages()'s signature. Nothing in this
+// function or its callees (ensureFreeSpaceForWrite(), evictOldest(),
+// ensureDirExists(), the directory-path builders) re-enters
+// appendStoredMessage() or invokes any registered callback capable of
+// mutating THIS conversation's directory between the generation snapshot
+// and the reuse decision -- g_onEvicted, the only callback in this file,
+// only fires from removeRecordFile(), which only runs here via the
+// per-thread eviction path already excluded above, or earlier during
+// ensureFreeSpaceForWrite() (before the generation snapshot is even
+// taken). The generation check is kept anyway as the conservative guard
+// this task calls for, not because a live reentrant caller was found.
+// This establishes no persistent cache -- msgCount, maxSeqFromCount,
+// countDirOpenFailed and generationBeforeCount are all locals scoped to
+// one call -- and does not claim the underlying FS API can detect a
+// directory listing interrupted partway through by an error; see
+// listSequences()'s own residual-limitation comment above. A
+// missing/unopenable directory instead always falls back to the original
+// post-directory-creation findMaxSequence() scan below, unchanged from
+// #4.9o.
 bool appendStoredMessage(const char* group_code, const char* contact_key, Direction direction, uint16_t flags,
                          uint32_t effective_sort_timestamp, const uint8_t* wirePacket, uint16_t wirePacketLen,
                          const uint8_t* localPayload, uint16_t localPayloadLen, MessageRef* outRef) {
   constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
   uint32_t totalStart = millis();
+  bool maxSeqReused = false;
 
   uint32_t freeSpaceStart = millis();
   ensureFreeSpaceForWrite();
   uint32_t freeSpaceElapsed = millis() - freeSpaceStart;
 
   uint32_t countStart = millis();
-  uint16_t msgCount = countMessages(group_code, contact_key);
+  uint32_t generationBeforeCount = getStorageChangeGeneration();
+  uint32_t maxSeqFromCount = 0;
+  bool countDirOpenFailed = false;
+  uint16_t msgCount = countMessages(group_code, contact_key, &maxSeqFromCount, &countDirOpenFailed);
   uint32_t countElapsed = millis() - countStart;
 
   uint32_t evictElapsed = kUnmeasuredMs;
@@ -539,11 +601,12 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
       uint32_t totalElapsed = millis() - totalStart;
       Serial.printf(
           "[PERF][STORE_APPEND] total=%lu ms exit=evict-fail freeSpace=%lu ms count=%lu ms evict=%lu ms "
-          "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms\n",
+          "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d\n",
           static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
           static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
           static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
-          static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs));
+          static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
+          maxSeqReused ? 1 : 0);
       return false;
     }
   }
@@ -559,7 +622,14 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   uint32_t dirsElapsed = millis() - dirsStart;
 
   uint32_t maxSeqStart = millis();
-  uint32_t nextSeq = findMaxSequence(group_code, contact_key) + 1;
+  uint32_t nextSeq;
+  if (!countDirOpenFailed && msgCount < kMaxMessagesPerThread &&
+      getStorageChangeGeneration() == generationBeforeCount) {
+    nextSeq = maxSeqFromCount + 1;
+    maxSeqReused = true;
+  } else {
+    nextSeq = findMaxSequence(group_code, contact_key) + 1;
+  }
   uint32_t maxSeqElapsed = millis() - maxSeqStart;
 
   uint32_t prepareStart = millis();
@@ -584,11 +654,12 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
     uint32_t totalElapsed = millis() - totalStart;
     Serial.printf(
         "[PERF][STORE_APPEND] total=%lu ms exit=rewrite-fail freeSpace=%lu ms count=%lu ms evict=%lu ms "
-        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms\n",
+        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d\n",
         static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
         static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
         static_cast<unsigned long>(dirsElapsed), static_cast<unsigned long>(maxSeqElapsed),
-        static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed));
+        static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed),
+        maxSeqReused ? 1 : 0);
     return false;
   }
   if (outRef != nullptr) *outRef = ref;
@@ -597,11 +668,12 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   if (totalElapsed >= 20) {
     Serial.printf(
         "[PERF][STORE_APPEND] total=%lu ms exit=completion freeSpace=%lu ms count=%lu ms evict=%lu ms "
-        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms\n",
+        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d\n",
         static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
         static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
         static_cast<unsigned long>(dirsElapsed), static_cast<unsigned long>(maxSeqElapsed),
-        static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed));
+        static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed),
+        maxSeqReused ? 1 : 0);
   }
   return true;
 }
