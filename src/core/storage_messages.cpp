@@ -54,6 +54,25 @@ EvictedCallback g_onEvicted = nullptr;
 // decremented or reset except by reboot (0 at cold start).
 uint32_t g_storageChangeGeneration = 0;
 
+// Hardware Diagnostic #4.9u: a SEPARATE RAM-only generation counter,
+// bumped alongside (never instead of) g_storageChangeGeneration above at
+// every mutation that could affect whether ANY pending-outbox record
+// exists anywhere -- but, unlike g_storageChangeGeneration, deliberately
+// NOT bumped by a successful non-pending atomicRewrite() (see that
+// function's own comment below), so Outbox's empty-scan cache
+// (outbox.cpp) can survive exactly that one case: a successful write
+// whose resulting on-disk header has no FLAG_PENDING_OUTBOX bit, which by
+// construction cannot have created a new pending record and therefore
+// cannot invalidate a previously-established "no pending messages
+// anywhere" answer. Every other mutation this file makes -- a pending
+// append or flag-set, ANY failed write regardless of its intended flags,
+// every deletion, and every external mutation notification -- still
+// bumps this exactly like the general generation, conservatively. Same
+// usage contract as g_storageChangeGeneration: RAM-only, starts at 0
+// every boot, never decremented or reset except by reboot, only ever
+// compared between two readings taken within the same boot session.
+uint32_t g_outboxChangeGeneration = 0;
+
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
@@ -221,6 +240,12 @@ bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t 
   // covers deletion for both. See g_storageChangeGeneration's own comment
   // above for why unconditional-before-the-attempt is the safe rule.
   g_storageChangeGeneration++;
+  // Hardware Diagnostic #4.9u: conservative -- a deletion could remove a
+  // pending OR non-pending record, and determining which would require
+  // reading the header first (readHeaderOnly() below can itself fail), so
+  // this always bumps alongside the general generation rather than trying
+  // to skip it for a record known to be non-pending.
+  g_outboxChangeGeneration++;
 
   StoredHeader hdr;
   bool haveHdr = readHeaderOnly(group_code, contact_key, seq, &hdr);
@@ -434,6 +459,8 @@ void setOnEvictedCallback(EvictedCallback cb) { g_onEvicted = cb; }
 
 uint32_t getStorageChangeGeneration() { return g_storageChangeGeneration; }
 
+uint32_t getOutboxChangeGeneration() { return g_outboxChangeGeneration; }
+
 // Hardware Diagnostic #4.9k: narrow escape hatch for the one piece of code
 // outside this file that mutates /messages directly on disk without going
 // through atomicRewrite()/removeRecordFile() -- currently only
@@ -449,7 +476,14 @@ uint32_t getStorageChangeGeneration() { return g_storageChangeGeneration; }
 // fully succeeded or fully no-opped. This is not a general-purpose API:
 // do not call it from ordinary MessageStore-mediated code, which already
 // bumps the generation itself.
-void notifyExternalStorageMutationAttempted() { g_storageChangeGeneration++; }
+// Hardware Diagnostic #4.9u: conservatively bumps the Outbox generation
+// too -- an external deletion (currently only whole-group removal) could
+// remove pending records, and this file has no way to know from here
+// whether it did.
+void notifyExternalStorageMutationAttempted() {
+  g_storageChangeGeneration++;
+  g_outboxChangeGeneration++;
+}
 
 void init() {
   ensureDirExists("/messages");
@@ -518,9 +552,25 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
   // even though this function reports failure).
   g_storageChangeGeneration++;
 
+  // Hardware Diagnostic #4.9u: if the header being written IS pending,
+  // this attempt could be creating (or re-affirming) a pending record, so
+  // bump the Outbox generation unconditionally too, before any filesystem
+  // work, on every attempt -- exactly like g_storageChangeGeneration
+  // above, for the same "may have touched what matters the moment it was
+  // attempted" reason. If it is NOT pending, this write cannot be
+  // creating a new pending record; the Outbox generation is only bumped
+  // below, at whichever exit this call actually fails at -- never on the
+  // success path, since a non-pending write that fully succeeds cannot
+  // have changed whether any pending record exists.
+  bool intendsPending = (header.flags & FLAG_PENDING_OUTBOX) != 0;
+  if (intendsPending) g_outboxChangeGeneration++;
+
   static uint8_t scratch[kMaxRecordFileSize];
   size_t needed = kStoredHeaderDiskSize + 2 + wirePacketLen + 2 + localPayloadLen;
-  if (needed > sizeof(scratch)) return false;
+  if (needed > sizeof(scratch)) {
+    if (!intendsPending) g_outboxChangeGeneration++;
+    return false;
+  }
 
   size_t pos = 0;
   scratch[pos++] = static_cast<uint8_t>(header.direction);
@@ -549,17 +599,28 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
   snprintf(tempPath, sizeof(tempPath), "%s.tmp", finalPath);
 
   File f = LittleFS.open(tempPath, "w");
-  if (!f) return false;
+  if (!f) {
+    if (!intendsPending) g_outboxChangeGeneration++;
+    return false;
+  }
   size_t written = f.write(scratch, pos);
   f.flush();
   f.close();
   if (written != pos) {
     LittleFS.remove(tempPath);
+    if (!intendsPending) g_outboxChangeGeneration++;
     return false;
   }
 
   LittleFS.remove(finalPath);  // overwrite semantics: clear any prior file at the target first
-  return LittleFS.rename(tempPath, finalPath);
+  // Hardware Diagnostic #4.9u: captured rather than returned directly, so
+  // a non-pending write that fails here (the one remaining failure exit)
+  // can still bump the Outbox generation before returning -- success
+  // (renamed == true) never does. Every other operation/ordering below is
+  // unchanged.
+  bool renamed = LittleFS.rename(tempPath, finalPath);
+  if (!intendsPending && !renamed) g_outboxChangeGeneration++;
+  return renamed;
 }
 
 namespace {

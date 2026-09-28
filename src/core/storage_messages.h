@@ -95,6 +95,22 @@ void init();
 // storage_messages.cpp for exactly where and why this is bumped.
 uint32_t getStorageChangeGeneration();
 
+// Hardware Diagnostic #4.9u: a SEPARATE RAM-only generation counter,
+// specifically for Outbox's empty-scan cache (outbox.cpp) -- bumped
+// alongside getStorageChangeGeneration() above at every mutation that
+// could affect whether ANY pending-outbox record exists anywhere, but
+// deliberately NOT bumped by a successful write whose resulting header
+// has no FLAG_PENDING_OUTBOX bit (see atomicRewrite()'s own comment in
+// storage_messages.cpp), since such a write cannot have created a new
+// pending record and therefore cannot invalidate a previously-established
+// "no pending messages anywhere" answer. Every other mutation (a pending
+// append or flag-set, ANY failed write, every deletion, every external
+// mutation notification) still bumps this like the general generation.
+// Same usage contract as getStorageChangeGeneration(): RAM-only, resets
+// to 0 every boot, compared only between two readings taken within the
+// same boot session, never stored as a count/version in its own right.
+uint32_t getOutboxChangeGeneration();
+
 // Hardware Diagnostic #4.9k: narrowly-scoped notification for the one
 // piece of code outside this file that mutates /messages directly without
 // going through atomicRewrite()/removeRecordFile() -- currently only
