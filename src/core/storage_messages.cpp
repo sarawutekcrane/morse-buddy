@@ -414,6 +414,23 @@ void setOnEvictedCallback(EvictedCallback cb) { g_onEvicted = cb; }
 
 uint32_t getStorageChangeGeneration() { return g_storageChangeGeneration; }
 
+// Hardware Diagnostic #4.9k: narrow escape hatch for the one piece of code
+// outside this file that mutates /messages directly on disk without going
+// through atomicRewrite()/removeRecordFile() -- currently only
+// Storage::removeGroupDirectoryIfPresent() (storage_init.cpp), which
+// deletes a whole group's message files/directories itself. This advances
+// the same g_storageChangeGeneration those two internal primitives bump,
+// so any index or scan this file has cached is correctly invalidated by
+// that external mutation attempt. The caller must invoke this exactly
+// once, before its own destructive filesystem work begins -- the same
+// unconditional-before-the-attempt rule those internal bump sites follow,
+// since a deletion that fails partway through may still have removed some
+// files, so a cache must not survive on the hope that the attempt either
+// fully succeeded or fully no-opped. This is not a general-purpose API:
+// do not call it from ordinary MessageStore-mediated code, which already
+// bumps the generation itself.
+void notifyExternalStorageMutationAttempted() { g_storageChangeGeneration++; }
+
 void init() {
   ensureDirExists("/messages");
   // Dedup rings are rebuilt lazily per-conversation on first touch
@@ -581,6 +598,21 @@ namespace {
 ConversationIndexEntry g_index[kMaxMessagesPerThread];
 uint16_t g_indexCount = 0;
 
+// Hardware Diagnostic #4.9k: identity + generation of the ONE conversation
+// currently held in the shared g_index/g_indexCount above, if any. There
+// is exactly one cache slot, matching the single shared index -- switching
+// A -> B -> A means A's own entry must be reloaded, not that a second slot
+// remembers it. g_indexCacheValid starts false (nothing cached yet at
+// boot; this file adds no boot preload). Identity buffers are sized with
+// the same existing constants MessageRef/ConversationIndexEntry callers
+// already use (PacketCodec::kGroupCodeLen, kContactKeyLen) rather than a
+// new literal, so they can hold any group_code/contact_key this codebase
+// considers representable.
+bool g_indexCacheValid = false;
+char g_indexCacheGroup[PacketCodec::kGroupCodeLen] = {0};
+char g_indexCacheContact[kContactKeyLen] = {0};
+uint32_t g_indexCacheGeneration = 0;
+
 bool indexEntryAfter(const ConversationIndexEntry& a, const ConversationIndexEntry& b) {
   if (a.effective_sort_timestamp != b.effective_sort_timestamp) {
     return a.effective_sort_timestamp > b.effective_sort_timestamp;
@@ -647,15 +679,67 @@ bool readIndexMetadata(const char* group_code, const char* contact_key, uint32_t
 // millis() rollover) and only printed, as one line, after everything is
 // done, so the diagnostic Serial.printf() call itself is never included in
 // any of the four measured windows.
+//
+// Hardware Diagnostic #4.9k: a cache-hit check now runs first (see the
+// early return below) -- when it hits, none of the above real-load timing
+// runs at all, so the existing [PERF][CHAT_INDEX] total/list/read/sort
+// line only ever describes an actual load, exactly as before. A hit
+// instead prints its own compact line. No boot preload: g_indexCacheValid
+// starts false, so the very first call for any conversation always falls
+// through to a real load.
 uint16_t loadConversationIndex(const char* group_code, const char* contact_key) {
+  // Hardware Diagnostic #4.9k: reuse the shared index untouched when
+  // nothing that could invalidate it has happened since the last
+  // successful, reliable load of this EXACT conversation -- same group,
+  // same contact, same storage generation. Zero filesystem access on a
+  // hit. There is only one cache slot (matching the one shared g_index),
+  // so switching A -> B -> A always misses on the return to A; only
+  // re-entering the SAME conversation with nothing having bumped the
+  // generation in between can hit.
+  if (g_indexCacheValid && strcmp(g_indexCacheGroup, group_code) == 0 &&
+      strcmp(g_indexCacheContact, contact_key) == 0 &&
+      getStorageChangeGeneration() == g_indexCacheGeneration) {
+    Serial.printf("[PERF][CHAT_INDEX] cacheHit=1 indexed=%u\n", static_cast<unsigned>(g_indexCount));
+    return g_indexCount;
+  }
+  // Falling through to a real load: whatever was cached no longer applies
+  // once g_index below starts being overwritten, so invalidate it BEFORE
+  // that happens -- if this load itself turns out unreliable, no stale
+  // "valid" cache survives it either.
+  g_indexCacheValid = false;
+
   uint32_t totalStart = millis();
+
+  // Hardware Diagnostic #4.9k: generation snapshot taken before directory
+  // enumeration starts; compared again after the metadata-read loop
+  // finishes (sorting never touches storage, so it can't move this) to
+  // confirm nothing mutated this conversation's storage while this load
+  // was in progress.
+  uint32_t generationBeforeLoad = getStorageChangeGeneration();
 
   static uint32_t seqs[kMaxMessagesPerThread];
   uint32_t listStart = millis();
-  uint16_t n = listSequences(group_code, contact_key, seqs, kMaxMessagesPerThread);
+  // Hardware Diagnostic #4.9k: same outOpenFailed output #4.9h-follow-up
+  // added to listSequences() -- any failed/non-directory open, INCLUDING a
+  // conversation directory that has simply never been created, makes this
+  // load ineligible for caching below. Unlike forEachConversation()'s
+  // multi-directory walk (where a never-created group/root is normal),
+  // here group_code/contact_key name one specific, already-selected
+  // conversation, so treating any open failure as uncacheable is the
+  // simple, correct rule the task calls for -- it does not change what is
+  // returned or enumerated, only whether the result may be trusted later.
+  bool dirOpenFailed = false;
+  uint16_t n = listSequences(group_code, contact_key, seqs, kMaxMessagesPerThread, &dirOpenFailed);
   uint32_t listElapsed = millis() - listStart;
 
   g_indexCount = 0;
+  // Hardware Diagnostic #4.9k: sticky-false across the whole read loop --
+  // any single readIndexMetadata() failure poisons cacheability for this
+  // load, but (matching the existing behavior this comment already
+  // documented) never stops or skips processing of the OTHER records:
+  // every one that DOES load successfully is still indexed exactly as
+  // before.
+  bool metadataReliable = true;
   uint32_t readStart = millis();
   for (uint16_t i = 0; i < n && g_indexCount < kMaxMessagesPerThread; i++) {
     StoredHeader hdr;
@@ -667,6 +751,8 @@ uint16_t loadConversationIndex(const char* group_code, const char* contact_key) 
       strncpy(e.message_id, mid, PacketCodec::kMessageIdLen - 1);
       e.message_id[PacketCodec::kMessageIdLen - 1] = '\0';
       e.flags = hdr.flags;
+    } else {
+      metadataReliable = false;
     }
   }
   uint32_t readElapsed = millis() - readStart;
@@ -682,6 +768,29 @@ uint16_t loadConversationIndex(const char* group_code, const char* contact_key) 
     g_index[j + 1] = key;
   }
   uint32_t sortElapsed = millis() - sortStart;
+
+  // Hardware Diagnostic #4.9k: establish cache validity only when this
+  // load can be trusted to still be correct until something bumps the
+  // generation again -- reliable directory enumeration AND reliable
+  // per-record metadata reads AND the generation unchanged across the
+  // whole load (a successfully opened, genuinely empty directory still
+  // qualifies: dirOpenFailed is false and the read loop trivially stays
+  // reliable with n == 0). A partial failure still returns every
+  // successfully indexed entry above exactly as before; it simply isn't
+  // cached for reuse. Overlong group_code/contact_key that the cache
+  // buffers can't hold without truncation are also refused -- caching a
+  // truncated identity could later false-hit against a different,
+  // longer key sharing the same truncated prefix.
+  bool loadReliable = !dirOpenFailed && metadataReliable && (getStorageChangeGeneration() == generationBeforeLoad);
+  if (loadReliable && strlen(group_code) < sizeof(g_indexCacheGroup) &&
+      strlen(contact_key) < sizeof(g_indexCacheContact)) {
+    strncpy(g_indexCacheGroup, group_code, sizeof(g_indexCacheGroup) - 1);
+    g_indexCacheGroup[sizeof(g_indexCacheGroup) - 1] = '\0';
+    strncpy(g_indexCacheContact, contact_key, sizeof(g_indexCacheContact) - 1);
+    g_indexCacheContact[sizeof(g_indexCacheContact) - 1] = '\0';
+    g_indexCacheGeneration = getStorageChangeGeneration();
+    g_indexCacheValid = true;
+  }
 
   uint32_t totalElapsed = millis() - totalStart;
   if (totalElapsed >= 20) {

@@ -5,6 +5,7 @@
 
 #include "core/display.h"
 #include "core/input.h"
+#include "core/storage_messages.h"
 
 namespace {
 
@@ -88,6 +89,16 @@ Preferences& notify() { return g_notify; }
 Preferences& solo() { return g_solo; }
 
 void removeGroupDirectoryIfPresent(const char* group_code) {
+  // Hardware Diagnostic #4.9k: this function deletes message files/
+  // directories directly, bypassing MessageStore's own atomicRewrite()/
+  // removeRecordFile() (which bump its storage-change generation
+  // themselves) -- so it must advance that same generation itself,
+  // unconditionally, before any of its own destructive filesystem work
+  // below, so any conversation index or scan MessageStore has cached is
+  // correctly invalidated even if this deletion attempt fails partway
+  // through. Deletion behavior itself (ordering, calls) is unchanged.
+  MessageStore::notifyExternalStorageMutationAttempted();
+
   char path[48];
   snprintf(path, sizeof(path), "/messages/%s", group_code);
 

@@ -95,6 +95,17 @@ void init();
 // storage_messages.cpp for exactly where and why this is bumped.
 uint32_t getStorageChangeGeneration();
 
+// Hardware Diagnostic #4.9k: narrowly-scoped notification for the one
+// piece of code outside this file that mutates /messages directly without
+// going through atomicRewrite()/removeRecordFile() -- currently only
+// Storage::removeGroupDirectoryIfPresent(). Advances the same generation
+// getStorageChangeGeneration() reports, so anything this file has cached
+// (e.g. the shared conversation index) is correctly invalidated. Call
+// exactly once, before that external code's own destructive filesystem
+// work begins. Not for use by ordinary MessageStore-mediated mutations,
+// which already bump the generation themselves.
+void notifyExternalStorageMutationAttempted();
+
 // Appends a new record. wirePacket/wirePacketLen is the exact bytes
 // sent/received; localPayload may be nullptr/0 (TEXT needs none).
 // Enforces per-thread 300 FIFO + global low-space eviction first; returns
