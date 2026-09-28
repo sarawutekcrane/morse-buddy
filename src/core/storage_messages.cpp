@@ -577,10 +577,21 @@ namespace {
 //   - no candidate is already outstanding (never overwrite one and make
 //     the old index look like it covers more than the one append that
 //     created it);
-//   - this append's own directory enumeration (countMessages()) opened
-//     successfully and its count agreed with the cached index's own
-//     count -- two independently obtained "how many records exist"
-//     readings must agree;
+//   - this append's own count phase (msgCount) agreed with the cached
+//     index's own count (g_indexCount). Hardware Diagnostic #4.9r: when
+//     that count phase used the RAM-resident index itself (countReused)
+//     rather than a real directory enumeration, msgCount IS g_indexCount
+//     by construction -- this check is then a tautology, not a second
+//     independent reading, and it is trivially satisfied precisely
+//     because the RAM path itself already required the pre-append index
+//     to be valid for this exact identity and generation (see
+//     appendStoredMessage()'s own count-phase comment). When the
+//     fallback countMessages() path ran instead, msgCount remains a
+//     genuinely independent filesystem reading compared against
+//     g_indexCount, exactly as before #4.9r;
+//   - this append's own count phase did not report a directory-open
+//     failure (countDirOpenFailed) -- always false when the RAM path was
+//     used, since no open was attempted there to fail;
 //   - #4.9p's maximum-sequence reuse path was actually used, which by
 //     construction already means no per-thread eviction was attempted;
 //   - the cached index has room for one more entry;
@@ -695,12 +706,28 @@ void maybeRecordIndexAppendCandidate(const char* group_code, const char* contact
 // missing/unopenable directory instead always falls back to the original
 // post-directory-creation findMaxSequence() scan below, unchanged from
 // #4.9o.
+//
+// Hardware Diagnostic #4.9r: the count phase below now tries the
+// RAM-resident conversation index (g_index) before calling countMessages()
+// at all -- see the count phase's own comment for the exact eligibility
+// list and countReused's meaning. countMessages() (and therefore a real
+// directory enumeration) only runs when that RAM path is ineligible or
+// its own post-scan generation recheck fails. Everything downstream
+// (the eviction check, the #4.9p maxSeq-reuse decision, and
+// maybeRecordIndexAppendCandidate()'s own checks) consumes msgCount/
+// maxSeqFromCount/countDirOpenFailed exactly as before, uniformly,
+// whichever source produced them -- unchanged.
 bool appendStoredMessage(const char* group_code, const char* contact_key, Direction direction, uint16_t flags,
                          uint32_t effective_sort_timestamp, const uint8_t* wirePacket, uint16_t wirePacketLen,
                          const uint8_t* localPayload, uint16_t localPayloadLen, MessageRef* outRef) {
   constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
   uint32_t totalStart = millis();
   bool maxSeqReused = false;
+  // Hardware Diagnostic #4.9r: initialized false before any exit, same as
+  // maxSeqReused above -- set true only when the count phase below
+  // actually used the RAM-resident g_index instead of a real directory
+  // enumeration (countMessages()).
+  bool countReused = false;
 
   // Hardware Diagnostic #4.9q: snapshot taken before ensureFreeSpaceForWrite()
   // runs, so entryIndexEligible reflects the TRUE pre-append state -- low-
@@ -720,7 +747,47 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   uint32_t generationBeforeCount = getStorageChangeGeneration();
   uint32_t maxSeqFromCount = 0;
   bool countDirOpenFailed = false;
-  uint16_t msgCount = countMessages(group_code, contact_key, &maxSeqFromCount, &countDirOpenFailed);
+  uint16_t msgCount = 0;
+  // Hardware Diagnostic #4.9r: try the RAM-resident conversation index
+  // before falling back to a real directory enumeration. Eligible only
+  // when ALL of: a valid cached index exists for this EXACT identity; its
+  // cached generation still equals the CURRENT generation, read fresh
+  // here (not the entry-time snapshot above -- ensureFreeSpaceForWrite()
+  // just ran, and a low-space eviction there would already have bumped
+  // the generation past what the cache reflects, which must invalidate
+  // this just like any other intervening mutation); no #4.9q candidate is
+  // currently outstanding for it; and it has room for one more entry.
+  // Reliability here comes entirely from g_indexCacheValid having already
+  // been established by a prior loadConversationIndex() (a full load or a
+  // #4.9q incremental apply) -- this is NOT a fresh directory open or an
+  // independent enumeration, so countDirOpenFailed is simply left false
+  // (nothing was attempted here that could fail) rather than claimed as a
+  // verified open; its existing meaning for the fallback path below is
+  // unchanged.
+  if (g_indexCacheValid && strcmp(g_indexCacheGroup, group_code) == 0 &&
+      strcmp(g_indexCacheContact, contact_key) == 0 && g_indexCacheGeneration == generationBeforeCount &&
+      !g_pendingCandidateValid && g_indexCount < kMaxMessagesPerThread) {
+    // The index is sorted by (effective_sort_timestamp, message_id), NOT
+    // by sequence -- the last entry is not necessarily the highest
+    // sequence, so every entry's sequence field must be scanned, with the
+    // same comparison and initial value (0) findMaxSequence() uses.
+    uint32_t ramMaxSeq = 0;
+    for (uint16_t i = 0; i < g_indexCount; i++) {
+      if (g_index[i].sequence > ramMaxSeq) ramMaxSeq = g_index[i].sequence;
+    }
+    // Recheck before accepting the RAM result: this scan only ever reads
+    // g_index, so nothing here can itself have mutated storage, but this
+    // still guards against a hypothetically reentrant mutation -- the
+    // same conservative style this diagnostic series has used throughout.
+    if (getStorageChangeGeneration() == generationBeforeCount) {
+      msgCount = g_indexCount;
+      maxSeqFromCount = ramMaxSeq;
+      countReused = true;
+    }
+  }
+  if (!countReused) {
+    msgCount = countMessages(group_code, contact_key, &maxSeqFromCount, &countDirOpenFailed);
+  }
   uint32_t countElapsed = millis() - countStart;
 
   uint32_t evictElapsed = kUnmeasuredMs;
@@ -732,12 +799,12 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
       uint32_t totalElapsed = millis() - totalStart;
       Serial.printf(
           "[PERF][STORE_APPEND] total=%lu ms exit=evict-fail freeSpace=%lu ms count=%lu ms evict=%lu ms "
-          "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d\n",
+          "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d countReused=%d\n",
           static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
           static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
           static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
           static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
-          maxSeqReused ? 1 : 0);
+          maxSeqReused ? 1 : 0, countReused ? 1 : 0);
       return false;
     }
   }
@@ -785,12 +852,12 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
     uint32_t totalElapsed = millis() - totalStart;
     Serial.printf(
         "[PERF][STORE_APPEND] total=%lu ms exit=rewrite-fail freeSpace=%lu ms count=%lu ms evict=%lu ms "
-        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d\n",
+        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d countReused=%d\n",
         static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
         static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
         static_cast<unsigned long>(dirsElapsed), static_cast<unsigned long>(maxSeqElapsed),
         static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed),
-        maxSeqReused ? 1 : 0);
+        maxSeqReused ? 1 : 0, countReused ? 1 : 0);
     return false;
   }
   if (outRef != nullptr) *outRef = ref;
@@ -807,12 +874,12 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   if (totalElapsed >= 20) {
     Serial.printf(
         "[PERF][STORE_APPEND] total=%lu ms exit=completion freeSpace=%lu ms count=%lu ms evict=%lu ms "
-        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d\n",
+        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms maxSeqReused=%d countReused=%d\n",
         static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
         static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
         static_cast<unsigned long>(dirsElapsed), static_cast<unsigned long>(maxSeqElapsed),
         static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed),
-        maxSeqReused ? 1 : 0);
+        maxSeqReused ? 1 : 0, countReused ? 1 : 0);
   }
   return true;
 }
