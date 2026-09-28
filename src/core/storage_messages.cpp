@@ -493,15 +493,62 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
   return LittleFS.rename(tempPath, finalPath);
 }
 
+// Hardware Diagnostic #4.9o: instrumentation only -- every existing call,
+// its arguments, its order, and every existing return/failure path below
+// are unchanged. countMessages()'s return value is now captured into a
+// local (msgCount) instead of being called inline inside the eviction
+// `if`, so it can also be timed -- this is the SAME single call the
+// original code made, not an additional one. evictOldest()'s and
+// atomicRewrite()'s existing return values are likewise captured for this
+// diagnostic's own log line, without changing what either failure path
+// does (both still return false exactly as before). No nested timing was
+// added inside ensureFreeSpaceForWrite(), countMessages(), evictOldest(),
+// findMaxSequence(), or atomicRewrite() themselves -- each is timed only
+// from this call site, as one disjoint (never overlapping, never re-run)
+// phase in this function's own linear sequence. kUnmeasuredMs marks a
+// phase never reached this call (dirs/maxSeq/prepare/rewrite on the
+// evict-fail exit) or never attempted (evict, whenever eviction wasn't
+// needed this call) -- never a real 0 ms measurement.
+//
+// This function is called from MessageStore::appendStoredMessage()'s own
+// caller chain, itself invoked from sendComposedMessage()'s STORE phase
+// (text_message.cpp, Hardware Diagnostic #4.9n) during CHAT_SEND, itself
+// nested inside CHAT_SCREEN's own input-processing window (text_message.cpp,
+// #4.9i/#4.9l). STORE_APPEND's own total is therefore nested inside both
+// CHAT_SEND.store and CHAT_SCREEN's total -- never added on top of either.
 bool appendStoredMessage(const char* group_code, const char* contact_key, Direction direction, uint16_t flags,
                          uint32_t effective_sort_timestamp, const uint8_t* wirePacket, uint16_t wirePacketLen,
                          const uint8_t* localPayload, uint16_t localPayloadLen, MessageRef* outRef) {
-  ensureFreeSpaceForWrite();
+  constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
+  uint32_t totalStart = millis();
 
-  if (countMessages(group_code, contact_key) >= kMaxMessagesPerThread) {
-    if (!evictOldest(group_code, contact_key)) return false;  // Storage Full
+  uint32_t freeSpaceStart = millis();
+  ensureFreeSpaceForWrite();
+  uint32_t freeSpaceElapsed = millis() - freeSpaceStart;
+
+  uint32_t countStart = millis();
+  uint16_t msgCount = countMessages(group_code, contact_key);
+  uint32_t countElapsed = millis() - countStart;
+
+  uint32_t evictElapsed = kUnmeasuredMs;
+  if (msgCount >= kMaxMessagesPerThread) {
+    uint32_t evictStart = millis();
+    bool evictOk = evictOldest(group_code, contact_key);
+    evictElapsed = millis() - evictStart;
+    if (!evictOk) {  // Storage Full
+      uint32_t totalElapsed = millis() - totalStart;
+      Serial.printf(
+          "[PERF][STORE_APPEND] total=%lu ms exit=evict-fail freeSpace=%lu ms count=%lu ms evict=%lu ms "
+          "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms\n",
+          static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
+          static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
+          static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
+          static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs));
+      return false;
+    }
   }
 
+  uint32_t dirsStart = millis();
   ensureDirExists("/messages");
   char groupDir[40];
   buildGroupDir(group_code, groupDir, sizeof(groupDir));
@@ -509,9 +556,13 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   char convDir[80];
   buildConversationDir(group_code, contact_key, convDir, sizeof(convDir));
   ensureDirExists(convDir);
+  uint32_t dirsElapsed = millis() - dirsStart;
 
+  uint32_t maxSeqStart = millis();
   uint32_t nextSeq = findMaxSequence(group_code, contact_key) + 1;
+  uint32_t maxSeqElapsed = millis() - maxSeqStart;
 
+  uint32_t prepareStart = millis();
   MessageRef ref;
   strncpy(ref.group_code, group_code, sizeof(ref.group_code) - 1);
   ref.group_code[sizeof(ref.group_code) - 1] = '\0';
@@ -524,9 +575,34 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   hdr.flags = flags;
   hdr.local_write_sequence = nextSeq;
   hdr.effective_sort_timestamp = effective_sort_timestamp;
+  uint32_t prepareElapsed = millis() - prepareStart;
 
-  if (!atomicRewrite(ref, hdr, wirePacket, wirePacketLen, localPayload, localPayloadLen)) return false;
+  uint32_t rewriteStart = millis();
+  bool rewriteOk = atomicRewrite(ref, hdr, wirePacket, wirePacketLen, localPayload, localPayloadLen);
+  uint32_t rewriteElapsed = millis() - rewriteStart;
+  if (!rewriteOk) {
+    uint32_t totalElapsed = millis() - totalStart;
+    Serial.printf(
+        "[PERF][STORE_APPEND] total=%lu ms exit=rewrite-fail freeSpace=%lu ms count=%lu ms evict=%lu ms "
+        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms\n",
+        static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
+        static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
+        static_cast<unsigned long>(dirsElapsed), static_cast<unsigned long>(maxSeqElapsed),
+        static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed));
+    return false;
+  }
   if (outRef != nullptr) *outRef = ref;
+
+  uint32_t totalElapsed = millis() - totalStart;
+  if (totalElapsed >= 20) {
+    Serial.printf(
+        "[PERF][STORE_APPEND] total=%lu ms exit=completion freeSpace=%lu ms count=%lu ms evict=%lu ms "
+        "dirs=%lu ms maxSeq=%lu ms prepare=%lu ms rewrite=%lu ms\n",
+        static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(freeSpaceElapsed),
+        static_cast<unsigned long>(countElapsed), static_cast<unsigned long>(evictElapsed),
+        static_cast<unsigned long>(dirsElapsed), static_cast<unsigned long>(maxSeqElapsed),
+        static_cast<unsigned long>(prepareElapsed), static_cast<unsigned long>(rewriteElapsed));
+  }
   return true;
 }
 
