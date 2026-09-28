@@ -42,13 +42,17 @@ struct GroupClient {
   // eligible immediately"; otherwise the millis() deadline before which no
   // further attempt is made.
   //
-  // Hardware Fix #4.9f: Part A1's ORIGINAL implementation reset this back
-  // to 0 the moment MQTTClient::connect() returned true, before
-  // subscribeAll()/Presence::publishOnline() had even run -- so a
-  // connection lost during that setup window (a real, observed failure
-  // mode: subscribeAll() ignored every subscribe() result, and 256dpi/MQTT
-  // v2.5.2 closes the connection on a subscribe error) let the very next
-  // serviceTick() retry immediately, completely bypassing this cooldown.
+  // Hardware Fix #4.9f: Part A1's ORIGINAL implementation called
+  // subscribeAll()/Presence::publishOnline() and THEN reset this back to
+  // 0 unconditionally, on connect() alone having returned true -- it never
+  // checked whether subscribeAll()/publishOnline() themselves actually
+  // succeeded or left the connection dead. The defect was failing to
+  // account for setup failure, not the ORDER of the reset: a connection
+  // lost during that setup window (a real, observed failure mode:
+  // subscribeAll() ignored every subscribe() result, and 256dpi/MQTT
+  // v2.5.2 closes the connection on a subscribe error) still got the
+  // reset-to-0 treatment, so the very next serviceTick() could retry
+  // immediately, completely bypassing this cooldown.
   // connectGroupIfNeeded() now sets this to a fresh deadline after EVERY
   // actual attempt -- success or any failure stage -- never back to 0.
   // This field only ever gates connectGroupIfNeeded() itself; a client
@@ -62,11 +66,16 @@ GroupClient g_clients[Settings::kMaxGroups];
 bool g_maintenanceMode = false;
 
 // Hardware Fix #4.9d Part A1/A2, corrected by #4.9f: a disconnected group
-// may retry at most once every 5000ms (rather than once per tick), and any
-// single connect attempt is bounded to 500ms instead of the old 5000ms --
-// both necessary together, since MQTTClient::connect() is still fully
-// synchronous: throttling alone would still let one attempt block the UI
-// task for up to the old 5-second timeout when its turn came up.
+// may retry at most once every 5000ms (rather than once per tick), and the
+// MQTT-level command timeout used for a connect attempt's protocol
+// exchange is bounded to 500ms instead of the old 5000ms. This does NOT
+// bound the entire connect() call -- MQTTClient::connect() first performs
+// the underlying TCP/DNS work via WiFiClient::connect(host, port), which
+// this timeout parameter has no effect on, before any MQTT-level exchange
+// even starts. Both the throttle AND the reduced command timeout are
+// necessary together: throttling alone would still let one attempt block
+// the UI task for however long that unbounded TCP/DNS phase takes, every
+// time its turn came up.
 constexpr uint32_t kMqttReconnectIntervalMs = 5000;
 constexpr uint32_t kMqttCommandTimeoutMs = 500;
 
@@ -254,9 +263,12 @@ void buildClientId(const char* group_code, char* outBuf, size_t outBufSize) {
 // whether a failure is noticed and stops the sequence is new.
 //
 // Hardware Diagnostic #4.9e Part B2, extended by #4.9f Part C: 256dpi/MQTT's
-// subscribe() waits synchronously for the broker's SUBACK within the
-// configured command timeout, so per-subscribe timing (now also carrying
-// the actual result, lastError(), and current connection state, snapshotted
+// subscribe() is SUSPECTED to wait synchronously for the broker's SUBACK
+// within the configured command timeout, based on the library's general
+// design and the hardware timing evidence gathered so far -- this has not
+// yet been confirmed by an actual error/timeout captured on hardware via
+// the diagnostics below. Per-subscribe timing (carrying the actual
+// result, lastError(), and current connection state, snapshotted
 // immediately after the call) pinpoints exactly which of the 13 topics (if
 // any) is slow or failing, not just that subscribeAll() as a whole was.
 bool subscribeAll(GroupClient& gc) {
@@ -395,17 +407,23 @@ void connectGroupIfNeeded(GroupClient& gc, uint32_t now) {
     }
   }
 
-  // Hardware Fix #4.9f Part A: after EVERY actual attempt above -- full
-  // success or a failure at any stage -- establish a FRESH cooldown
-  // deadline from a fresh millis() reading. Never reset back to 0 on
-  // success: while this client stays connected, gc.mqtt->connected() at
-  // the top of this function always returns before this deadline is even
-  // read, so a healthy connection's normal mqtt->loop() servicing is
-  // completely unaffected by it; the deadline only takes effect the next
-  // time THIS connection is lost, closing the exact gap the hardware
-  // evidence found (a connection lost during setup could previously
-  // reconnect on the very next tick, bypassing this cooldown entirely).
-  gc.nextReconnectAttemptMs = computeNextReconnectDeadline(now);
+  // Hardware Fix #4.9f Part A, corrected by #4.9f follow-up: after EVERY
+  // actual attempt above -- full success or a failure at any stage --
+  // establish a FRESH cooldown deadline from a FRESH millis() reading
+  // taken HERE, not from `now` (the parameter captured once at the top of
+  // serviceTick(), before any of this function's own connect/subscribe/
+  // publish work ran). Using the stale `now` would undercount the actual
+  // cooldown by however long that work took -- often hundreds of
+  // milliseconds per the hardware timing evidence -- silently shrinking
+  // the intended 5-second window. Never reset back to 0 on success: while
+  // this client stays connected, gc.mqtt->connected() at the top of this
+  // function always returns before this deadline is even read, so a
+  // healthy connection's normal mqtt->loop() servicing is completely
+  // unaffected by it; the deadline only takes effect the next time THIS
+  // connection is lost, closing the exact gap the hardware evidence found
+  // (a connection lost during setup could previously reconnect on the
+  // very next tick, bypassing this cooldown entirely).
+  gc.nextReconnectAttemptMs = computeNextReconnectDeadline(millis());
 
   // Part C: one setup summary per actual attempt.
   Serial.printf("[PERF][MQTT] setup group=%s result=%d stage=%s connected=%d nextRetryMs=%lu\n", gc.group_code,
