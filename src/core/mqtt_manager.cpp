@@ -717,12 +717,37 @@ bool publishRaw(const char* group_code, const char* topic_suffix, const char* pa
   return gc->mqtt->publish(topic, payload, retained, qos);
 }
 
+// Hardware Diagnostic #4.9s: QoS1 publishes only, timed around the actual
+// publish() call -- QoS0 (radio audio) keeps its original direct path,
+// with no timing/error-state reads/logging, to avoid per-audio-packet
+// overhead. result/lastError()/connected() are snapshotted in that exact
+// order, immediately after publish() returns and before any
+// Serial.printf(); connectedBefore=1 is a literal, justified by the
+// connected() guard above -- no extra connected() call is added just to
+// log it. returnCode() is deliberately NOT read here: it is
+// connection-related, not the current publish's own error. Logged only
+// on failure or when the call took >=20ms.
 bool publishBinary(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                    bool retained, int qos) {
   GroupClient* gc = findClientSlot(group_code);
   if (gc == nullptr || gc->mqtt == nullptr || !gc->mqtt->connected()) return false;
   char topic[80];
   snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", group_code, topic_suffix);
+  if (qos == 1) {
+    uint32_t publishStart = millis();
+    bool result = gc->mqtt->publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
+    uint32_t publishElapsed = millis() - publishStart;
+    int lastErr = static_cast<int>(gc->mqtt->lastError());
+    bool connectedAfter = gc->mqtt->connected();
+    if (!result || publishElapsed >= 20) {
+      Serial.printf(
+          "[PERF][MQTT] publish group=%s qos=%d retained=%d bytes=%u %lu ms result=%d lastError=%d "
+          "connectedBefore=1 connectedAfter=%d\n",
+          group_code, qos, retained ? 1 : 0, static_cast<unsigned>(len),
+          static_cast<unsigned long>(publishElapsed), result ? 1 : 0, lastErr, connectedAfter ? 1 : 0);
+    }
+    return result;
+  }
   return gc->mqtt->publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
 }
 
