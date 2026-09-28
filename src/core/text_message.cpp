@@ -1080,18 +1080,29 @@ void screenChat() {
   uint32_t historyViewportElapsed = 0;
   uint32_t historyRenderElapsed = 0;
   uint32_t composeRenderElapsed = 0;
-  // Hardware Diagnostic #4.9l: true the moment ANY history-focus
-  // interaction or focus transition happens during THIS pass -- checked
-  // after every popped event below (not just once at the end), so a
-  // batch that enters history and then leaves it again before the loop
-  // finishes still gets caught, per the requirement that multiple queued
-  // events cannot hide an intermediate invalidation.
-  bool historyFocusTouchedThisPass = false;
+  // Hardware Diagnostic #4.9l, corrected by its follow-up: true the moment
+  // ANY history-focus interaction or focus transition happens during THIS
+  // pass. Initialized from the focus state ALREADY true entering this
+  // pass (not unconditionally false) -- a pass that begins history-
+  // focused and whose one-and-only queued event transitions straight back
+  // to compose focus must still count as touched, even though checking
+  // ONLY after that event would show compose-focused and miss it. Then
+  // checked again immediately before AND after every popped event inside
+  // the loop below (sticky -- never cleared back to false), so a batch
+  // that enters history and leaves it again before the loop finishes is
+  // also caught, per the requirement that multiple queued events cannot
+  // hide an intermediate invalidation.
+  bool historyFocusTouchedThisPass = (g_historyCursor != kNoHistoryCursor);
   // Hardware Diagnostic #4.9l: whether the history-viewport (startIdx,
   // startRowSkip) computed below actually came from the reused cache
   // rather than a real recompute -- see the viewport-reuse check further
   // down for the full eligibility/invalidation rules.
   bool viewportReused = false;
+  // Hardware Diagnostic #4.9l follow-up: set when the ACTUAL drawing pass
+  // below observes a row-load failure (loadHistoryRow()'s own reliability
+  // output) -- conservatively invalidates the cache/candidate at
+  // publication time even though it never alters what gets drawn.
+  bool renderObservedUnreliable = false;
   // `justEntered` must be declared before the lambda below so its by-
   // reference capture is valid (a lambda can only capture names already in
   // scope at its own definition point) -- it is still the SAME
@@ -1143,6 +1154,11 @@ void screenChat() {
   bool hadEvent = false;
   while (Input::popEvent(e)) {
     hadEvent = true;
+    // Hardware Diagnostic #4.9l follow-up: checked immediately BEFORE
+    // dispatching this event too, not only after -- see the declaration
+    // above for why "after only" can miss a single event that transitions
+    // straight from history focus back to compose.
+    if (g_historyCursor != kNoHistoryCursor) historyFocusTouchedThisPass = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
       bool rotateRefreshWasDirty = g_indexDirty;
       uint32_t rotateRefreshStart = millis();
@@ -1309,38 +1325,48 @@ void screenChat() {
   uint16_t startIdx = 0;
   uint16_t startRowSkip = 0;
   uint32_t historyViewportStart = millis();
-  // Hardware Diagnostic #4.9l: reuse the previously cached (startIdx,
-  // startRowSkip) instead of recomputing when EVERY one of these holds --
-  // deliberately conservative; any single condition failing falls back to
-  // the original, unmodified computeHistoryViewport() call below, exactly
-  // as before this diagnostic:
+  // Hardware Diagnostic #4.9l, corrected by its follow-up: reuse the
+  // previously PUBLISHED (startIdx, startRowSkip) instead of recomputing
+  // when EVERY one of these holds -- deliberately conservative; any
+  // single condition failing falls back to a real computeHistoryViewport()
+  // call below, exactly as before this diagnostic existed:
   //  - not the first pass after entry (!justEntered) and no full redraw
-  //    is already pending (!firstDraw, which covers the entry/memory-low/
-  //    viewportLines-changed cases too, since those all set or imply it);
+  //    is already pending (!firstDraw) -- these only ever block reuse
+  //    NOW; they do not themselves cover a viewportLines change (that is
+  //    its own separate check below -- see the note on that line) and
+  //    they never prevent a fresh, reliable result computed on such a
+  //    pass from being published as a candidate for a LATER pass, per
+  //    part B below;
   //  - the render this cache was published from, AND this pass, are both
   //    compose-focused (g_chatLastComposeFocused, composeFocused) -- a
   //    history-focused pass (or one transitioning into/out of it) never
   //    qualifies, on either side;
   //  - no history-focus interaction/transition happened anywhere in this
-  //    pass's input batch (!historyFocusTouchedThisPass), including a
-  //    transient enter-then-leave -- this is also what protects against
-  //    Enigma's and this file's own per-type "held" reveal toggle
-  //    (g_holdActive/g_heldRef in enigma.cpp and in this file), which can
-  //    change a message's rendered row height with no storage write: both
-  //    are only ever set from a history-focused DOT_PRESS_START/RELEASE
-  //    dispatch (dispatchHistoryMessageEvent() -> handleHistoryFocusEvent()
-  //    only), so a hold state can never change during a pass this check
-  //    already excludes, and the very next compose-focused pass after
-  //    leaving history is itself excluded too (g_chatLastComposeFocused
-  //    was false for it), forcing one fresh, correct recompute before any
-  //    later reuse resumes;
+  //    pass's input batch (!historyFocusTouchedThisPass, now correctly
+  //    initialized from the focus state entering this pass and checked
+  //    both before and after every event -- see its declaration above),
+  //    including a transient enter-then-leave -- this is also what
+  //    protects against Enigma's and this file's own per-type "held"
+  //    reveal toggle (g_holdActive/g_heldRef in enigma.cpp and in this
+  //    file), which can change a message's rendered row height with no
+  //    storage write: both are only ever set from a history-focused
+  //    DOT_PRESS_START/RELEASE dispatch (dispatchHistoryMessageEvent() ->
+  //    handleHistoryFocusEvent() only), so a hold state can never change
+  //    during a pass this check already excludes, and the very next
+  //    compose-focused pass after leaving history is itself excluded too
+  //    (g_chatLastComposeFocused was false for it), forcing one fresh,
+  //    correct recompute before any later reuse resumes;
   //  - no index refresh was requested/performed anywhere in this pass
   //    (!indexReloadOccurred, which already covers the ENCODER_ROTATE-
   //    triggered refresh inside the input loop above, not only the final
   //    refreshIndexIfNeeded() call);
-  //  - identity, index count, storage generation, viewportLines, and the
-  //    font/layout geometry (line height, labelX) all match exactly what
-  //    was true when the cached result was published.
+  //  - identity, index count, and storage generation all still match what
+  //    was true when the cached result was published;
+  //  - viewportLines and the font/layout geometry (line height, labelX)
+  //    still match too -- this, not firstDraw, is what actually detects a
+  //    compose-expansion/shrink height change; firstDraw only reflects an
+  //    explicit full-redraw request (entry, memory-low, or any other
+  //    g_chatNeedsFullRedraw=true site).
   // Game message rendering (number_guessing_friend.cpp) was inspected too
   // (read-only) and found to carry no comparable transient toggle -- its
   // text is derived purely from stored localPayload/direction, already
@@ -1353,43 +1379,51 @@ void screenChat() {
                                g_chatViewportCacheGeneration == MessageStore::getStorageChangeGeneration() &&
                                g_chatViewportCacheViewportLines == viewportLines &&
                                g_chatViewportCacheLabelX == labelX && g_chatViewportCacheLineHeight == lh;
+  // Hardware Diagnostic #4.9l follow-up: a candidate for a NEW cache
+  // entry, tracked purely in locals -- g_chatViewportCache* is never
+  // written here. Whether it actually becomes the live cache is decided
+  // once, at this function's natural end, after history/compose rendering
+  // has completed (part B). `viewportCandidateGeneration` is the
+  // generation read BEFORE computeHistoryViewport() runs, never a value
+  // re-read afterward, so publication can detect a mutation that happened
+  // during computation or rendering and refuse to publish a now-stale
+  // result.
+  bool viewportCandidateReady = false;
+  uint32_t viewportCandidateGeneration = 0;
   if (viewportReuseEligible) {
     startIdx = g_chatViewportCacheStartIdx;
     startRowSkip = g_chatViewportCacheStartRowSkip;
     viewportReused = true;
   } else {
-    // Hardware Diagnostic #4.9l: reliability threaded through unchanged --
-    // see computeHistoryViewport()'s own comment. A result derived from
-    // any fallback placeholder (missing index entry, failed loadMessage(),
+    // About to compute a fresh result that will replace whatever the
+    // cache currently describes -- invalidate it now, before computing,
+    // rather than leaving a stale valid=true flag around for however long
+    // computation and rendering below take.
+    g_chatViewportCacheValid = false;
+    uint32_t generationBeforeCompute = MessageStore::getStorageChangeGeneration();
+    // Reliability threaded through unchanged -- see
+    // computeHistoryViewport()'s own comment. A result derived from any
+    // fallback placeholder (missing index entry, failed loadMessage(),
     // failed scratch acquisition, or an unavailable renderer) is still
     // returned and used for THIS pass's rendering exactly as before, but
-    // is never published below as reusable.
+    // is never made into a reuse candidate.
     bool viewportReliable = true;
     computeHistoryViewport(viewportLines, labelX, &startIdx, &startRowSkip, &viewportReliable);
-    // Only a reliable result computed on a pass that is ITSELF a stable
-    // compose-focused, non-full-redraw baseline is worth publishing -- one
-    // computed while history-focused, or mid-transition, or forced by a
-    // full redraw, must not become the seed for a later reuse.
-    if (viewportReliable && composeFocused && !firstDraw) {
-      strncpy(g_chatViewportCacheGroup, g_selectedGroupCode, sizeof(g_chatViewportCacheGroup) - 1);
-      g_chatViewportCacheGroup[sizeof(g_chatViewportCacheGroup) - 1] = '\0';
-      strncpy(g_chatViewportCacheContact, g_selectedContactKey, sizeof(g_chatViewportCacheContact) - 1);
-      g_chatViewportCacheContact[sizeof(g_chatViewportCacheContact) - 1] = '\0';
-      g_chatViewportCacheIndexTotal = g_indexTotal;
-      g_chatViewportCacheGeneration = MessageStore::getStorageChangeGeneration();
-      g_chatViewportCacheViewportLines = viewportLines;
-      g_chatViewportCacheLabelX = labelX;
-      g_chatViewportCacheLineHeight = lh;
-      g_chatViewportCacheStartIdx = startIdx;
-      g_chatViewportCacheStartRowSkip = startRowSkip;
-      g_chatViewportCacheValid = true;
-    } else {
-      g_chatViewportCacheValid = false;
+    // A reliable result computed while compose-focused is a candidate to
+    // seed a LATER pass's cache even when THIS pass is itself an entry or
+    // full-redraw pass (firstDraw/justEntered only ever block reuse NOW,
+    // per the eligibility check above -- never candidacy): the very next
+    // pass, once no longer justEntered/firstDraw, can then reuse it.
+    if (viewportReliable && composeFocused) {
+      viewportCandidateReady = true;
+      viewportCandidateGeneration = generationBeforeCompute;
     }
   }
   // Measures only the reuse check above, or the real recompute -- never a
   // stale duration left over from any earlier pass, since this whole
-  // block (and historyViewportStart itself) runs fresh every call.
+  // block (and historyViewportStart itself) runs fresh every call. Actual
+  // publication (part B) happens later, after rendering, and is not
+  // included in this window either.
   historyViewportElapsed = millis() - historyViewportStart;
   int16_t composeY = static_cast<int16_t>(contentTop + viewportLines * lh);
 
@@ -1422,7 +1456,15 @@ void screenChat() {
     uint16_t rowsDrawn = 0;
     for (uint16_t i = startIdx; i < g_indexTotal && rowsDrawn < viewportLines; i++) {
       HistoryRowInfo info;
-      loadHistoryRow(i, labelX, &info);
+      // Hardware Diagnostic #4.9l follow-up: observes (never alters) the
+      // same fallback-placeholder signal used for the viewport computation
+      // above -- a failure actually seen while DRAWING conservatively
+      // invalidates the viewport cache/candidate at this function's
+      // natural end, even on a pass that reused a previously cached
+      // result (see renderObservedUnreliable's declaration and use).
+      bool rowReliable = true;
+      loadHistoryRow(i, labelX, &info, &rowReliable);
+      if (!rowReliable) renderObservedUnreliable = true;
       uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;
       size_t len = strlen(info.lineBuf);
       size_t pos = 0;
@@ -1578,6 +1620,43 @@ void screenChat() {
   g_chatLastStartRowSkip = static_cast<int16_t>(startRowSkip);
   g_chatLastCursor = g_historyCursor;
   g_chatLastRowOffset = g_historyRowOffset;
+
+  // Hardware Diagnostic #4.9l follow-up part B: the viewport cache is
+  // published (or invalidated) HERE, at this function's natural end,
+  // after history/compose rendering has actually completed -- never
+  // earlier (a recompute already invalidated the OLD cache the moment it
+  // started, well above). A row-load failure actually observed while
+  // drawing (renderObservedUnreliable) conservatively invalidates
+  // whatever is current -- a fresh candidate that was about to be
+  // published, or an already-reused cache from earlier in this same pass
+  // -- since it means at least one row's true height could differ from
+  // what either describes. Otherwise, a candidate from a real computation
+  // above is published only if it is still reliable, this pass is still
+  // compose-focused, and the storage generation captured BEFORE
+  // computeHistoryViewport() ran still matches now -- catching any
+  // mutation that happened during computation or during rendering itself.
+  // A previously unreliable result never becomes valid here; only a
+  // genuinely reliable, still-consistent candidate is ever published. On
+  // a pass that reused the existing cache (no candidate was computed),
+  // this leaves that cache exactly as it already was, unless the drawing
+  // failure above just invalidated it.
+  if (renderObservedUnreliable) {
+    g_chatViewportCacheValid = false;
+  } else if (viewportCandidateReady && composeFocused &&
+             viewportCandidateGeneration == MessageStore::getStorageChangeGeneration()) {
+    strncpy(g_chatViewportCacheGroup, g_selectedGroupCode, sizeof(g_chatViewportCacheGroup) - 1);
+    g_chatViewportCacheGroup[sizeof(g_chatViewportCacheGroup) - 1] = '\0';
+    strncpy(g_chatViewportCacheContact, g_selectedContactKey, sizeof(g_chatViewportCacheContact) - 1);
+    g_chatViewportCacheContact[sizeof(g_chatViewportCacheContact) - 1] = '\0';
+    g_chatViewportCacheIndexTotal = g_indexTotal;
+    g_chatViewportCacheGeneration = viewportCandidateGeneration;
+    g_chatViewportCacheViewportLines = viewportLines;
+    g_chatViewportCacheLabelX = labelX;
+    g_chatViewportCacheLineHeight = lh;
+    g_chatViewportCacheStartIdx = startIdx;
+    g_chatViewportCacheStartRowSkip = startRowSkip;
+    g_chatViewportCacheValid = true;
+  }
 
   emitChatScreenPerf("render");
 }
