@@ -458,6 +458,55 @@ void init() {
   // messages" without an eager full-tree scan at boot.
 }
 
+namespace {
+// Hardware Diagnostic #4.9k: relocated here (from just above
+// loadConversationIndex(), where indexEntryAfter()/readIndexMetadata()
+// still remain) so appendStoredMessage() below -- Hardware Diagnostic
+// #4.9q -- can read/write these same globals. Nothing about the
+// declarations themselves changed, only their position in the file.
+ConversationIndexEntry g_index[kMaxMessagesPerThread];
+uint16_t g_indexCount = 0;
+
+// Hardware Diagnostic #4.9k: identity + generation of the ONE conversation
+// currently held in the shared g_index/g_indexCount above, if any. There
+// is exactly one cache slot, matching the single shared index -- switching
+// A -> B -> A means A's own entry must be reloaded, not that a second slot
+// remembers it. g_indexCacheValid starts false (nothing cached yet at
+// boot; this file adds no boot preload). Identity buffers are sized with
+// the same existing constants MessageRef/ConversationIndexEntry callers
+// already use (PacketCodec::kGroupCodeLen, kContactKeyLen) rather than a
+// new literal, so they can hold any group_code/contact_key this codebase
+// considers representable.
+bool g_indexCacheValid = false;
+char g_indexCacheGroup[PacketCodec::kGroupCodeLen] = {0};
+char g_indexCacheContact[kContactKeyLen] = {0};
+uint32_t g_indexCacheGeneration = 0;
+
+// Hardware Diagnostic #4.9q: pending single-entry incremental-refresh
+// candidate for the g_index above. Recorded only by appendStoredMessage()
+// (see its own maybeRecordIndexAppendCandidate() call, in its success
+// path only) on a fully successful append to a conversation whose cached
+// index was valid and unchanged across the ENTIRE append. Consumed only
+// by the NEXT loadConversationIndex() call for this EXACT identity --
+// see tryApplyIndexAppendCandidate() -- which either applies it (reading
+// just the new record and inserting it in place) or discards it and
+// falls back to the existing full-load path. appendStoredMessage() never
+// writes g_index/g_indexCount/g_indexCacheValid/g_indexCacheGroup/
+// g_indexCacheContact/g_indexCacheGeneration itself -- only these scalar
+// fields -- so any code currently iterating g_index via getIndexEntry(),
+// or holding a count from its last loadConversationIndex() call, is
+// completely unaffected by an append until it explicitly reloads. Scalars
+// only: no pointer into g_index or any other shared buffer is ever stored
+// here, and this is not a persistent cache -- it describes exactly one
+// pending append, consumed or discarded by the very next load for this
+// identity, never accumulated across more than one.
+bool g_pendingCandidateValid = false;
+char g_pendingCandidateGroup[PacketCodec::kGroupCodeLen] = {0};
+char g_pendingCandidateContact[kContactKeyLen] = {0};
+uint32_t g_pendingCandidateSequence = 0;
+uint32_t g_pendingCandidatePostWriteGeneration = 0;
+}  // namespace
+
 bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
                    uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen) {
   // Hardware Diagnostic #4.9h: bumped unconditionally, before any of this
@@ -512,6 +561,78 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
   LittleFS.remove(finalPath);  // overwrite semantics: clear any prior file at the target first
   return LittleFS.rename(tempPath, finalPath);
 }
+
+namespace {
+// Hardware Diagnostic #4.9q: called only from appendStoredMessage()'s
+// success path, after atomicRewrite() has already returned true. Never
+// mutates g_index, g_indexCount, or any g_indexCache* field -- only ever
+// writes the g_pendingCandidate* scalars, so any code currently iterating
+// the shared index (getIndexEntry()) or holding a count from its last
+// loadConversationIndex() call is completely unaffected until it
+// explicitly reloads. Records a candidate only when EVERY one of these
+// holds, all evaluated against this exact append:
+//   - a reliable, valid cached index for this exact group/contact existed
+//     at function entry (entryIndexEligible, computed by the caller from
+//     a generation snapshot taken before ensureFreeSpaceForWrite() ran);
+//   - no candidate is already outstanding (never overwrite one and make
+//     the old index look like it covers more than the one append that
+//     created it);
+//   - this append's own directory enumeration (countMessages()) opened
+//     successfully and its count agreed with the cached index's own
+//     count -- two independently obtained "how many records exist"
+//     readings must agree;
+//   - #4.9p's maximum-sequence reuse path was actually used, which by
+//     construction already means no per-thread eviction was attempted;
+//   - the cached index has room for one more entry;
+//   - the new sequence is not already present in the cached index;
+//   - exactly one generation advance happened across the ENTIRE append,
+//     from entry to just after atomicRewrite() succeeded -- computed with
+//     unsigned (rollover-safe) subtraction, so this single check also
+//     catches low-space eviction, per-thread eviction, and any other
+//     mutation or callback that could have touched storage or the shared
+//     index along the way;
+//   - a final recheck, read fresh (not reused from the entry snapshot),
+//     that the cache is STILL valid for this exact identity right now --
+//     never revives a candidate against an index that had already gone
+//     invalid by the time this runs.
+// A second append before the first candidate is consumed can never
+// overwrite it with a mismatched one: g_indexCacheGeneration is only ever
+// advanced by loadConversationIndex() consuming or discarding a
+// candidate, so a second append's own entryIndexEligible can only be true
+// if the first candidate was already consumed or discarded by an
+// intervening load -- never while one is still outstanding for this
+// identity. The explicit g_pendingCandidateValid check below is kept
+// anyway as the same kind of conservative, defense-in-depth guard this
+// diagnostic series has used throughout (e.g. #4.9p's own generation
+// check), not because this invariant was found to be otherwise breakable.
+void maybeRecordIndexAppendCandidate(const char* group_code, const char* contact_key, bool entryIndexEligible,
+                                     uint32_t entryGeneration, bool countDirOpenFailed, uint16_t msgCount,
+                                     bool maxSeqReused, uint32_t newSequence) {
+  if (!entryIndexEligible || g_pendingCandidateValid) return;
+  if (countDirOpenFailed || !maxSeqReused) return;
+  if (msgCount != g_indexCount) return;
+  if (g_indexCount >= kMaxMessagesPerThread) return;
+  for (uint16_t i = 0; i < g_indexCount; i++) {
+    if (g_index[i].sequence == newSequence) return;
+  }
+  uint32_t generationNow = getStorageChangeGeneration();
+  if (generationNow - entryGeneration != 1u) return;  // unsigned, rollover-safe
+  // Recheck fresh, right before writing the candidate: never revive an
+  // index that has since gone invalid, and never trust the entry-time
+  // snapshot alone for the final write.
+  if (!g_indexCacheValid || strcmp(g_indexCacheGroup, group_code) != 0 ||
+      strcmp(g_indexCacheContact, contact_key) != 0) {
+    return;
+  }
+  strncpy(g_pendingCandidateGroup, group_code, sizeof(g_pendingCandidateGroup) - 1);
+  g_pendingCandidateGroup[sizeof(g_pendingCandidateGroup) - 1] = '\0';
+  strncpy(g_pendingCandidateContact, contact_key, sizeof(g_pendingCandidateContact) - 1);
+  g_pendingCandidateContact[sizeof(g_pendingCandidateContact) - 1] = '\0';
+  g_pendingCandidateSequence = newSequence;
+  g_pendingCandidatePostWriteGeneration = generationNow;
+  g_pendingCandidateValid = true;
+}
+}  // namespace
 
 // Hardware Diagnostic #4.9o: instrumentation only -- every existing call,
 // its arguments, its order, and every existing return/failure path below
@@ -580,6 +701,16 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
   uint32_t totalStart = millis();
   bool maxSeqReused = false;
+
+  // Hardware Diagnostic #4.9q: snapshot taken before ensureFreeSpaceForWrite()
+  // runs, so entryIndexEligible reflects the TRUE pre-append state -- low-
+  // space eviction below (if any) must not be mistaken for "nothing
+  // happened yet." See maybeRecordIndexAppendCandidate()'s own comment,
+  // just above this function, for the full eligibility list this feeds.
+  uint32_t entryGeneration = getStorageChangeGeneration();
+  bool entryIndexEligible = g_indexCacheValid && strcmp(g_indexCacheGroup, group_code) == 0 &&
+                            strcmp(g_indexCacheContact, contact_key) == 0 &&
+                            g_indexCacheGeneration == entryGeneration;
 
   uint32_t freeSpaceStart = millis();
   ensureFreeSpaceForWrite();
@@ -664,6 +795,14 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   }
   if (outRef != nullptr) *outRef = ref;
 
+  // Hardware Diagnostic #4.9q: only ever reached after atomicRewrite()
+  // has already returned true -- an evict-fail or rewrite-fail return
+  // above never reaches this call, so a failed append can never create a
+  // candidate. See maybeRecordIndexAppendCandidate()'s own comment for
+  // the full eligibility list it checks before recording anything.
+  maybeRecordIndexAppendCandidate(group_code, contact_key, entryIndexEligible, entryGeneration, countDirOpenFailed,
+                                  msgCount, maxSeqReused, nextSeq);
+
   uint32_t totalElapsed = millis() - totalStart;
   if (totalElapsed >= 20) {
     Serial.printf(
@@ -743,24 +882,11 @@ bool loadMessage(const MessageRef& ref, StoredMessageView* outView) {
 }
 
 namespace {
-ConversationIndexEntry g_index[kMaxMessagesPerThread];
-uint16_t g_indexCount = 0;
-
-// Hardware Diagnostic #4.9k: identity + generation of the ONE conversation
-// currently held in the shared g_index/g_indexCount above, if any. There
-// is exactly one cache slot, matching the single shared index -- switching
-// A -> B -> A means A's own entry must be reloaded, not that a second slot
-// remembers it. g_indexCacheValid starts false (nothing cached yet at
-// boot; this file adds no boot preload). Identity buffers are sized with
-// the same existing constants MessageRef/ConversationIndexEntry callers
-// already use (PacketCodec::kGroupCodeLen, kContactKeyLen) rather than a
-// new literal, so they can hold any group_code/contact_key this codebase
-// considers representable.
-bool g_indexCacheValid = false;
-char g_indexCacheGroup[PacketCodec::kGroupCodeLen] = {0};
-char g_indexCacheContact[kContactKeyLen] = {0};
-uint32_t g_indexCacheGeneration = 0;
-
+// Hardware Diagnostic #4.9q: g_index/g_indexCount and the g_indexCache*/
+// g_pendingCandidate* globals these functions use now live earlier in
+// this file (just above atomicRewrite()), so appendStoredMessage() can
+// also reach them -- see that relocated block's own comment for why nothing
+// about their behavior changed, only their declaration point.
 bool indexEntryAfter(const ConversationIndexEntry& a, const ConversationIndexEntry& b) {
   if (a.effective_sort_timestamp != b.effective_sort_timestamp) {
     return a.effective_sort_timestamp > b.effective_sort_timestamp;
@@ -812,6 +938,100 @@ bool readIndexMetadata(const char* group_code, const char* contact_key, uint32_t
   memcpy(outId, idBuf, PacketCodec::kMessageIdLen);
   return true;
 }
+
+// Hardware Diagnostic #4.9q: attempts to apply the single-entry pending
+// index-append candidate recorded by appendStoredMessage() (see
+// maybeRecordIndexAppendCandidate()'s own comment, just above
+// appendStoredMessage() earlier in this file, for exactly when and why a
+// candidate is recorded). Called by loadConversationIndex() only after it
+// has already established g_pendingCandidateValid is true and the
+// candidate's identity matches group_code/contact_key. Returns true only
+// if g_index/g_indexCount were actually updated in place; a false return
+// always means this function has already cleared g_pendingCandidateValid
+// itself, so the caller's only remaining job is to fall back to the
+// existing full-load path -- it must never retry the same candidate, and
+// must not treat a false return as having left a partially modified
+// index (it never mutates g_index/g_indexCount until every prerequisite
+// below has already passed).
+bool tryApplyIndexAppendCandidate(const char* group_code, const char* contact_key) {
+  // Recheck fresh here, rather than trusting the append-time snapshot
+  // that originally made this candidate eligible -- never revive a
+  // cached index that has since gone invalid or now belongs to a
+  // different identity.
+  if (!g_indexCacheValid || strcmp(g_indexCacheGroup, group_code) != 0 ||
+      strcmp(g_indexCacheContact, contact_key) != 0) {
+    g_pendingCandidateValid = false;
+    return false;
+  }
+  if (g_indexCount >= kMaxMessagesPerThread) {
+    g_pendingCandidateValid = false;
+    return false;
+  }
+  for (uint16_t i = 0; i < g_indexCount; i++) {
+    if (g_index[i].sequence == g_pendingCandidateSequence) {
+      g_pendingCandidateValid = false;
+      return false;
+    }
+  }
+  // The one generation this candidate is valid for -- appendStoredMessage()
+  // only ever recorded it when this equaled the generation immediately
+  // after its own atomicRewrite() succeeded, with nothing else advancing
+  // the generation in between. Any further mutation since then (a second
+  // append, an eviction, an external notifyExternalStorageMutationAttempted())
+  // moves the generation past this value, which this check catches.
+  if (getStorageChangeGeneration() != g_pendingCandidatePostWriteGeneration) {
+    g_pendingCandidateValid = false;
+    return false;
+  }
+
+  StoredHeader hdr;
+  char mid[PacketCodec::kMessageIdLen];
+  bool readOk = readIndexMetadata(group_code, contact_key, g_pendingCandidateSequence, &hdr, mid);
+  // Stable-generation recheck after the read, mirroring loadConversationIndex()'s
+  // own before/after comparison for a full load -- the read above must not
+  // have raced a mutation landing after the prerequisite check just above.
+  if (!readOk || getStorageChangeGeneration() != g_pendingCandidatePostWriteGeneration) {
+    g_pendingCandidateValid = false;
+    return false;
+  }
+
+  ConversationIndexEntry newEntry;
+  newEntry.sequence = g_pendingCandidateSequence;
+  newEntry.effective_sort_timestamp = hdr.effective_sort_timestamp;
+  strncpy(newEntry.message_id, mid, PacketCodec::kMessageIdLen - 1);
+  newEntry.message_id[PacketCodec::kMessageIdLen - 1] = '\0';
+  newEntry.flags = hdr.flags;
+
+  // Find the insertion point in the existing ascending-sorted g_index,
+  // exactly as the full-load insertion sort would place this entry.
+  uint16_t insertPos = g_indexCount;
+  for (uint16_t i = 0; i < g_indexCount; i++) {
+    bool newAfterExisting = indexEntryAfter(newEntry, g_index[i]);
+    bool existingAfterNew = indexEntryAfter(g_index[i], newEntry);
+    if (!newAfterExisting && !existingAfterNew) {
+      // Equal on both sort keys -- a real full load's relative order for
+      // tied entries depends on filesystem enumeration order, which this
+      // incremental path never reproduces. Conservatively refuse to
+      // invent a tie order rather than risk a wrong one.
+      g_pendingCandidateValid = false;
+      return false;
+    }
+    if (existingAfterNew) {
+      insertPos = i;
+      break;
+    }
+  }
+
+  for (uint16_t i = g_indexCount; i > insertPos; i--) {
+    g_index[i] = g_index[i - 1];
+  }
+  g_index[insertPos] = newEntry;
+  g_indexCount++;
+
+  g_indexCacheGeneration = g_pendingCandidatePostWriteGeneration;
+  g_pendingCandidateValid = false;
+  return true;
+}
 }  // namespace
 
 // Hardware Diagnostic #4.9i: instrumentation only -- every existing return
@@ -835,6 +1055,30 @@ bool readIndexMetadata(const char* group_code, const char* contact_key, uint32_t
 // instead prints its own compact line. No boot preload: g_indexCacheValid
 // starts false, so the very first call for any conversation always falls
 // through to a real load.
+//
+// Hardware Diagnostic #4.9q: between the cache-hit check and the full
+// load, a third possibility now exists -- applying a pending single-entry
+// append candidate (see tryApplyIndexAppendCandidate()) that reads and
+// inserts just the ONE newly appended record instead of re-enumerating
+// and re-reading the whole conversation. It prints its own
+// "[PERF][CHAT_INDEX] incremental=1 ..." line and returns exactly like a
+// full load would (same g_indexCount, same g_index ordering) -- a caller
+// cannot tell from the return value alone which of the three paths ran.
+// Scope for this first implementation is exactly one successful append to
+// a valid, unchanged, below-capacity index (see maybeRecordIndexAppendCandidate()'s
+// own eligibility list); eviction, multiple appends before a reload, flag/
+// payload changes, group deletion, an unreliable prior load, and an
+// identity switch all still fall back to the full load below unchanged.
+// Every caller that reloads only when its own dirty flag is set (e.g.
+// text_message.cpp/enigma.cpp/number_guessing_friend.cpp's
+// refreshIndexIfNeeded(), and text_message.cpp's own [PERF][CHAT_SCREEN]
+// indexReload=1 diagnostic) still calls this same function on a reload,
+// unaware of and unaffected by which of the three paths above actually
+// ran -- so "a reload happened" (indexReload=1) no longer implies a full
+// re-enumeration; it may now mean this incremental path ran instead. This
+// file cannot itself change how those out-of-file diagnostics label that
+// distinction (only storage_messages.cpp is in scope for this commit);
+// this comment documents the fact for whoever next touches that file.
 uint16_t loadConversationIndex(const char* group_code, const char* contact_key) {
   // Hardware Diagnostic #4.9k: reuse the shared index untouched when
   // nothing that could invalidate it has happened since the last
@@ -850,6 +1094,40 @@ uint16_t loadConversationIndex(const char* group_code, const char* contact_key) 
     Serial.printf("[PERF][CHAT_INDEX] cacheHit=1 indexed=%u\n", static_cast<unsigned>(g_indexCount));
     return g_indexCount;
   }
+
+  // Hardware Diagnostic #4.9q: a pending append candidate for a DIFFERENT
+  // identity is now definitely stale -- either this call is about to
+  // overwrite the cache slot with a full load for that different
+  // identity, or (if this requested identity matches the cache slot's
+  // current contents) that slot never was the candidate's own baseline in
+  // the first place. Switching conversations discards it outright rather
+  // than letting it linger for a return to the candidate's identity
+  // later, by which point the cache slot's contents would have already
+  // changed out from under it.
+  if (g_pendingCandidateValid &&
+      (strcmp(g_pendingCandidateGroup, group_code) != 0 || strcmp(g_pendingCandidateContact, contact_key) != 0)) {
+    g_pendingCandidateValid = false;
+  }
+
+  // Hardware Diagnostic #4.9q: identity necessarily matches here (any
+  // mismatch was just discarded above). Ordinary cache-hit above already
+  // failed, which -- given appendStoredMessage() never updates
+  // g_indexCacheGeneration itself -- can only mean a candidate for this
+  // exact identity is outstanding, or no candidate exists at all and a
+  // real load is needed. tryApplyIndexAppendCandidate() re-verifies every
+  // prerequisite itself and always clears g_pendingCandidateValid before
+  // returning false, so a false return here safely falls through to the
+  // existing full-load path below with nothing left to discard.
+  if (g_pendingCandidateValid) {
+    uint32_t incTotalStart = millis();
+    if (tryApplyIndexAppendCandidate(group_code, contact_key)) {
+      uint32_t incTotalElapsed = millis() - incTotalStart;
+      Serial.printf("[PERF][CHAT_INDEX] incremental=1 total=%lu ms indexed=%u\n",
+                    static_cast<unsigned long>(incTotalElapsed), static_cast<unsigned>(g_indexCount));
+      return g_indexCount;
+    }
+  }
+
   // Falling through to a real load: whatever was cached no longer applies
   // once g_index below starts being overwritten, so invalidate it BEFORE
   // that happens -- if this load itself turns out unreliable, no stale
