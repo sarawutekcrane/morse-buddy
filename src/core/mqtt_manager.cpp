@@ -158,11 +158,15 @@ constexpr uint16_t kMaxStoredPacketSize = 1024;
 // fixed 1024-byte array) — kMaxStoredPacketSize remains the cap on what a
 // single packet may occupy, it just no longer pre-reserves that much .bss
 // for every one of the 16 slots regardless of what's actually queued.
-// Lifecycle: onMqttMessage() allocates+copies+takes ownership on enqueue;
-// drainReceiveQueue() frees exactly once and nulls the pointer after a
-// slot's payload has been fully processed, whatever path that took
-// (malformed topic, presence, malformed packet, unknown kind, or a
-// successful dispatch) — see processQueuedMessage()/drainReceiveQueue().
+// Lifecycle: onMqttMessage() allocates+copies+takes ownership on enqueue.
+// Fix Phase 1A: drainReceiveQueue() now detaches a slot's contents into a
+// local QueuedMessage copy and frees the original slot's ownership (data=
+// nullptr, used=false) BEFORE calling processQueuedMessage() — not after.
+// This struct has no user-declared destructor or copy constructor, so the
+// implicit copy is a plain shallow memberwise copy (the pointer value is
+// duplicated, nothing is deep-copied or auto-freed); ownership of the one
+// live payload always follows whichever copy the code chooses to free —
+// see drainReceiveQueue() for why the slot is relinquished first.
 struct QueuedMessage {
   bool used = false;
   char group_code[33] = {0};
@@ -228,8 +232,10 @@ const char* extractTopicSuffix(const char* fullTopic) {
 // One dequeued item's worth of dispatch — factored out of drainReceiveQueue
 // so every exit from this function (malformed topic, presence, malformed
 // packet, unregistered kind, or a successful dispatch) returns to exactly
-// one place that frees the slot's payload, guaranteeing it happens once
-// regardless of which path was taken.
+// one place. `q` is a detached local copy owned by the caller (see Fix
+// Phase 1A in drainReceiveQueue()), not a live reference into g_queue[] —
+// this function never frees q.data itself; the caller frees it exactly
+// once after this function returns, regardless of which path was taken.
 void processQueuedMessage(const QueuedMessage& q) {
   const char* suffix = extractTopicSuffix(q.topic);
   if (suffix == nullptr) return;
@@ -253,19 +259,43 @@ void drainReceiveQueue() {
   uint32_t drainStart = millis();
   uint16_t drainedCount = 0;
   while (g_queueCount > 0) {
-    QueuedMessage& q = g_queue[g_queueHead];
-    g_queueHead = static_cast<uint8_t>((g_queueHead + 1) % kQueueCapacity);
+    // Fix Phase 1A: detach this slot's contents into a local copy, and
+    // relinquish the original slot's ownership (data=nullptr, used=false)
+    // BEFORE calling processQueuedMessage() — not after, as this used to
+    // do by keeping a live reference into g_queue[g_queueHead] across the
+    // whole dispatch. A dispatched handler can itself call
+    // publishBinary()/publishRaw(), which reach the MQTT library's own
+    // publish()/subscribe(); whether that library pumps a synchronous
+    // socket read internally and reentrantly invokes onMqttMessage()
+    // before returning is not something this file can rule out (256dpi/
+    // MQTT's source is not available in this environment to verify either
+    // way — see this file's own header note). g_queueCount was already
+    // decremented for this slot below, so once the ring has wrapped near
+    // g_queueTail == this index is reachable, and a reentrant enqueue
+    // landing there while the old code still held `q` as a live reference
+    // would delete[] and overwrite the very payload dispatch was using —
+    // a use-after-free. Taking a full value copy and clearing the
+    // original slot's fields first closes that window: whatever a
+    // reentrant onMqttMessage() call does to g_queue[idx] from here on, it
+    // is working with a slot this function has already relinquished, never
+    // one still referenced by `local`.
+    uint8_t idx = g_queueHead;
+    QueuedMessage local = g_queue[idx];
+    g_queue[idx].data = nullptr;
+    g_queue[idx].used = false;
+    g_queue[idx].len = 0;
+    g_queueHead = static_cast<uint8_t>((idx + 1) % kQueueCapacity);
     g_queueCount--;
 
-    processQueuedMessage(q);
+    processQueuedMessage(local);
     drainedCount++;
 
-    // Free exactly once, then reset the slot, no matter which path
-    // processQueuedMessage took.
-    delete[] q.data;
-    q.data = nullptr;
-    q.used = false;
-    q.len = 0;
+    // Free exactly once, from the detached local copy — never touch
+    // g_queue[idx] again past this point; processQueuedMessage() above may
+    // already have caused a different, still-live item to be enqueued
+    // there (or wherever the tail now points), and this function must
+    // never clear or free a slot it no longer owns.
+    delete[] local.data;
   }
   uint32_t drainElapsed = millis() - drainStart;
   if (drainElapsed >= 20) {
@@ -694,14 +724,20 @@ void setMaintenanceModeActive(bool active) {
     drainReceiveQueue();
 
     // Defensive verification, not expected to ever fire: drainReceiveQueue()
-    // unconditionally loops until g_queueCount reaches 0, and nothing on
-    // that synchronous path can re-enter onMqttMessage() to re-queue
-    // something (that only ever happens from inside gc.mqtt->loop(),
-    // which serviceTick() -- now paused -- is the only caller of). Kept
-    // as an explicit, leak-proof fallback rather than trusting that
-    // invariant silently: if it ever fires, every dynamic payload still
-    // marked used is freed exactly once here rather than left allocated
-    // for the duration of OTA.
+    // unconditionally loops until g_queueCount reaches 0, re-checking the
+    // count on every iteration -- so even a reentrant onMqttMessage() call
+    // during this drain would itself get picked up and drained before the
+    // loop exits, not left behind. This is NOT limited to reentrancy via
+    // gc.mqtt->loop() (which serviceTick() -- now paused -- is the only
+    // caller of): a dispatched handler can itself call publishBinary()/
+    // publishRaw(), and whether the MQTT library's publish()/subscribe()
+    // pump a synchronous read internally and reentrantly invoke
+    // onMqttMessage() before returning is not something this file can rule
+    // out (256dpi/MQTT's source is not available here to verify). Kept as
+    // an explicit, leak-proof fallback rather than trusting the drain-to-
+    // empty invariant silently: if it ever fires for some other reason,
+    // every dynamic payload still marked used is freed exactly once here
+    // rather than left allocated for the duration of OTA.
     if (g_queueCount != 0) {
       Serial.printf("[mqtt] maintenance mode: %u receive-queue payload(s) left after drain; forcing release\n",
                    static_cast<unsigned>(g_queueCount));
