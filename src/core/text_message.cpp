@@ -767,14 +767,12 @@ void composeRowText(const ComposeLayout& layout, const char* prefix, uint8_t row
 // its arguments, and its position in the sequence below are unchanged;
 // this only wraps each already-existing phase in millis()-delta timing
 // and captures already-existing return values (publishBinary()'s bool,
-// and appendStoredMessage()'s bool) -- previously discarded, now captured
-// into storeOk for this diagnostic ONLY: clearDraft()/markIndexDirty()
-// below still run unconditionally afterward exactly as before, so a
-// failed store still silently clears the draft as it already did. That
-// is an existing, separate correctness gap this commit deliberately does
-// NOT fix -- see the exit=completion log line's storeOk field, which now
-// makes that gap directly observable on hardware for a future corrective
-// commit.
+// and appendStoredMessage()'s bool) into the exit=completion log line.
+//
+// Phase 2B-1: storeOk now also gates clearDraft() in exactly one case --
+// when BOTH the publish and the store report failure, the finalized draft
+// is kept (see the comment at that call below). markIndexDirty() stays
+// unconditional after any storage attempt.
 //
 // Each phase's window is disjoint from the others (sequential, never
 // nested) except for one unavoidable overlap: this function's own
@@ -878,17 +876,28 @@ void sendComposedMessage() {
   uint32_t storeStart = millis();
   MessageRef outRef;
   // Hardware Diagnostic #4.9n: storeOk captures appendStoredMessage()'s
-  // existing return value for this diagnostic's own log line only -- see
-  // this function's top comment. clearDraft()/markIndexDirty() below are
-  // unconditional, exactly as before; storeOk does not gate them.
+  // existing return value -- for the log line below and (Phase 2B-1) for
+  // the draft-retention decision after it.
   bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
                                                    MessageStore::Direction::SENT, flags, env.timestamp, wireBuf,
                                                    static_cast<uint16_t>(wireLen), nullptr, 0, &outRef);
   uint32_t storeElapsed = millis() - storeStart;
 
   uint32_t clearStart = millis();
-  clearDraft();
-  markIndexDirty();
+  // Phase 2B-1: if neither the publish nor the store succeeded, nothing
+  // holds this message (no local record, no Outbox entry to retry), so
+  // clearing the draft would lose it -- keep the finalized draft instead.
+  // Every other outcome clears exactly as before, including publish=true/
+  // store=false (not in local history, but the broker accepted it).
+  //
+  // published=false only means this device got no confirmation (not
+  // connected, or no PUBACK within the timeout) -- NOT proof that the
+  // broker/recipient received nothing. If the user re-sends the kept
+  // draft, it goes out as a NEW message (new message_id) and may
+  // duplicate one that did get through; this is not exactly-once. No
+  // automatic retry happens here.
+  if (published || storeOk) clearDraft();
+  markIndexDirty();  // a storage attempt was made either way (eviction may have run)
   uint32_t clearElapsed = millis() - clearStart;
 
   uint32_t totalElapsed = millis() - totalStart;

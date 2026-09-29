@@ -1383,12 +1383,17 @@ void sendEnigmaMessage() {
   size_t localLen = encodeLocalPayload(LOCK_UNLOCKED, normalizedPlaintext, localPayload, sizeof(localPayload));
 
   MessageRef outRef;
-  MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey, MessageStore::Direction::SENT, flags,
-                                    env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), localPayload, localLen,
-                                    &outRef);
+  bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
+                                                   MessageStore::Direction::SENT, flags, env.timestamp, wireBuf,
+                                                   static_cast<uint16_t>(wireLen), localPayload, localLen, &outRef);
 
-  clearDraft();
-  markIndexDirty();
+  // Phase 2B-1: same draft-retention rule and caveats as text_message.cpp's
+  // sendComposedMessage() -- keep the finalized draft only when BOTH the
+  // publish and the store failed (nothing else holds the message). A
+  // user re-send of that draft is a NEW message and may duplicate one the
+  // broker did receive without confirming; no automatic retry here.
+  if (published || storeOk) clearDraft();
+  markIndexDirty();  // a storage attempt was made either way (eviction may have run)
 }
 
 void finalizeComposeChar() {
