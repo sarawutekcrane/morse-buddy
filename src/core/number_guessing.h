@@ -62,4 +62,16 @@ void resetDigitRowRenderState(DigitRowRenderState* rs);
 void renderDigitRow(DigitRowRenderState* rs, int16_t x, int16_t y, const char* labelPrefix,
                     const DigitEntryState& state);
 
+// Fixed cell pitch renderDigitRow() uses (widest 0-9/'_' glyph + padding),
+// in the widget's current font.
+int16_t digitCellWidth();
+
+// Phase 2A: one recorded-attempt row ("1 2 3 4   2A2B") whose four digits
+// share EXACT pixel X with renderDigitRow()'s cells for the same
+// (x, labelPrefix), result text trailing after the fourth cell. Shared by
+// Play Solo and Race's guess screen so both present A/B identically.
+// Draws only; the caller clears the row region beforehand if needed.
+void drawGuessHistoryRow(int16_t x, int16_t y, const char* labelPrefix, uint16_t guessValue, uint8_t a,
+                         uint8_t b);
+
 }  // namespace NumberGuessing

@@ -34,6 +34,7 @@ void screenRaceRoom();
 void screenRaceGuess();
 void enterGuessScreen();
 void stopRoomPtt();
+void invalidateGuessOutcome();
 
 // =============================================================================
 // Room / round state (Phase 4 sections 11-18)
@@ -72,6 +73,61 @@ uint32_t g_roomActionStatusUntilMs = 0;
 void clearRoomActionStatus() {
   g_roomActionStatusText = nullptr;
   g_roomActionStatusUntilMs = 0;
+}
+
+// Phase 2A: rollover-safe "deadline not yet reached" (same signed-difference
+// technique as the Room action status check in screenRaceRoom()).
+bool beforeDeadline(uint32_t nowMs, uint32_t untilMs) { return static_cast<int32_t>(nowMs - untilMs) < 0; }
+
+// Phase 2A: Race guess history -- Solo-style "1 2 3 4   2A2B" rows for THIS
+// device's own submitted guesses in the current round. Local RAM only
+// (never persisted, never published), bounded: once full the oldest entry
+// is dropped, which only ever affects rows already scrolled off screen
+// (the Guess screen shows at most ~5 at PRIMARY line height). Keyed by the
+// round it belongs to, so a stale result can never be shown against a
+// different round's secret; cleared on every round end/reset/group change.
+struct RaceGuessEntry {
+  uint16_t guessValue;
+  uint8_t a;
+  uint8_t b;
+};
+constexpr uint8_t kRaceHistoryCap = 8;
+RaceGuessEntry g_raceHistory[kRaceHistoryCap];  // oldest first
+uint8_t g_raceHistoryCount = 0;
+char g_raceHistoryRoundId[kIdLen] = {0};
+// Bumped on every append/clear so the Guess screen can tell "history
+// changed" apart from a plain digit-entry change (Solo uses historyCount
+// for this, which stops changing once this bounded buffer is full).
+uint16_t g_raceHistoryVersion = 0;
+
+void clearRaceGuessHistory() {
+  g_raceHistoryCount = 0;
+  g_raceHistoryRoundId[0] = '\0';
+  g_raceHistoryVersion++;
+}
+
+void appendRaceGuess(const uint8_t digits[NumberGuessing::kSecretDigits], NumberGuessing::GuessResult r) {
+  if (g_raceHistoryCount == kRaceHistoryCap) {
+    memmove(&g_raceHistory[0], &g_raceHistory[1], sizeof(g_raceHistory[0]) * (kRaceHistoryCap - 1));
+    g_raceHistoryCount--;
+  }
+  RaceGuessEntry& e = g_raceHistory[g_raceHistoryCount++];
+  e.guessValue = static_cast<uint16_t>(digits[0] * 1000 + digits[1] * 100 + digits[2] * 10 + digits[3]);
+  e.a = r.a;
+  e.b = r.b;
+  g_raceHistoryVersion++;
+}
+
+// Phase 2A (D1): local-only "Solved! 4A0B" acknowledgement shown on the
+// Room's score row after this device's own correct guess. It states the
+// local evaluation result only -- NOT that the SOLVED packet reached the
+// broker or any peer (publishBinary()'s result is still discarded).
+uint32_t g_roomSolvedNoticeUntilMs = 0;
+bool g_roomSolvedNoticeActive = false;
+
+void clearRoomSolvedNotice() {
+  g_roomSolvedNoticeActive = false;
+  g_roomSolvedNoticeUntilMs = 0;
 }
 
 constexpr uint8_t kMaxParticipants = 20;
@@ -304,6 +360,11 @@ void applyReset() {
   // before either of those must not survive into whatever this room's
   // state becomes next.
   clearRoomActionStatus();
+  // Phase 2A: same reasoning for this round's guess history, any
+  // pending "Solved!" notice, and any pending/visible Guess outcome.
+  clearRaceGuessHistory();
+  clearRoomSolvedNotice();
+  invalidateGuessOutcome();
 }
 
 void publishReset() {
@@ -404,6 +465,11 @@ void publishStartRound() {
   generateRaceSecret(g_secret);
   g_hasHadFirstRound = true;
   g_phase = RoomPhase::ROUND_ACTIVE;
+  // Phase 2A: a new round supersedes the previous round's history, its
+  // notices, and any pending/visible Guess outcome.
+  clearRaceGuessHistory();
+  clearRoomSolvedNotice();
+  invalidateGuessOutcome();
 
   uint8_t payload[kIdLen + kIdLen + kDeviceIdLen + 4];
   size_t len = buildRoundPayload(g_inviteId, g_roundId, Identity::deviceId(), g_secret, payload, sizeof(payload));
@@ -429,6 +495,13 @@ void onLocalSolve() {
   strncpy(g_ownerDeviceId, Identity::deviceId(), sizeof(g_ownerDeviceId) - 1);
   g_phase = RoomPhase::LOBBY_WAITING;
   g_roundId[0] = '\0';
+  // Phase 2A (D1): the round is over -- drop its history and show a
+  // local-only, nonblocking acknowledgement on the Room screen (expires on
+  // its own; never gates any Room action). A correct guess is 4A0B by
+  // definition, so the text is fixed.
+  clearRaceGuessHistory();
+  g_roomSolvedNoticeActive = true;
+  g_roomSolvedNoticeUntilMs = millis() + 1500;
   Menu::goBack();  // back to Room
 }
 
@@ -480,9 +553,28 @@ char g_pendingWinner[kDeviceIdLen] = {0};
 
 void exitGuessConfirmYes() { Menu::goBack(); }
 
+// Phase 2A (D2): a guess may only be evaluated against a live round.
+bool isRoundActive() { return g_phase == RoomPhase::ROUND_ACTIVE && g_roundId[0] != '\0'; }
+
+// Phase 2A: binds the guess history and the in-progress digit entry to the
+// current round. When the round differs from the one the history belongs
+// to, both are discarded, so neither a previous round's results nor its
+// half-typed digits can carry over into (or be submitted against) the new
+// round. Same round -> no-op (history survives Room <-> Guess re-entry).
+// Returns true if anything was reset.
+bool syncGuessRound() {
+  if (strcmp(g_raceHistoryRoundId, g_roundId) == 0) return false;
+  clearRaceGuessHistory();
+  strncpy(g_raceHistoryRoundId, g_roundId, sizeof(g_raceHistoryRoundId) - 1);
+  g_raceHistoryRoundId[sizeof(g_raceHistoryRoundId) - 1] = '\0';
+  NumberGuessing::resetDigitEntry(&g_digitEntry);
+  return true;
+}
+
 void enterGuessScreen() {
   NumberGuessing::resetDigitEntry(&g_digitEntry);
   g_guessResultText = nullptr;
+  if (isRoundActive()) syncGuessRound();
   g_isRoomScreenActive = false;
   stopRoomPtt();
   RadioTransport::setUiContext(RadioTransport::UiContext::NONE);
@@ -497,7 +589,30 @@ bool g_raceGuessDirty = true;
 bool g_raceGuessNeedsFullRedraw = true;
 bool g_raceGuessLastShowingResult = false;
 NumberGuessing::DigitRowRenderState g_raceGuessRowState;
+uint16_t g_raceGuessLastHistoryVersion = 0;
 
+// Phase 2A: drops every pending AND visible Guess-screen outcome ("Solved by
+// X" pending or shown, "Round ended" shown, its deadline) plus any not-yet-
+// consumed auto-enter request. Called at every transition that supersedes
+// the round those belonged to: reset/leave (applyReset()), group change,
+// and local or remote new round. Forces a full Guess redraw so a notice
+// that was on screen is replaced by the entry layout on the next tick.
+void invalidateGuessOutcome() {
+  g_pendingExternalSolve = false;
+  g_guessResultText = nullptr;
+  g_guessResultUntilMs = 0;
+  g_pendingAutoEnterGuess = false;
+  g_raceGuessDirty = true;
+  g_raceGuessNeedsFullRedraw = true;
+}
+
+// Phase 2A: layout matches Play Solo's screenSoloGuess() exactly -- Guess
+// row pinned to the bottom of the content area, this round's history rows
+// filling upward from it (most recent immediately above Guess), every
+// history row drawn by the same NumberGuessing::drawGuessHistoryRow() Solo
+// uses, so A/B meaning and presentation are identical. During an active
+// round the only things ever drawn are this device's own submitted guesses,
+// their A/B results, and the live digit-entry row -- never g_secret.
 void screenRaceGuess() {
   if (Menu::consumeJustEntered()) {
     NumberGuessing::resetDigitEntry(&g_digitEntry);
@@ -516,10 +631,33 @@ void screenRaceGuess() {
     g_raceGuessDirty = true;
   }
 
-  if (g_guessResultText != nullptr && millis() >= g_guessResultUntilMs) {
+  // Phase 2A (D3): rollover-safe expiry (was a plain `millis() >= UntilMs`,
+  // which expires immediately if UntilMs wrapped past UINT32_MAX).
+  if (g_guessResultText != nullptr && !beforeDeadline(millis(), g_guessResultUntilMs)) {
     g_guessResultText = nullptr;
     Menu::goBack();
     return;
+  }
+
+  // Phase 2A (D2): the round this screen was opened for is gone (RESET,
+  // owner-offline reset, or otherwise no longer ROUND_ACTIVE) with no
+  // external-solve notice to show instead -- stop accepting guesses for it.
+  // Reuses the timed-notice path above: input freezes, then back to Room.
+  if (g_guessResultText == nullptr && !isRoundActive()) {
+    clearRaceGuessHistory();
+    g_guessResultText = "Round ended";
+    g_guessResultUntilMs = millis() + 1500;
+    g_raceGuessDirty = true;
+  }
+
+  // A different round arrived while this screen was open: drop the old
+  // round's history and half-typed digits before any input is processed.
+  // The user is already on this round's Guess screen, so a pending
+  // auto-enter request for it is satisfied (otherwise the next Back would
+  // bounce straight back in from the Room).
+  if (g_guessResultText == nullptr) {
+    if (syncGuessRound()) g_raceGuessDirty = true;
+    g_pendingAutoEnterGuess = false;
   }
 
   Input::update();
@@ -534,14 +672,16 @@ void screenRaceGuess() {
     if (g_guessResultText != nullptr) continue;  // freeze input while showing the outcome
     if (e.type == InputEventType::ENCODER_SHORT) {
       if (g_digitEntry.count == 4) {
+        if (!isRoundActive()) continue;  // D2: never evaluate/score/publish a stale round
         NumberGuessing::GuessResult r = NumberGuessing::evaluate(g_secret, g_digitEntry.digits);
         if (r.a == 4) {
           onLocalSolve();
           return;
         }
+        appendRaceGuess(g_digitEntry.digits, r);
         NumberGuessing::resetDigitEntry(&g_digitEntry);
       } else {
-        ConfirmPromptConfig cfg{"Exit this game?", nullptr, false, exitGuessConfirmYes, nullptr};
+        ConfirmPromptConfig cfg{"Exit this game?", "Guess needs 4 digits", false, exitGuessConfirmYes, nullptr};
         Menu::startConfirmPrompt(cfg);
         Menu::pushScreen(Menu::confirmPromptScreen);
       }
@@ -560,12 +700,15 @@ void screenRaceGuess() {
   g_raceGuessDirty = false;
 
   Display::setFont(Display::Font::PRIMARY);
-  int16_t y = Display::kStatusBarHeight + 2;
+  int16_t lh = Display::lineHeight();
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t guessY = static_cast<int16_t>(Display::kScreenHeight - lh);
+  static const char* const kGuessLabel = "Guess: ";
 
-  // Showing the transient "Solved by X" outcome is a genuine content-type
-  // change from the guess-entry row, so it forces a full redraw same as
-  // first entry (Global Invariant 12's spirit); it is otherwise static
-  // while shown, so no further per-tick diffing is needed there.
+  // Showing the transient "Solved by X" / "Round ended" outcome is a
+  // genuine content-type change from the guess-entry layout, so it forces a
+  // full redraw same as first entry (Global Invariant 12's spirit); it is
+  // otherwise static while shown, so no further per-tick diffing is needed.
   bool showingResult = (g_guessResultText != nullptr);
   bool phaseChanged = (showingResult != g_raceGuessLastShowingResult);
   bool forceFull = g_raceGuessNeedsFullRedraw || phaseChanged;
@@ -573,16 +716,37 @@ void screenRaceGuess() {
   if (showingResult) {
     if (forceFull) {
       Display::clearContentArea();
-      Display::printLine(2, y, g_guessResultText);
+      Display::printLine(2, contentTop, g_guessResultText);
       g_raceGuessNeedsFullRedraw = false;
     }
   } else {
+    // Same three-way split as screenSoloGuess(): full draw on entry/phase
+    // change, history region only when a guess was recorded or history was
+    // cleared, and otherwise only renderDigitRow()'s own per-cell diffing.
+    bool historyChanged = forceFull || (g_raceHistoryVersion != g_raceGuessLastHistoryVersion);
     if (forceFull) {
       Display::clearContentArea();
       NumberGuessing::resetDigitRowRenderState(&g_raceGuessRowState);
       g_raceGuessNeedsFullRedraw = false;
+    } else if (historyChanged) {
+      int16_t regionH = static_cast<int16_t>(guessY - contentTop);
+      if (regionH < 0) regionH = 0;
+      Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
-    NumberGuessing::renderDigitRow(&g_raceGuessRowState, 2, y, "Guess: ", g_digitEntry);
+    if (historyChanged) {
+      int16_t availableHistoryHeight = static_cast<int16_t>(guessY - contentTop);
+      uint8_t maxRows = (availableHistoryHeight > 0) ? static_cast<uint8_t>(availableHistoryHeight / lh) : 0;
+      uint8_t shown = (g_raceHistoryCount < maxRows) ? g_raceHistoryCount : maxRows;
+      uint8_t startIdx = static_cast<uint8_t>(g_raceHistoryCount - shown);
+      for (uint8_t i = startIdx; i < g_raceHistoryCount; i++) {
+        uint8_t rowIndex = static_cast<uint8_t>(i - startIdx);
+        int16_t rowY = static_cast<int16_t>(guessY - (shown - rowIndex) * lh);
+        const RaceGuessEntry& g = g_raceHistory[i];
+        NumberGuessing::drawGuessHistoryRow(2, rowY, kGuessLabel, g.guessValue, g.a, g.b);
+      }
+      g_raceGuessLastHistoryVersion = g_raceHistoryVersion;
+    }
+    NumberGuessing::renderDigitRow(&g_raceGuessRowState, 2, guessY, kGuessLabel, g_digitEntry);
   }
 
   g_raceGuessLastShowingResult = showingResult;
@@ -709,7 +873,7 @@ void leaveRaceMode() {
 // for extra overlap/clipping review under the larger PRIMARY font).
 bool g_raceRoomNeedsFullRedraw = true;
 char g_raceRoomLastActionLabel[24] = {0};
-char g_raceRoomLastScoreLine[16] = {0};
+char g_raceRoomLastScoreLine[32] = {0};
 uint8_t g_raceRoomLastOnlineCount = 0xFF;
 char g_raceRoomLastOnlineNames[4][17] = {{0}};
 
@@ -787,8 +951,8 @@ void screenRaceRoom() {
   // of UINT32_MAX when the notice is set, `now + 1500` wraps to a small
   // value, and a naive `millis() < UntilMs` would then read false (looks
   // already expired) immediately, even though the notice was just set.
-  // g_guessResultText's own pre-existing convention is unrelated to this
-  // round's correction and is intentionally left as-is.
+  // (Phase 2A: g_guessResultText's expiry now uses the same technique, via
+  // beforeDeadline().)
   if (g_roomActionStatusText != nullptr && static_cast<int32_t>(millis() - g_roomActionStatusUntilMs) < 0) {
     actionText = g_roomActionStatusText;
     hasAction = false;  // not a live action right now -- no ">" marker
@@ -828,8 +992,12 @@ void screenRaceRoom() {
   }
 
   uint16_t score = getScore(Identity::deviceId());
-  char scoreLine[16];
-  snprintf(scoreLine, sizeof(scoreLine), "Score: %u", score);
+  // Phase 2A (D1): the local "Solved!" acknowledgement rides on the score
+  // row (not the action row, which stays live so "> Start Round" remains
+  // visible and usable immediately) and expires on its own.
+  if (g_roomSolvedNoticeActive && !beforeDeadline(millis(), g_roomSolvedNoticeUntilMs)) clearRoomSolvedNotice();
+  char scoreLine[32];
+  snprintf(scoreLine, sizeof(scoreLine), "Score: %u%s", score, g_roomSolvedNoticeActive ? "  Solved! 4A0B" : "");
   if (firstDraw || strcmp(scoreLine, g_raceRoomLastScoreLine) != 0) {
     int16_t oldW = Display::textWidth(g_raceRoomLastScoreLine);
     int16_t newW = Display::textWidth(scoreLine);
@@ -920,6 +1088,11 @@ void groupSelectTrampoline() {
   // different room's identity here must not let it appear in the new
   // room.
   clearRoomActionStatus();
+  // Phase 2A: likewise for guess history, the "Solved!" notice, and any
+  // pending/visible Guess outcome.
+  clearRaceGuessHistory();
+  clearRoomSolvedNotice();
+  invalidateGuessOutcome();
   Menu::goBack();
   Menu::pushScreen(screenRaceRoom);
 }
@@ -1037,6 +1210,14 @@ void handleRaceRoundPacket(const char* group_code, const char* topic, const uint
   memcpy(g_secret, secret, 4);
   g_hasHadFirstRound = true;
   g_phase = RoomPhase::ROUND_ACTIVE;
+  // Phase 2A: a new round supersedes the previous one's history, its
+  // "Solved!" notice, and any pending or visible Guess outcome for it (a
+  // stale "Solved by X" would otherwise be formatted with THIS round's
+  // secret, and a visible one would freeze input and later pop the screen
+  // on its old deadline). Must run before the auto-enter flag is set below.
+  clearRaceGuessHistory();
+  clearRoomSolvedNotice();
+  invalidateGuessOutcome();
   if (g_haveJoined) g_pendingAutoEnterGuess = true;
 }
 
@@ -1054,6 +1235,7 @@ void handleRaceSolvedPacket(const char* group_code, const char* topic, const uin
   g_roundId[0] = '\0';
   strncpy(g_pendingWinner, winner, sizeof(g_pendingWinner) - 1);
   g_pendingExternalSolve = true;
+  clearRaceGuessHistory();  // Phase 2A: round over
 }
 
 void handleRaceResetPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {

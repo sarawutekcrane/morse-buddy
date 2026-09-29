@@ -155,6 +155,26 @@ void renderDigitRow(DigitRowRenderState* rs, int16_t x, int16_t y, const char* l
   }
 }
 
+void drawGuessHistoryRow(int16_t x, int16_t y, const char* labelPrefix, uint16_t guessValue, uint8_t a,
+                         uint8_t b) {
+  int16_t digitsX = static_cast<int16_t>(x + Display::textWidth(labelPrefix) + 4);
+  int16_t cellW = digitCellWidth();
+  int16_t resultX = static_cast<int16_t>(digitsX + kSecretDigits * cellW + 8);
+  uint8_t digits[kSecretDigits] = {
+      static_cast<uint8_t>((guessValue / 1000) % 10),
+      static_cast<uint8_t>((guessValue / 100) % 10),
+      static_cast<uint8_t>((guessValue / 10) % 10),
+      static_cast<uint8_t>(guessValue % 10),
+  };
+  for (uint8_t d = 0; d < kSecretDigits; d++) {
+    char buf[2] = {static_cast<char>('0' + digits[d]), '\0'};
+    Display::printLine(static_cast<int16_t>(digitsX + d * cellW), y, buf);
+  }
+  char resultBuf[8];
+  snprintf(resultBuf, sizeof(resultBuf), "%uA%uB", a, b);
+  Display::printLine(resultX, y, resultBuf);
+}
+
 }  // namespace NumberGuessing
 
 // =============================================================================
@@ -308,9 +328,6 @@ void screenSoloGuess() {
   int16_t guessY = static_cast<int16_t>(Display::kScreenHeight - lh);
 
   static const char* const kGuessLabel = "Guess: ";
-  int16_t digitsX = static_cast<int16_t>(2 + Display::textWidth(kGuessLabel) + 4);
-  int16_t cellW = NumberGuessing::digitCellWidth();
-  int16_t resultX = static_cast<int16_t>(digitsX + NumberGuessing::kSecretDigits * cellW + 8);
 
   int16_t availableHistoryHeight = static_cast<int16_t>(guessY - contentTop);
   uint16_t maxHistoryRows = (availableHistoryHeight > 0) ? static_cast<uint16_t>(availableHistoryHeight / lh) : 0;
@@ -339,19 +356,7 @@ void screenSoloGuess() {
       uint16_t rowIndex = static_cast<uint16_t>(i - startIdx);
       int16_t rowY = static_cast<int16_t>(guessY - (shown - rowIndex) * lh);
       const GuessEntry& g = g_solo.history[i];
-      uint8_t digits[NumberGuessing::kSecretDigits] = {
-          static_cast<uint8_t>((g.guessValue / 1000) % 10),
-          static_cast<uint8_t>((g.guessValue / 100) % 10),
-          static_cast<uint8_t>((g.guessValue / 10) % 10),
-          static_cast<uint8_t>(g.guessValue % 10),
-      };
-      for (uint8_t d = 0; d < NumberGuessing::kSecretDigits; d++) {
-        char buf[2] = {static_cast<char>('0' + digits[d]), '\0'};
-        Display::printLine(static_cast<int16_t>(digitsX + d * cellW), rowY, buf);
-      }
-      char resultBuf[8];
-      snprintf(resultBuf, sizeof(resultBuf), "%uA%uB", g.aCount, g.bCount);
-      Display::printLine(resultX, rowY, resultBuf);
+      NumberGuessing::drawGuessHistoryRow(2, rowY, kGuessLabel, g.guessValue, g.aCount, g.bCount);
     }
     g_soloGuessLastHistoryCount = g_solo.historyCount;
   }
