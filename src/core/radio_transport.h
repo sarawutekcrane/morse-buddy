@@ -49,9 +49,26 @@ void setUiContext(UiContext ctx);
 void setMaintenanceModeActive(bool active);
 
 // ---- Private (one recipient) ------------------------------------------------
+// Fix Phase 1C: startPrivateCall()'s three refusal cases (already active,
+// maintenance, and now group-not-Ready) used to be indistinguishable from
+// the caller's side -- all silent no-ops, with the Talk screen simply
+// staying on whatever status it already showed. NOT_READY specifically
+// must be observable: a DOT press that silently does nothing when the
+// group hasn't finished its staged setup yet is indistinguishable, from
+// the user's seat, from a broken button. The caller (radio.cpp's
+// screenTalk(), the sole caller) uses this to show concise, non-silent
+// feedback instead.
+enum class StartCallResult : uint8_t {
+  ACCEPTED,    // entered CLAIMING; sendClaim() has been issued
+  NOT_READY,   // group_code's MQTT setup (connect/subscribe/presence) has not finished yet
+  UNAVAILABLE, // already mid-call, or Maintenance Mode is active
+};
+
 // Starts a PTT burst: claims the channel, and on GRANT negotiates transport
-// and starts streaming captured mic audio. No-op if already active.
-void startPrivateCall(const char* group_code, const char* recipient_device_id);
+// and starts streaming captured mic audio. On any refusal (see
+// StartCallResult), no state changes at all: CLAIMING is not entered, no
+// claim timer starts, and mic capture is not activated.
+StartCallResult startPrivateCall(const char* group_code, const char* recipient_device_id);
 
 // PTT released: publishes RELEASE (if we hold the claim), stops capture and
 // tears the session down locally, regardless of state.

@@ -334,6 +334,30 @@ void handleRadioBusyPacket(const char* group_code, const char* topic, const uint
   if (!parseBusyPayload(payload, static_cast<uint16_t>(payloadLen), &type, claimer, sessionId)) return;
 
   if (type == BUSY_CLAIM) {
+    // Fix Phase 1C: granting implicitly promises the claimer a
+    // SESSION_START/SESSION_ACK exchange on OUR OWN radio/session
+    // subscription (topic #11 of 13) shortly after -- if that subscription
+    // isn't active yet (a real possibility once setup is staged across
+    // ticks), the claimer's own SESSION_START would simply never be
+    // delivered to us (plain MQTT: a message published before a
+    // subscription takes effect is not retroactively delivered once it
+    // does), leaving them stuck in NEGOTIATING with nothing to show for a
+    // GRANT that promised otherwise. isGroupReady() implies subscribeAll()
+    // already fully succeeded, so gating the grant on it closes this for
+    // the whole session flow in one place, not just this one reply.
+    // Deliberately do NOTHING (neither grant nor deny) when not ready --
+    // sending DENY here would be actively misleading (it tells the caller
+    // "permanently busy, stop retrying" via g_call.denied=true, when the
+    // real situation is "temporarily not ready yet"); staying silent lets
+    // the caller's own existing 250ms-retry/1s-total-timeout claim logic
+    // (radio_transport.cpp's own kClaimRetryIntervalMs/kClaimTotalTimeoutMs)
+    // naturally retry once we do become ready, or fail gracefully exactly
+    // like reaching an unreachable receiver does today. This does NOT
+    // apply to BUSY_RELEASE below -- releasing only ever tears down
+    // existing state and promises no reply of its own, so it is never held
+    // back by this same-group readiness check.
+    if (!MqttManager::isGroupReady(group_code)) return;
+
     // Same claimer is accepted even with a different session_id (a fresh
     // re-claim after a clean hang-up) — only a DIFFERENT claimer while
     // busy is denied.
@@ -930,9 +954,24 @@ Registrar g_registrar;
 
 void setUiContext(UiContext ctx) { g_uiContext = ctx; }
 
-void startPrivateCall(const char* group_code, const char* recipient_device_id) {
-  if (g_maintenanceMode) return;  // Phase 5 OTA: no new Radio session may begin
-  if (g_call.state != PrivateState::IDLE) return;
+StartCallResult startPrivateCall(const char* group_code, const char* recipient_device_id) {
+  if (g_maintenanceMode) return StartCallResult::UNAVAILABLE;  // Phase 5 OTA: no new Radio session may begin
+  if (g_call.state != PrivateState::IDLE) return StartCallResult::UNAVAILABLE;
+  // Fix Phase 1C: this call enters CLAIMING and starts sendClaim()'s own
+  // retry timers immediately below, BEFORE any network I/O happens -- a
+  // GRANT/DENY reply can only ever reach this device on its own
+  // radio/busy_reply/<device> subscription (one of the 13), so starting a
+  // claim before that subscription is confirmed active risks a reply that
+  // silently can never be delivered (plain MQTT does not retroactively
+  // deliver a message published before the matching subscribe() took
+  // effect). isGroupReady() implies subscribeAll() already fully
+  // succeeded, closing this for radio/session too (needed a few steps
+  // later in the same flow) in the same one check. Returning NOT_READY
+  // here (rather than silently no-op'ing, as this function used to) is
+  // what lets the caller show real feedback instead of an apparently-dead
+  // button; no state changes at all on this path -- CLAIMING is not
+  // entered, no claim timer starts, mic capture is not activated.
+  if (!MqttManager::isGroupReady(group_code)) return StartCallResult::NOT_READY;
   ensureUdpBegun();
   strncpy(g_call.group_code, group_code, sizeof(g_call.group_code) - 1);
   strncpy(g_call.peer_device_id, recipient_device_id, sizeof(g_call.peer_device_id) - 1);
@@ -945,6 +984,7 @@ void startPrivateCall(const char* group_code, const char* recipient_device_id) {
   g_call.claimLastSentMs = now;
   setRadioAudioActive(true);
   sendClaim();
+  return StartCallResult::ACCEPTED;
 }
 
 // Publishes a RELEASE (if we currently hold the claim as caller) and tears

@@ -545,11 +545,21 @@ bool isContactRadioAvailable(const char* group_code, const char* device_id) {
 
 void setOwnRadioAvailable(bool available) { g_ownRadioAvailable = available; }
 
+// Fix Phase 1C: isGroupReady() here, not isGroupConnected() -- this is not
+// about a receive-side subscription dependency (it isn't), it is to avoid
+// this ad-hoc republish racing the staged setup engine's own single
+// publishOnline() step for the same group: isGroupConnected() alone could
+// be true mid-setup (transport up, subscriptions not yet finished), and
+// firing a SECOND, independent ONLINE publish through this path while the
+// staged engine's own first one is still pending would double-announce out
+// of the engine's own intended order. Waiting for isGroupReady() means
+// this only ever republishes for a group whose own initial setup-driven
+// ONLINE publish has already completed.
 void republishOwnPresenceAllGroups() {
   uint8_t n = Settings::getGroupCount();
   for (uint8_t i = 0; i < n; i++) {
     Settings::FamilyGroup g = Settings::getGroup(i);
-    if (MqttManager::isGroupConnected(g.code)) publishOnline(g.code);
+    if (MqttManager::isGroupReady(g.code)) publishOnline(g.code);
   }
 }
 

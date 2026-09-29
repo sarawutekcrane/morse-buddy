@@ -236,6 +236,48 @@ bool parseChunkPayload(const uint8_t* data, uint16_t len, char* outMsgId, char* 
   return true;
 }
 
+// Fix Phase 1C (rechecked): unlike the CHALLENGE send below (a single
+// PK_MESSAGE packet that falls back to FLAG_PENDING_OUTBOX -- the same
+// Outbox-retried pattern as an ordinary text message), this RESULT send is
+// NOT a plain "bare outbound send" and calling it that would understate
+// its risk profile:
+//  - transport can publish (isGroupConnected(), checked once below) is a
+//    different thing from "the application's request/response path is
+//    ready" -- there is no response path here at all: no ACK, no reply,
+//    nothing this device waits to receive, so isGroupReady() genuinely
+//    buys nothing here (confirmed, not assumed) and isGroupConnected()
+//    remains the correct gate;
+//  - it is MULTI-PACKET and effectively all-or-nothing: connectivity is
+//    checked ONCE before the loop, not re-verified per chunk, and the
+//    receiver's handleGameResultChunkPacket() reassembly requires EVERY
+//    chunk's bit set before it is used at all -- a connection that drops
+//    between chunk 0 and chunk 1 leaves that reassembly PERMANENTLY
+//    incomplete (until incidentally evicted by 4 unrelated later
+//    transfers, kMaxReassembly), not merely delayed;
+//  - "publish succeeded" (publishBinary() returning true) is NOT "peer
+//    processed the command": there is no completion acknowledgment in
+//    either direction, so a full send failure is invisible to both sides
+//    -- the solver's own device shows its own result regardless
+//    (persistActiveGame() above already updates local state
+//    unconditionally, matching the same local-first pattern used
+//    elsewhere), but the challenger has no timeout/expiry and may never
+//    learn their friend answered;
+//  - there is NO retry at all for this send (unlike the CHALLENGE send's
+//    Outbox fallback) -- a failure here is not merely delayed, it is lost.
+// None of this is NEW: isGroupConnected() is evaluated with the same
+// transport-only meaning before and after this candidate, and this loop
+// runs synchronously within one call (it never yields to serviceTick()
+// between chunks), so staged setup does not change how a drop MID-LOOP
+// could happen. What staged setup CAN widen is the same effect described
+// in publishRacePacket()'s own comment: when this group's transport is
+// reconnecting while sharing the one-operation-per-tick setup budget with
+// other groups, the total disconnected window this ONE-SHOT NO-RETRY send
+// can land inside is larger than under the old atomic model -- and because
+// this specific site has no Outbox-style recovery at all, that widened
+// window converts more directly into a permanently lost result than it
+// does for Race's redundant/self-healing control traffic. This is an
+// OPEN, unresolved, PRE-EXISTING gap this candidate does not fix -- named
+// precisely here rather than left folded into a blanket "bare send" claim.
 void sendResultChunks(const char* group_code, const char* challenger_contact_key, const char* challenge_message_id,
                       const FriendGameState& s) {
   if (!MqttManager::isGroupConnected(group_code)) return;  // best-effort only; no retry for the chunk transfer

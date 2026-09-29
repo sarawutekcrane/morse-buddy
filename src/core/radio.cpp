@@ -186,6 +186,14 @@ void leaveTalk() {
 bool g_talkDirty = true;
 bool g_talkNeedsFullRedraw = true;
 const char* g_talkLastStatus = nullptr;
+// Fix Phase 1C: the outcome of the most recent startPrivateCall() attempt,
+// shown as status text below for as long as the call state is still IDLE
+// (i.e. nothing has happened since to make it moot) -- so a DOT press that
+// gets refused because the group isn't Ready yet, or is otherwise
+// unavailable, is never indistinguishable from a dead button. Reset to
+// ACCEPTED (meaning "nothing to show") on screen entry and on every fresh
+// attempt.
+RadioTransport::StartCallResult g_lastPrivateStartResult = RadioTransport::StartCallResult::ACCEPTED;
 
 void screenTalk() {
   bool isEveryone = strcmp(g_selectedContactKey, MessageStore::kEveryone) == 0;
@@ -199,6 +207,7 @@ void screenTalk() {
     g_talkDirty = true;
     g_talkNeedsFullRedraw = true;
     g_talkLastStatus = nullptr;
+    g_lastPrivateStartResult = RadioTransport::StartCallResult::ACCEPTED;
   }
 
   Input::update();
@@ -213,7 +222,7 @@ void screenTalk() {
       if (isEveryone) {
         RadioTransport::startBroadcastCall(g_selectedGroupCode);
       } else {
-        RadioTransport::startPrivateCall(g_selectedGroupCode, g_selectedContactKey);
+        g_lastPrivateStartResult = RadioTransport::startPrivateCall(g_selectedGroupCode, g_selectedContactKey);
       }
     } else if (e.type == InputEventType::DOT_RELEASE) {
       if (isEveryone) {
@@ -240,6 +249,15 @@ void screenTalk() {
     if (RadioTransport::isBroadcasting()) status = "Talking...";
   } else if (RadioTransport::isPrivateDenied()) {
     status = "BUSY (no mic)";
+  } else if (RadioTransport::getPrivateState() == RadioTransport::PrivateState::IDLE &&
+             g_lastPrivateStartResult != RadioTransport::StartCallResult::ACCEPTED) {
+    // Fix Phase 1C: still IDLE means nothing has happened since the last
+    // startPrivateCall() attempt to make its outcome moot (a later
+    // ACCEPTED attempt already reset this to ACCEPTED itself, and any
+    // state change away from IDLE means it no longer applies) -- show
+    // exactly why the last press didn't start a call, instead of silently
+    // matching the ordinary "Ready" case below.
+    status = (g_lastPrivateStartResult == RadioTransport::StartCallResult::NOT_READY) ? "Not ready..." : "Unavailable";
   } else {
     switch (RadioTransport::getPrivateState()) {
       case RadioTransport::PrivateState::CLAIMING:
