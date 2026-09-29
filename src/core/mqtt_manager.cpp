@@ -890,7 +890,101 @@ void serviceInit() {
   registerConnectivityStatusProvider(connectivityStatusProvider);
 }
 
+// ---- Diagnostics for the qos0 publish path (Fix Phase 1E: instrumentation
+// only, no behavior change) ---------------------------------------------
+// Bounded, RAM-only aggregate -- no dynamic allocation, no payload content.
+// Covers every publishBinary() call that takes the qos0 (i.e. non-qos1)
+// path below: radio/busy, radio/busy_reply, radio/session and radio/audio*
+// ALL use qos=0, so this is NOT audio-specific -- control packets (CLAIM/
+// RELEASE/GRANT/DENY/SESSION_START/SESSION_ACK) share this exact path and
+// this exact counter. Only the actual gc->mqtt->publish() call itself is
+// timed/counted; the shared connected() guard inside publishBinary() below
+// (common to both the qos1 and qos0 paths) returns before either path is
+// reached and is intentionally NOT counted here as a distinct "refusal"
+// bucket -- doing so
+// would require restructuring that shared guard, which is out of this
+// round's scope. A window's summary is emitted at most once per second,
+// only when the window contains a slow call (>=20ms, the SAME threshold
+// the existing qos1 PERF line already uses) or an actual publish()
+// failure; fast, healthy qos0 traffic stays completely silent.
+//
+// This is a SEPARATE measurement from radio_audio.cpp's own
+// callbackElapsed timing: when this call happens from inside a RadioAudio
+// capture callback, that callback's own elapsed time (recorded in
+// radio_audio.cpp) already CONTAINS this call's elapsed time -- the two
+// must never be added together when reading both logs.
+//
+// Declared here, ahead of serviceTick(), specifically so serviceTick() can
+// call flushQos0DiagIfDue() directly below (Fix Phase 1E, corrected) --
+// both live in this file's same top-level anonymous namespace, just
+// reordered; no new header, API, or cross-TU sharing was added.
+struct Qos0Diag {
+  uint32_t windowStartMs = 0;
+  uint32_t attempted = 0;
+  uint32_t succeeded = 0;
+  uint32_t failed = 0;
+  uint32_t elapsedSumMs = 0;
+  uint32_t elapsedMaxMs = 0;
+  int lastFailErr = 0;
+  bool lastFailConnectedAfter = false;
+  bool notable = false;
+};
+Qos0Diag g_qos0Diag;
+
+constexpr uint32_t kQos0DiagWindowMs = 1000;
+constexpr uint32_t kQos0DiagSlowMs = 20;  // matches publishBinary()'s existing qos1 PERF threshold elsewhere in this file
+
+void recordQos0Publish(uint32_t elapsedMs, bool result, int lastErr, bool connectedAfter) {
+  g_qos0Diag.attempted++;
+  if (result) {
+    g_qos0Diag.succeeded++;
+  } else {
+    g_qos0Diag.failed++;
+    g_qos0Diag.lastFailErr = lastErr;
+    g_qos0Diag.lastFailConnectedAfter = connectedAfter;
+  }
+  g_qos0Diag.elapsedSumMs += elapsedMs;
+  if (elapsedMs > g_qos0Diag.elapsedMaxMs) g_qos0Diag.elapsedMaxMs = elapsedMs;
+  if (elapsedMs >= kQos0DiagSlowMs || !result) g_qos0Diag.notable = true;
+}
+
+// Rollover-safe: plain uint32_t subtraction, same idiom as
+// drainReceiveQueueCooperative() elsewhere in this file. Checked from TWO
+// places (Fix Phase 1E, corrected): opportunistically at the end of each
+// actual qos0 publish() call, so fast, back-to-back traffic doesn't wait an
+// extra tick once due; AND unconditionally at the very top of serviceTick()
+// on every tick, before its maintenance/WiFi early returns -- that second
+// call site is what guarantees a pending notable window is still flushed
+// once due even if no further qos0 publish() ever occurs (e.g. a single
+// slow or failing call with no follow-up traffic). Both call sites are
+// harmless no-ops when the window isn't due yet, and neither performs any
+// network operation or extra polling -- only millis() and this in-RAM
+// state are read. The one-second rate limit and window-reset behavior are
+// unchanged regardless of which call site triggers the flush.
+void flushQos0DiagIfDue(uint32_t nowMs) {
+  uint32_t windowElapsedMs = nowMs - g_qos0Diag.windowStartMs;
+  if (windowElapsedMs < kQos0DiagWindowMs) return;
+  if (g_qos0Diag.notable) {
+    Serial.printf(
+        "[DIAG][MQTT] qos0 tMs=%lu windowMs=%lu attempted=%lu succeeded=%lu failed=%lu sumMs=%lu maxMs=%lu "
+        "lastFailErr=%d lastFailConnAfter=%d\n",
+        static_cast<unsigned long>(nowMs), static_cast<unsigned long>(windowElapsedMs),
+        static_cast<unsigned long>(g_qos0Diag.attempted), static_cast<unsigned long>(g_qos0Diag.succeeded),
+        static_cast<unsigned long>(g_qos0Diag.failed), static_cast<unsigned long>(g_qos0Diag.elapsedSumMs),
+        static_cast<unsigned long>(g_qos0Diag.elapsedMaxMs), g_qos0Diag.lastFailErr,
+        g_qos0Diag.lastFailConnectedAfter ? 1 : 0);
+  }
+  g_qos0Diag = Qos0Diag{};
+  g_qos0Diag.windowStartMs = nowMs;
+}
+
 void serviceTick() {
+  // Fix Phase 1E (corrected): flush a pending notable qos0 diagnostic
+  // window unconditionally, before any early return below, using this
+  // tick's own periodic call. No network operation and no extra polling
+  // are added -- this only reads millis() and this file's own in-RAM
+  // diagnostic state; see flushQos0DiagIfDue()'s comment above.
+  flushQos0DiagIfDue(static_cast<uint32_t>(millis()));
   if (g_maintenanceMode) return;  // Phase 5 OTA: reconnect/receive paused
 
   // Fix Phase 1C: detect exactly the tick WiFi recovers from a drop (not
@@ -1193,16 +1287,24 @@ bool publishRaw(const char* group_code, const char* topic_suffix, const char* pa
   return gc->mqtt->publish(topic, payload, retained, qos);
 }
 
-// Hardware Diagnostic #4.9s: QoS1 publishes only, timed around the actual
-// publish() call -- QoS0 (radio audio) keeps its original direct path,
-// with no timing/error-state reads/logging, to avoid per-audio-packet
-// overhead. result/lastError()/connected() are snapshotted in that exact
-// order, immediately after publish() returns and before any
+// Hardware Diagnostic #4.9s: QoS1 publishes, timed around the actual
+// publish() call. result/lastError()/connected() are snapshotted in that
+// exact order, immediately after publish() returns and before any
 // Serial.printf(); connectedBefore=1 is a literal, justified by the
 // connected() guard above -- no extra connected() call is added just to
 // log it. returnCode() is deliberately NOT read here: it is
 // connection-related, not the current publish's own error. Logged only
 // on failure or when the call took >=20ms.
+//
+// Fix Phase 1E (corrected): the qos0 path below ("radio audio" is
+// inaccurate -- radio/busy, radio/busy_reply, radio/session and
+// radio/audio* control AND audio packets alike all use qos=0) previously
+// had no timing/error-state reads at all, per-packet overhead being the
+// reason. It now also snapshots result/lastError()/connected() per call,
+// same as this qos1 block -- but logs only a bounded, rate-limited (at
+// most once per second) aggregate summary, not a per-call line, so this
+// remains no per-packet log overhead in the steady/healthy case. See
+// Qos0Diag/recordQos0Publish()/flushQos0DiagIfDue() above.
 //
 // Hardware Diagnostic #4.9t: TEMPORARY synchronous experiment, not a
 // non-blocking fix -- see kMqttPublishTimeoutMsExperiment's own comment.
@@ -1242,7 +1344,20 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
     }
     return result;
   }
-  return gc->mqtt->publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
+  // Fix Phase 1E: qos0 path -- the actual publish() call, arguments, and
+  // return value are UNCHANGED; only newly-added local variables capture
+  // what's needed for the bounded, rate-limited diagnostic below. Order
+  // matches the existing qos1 block immediately above: result, lastError,
+  // connected() are snapshotted in that exact order, immediately after
+  // publish() returns, before any recording/logging.
+  uint32_t qos0Start = static_cast<uint32_t>(millis());
+  bool qos0Result = gc->mqtt->publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
+  uint32_t qos0Elapsed = static_cast<uint32_t>(millis()) - qos0Start;
+  int qos0LastErr = static_cast<int>(gc->mqtt->lastError());
+  bool qos0ConnectedAfter = gc->mqtt->connected();
+  recordQos0Publish(qos0Elapsed, qos0Result, qos0LastErr, qos0ConnectedAfter);
+  flushQos0DiagIfDue(static_cast<uint32_t>(millis()));
+  return qos0Result;
 }
 
 }  // namespace MqttManager
