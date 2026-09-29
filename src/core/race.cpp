@@ -79,6 +79,105 @@ void clearRoomActionStatus() {
 // technique as the Room action status check in screenRaceRoom()).
 bool beforeDeadline(uint32_t nowMs, uint32_t untilMs) { return static_cast<int32_t>(nowMs - untilMs) < 0; }
 
+// =============================================================================
+// Phase 2C-1: replayed-Short protection across Race actions and screens.
+//
+// Race actions block synchronously (QoS1 publishes, Identity::nextId()'s
+// NVS write, and -- with Mute-outside-Radio on -- presence republishes on
+// Guess/Room entry). Encoder Shorts pressed meanwhile are captured by
+// input.cpp's sampler and replayed later, carrying their RELEASE time as
+// eventMs. Without protection a replayed Short turns Invite into Start
+// Round (C1), a local solve into the next round (C2), Start Round into
+// Continue, a Continue into a second Guess push, and Continue/automatic
+// entry into Guess's "Exit this game?" prompt (H3).
+//
+// One module-wide window, shared by the Room and Guess screens (so it
+// survives the Room <-> Guess transitions it exists to cover -- there is
+// deliberately NO reset on screen entry):
+//  - Opened by an accepted Room action (Invite / Start Round / Join /
+//    Continue) or a solving Guess Short, with start = that Short's own
+//    eventMs; or by automatic entry into Guess, with start = the eventMs
+//    of the last Short a Race screen popped (encoder FIFO: every Short
+//    popped later is >= it), or, if none was ever popped, a half-range
+//    interval ending at end.
+//  - OPEN until the end of the tick that opened it: every Short popped
+//    meanwhile is dropped (it is queued behind the opening one).
+//  - BOUNDED once g_raceShortWindowEndMs is recorded at that tick's end
+//    (by the screenRaceRoom()/screenRaceGuess() wrappers, whichever screen
+//    the tick ended on): a Short is dropped iff its release time lies in
+//    [start, end] (unsigned modular interval: rollover, zero and equal
+//    timestamps need no special case).
+//  - CLOSED on the first popped Short released after end (processed
+//    normally), on leaving Race (the Room stops handling that batch as soon
+//    as it leaves), on group change, and on Race entry. Not on
+//    a completed drain or elapsed time: encSwSampleTimerCallback() stamps
+//    atMs before enqueueing, so a stale release can become visible late;
+//    the guarantee used is that ENCODER_SHORT comes only from that single
+//    serialized producer through FIFO queues, so popped Shorts arrive in
+//    non-decreasing release order (see text_message.cpp's SendWindow
+//    comment for the full audit).
+//  - Deliberately NOT closed by a packet-driven reset (RESET / owner
+//    offline): the window only drops Shorts released before its end, so it
+//    cannot swallow any press made in the new context, while clearing it
+//    would let a stale Short trigger Invite in the reset room.
+// Only ENCODER_SHORT is affected; Back, rotation and DOT/Morse input are
+// untouched. Residual (as in 2B): a genuinely later press ~49.7 days after
+// start can alias into the interval; that one press is dropped.
+// =============================================================================
+enum class RaceShortWindow : uint8_t { CLOSED, OPEN, BOUNDED };
+RaceShortWindow g_raceShortWindow = RaceShortWindow::CLOSED;
+uint32_t g_raceShortWindowStartMs = 0;
+uint32_t g_raceShortWindowEndMs = 0;
+bool g_raceShortWindowStartKnown = false;
+bool g_raceShortWindowOpenedThisTick = false;
+uint32_t g_raceShortWatermarkMs = 0;  // eventMs of the last Short a Race screen popped
+bool g_raceShortWatermarkValid = false;
+
+void openRaceShortWindow(uint32_t startMs) {
+  g_raceShortWindow = RaceShortWindow::OPEN;
+  g_raceShortWindowStartMs = startMs;
+  g_raceShortWindowStartKnown = true;
+  g_raceShortWindowOpenedThisTick = true;
+}
+
+// Automatic entry has no accepted Short of its own: bound it below by the
+// last Short a Race screen popped (encoder FIFO ordering), if any.
+void openRaceShortWindowFromWatermark() {
+  openRaceShortWindow(g_raceShortWatermarkMs);
+  g_raceShortWindowStartKnown = g_raceShortWatermarkValid;
+}
+
+void closeRaceShortWindow() {
+  g_raceShortWindow = RaceShortWindow::CLOSED;
+  g_raceShortWindowOpenedThisTick = false;
+}
+
+// Called by both screen wrappers after their tick body.
+void finishRaceScreenTick() {
+  if (g_raceShortWindowOpenedThisTick && g_raceShortWindow == RaceShortWindow::OPEN) {
+    g_raceShortWindowEndMs = millis();
+    if (!g_raceShortWindowStartKnown) g_raceShortWindowStartMs = g_raceShortWindowEndMs - 0x7FFFFFFFu;
+    g_raceShortWindow = RaceShortWindow::BOUNDED;
+  }
+  g_raceShortWindowOpenedThisTick = false;
+}
+
+// True if `e` is a Short replayed from the current window (drop it).
+// Retires the window on the first Short released after its end.
+bool isReplayedRaceShort(const InputEvent& e) {
+  if (e.type != InputEventType::ENCODER_SHORT) return false;
+  g_raceShortWatermarkMs = e.eventMs;
+  g_raceShortWatermarkValid = true;
+  if (g_raceShortWindow == RaceShortWindow::OPEN) return true;
+  if (g_raceShortWindow != RaceShortWindow::BOUNDED) return false;
+  if (static_cast<uint32_t>(e.eventMs - g_raceShortWindowStartMs) <=
+      static_cast<uint32_t>(g_raceShortWindowEndMs - g_raceShortWindowStartMs)) {
+    return true;
+  }
+  g_raceShortWindow = RaceShortWindow::CLOSED;
+  return false;
+}
+
 // Phase 2A: Race guess history -- Solo-style "1 2 3 4   2A2B" rows for THIS
 // device's own submitted guesses in the current round. Local RAM only
 // (never persisted, never published), bounded: once full the oldest entry
@@ -332,14 +431,19 @@ bool parseSolvedPayload(const uint8_t* data, uint16_t len, char* outRoundId, cha
 // disconnected -- it does not create a new kind of failure.
 //
 // Race/radio integration is NOT claimed complete by this candidate.
-void publishRacePacket(uint8_t kind, const uint8_t* payload, size_t payloadLen, const char* topicSuffix,
+// Phase 2C-1: now returns publishBinary()'s result (false also if the
+// packet could not be encoded) so Invite/Start/Join can report an
+// unconfirmed outcome locally. false means "not confirmed by this device"
+// (not connected, or no PUBACK) -- not proof the broker/peers got nothing.
+// Callers that ignored it before still ignore it; no retry anywhere.
+bool publishRacePacket(uint8_t kind, const uint8_t* payload, size_t payloadLen, const char* topicSuffix,
                        bool retained) {
   uint8_t wireBuf[PacketCodec::kHeaderSize + 96];
-  if (payloadLen + PacketCodec::kHeaderSize > sizeof(wireBuf)) return;
-  if (!PacketCodec::encodeHeader(kind, static_cast<uint16_t>(payloadLen), wireBuf, sizeof(wireBuf))) return;
+  if (payloadLen + PacketCodec::kHeaderSize > sizeof(wireBuf)) return false;
+  if (!PacketCodec::encodeHeader(kind, static_cast<uint16_t>(payloadLen), wireBuf, sizeof(wireBuf))) return false;
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, payloadLen);
-  MqttManager::publishBinary(g_groupCode, topicSuffix, wireBuf,
-                             static_cast<uint16_t>(PacketCodec::kHeaderSize + payloadLen), retained, 1);
+  return MqttManager::publishBinary(g_groupCode, topicSuffix, wireBuf,
+                                    static_cast<uint16_t>(PacketCodec::kHeaderSize + payloadLen), retained, 1);
 }
 
 // =============================================================================
@@ -406,7 +510,7 @@ void publishReset() {
 // period or a retry/resend protocol on the JOIN side, both out of this
 // round's scope. publishStartRound() below has the analogous dependency
 // and the same residual limitation.
-void publishInvite() {
+bool publishInvite() {
   char inviteId[kIdLen];
   Identity::nextId(inviteId, sizeof(inviteId));
   strncpy(g_inviteId, inviteId, sizeof(g_inviteId) - 1);
@@ -419,15 +523,15 @@ void publishInvite() {
 
   uint8_t payload[kIdLen + kDeviceIdLen];
   size_t len = buildInvitePayload(g_inviteId, Identity::deviceId(), payload, sizeof(payload));
-  if (len > 0) publishRacePacket(PacketCodec::PK_RACE_INVITE, payload, len, "race/invite", false);
+  return len > 0 && publishRacePacket(PacketCodec::PK_RACE_INVITE, payload, len, "race/invite", false);
 }
 
-void publishJoin() {
+bool publishJoin() {
   g_haveJoined = true;
   addParticipant(Identity::deviceId());
   uint8_t payload[kIdLen + kDeviceIdLen];
   size_t len = buildJoinPayload(g_inviteId, Identity::deviceId(), payload, sizeof(payload));
-  if (len > 0) publishRacePacket(PacketCodec::PK_RACE_JOIN, payload, len, "race/join", false);
+  return len > 0 && publishRacePacket(PacketCodec::PK_RACE_JOIN, payload, len, "race/join", false);
 }
 
 void generateRaceSecret(uint8_t out[4]) {
@@ -458,7 +562,7 @@ void generateRaceSecret(uint8_t out[4]) {
 // device's own subscription, after Start Round has already succeeded and
 // while waiting for a SOLVED, is not covered by this one-time, press-time
 // gate.
-void publishStartRound() {
+bool publishStartRound() {
   char roundId[kIdLen];
   Identity::nextId(roundId, sizeof(roundId));
   strncpy(g_roundId, roundId, sizeof(g_roundId) - 1);
@@ -473,7 +577,7 @@ void publishStartRound() {
 
   uint8_t payload[kIdLen + kIdLen + kDeviceIdLen + 4];
   size_t len = buildRoundPayload(g_inviteId, g_roundId, Identity::deviceId(), g_secret, payload, sizeof(payload));
-  if (len > 0) publishRacePacket(PacketCodec::PK_RACE_ROUND, payload, len, "race/round", true);
+  return len > 0 && publishRacePacket(PacketCodec::PK_RACE_ROUND, payload, len, "race/round", true);
 }
 
 void publishSolved() {
@@ -551,6 +655,24 @@ uint32_t g_guessResultUntilMs = 0;
 bool g_pendingExternalSolve = false;
 char g_pendingWinner[kDeviceIdLen] = {0};
 
+// Phase 2C-1 (review round 2): nonblocking local notice on the Guess screen
+// for an action whose outcome is only known once Guess is already the
+// destination -- today only a Join-before-Continue whose publish this
+// device could not confirm. Shown on the top content row while the Guess
+// row and history stay usable (unlike g_guessResultText, it never freezes
+// input or navigates). Visible for kGuessNoticeVisibleMs from when it is
+// first actually drawn; cleared by invalidateGuessOutcome() (reset, leave,
+// group change, new round).
+constexpr uint32_t kGuessNoticeVisibleMs = 1500;
+const char* g_guessNoticeText = nullptr;
+bool g_guessNoticeDrawn = false;
+uint32_t g_guessNoticeShownMs = 0;
+
+void setGuessNotice(const char* text) {
+  g_guessNoticeText = text;
+  g_guessNoticeDrawn = false;
+}
+
 void exitGuessConfirmYes() { Menu::goBack(); }
 
 // Phase 2A (D2): a guess may only be evaluated against a live round.
@@ -588,6 +710,7 @@ void enterGuessScreen() {
 bool g_raceGuessDirty = true;
 bool g_raceGuessNeedsFullRedraw = true;
 bool g_raceGuessLastShowingResult = false;
+bool g_raceGuessLastShowingNotice = false;
 NumberGuessing::DigitRowRenderState g_raceGuessRowState;
 uint16_t g_raceGuessLastHistoryVersion = 0;
 
@@ -598,6 +721,8 @@ uint16_t g_raceGuessLastHistoryVersion = 0;
 // and local or remote new round. Forces a full Guess redraw so a notice
 // that was on screen is replaced by the entry layout on the next tick.
 void invalidateGuessOutcome() {
+  g_guessNoticeText = nullptr;  // Phase 2C-1: its context is gone too
+  g_guessNoticeDrawn = false;
   g_pendingExternalSolve = false;
   g_guessResultText = nullptr;
   g_guessResultUntilMs = 0;
@@ -613,7 +738,17 @@ void invalidateGuessOutcome() {
 // uses, so A/B meaning and presentation are identical. During an active
 // round the only things ever drawn are this device's own submitted guesses,
 // their A/B results, and the live digit-entry row -- never g_secret.
+void screenRaceGuessTick();
+
+// Phase 2C-1: records the replayed-Short window's end at the end of the tick
+// that opened it (a solving Short ends this tick on the Room) -- see
+// RaceShortWindow.
 void screenRaceGuess() {
+  screenRaceGuessTick();
+  finishRaceScreenTick();
+}
+
+void screenRaceGuessTick() {
   if (Menu::consumeJustEntered()) {
     NumberGuessing::resetDigitEntry(&g_digitEntry);
     g_raceGuessDirty = true;
@@ -650,6 +785,15 @@ void screenRaceGuess() {
     g_raceGuessDirty = true;
   }
 
+  // Phase 2C-1: the Guess notice expires kGuessNoticeVisibleMs after it was
+  // first drawn; removing it gives its row back to history (full redraw).
+  if (g_guessNoticeText != nullptr && g_guessNoticeDrawn &&
+      static_cast<uint32_t>(millis() - g_guessNoticeShownMs) >= kGuessNoticeVisibleMs) {
+    g_guessNoticeText = nullptr;
+    g_guessNoticeDrawn = false;
+    g_raceGuessDirty = true;
+  }
+
   // A different round arrived while this screen was open: drop the old
   // round's history and half-typed digits before any input is processed.
   // The user is already on this round's Guess screen, so a pending
@@ -664,10 +808,15 @@ void screenRaceGuess() {
   InputEvent e;
   bool hadEvent = false;
   while (Input::popEvent(e)) {
+    if (isReplayedRaceShort(e)) continue;  // Phase 2C-1: Short replayed from a Race action window
     hadEvent = true;
     if (Input::isBack(e)) {
       Menu::goBack();
-      continue;
+      // Phase 2C-1 (review round 2): Guess no longer owns input; the rest
+      // of the batch stays queued for the Room (whose own Back handler runs
+      // leaveRaceMode()) instead of being handled here -- a second Back
+      // processed here would pop past the Room without that cleanup.
+      break;
     }
     if (g_guessResultText != nullptr) continue;  // freeze input while showing the outcome
     if (e.type == InputEventType::ENCODER_SHORT) {
@@ -675,6 +824,7 @@ void screenRaceGuess() {
         if (!isRoundActive()) continue;  // D2: never evaluate/score/publish a stale round
         NumberGuessing::GuessResult r = NumberGuessing::evaluate(g_secret, g_digitEntry.digits);
         if (r.a == 4) {
+          openRaceShortWindow(e.eventMs);  // Phase 2C-1: covers the solve's blocking and Guess -> Room
           onLocalSolve();
           return;
         }
@@ -684,6 +834,7 @@ void screenRaceGuess() {
         ConfirmPromptConfig cfg{"Exit this game?", "Guess needs 4 digits", false, exitGuessConfirmYes, nullptr};
         Menu::startConfirmPrompt(cfg);
         Menu::pushScreen(Menu::confirmPromptScreen);
+        break;  // Phase 2C-1: the prompt now owns the remaining input
       }
     } else {
       NumberGuessing::handleDigitEntryEvent(&g_digitEntry, e);
@@ -711,7 +862,12 @@ void screenRaceGuess() {
   // otherwise static while shown, so no further per-tick diffing is needed.
   bool showingResult = (g_guessResultText != nullptr);
   bool phaseChanged = (showingResult != g_raceGuessLastShowingResult);
-  bool forceFull = g_raceGuessNeedsFullRedraw || phaseChanged;
+  // Phase 2C-1: the notice appearing/disappearing moves the history area's
+  // top edge, so it is a full redraw like any other layout change.
+  bool showingNotice = !showingResult && g_guessNoticeText != nullptr;
+  bool noticeChanged = (showingNotice != g_raceGuessLastShowingNotice);
+  bool forceFull = g_raceGuessNeedsFullRedraw || phaseChanged || noticeChanged;
+  int16_t historyTop = static_cast<int16_t>(contentTop + (showingNotice ? lh : 0));
 
   if (showingResult) {
     if (forceFull) {
@@ -728,13 +884,20 @@ void screenRaceGuess() {
       Display::clearContentArea();
       NumberGuessing::resetDigitRowRenderState(&g_raceGuessRowState);
       g_raceGuessNeedsFullRedraw = false;
+      if (showingNotice) {
+        Display::printLine(2, contentTop, g_guessNoticeText);
+        if (!g_guessNoticeDrawn) {  // visible duration starts at the first actual draw
+          g_guessNoticeDrawn = true;
+          g_guessNoticeShownMs = millis();
+        }
+      }
     } else if (historyChanged) {
-      int16_t regionH = static_cast<int16_t>(guessY - contentTop);
+      int16_t regionH = static_cast<int16_t>(guessY - historyTop);
       if (regionH < 0) regionH = 0;
-      Display::tft().fillRect(0, contentTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
+      Display::tft().fillRect(0, historyTop, Display::kScreenWidth, regionH, ST77XX_BLACK);
     }
     if (historyChanged) {
-      int16_t availableHistoryHeight = static_cast<int16_t>(guessY - contentTop);
+      int16_t availableHistoryHeight = static_cast<int16_t>(guessY - historyTop);
       uint8_t maxRows = (availableHistoryHeight > 0) ? static_cast<uint8_t>(availableHistoryHeight / lh) : 0;
       uint8_t shown = (g_raceHistoryCount < maxRows) ? g_raceHistoryCount : maxRows;
       uint8_t startIdx = static_cast<uint8_t>(g_raceHistoryCount - shown);
@@ -750,6 +913,7 @@ void screenRaceGuess() {
   }
 
   g_raceGuessLastShowingResult = showingResult;
+  g_raceGuessLastShowingNotice = showingNotice;
 }
 
 // =============================================================================
@@ -795,12 +959,31 @@ void screenRaceGuess() {
 // state that owns it. Gating here, before either function is entered,
 // means NEITHER function's local state mutation nor its network publish
 // ever runs on a refusal -- there is nothing to "undo".
-void handleRoomAction() {
+void drawRoomActionNow(const char* text);
+bool handleRoomAction(const InputEvent& e);
+
+// Phase 2C-1: timed local notice for an action whose publish this device
+// could not confirm. Same slot/expiry as the Ready refusal above (1500ms,
+// rollover-safe, cleared by reset / group change / new lobby or round), so
+// it can never hide a usable action label for longer than that. No
+// rollback and no retry: the local state transition already happened
+// exactly as before this change.
+void setRoomActionUnconfirmed(const char* text) {
+  g_roomActionStatusText = text;
+  g_roomActionStatusUntilMs = millis() + 1500;
+}
+
+// Phase 2C-1: `e` is the accepted Short. Each action that proceeds draws its
+// in-progress text BEFORE its blocking work and opens the replayed-Short
+// window (see RaceShortWindow above). A Ready refusal or a no-op press
+// ("Waiting for start...") does no blocking work and opens nothing.
+// Returns true iff it navigated away from the Room (Continue -> Guess).
+bool handleRoomAction(const InputEvent& e) {
   if (g_phase == RoomPhase::NO_LOBBY) {
     if (!MqttManager::isGroupReady(g_groupCode)) {
       g_roomActionStatusText = "Connecting, try again";
       g_roomActionStatusUntilMs = millis() + 1500;
-      return;  // no publish, no phase/participant change, selection untouched
+      return false;  // no publish, no phase/participant change, selection untouched
     }
     // Fix Phase 1C (round 4 correction): a still-pending refusal notice
     // from an EARLIER press must not keep showing once this fresh,
@@ -811,23 +994,39 @@ void handleRoomAction() {
     // runs before recomputing the phase-driven label, so an un-cleared
     // notice would keep winning even though it's no longer accurate).
     clearRoomActionStatus();
-    publishInvite();
+    openRaceShortWindow(e.eventMs);
+    drawRoomActionNow("Inviting...");
+    if (!publishInvite()) setRoomActionUnconfirmed("Invite unconfirmed");
   } else if (g_phase == RoomPhase::LOBBY_WAITING) {
     if (strcmp(g_ownerDeviceId, Identity::deviceId()) == 0) {
       if (!MqttManager::isGroupReady(g_groupCode)) {
         g_roomActionStatusText = "Connecting, try again";
         g_roomActionStatusUntilMs = millis() + 1500;
-        return;  // no publish, no phase change, g_roundId/g_secret untouched
+        return false;  // no publish, no phase change, g_roundId/g_secret untouched
       }
       clearRoomActionStatus();  // same reasoning as the Invite branch above
-      publishStartRound();
+      openRaceShortWindow(e.eventMs);
+      drawRoomActionNow("Starting...");
+      if (!publishStartRound()) setRoomActionUnconfirmed("Start unconfirmed");
     } else if (!g_haveJoined) {
-      publishJoin();
+      openRaceShortWindow(e.eventMs);
+      drawRoomActionNow("Joining...");
+      if (!publishJoin()) setRoomActionUnconfirmed("Join unconfirmed");
     }
   } else {  // ROUND_ACTIVE
-    if (!g_haveJoined) publishJoin();
+    // Continue: the window also covers the Room -> Guess transition, so a
+    // replayed Short can neither push Guess again nor open Guess's Exit
+    // prompt. An unconfirmed Join-before-Continue is shown on Guess.
+    openRaceShortWindow(e.eventMs);
+    if (!g_haveJoined) {
+      drawRoomActionNow("Joining...");
+      // Reported on the destination (Guess), where it is actually seen.
+      if (!publishJoin()) setGuessNotice("Join unconfirmed");
+    }
     enterGuessScreen();
+    return true;
   }
+  return false;
 }
 
 void checkOwnerOnline() {
@@ -859,6 +1058,7 @@ void leaveRaceMode() {
   }
   g_scoreCount = 0;  // "Reset: only when exiting Race Mode to Training Game"
   applyReset();
+  closeRaceShortWindow();  // Phase 2C-1: Race is left (the Room stops handling this batch)
 }
 
 // Hardware Fix #3: this screen is driven by async network/presence events
@@ -877,7 +1077,34 @@ char g_raceRoomLastScoreLine[32] = {0};
 uint8_t g_raceRoomLastOnlineCount = 0xFF;
 char g_raceRoomLastOnlineNames[4][17] = {{0}};
 
+// Phase 2C-1: synchronous in-progress text on the Room's action row, drawn
+// before the action's blocking work. The row's diff cache is updated so the
+// next render repaints it with whatever label/notice then applies. If the
+// Room has not rendered since entry, the content area is cleared first
+// (the pending full redraw repaints everything afterwards).
+void drawRoomActionNow(const char* text) {
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t lh = Display::lineHeight();
+  int16_t actionY = static_cast<int16_t>(Display::kStatusBarHeight + 2 + lh);
+  if (g_raceRoomNeedsFullRedraw) {
+    Display::clearContentArea();
+  } else {
+    Display::tft().fillRect(0, actionY, Display::kScreenWidth, lh, ST77XX_BLACK);
+  }
+  Display::printLine(2, actionY, text);
+  strncpy(g_raceRoomLastActionLabel, text, sizeof(g_raceRoomLastActionLabel) - 1);
+  g_raceRoomLastActionLabel[sizeof(g_raceRoomLastActionLabel) - 1] = '\0';
+}
+
+void screenRaceRoomTick();
+
+// Phase 2C-1: see screenRaceGuess() -- same tick-end window handling.
 void screenRaceRoom() {
+  screenRaceRoomTick();
+  finishRaceScreenTick();
+}
+
+void screenRaceRoomTick() {
   if (Menu::consumeJustEntered()) {
     g_isRoomScreenActive = true;
     RadioTransport::setUiContext(RadioTransport::UiContext::RACE_ROOM);
@@ -888,6 +1115,7 @@ void screenRaceRoom() {
   checkOwnerOnline();
   if (g_pendingAutoEnterGuess) {
     g_pendingAutoEnterGuess = false;
+    openRaceShortWindowFromWatermark();  // Phase 2C-1: covers entry blocking + Room -> Guess
     enterGuessScreen();
     return;
   }
@@ -895,17 +1123,20 @@ void screenRaceRoom() {
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
+    if (isReplayedRaceShort(e)) continue;  // Phase 2C-1: Short replayed from a Race action window
     if (Input::isBack(e)) {
       leaveRaceMode();
       Menu::goBack();
-      continue;
+      // Phase 2C-1 (review round 2): Race is left; the rest of the batch
+      // belongs to the screen below, not to Race (no post-exit actions).
+      break;
     }
     if (e.type == InputEventType::DOT_PRESS_START) {
       startRoomPtt();
     } else if (e.type == InputEventType::DOT_RELEASE) {
       stopRoomPtt();
     } else if (e.type == InputEventType::ENCODER_SHORT) {
-      handleRoomAction();
+      if (handleRoomAction(e)) break;  // Phase 2C-1: Guess now owns the remaining input
     }
   }
 
@@ -1088,6 +1319,7 @@ void groupSelectTrampoline() {
   // different room's identity here must not let it appear in the new
   // room.
   clearRoomActionStatus();
+  closeRaceShortWindow();  // Phase 2C-1: a different room is a new context
   // Phase 2A: likewise for guess history, the "Solved!" notice, and any
   // pending/visible Guess outcome.
   clearRaceGuessHistory();
@@ -1137,6 +1369,7 @@ void screenNoFamilyGroups() {
 }
 
 void screenRaceEntry() {
+  closeRaceShortWindow();  // Phase 2C-1: every Race visit starts without a window
   uint8_t n = Settings::getGroupCount();
   ScreenHandlerFn target;
   if (n == 0) {
@@ -1171,6 +1404,7 @@ void handleRaceInvitePacket(const char* group_code, const char* topic, const uin
   g_phase = RoomPhase::LOBBY_WAITING;
   g_participantCount = 0;
   addParticipant(initiator);
+  clearRoomActionStatus();  // Phase 2C-1: a notice from before this lobby must not hide "Join"
 
   Notifications::setRaceInvitePending(true);
   playTone(1000, 150, SOUND_NOTIFICATION);
@@ -1218,6 +1452,7 @@ void handleRaceRoundPacket(const char* group_code, const char* topic, const uint
   clearRaceGuessHistory();
   clearRoomSolvedNotice();
   invalidateGuessOutcome();
+  clearRoomActionStatus();  // Phase 2C-1: nor may an earlier round's notice carry over
   if (g_haveJoined) g_pendingAutoEnterGuess = true;
 }
 
