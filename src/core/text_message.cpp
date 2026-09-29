@@ -1279,27 +1279,42 @@ int16_t g_chatViewportCacheLineHeight = 0;
 
 void markChatRenderDirty() { g_chatRenderDirty = true; }
 
-// Phase 2B-2: synchronous "Sending..." over the compose block as it is
-// CURRENTLY on screen. Geometry comes from the last completed render only
-// when one exists since entry (g_chatNeedsFullRedraw false => a render
-// finished and g_chatLastViewportLines matches the pixels); otherwise
-// (first tick after entry, or after a "Memory Low" pass) the content area
-// is cleared and a full redraw stays pending. Either way the next render
-// repaints the whole compose block (g_chatLastComposeSkipped sentinel).
+// Phase 2B-2 (layout fix): synchronous "Sending..." on its own row directly
+// ABOVE the compose block as it is CURRENTLY on screen, leaving the draft
+// rows (and their cursor) untouched -- the same row the status will occupy
+// once rendered, since a status always adds one row above the draft.
+// Geometry comes from the last completed render only when one exists since
+// entry (g_chatNeedsFullRedraw false => a render finished and
+// g_chatLastViewportLines matches the pixels):
+//  - history rows visible (lastViewportLines > 0): overwrite the bottom
+//    history row, i.e. the row just above the compose block;
+//  - compose already fills the content area (lastViewportLines == 0):
+//    overwrite its top visible row -- the draft row the rendered layout
+//    will scroll off anyway once the status reserves a row;
+//  - no valid geometry (first tick after entry, or after "Memory Low"):
+//    clear the content area and draw at the top.
+// A full redraw is then requested as a defensive measure. Today it is
+// redundant: every Send path that reaches the outcome render marks the
+// index dirty (so the render's contentChanged branch repaints the whole
+// history region, including an overwritten history row), and a changed
+// compose row count takes the full-clear or compose-block repaint path. It
+// only guarantees the overwritten row is repainted if that invalidation
+// ever changes; the post-send render reloads and repaints history anyway.
 void drawSendingNow() {
   Display::setFont(Display::Font::PRIMARY);
   int16_t lh = Display::lineHeight();
   int16_t contentTop = Display::kStatusBarHeight + 2;
   int16_t rowY = contentTop;
   if (!g_chatNeedsFullRedraw && g_chatLastViewportLines != kNoViewportLines) {
-    rowY = static_cast<int16_t>(contentTop + g_chatLastViewportLines * lh);
-    Display::tft().fillRect(0, rowY, Display::kScreenWidth, Display::kScreenHeight - rowY, ST77XX_BLACK);
+    if (g_chatLastViewportLines > 0) {
+      rowY = static_cast<int16_t>(contentTop + (g_chatLastViewportLines - 1) * lh);
+    }
+    Display::tft().fillRect(0, rowY, Display::kScreenWidth, lh, ST77XX_BLACK);
   } else {
     Display::clearContentArea();
-    g_chatNeedsFullRedraw = true;
   }
   Display::printLine(static_cast<int16_t>(2 + Display::kCursorCellWidth), rowY, "Sending...");
-  g_chatLastComposeSkipped = 0xFF;
+  g_chatNeedsFullRedraw = true;
 }
 
 void screenChatTick();
@@ -1592,30 +1607,31 @@ void screenChatTick() {
   // No separate error row in this screen (unlike Enigma) -- the whole
   // budget below the history viewport is compose's own.
   //
-  // Phase 2B-2: while a Send outcome is active it occupies compose-block
-  // row 0 and any (retained) draft follows below it, still visible and
-  // editable; an EMPTY draft's blank row is replaced by the status instead
-  // of adding one. The block's row count therefore only changes when a
-  // status appears/disappears over a non-empty draft -- a viewportLines
-  // change, which takes the existing historyLayoutChanged full-clear path
-  // and misses the viewport cache (viewportLines is part of its key).
+  // Phase 2B-2 (layout fix): while a Send outcome is active it occupies its
+  // own row at the top of the compose block, ABOVE the draft (consistent
+  // with Enigma's separate status row). It never replaces a draft row and
+  // never receives the cursor: after a successful send the blank compose
+  // row stays below it with the normal cursor, and a retained draft stays
+  // visible and editable below it. A status appearing or disappearing
+  // therefore always changes the block's row count by one -- a
+  // viewportLines change (historyLayoutChanged full clear, viewport-cache
+  // miss) or, when compose already fills the content area, a change of the
+  // visible draft window (composeWindowChanged block repaint).
   uint16_t maxComposeRows = totalLines;
   if (maxComposeRows > kMaxShownComposeRows) maxComposeRows = kMaxShownComposeRows;
   uint16_t statusRows = (g_sendStatus != nullptr) ? 1 : 0;
-  bool draftBlank = (layout.totalRows <= 1 && composePrefixBuf[0] == '\0' && composeSuffix[0] == '\0');
   uint16_t maxDraftRows = static_cast<uint16_t>(maxComposeRows - statusRows);
   uint16_t shownDraftRows = (layout.totalRows < maxDraftRows) ? layout.totalRows : maxDraftRows;
-  if (statusRows == 1 && draftBlank) shownDraftRows = 0;
-  if (statusRows == 0 && shownDraftRows == 0) shownDraftRows = 1;
+  if (shownDraftRows == 0) shownDraftRows = 1;
   uint16_t shownComposeRows = static_cast<uint16_t>(statusRows + shownDraftRows);
   uint8_t skippedComposeRows = static_cast<uint8_t>(layout.totalRows - shownDraftRows);
   // Text for one shown compose-block row (status or draft) and whether the
-  // compose cursor belongs on it: logical draft row 0 as before, or the
-  // status row when it stands in for a blank draft.
+  // compose cursor belongs on it: logical draft row 0 as before, never the
+  // status row.
   auto composeBlockRow = [&](uint16_t shownRow, char* rowText, size_t cap, bool* cursorRow) {
     if (shownRow < statusRows) {
       snprintf(rowText, cap, "%s", g_sendStatus);
-      *cursorRow = (shownDraftRows == 0);
+      *cursorRow = false;
       return;
     }
     uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + (shownRow - statusRows));
