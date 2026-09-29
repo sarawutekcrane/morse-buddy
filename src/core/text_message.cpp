@@ -763,6 +763,139 @@ void composeRowText(const ComposeLayout& layout, const char* prefix, uint8_t row
   out[l] = '\0';
 }
 
+// =============================================================================
+// Phase 2B-2: Send feedback and replayed-Send suppression.
+//
+// Feedback only: "Sending..." is drawn synchronously BEFORE any blocking
+// Send work (Identity::nextId()'s NVS write, encoding, publish, storage,
+// and the index refresh that follows), then the outcome replaces it. The
+// device is still blocked for exactly as long as before -- nothing here
+// shortens or reorders that work.
+//
+// Replayed-Send window. Encoder-switch edges pressed while the send
+// blocks are captured by input.cpp's sampler and only converted into
+// events at the NEXT Input::update() (drainInputEdges()), each carrying
+// its RELEASE time as eventMs (processEncSwEdge()). Without this window a
+// Short released during the blocking send replays afterwards and either
+// sends a 2B-1-retained draft a second time or fires the empty-draft
+// action (Friend's Play-or-Cancel in a 1:1 chat).
+//  - OPEN, from the accepted Send until the end of the tick that ran it:
+//    every Short this screen pops is dropped. Anything popped in that tick
+//    after the accepted Send sits behind it in the same chronologically
+//    drained queue, so no timestamp comparison is needed (equal or zero
+//    eventMs included) and no unset end is ever compared against.
+//  - BOUNDED, once g_sendWindowEndMs is set at the end of that tick: a Short
+//    is dropped iff its release time lies in [start, end], start being the
+//    accepted Send's own eventMs (unsigned modular interval: rollover, zero
+//    and equal timestamps need no special case). A press begun during
+//    blocking but RELEASED after the end is not dropped -- eventMs is the
+//    release time.
+//  - CLOSED on the first popped Short released after the end (that Short
+//    is processed normally), or on leaving/re-entry. No timer, and not "one
+//    complete drain": encSwSampleTimerCallback() reads atMs = millis()
+//    BEFORE entering g_encSwMux to enqueue, and the esp_timer task can run
+//    concurrently with this task, so a release stamped <= end can become
+//    visible to Input::update() arbitrarily late. What IS guaranteed by the
+//    producer/consumer code: ENCODER_SHORT is emitted only from that one
+//    periodic callback's records; invocations of one esp_timer callback
+//    are serialized and each finishes its enqueue before returning, so
+//    records -- and therefore popped Shorts -- arrive in non-decreasing
+//    atMs order (drainInputEdges()'s DOT merge preserves each queue's own
+//    order; pushEvent()/popEvent() are FIFO; overflow drops, never
+//    reorders). Hence every Short popped after the accepted one has
+//    eventMs >= start, and once one released after the end is popped no
+//    stale one can follow. Residual: a genuinely later press ~49.7 days
+//    (2^32 ms minus the window length) after start can alias into the
+//    interval; that one press is dropped and the next retires the window.
+// Only Shorts are ever dropped; DOT/DASH, rotation and Back are untouched.
+// Leaving the chat or re-entering it resets everything.
+// =============================================================================
+enum class SendWindow : uint8_t { CLOSED, OPEN, BOUNDED };
+SendWindow g_sendWindow = SendWindow::CLOSED;
+uint32_t g_sendWindowStartMs = 0;  // accepted Send's own eventMs (release time)
+uint32_t g_sendWindowEndMs = 0;    // meaningful only while BOUNDED
+bool g_sendRanThisTick = false;
+
+// Outcome text shown as the first compose row until cleared. Timed
+// outcomes expire kSendStatusVisibleMs after they are first actually drawn
+// (never counted from before the index refresh/render); the others stay
+// until newer input or leaving. Older input replayed from the blocking
+// window never clears it.
+constexpr uint32_t kSendStatusVisibleMs = 3000;
+const char* g_sendStatus = nullptr;
+bool g_sendStatusTimed = false;
+bool g_sendStatusDrawn = false;
+uint32_t g_sendStatusShownMs = 0;
+
+struct SendResult {
+  const char* status;
+  bool timed;
+};
+
+bool msAfter(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) > 0; }
+
+void markChatRenderDirty();
+void drawSendingNow();
+
+void resetSendFeedback() {
+  g_sendWindow = SendWindow::CLOSED;
+  g_sendRanThisTick = false;
+  g_sendStatus = nullptr;
+  g_sendStatusDrawn = false;
+}
+
+void setSendStatus(const SendResult& r) {
+  g_sendStatus = r.status;
+  g_sendStatusTimed = r.timed;
+  g_sendStatusDrawn = false;
+  markChatRenderDirty();
+}
+
+void clearSendStatus() {
+  if (g_sendStatus == nullptr) return;
+  g_sendStatus = nullptr;
+  g_sendStatusDrawn = false;
+  markChatRenderDirty();
+}
+
+// Drops a Short released inside [start, end] (modular interval: rollover,
+// zero and equal timestamps need no special case). The first Short outside
+// it is genuinely later -- by the encoder FIFO ordering, every Short popped
+// after the accepted one has eventMs >= start -- so it retires the window
+// and is processed normally.
+bool isReplayedSend(const InputEvent& e) {
+  if (e.type != InputEventType::ENCODER_SHORT) return false;
+  if (g_sendWindow == SendWindow::OPEN) return true;
+  if (g_sendWindow != SendWindow::BOUNDED) return false;
+  if (static_cast<uint32_t>(e.eventMs - g_sendWindowStartMs) <=
+      static_cast<uint32_t>(g_sendWindowEndMs - g_sendWindowStartMs)) {
+    return true;
+  }
+  g_sendWindow = SendWindow::CLOSED;
+  return false;
+}
+
+// True only for input the user produced after the outcome became visible.
+bool isNewerThanSendOutcome(const InputEvent& e) {
+  if (g_sendWindow == SendWindow::OPEN) return false;
+  if (g_sendWindow == SendWindow::BOUNDED) return msAfter(e.eventMs, g_sendWindowEndMs);
+  return true;  // CLOSED: only reached via reset or a later Short, which itself cleared the status
+}
+
+SendResult resultForCompletion(bool online, bool published, bool storeOk) {
+  // Wording is no stronger than the evidence: publishBinary() true on
+  // QoS1 means MQTT 2.5.2 received a PUBACK (lwmqtt_publish(); the ack's
+  // packet id is not compared) -- never peer receipt. "queued" = stored
+  // with FLAG_PENDING_OUTBOX for Outbox retry; "not saved" = the local
+  // store reported failure (no cause assumed).
+  if (storeOk) {
+    if (published) return {"Server acknowledged", true};
+    return {online ? "Unconfirmed: queued" : "Offline: queued", true};
+  }
+  if (published) return {"Server acked; not saved", false};
+  return {online ? "Unconfirmed; not saved" : "Offline; not saved", false};  // 2B-1: draft kept
+}
+
 // Hardware Diagnostic #4.9n: instrumentation only -- every existing call,
 // its arguments, and its position in the sequence below are unchanged;
 // this only wraps each already-existing phase in millis()-delta timing
@@ -791,7 +924,7 @@ void composeRowText(const ComposeLayout& layout, const char* prefix, uint8_t row
 // not attempted because the group was offline) -- deliberately far
 // outside any real millis() delta this function could ever measure, so a
 // skipped phase can never be misread as "ran and took 0 ms."
-void sendComposedMessage() {
+SendResult sendComposedMessage() {
   constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
   uint32_t totalStart = millis();
 
@@ -831,7 +964,7 @@ void sendComposedMessage() {
         static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(kUnmeasuredMs),
         static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
         static_cast<unsigned long>(kUnmeasuredMs));
-    return;
+    return {"Message too long", false};  // encodeTextPayload(): text over kMaxDecodedTextLen
   }
 
   static uint8_t wireBuf[PacketCodec::kHeaderSize + 400];
@@ -847,7 +980,7 @@ void sendComposedMessage() {
         static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(kUnmeasuredMs),
         static_cast<unsigned long>(kUnmeasuredMs), static_cast<unsigned long>(kUnmeasuredMs),
         static_cast<unsigned long>(kUnmeasuredMs));
-    return;
+    return {"Can't encode message", false};
   }
   uint32_t envelopeElapsed = millis() - envelopeStart;
 
@@ -908,6 +1041,7 @@ void sendComposedMessage() {
       static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(topicElapsed),
       static_cast<unsigned long>(publishElapsed), static_cast<unsigned long>(storeElapsed),
       static_cast<unsigned long>(clearElapsed), online ? 1 : 0, published ? 1 : 0, storeOk ? 1 : 0);
+  return resultForCompletion(online, published, storeOk);
 }
 
 void finalizeComposeChar() {
@@ -1037,7 +1171,12 @@ void handleComposeEvent(const InputEvent& e) {
       // deferred word-gap model.
       if (g_composePatternLen > 0) finalizeComposeChar();
       if (g_composeLen > 0) {
-        sendComposedMessage();
+        // Phase 2B-2: visible acknowledgement BEFORE any blocking work.
+        drawSendingNow();
+        g_sendWindowStartMs = e.eventMs;
+        g_sendWindow = SendWindow::OPEN;
+        g_sendRanThisTick = true;
+        setSendStatus(sendComposedMessage());
       } else {
         invokeEmptyLineAction(Modes::TEXT, g_selectedGroupCode, g_selectedContactKey);
       }
@@ -1138,7 +1277,48 @@ uint16_t g_chatViewportCacheViewportLines = 0;
 int16_t g_chatViewportCacheLabelX = 0;
 int16_t g_chatViewportCacheLineHeight = 0;
 
+void markChatRenderDirty() { g_chatRenderDirty = true; }
+
+// Phase 2B-2: synchronous "Sending..." over the compose block as it is
+// CURRENTLY on screen. Geometry comes from the last completed render only
+// when one exists since entry (g_chatNeedsFullRedraw false => a render
+// finished and g_chatLastViewportLines matches the pixels); otherwise
+// (first tick after entry, or after a "Memory Low" pass) the content area
+// is cleared and a full redraw stays pending. Either way the next render
+// repaints the whole compose block (g_chatLastComposeSkipped sentinel).
+void drawSendingNow() {
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t lh = Display::lineHeight();
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t rowY = contentTop;
+  if (!g_chatNeedsFullRedraw && g_chatLastViewportLines != kNoViewportLines) {
+    rowY = static_cast<int16_t>(contentTop + g_chatLastViewportLines * lh);
+    Display::tft().fillRect(0, rowY, Display::kScreenWidth, Display::kScreenHeight - rowY, ST77XX_BLACK);
+  } else {
+    Display::clearContentArea();
+    g_chatNeedsFullRedraw = true;
+  }
+  Display::printLine(static_cast<int16_t>(2 + Display::kCursorCellWidth), rowY, "Sending...");
+  g_chatLastComposeSkipped = 0xFF;
+}
+
+void screenChatTick();
+
+// Phase 2B-2: closes the OPEN window at the end of the tick that ran the
+// send -- whichever return path that tick took (render, "Memory Low",
+// no-render) -- and drops all Send feedback once the chat was left.
 void screenChat() {
+  g_sendRanThisTick = false;
+  screenChatTick();
+  if (g_sendRanThisTick && g_sendWindow == SendWindow::OPEN) {
+    g_sendWindowEndMs = millis();
+    g_sendWindow = SendWindow::BOUNDED;
+  }
+  g_sendRanThisTick = false;
+  if (!g_chatIsOpen) resetSendFeedback();
+}
+
+void screenChatTick() {
   // Hardware Diagnostic #4.9i: instrumentation only -- every existing input
   // path, call order, early return, dirty flag, and redraw decision below
   // is unchanged; this only adds timing capture and one diagnostic
@@ -1234,6 +1414,13 @@ void screenChat() {
     // invalidates any previously cached viewport outright -- never reused
     // across entries.
     g_chatViewportCacheValid = false;
+    resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
+  }
+
+  // Phase 2B-2: a timed outcome expires only after it was actually drawn.
+  if (g_sendStatus != nullptr && g_sendStatusTimed && g_sendStatusDrawn &&
+      static_cast<uint32_t>(millis() - g_sendStatusShownMs) >= kSendStatusVisibleMs) {
+    clearSendStatus();
   }
 
   // Needed before input handling below: deciding how far ENCODER_ROTATE can
@@ -1245,7 +1432,13 @@ void screenChat() {
   InputEvent e;
   bool hadEvent = false;
   while (Input::popEvent(e)) {
+    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window
     hadEvent = true;
+    if (g_sendStatus != nullptr &&
+        (e.type == InputEventType::DOT_PRESS_START || e.type == InputEventType::ENCODER_SHORT) &&
+        isNewerThanSendOutcome(e)) {
+      clearSendStatus();
+    }
     // Hardware Diagnostic #4.9l follow-up: checked immediately BEFORE
     // dispatching this event too, not only after -- see the declaration
     // above for why "after only" can miss a single event that transitions
@@ -1398,11 +1591,37 @@ void screenChat() {
 
   // No separate error row in this screen (unlike Enigma) -- the whole
   // budget below the history viewport is compose's own.
+  //
+  // Phase 2B-2: while a Send outcome is active it occupies compose-block
+  // row 0 and any (retained) draft follows below it, still visible and
+  // editable; an EMPTY draft's blank row is replaced by the status instead
+  // of adding one. The block's row count therefore only changes when a
+  // status appears/disappears over a non-empty draft -- a viewportLines
+  // change, which takes the existing historyLayoutChanged full-clear path
+  // and misses the viewport cache (viewportLines is part of its key).
   uint16_t maxComposeRows = totalLines;
   if (maxComposeRows > kMaxShownComposeRows) maxComposeRows = kMaxShownComposeRows;
-  uint16_t shownComposeRows = (layout.totalRows < maxComposeRows) ? layout.totalRows : maxComposeRows;
-  if (shownComposeRows == 0) shownComposeRows = 1;
-  uint8_t skippedComposeRows = static_cast<uint8_t>(layout.totalRows - shownComposeRows);
+  uint16_t statusRows = (g_sendStatus != nullptr) ? 1 : 0;
+  bool draftBlank = (layout.totalRows <= 1 && composePrefixBuf[0] == '\0' && composeSuffix[0] == '\0');
+  uint16_t maxDraftRows = static_cast<uint16_t>(maxComposeRows - statusRows);
+  uint16_t shownDraftRows = (layout.totalRows < maxDraftRows) ? layout.totalRows : maxDraftRows;
+  if (statusRows == 1 && draftBlank) shownDraftRows = 0;
+  if (statusRows == 0 && shownDraftRows == 0) shownDraftRows = 1;
+  uint16_t shownComposeRows = static_cast<uint16_t>(statusRows + shownDraftRows);
+  uint8_t skippedComposeRows = static_cast<uint8_t>(layout.totalRows - shownDraftRows);
+  // Text for one shown compose-block row (status or draft) and whether the
+  // compose cursor belongs on it: logical draft row 0 as before, or the
+  // status row when it stands in for a blank draft.
+  auto composeBlockRow = [&](uint16_t shownRow, char* rowText, size_t cap, bool* cursorRow) {
+    if (shownRow < statusRows) {
+      snprintf(rowText, cap, "%s", g_sendStatus);
+      *cursorRow = (shownDraftRows == 0);
+      return;
+    }
+    uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + (shownRow - statusRows));
+    composeRowText(layout, composePrefixBuf, rowIdx, rowText, cap);
+    *cursorRow = (rowIdx == 0);
+  };
 
   // History gets whatever vertical space compose doesn't need this frame
   // (Hardware Fix #4.4 issue B: "history viewport above it shrinks as
@@ -1670,30 +1889,30 @@ void screenChat() {
       Display::tft().fillRect(0, composeY, Display::kScreenWidth, blockH, ST77XX_BLACK);
     }
     for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
-      uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
       char rowText[64];
-      composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      bool cursorRow = false;
+      composeBlockRow(shownRow, rowText, sizeof(rowText), &cursorRow);
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       // Hardware Fix #4.7 Part F: the cursor belongs to LOGICAL compose row
       // 0 (rowIdx == 0), never merely the first VISIBLE row (shownRow == 0)
       // -- when skippedComposeRows > 0, logical row 0 has scrolled off and
       // no shown row gets a cursor at all.
-      if (rowIdx == 0 && composeFocused) Display::drawSelectionCursor(2, y);
+      if (cursorRow && composeFocused) Display::drawSelectionCursor(2, y);
       Display::printLine(composePrefixX, y, rowText);
       strncpy(g_chatLastComposeRowText[shownRow], rowText, sizeof(g_chatLastComposeRowText[shownRow]) - 1);
       g_chatLastComposeRowText[shownRow][sizeof(g_chatLastComposeRowText[shownRow]) - 1] = '\0';
     }
   } else {
     for (uint16_t shownRow = 0; shownRow < shownComposeRows; shownRow++) {
-      uint8_t rowIdx = static_cast<uint8_t>(skippedComposeRows + shownRow);
       char rowText[64];
-      composeRowText(layout, composePrefixBuf, rowIdx, rowText, sizeof(rowText));
+      bool cursorRow = false;
+      composeBlockRow(shownRow, rowText, sizeof(rowText), &cursorRow);
       int16_t y = static_cast<int16_t>(composeY + shownRow * lh);
       bool textChanged = strcmp(rowText, g_chatLastComposeRowText[shownRow]) != 0;
-      bool markerNeedsRedraw = (rowIdx == 0) && composeFocusChanged;
+      bool markerNeedsRedraw = cursorRow && composeFocusChanged;
       if (textChanged) {
         Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
-        if (rowIdx == 0 && composeFocused) Display::drawSelectionCursor(2, y);
+        if (cursorRow && composeFocused) Display::drawSelectionCursor(2, y);
         Display::printLine(composePrefixX, y, rowText);
         strncpy(g_chatLastComposeRowText[shownRow], rowText, sizeof(g_chatLastComposeRowText[shownRow]) - 1);
         g_chatLastComposeRowText[shownRow][sizeof(g_chatLastComposeRowText[shownRow]) - 1] = '\0';
@@ -1704,6 +1923,13 @@ void screenChat() {
     }
   }
   composeRenderElapsed = millis() - composeRenderStart;
+  // Phase 2B-2: the compose block (status row included) is now on screen;
+  // a timed outcome's visible duration starts here, not before the index
+  // refresh/render that preceded it.
+  if (g_sendStatus != nullptr && !g_sendStatusDrawn) {
+    g_sendStatusDrawn = true;
+    g_sendStatusShownMs = millis();
+  }
 
   g_chatLastComposeFocused = composeFocused;
   g_chatLastComposeSkipped = skippedComposeRows;

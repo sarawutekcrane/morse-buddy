@@ -1313,15 +1313,100 @@ void composeRowText(const ComposeLayout& layout, const char* prefix, uint8_t row
   out[l] = '\0';
 }
 
-void sendEnigmaMessage() {
+// =============================================================================
+// Phase 2B-2: Send feedback and replayed-Send suppression -- same design,
+// states, and rules as text_message.cpp (see the SendWindow comment above
+// its sendComposedMessage() for the full rationale; kept per-mode, no
+// shared helper, per review). Enigma shows "Sending..." and the outcome on
+// its existing status row (errorLine), whose validation messages
+// (g_composeError) are unchanged and take precedence while set.
+// =============================================================================
+enum class SendWindow : uint8_t { CLOSED, OPEN, BOUNDED };
+SendWindow g_sendWindow = SendWindow::CLOSED;
+uint32_t g_sendWindowStartMs = 0;  // accepted Send's own eventMs (release time)
+uint32_t g_sendWindowEndMs = 0;    // meaningful only while BOUNDED
+bool g_sendRanThisTick = false;
+bool g_enigmaChatLeaving = false;
+
+constexpr uint32_t kSendStatusVisibleMs = 3000;
+const char* g_sendStatus = nullptr;
+bool g_sendStatusTimed = false;
+bool g_sendStatusDrawn = false;
+uint32_t g_sendStatusShownMs = 0;
+
+struct SendResult {
+  const char* status;  // nullptr: validation failure reported via g_composeError instead
+  bool timed;
+};
+
+bool msAfter(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) > 0; }
+
+void markEnigmaChatDirty();
+void drawSendingNow();
+
+void resetSendFeedback() {
+  g_sendWindow = SendWindow::CLOSED;
+  g_sendRanThisTick = false;
+  g_sendStatus = nullptr;
+  g_sendStatusDrawn = false;
+}
+
+void setSendStatus(const SendResult& r) {
+  g_sendStatus = r.status;
+  g_sendStatusTimed = r.timed;
+  g_sendStatusDrawn = false;
+  markEnigmaChatDirty();
+}
+
+void clearSendStatus() {
+  if (g_sendStatus == nullptr) return;
+  g_sendStatus = nullptr;
+  g_sendStatusDrawn = false;
+  markEnigmaChatDirty();
+}
+
+// Drops a Short released inside [start, end] (modular interval: rollover,
+// zero and equal timestamps need no special case). The first Short outside
+// it is genuinely later -- by the encoder FIFO ordering, every Short popped
+// after the accepted one has eventMs >= start -- so it retires the window
+// and is processed normally.
+bool isReplayedSend(const InputEvent& e) {
+  if (e.type != InputEventType::ENCODER_SHORT) return false;
+  if (g_sendWindow == SendWindow::OPEN) return true;
+  if (g_sendWindow != SendWindow::BOUNDED) return false;
+  if (static_cast<uint32_t>(e.eventMs - g_sendWindowStartMs) <=
+      static_cast<uint32_t>(g_sendWindowEndMs - g_sendWindowStartMs)) {
+    return true;
+  }
+  g_sendWindow = SendWindow::CLOSED;
+  return false;
+}
+
+bool isNewerThanSendOutcome(const InputEvent& e) {
+  if (g_sendWindow == SendWindow::OPEN) return false;
+  if (g_sendWindow == SendWindow::BOUNDED) return msAfter(e.eventMs, g_sendWindowEndMs);
+  return true;  // CLOSED: only reached via reset or a later Short, which itself cleared the status
+}
+
+SendResult resultForCompletion(bool online, bool published, bool storeOk) {
+  // Same evidence-bounded wording as text_message.cpp's resultForCompletion().
+  if (storeOk) {
+    if (published) return {"Server acknowledged", true};
+    return {online ? "Unconfirmed: queued" : "Offline: queued", true};
+  }
+  if (published) return {"Server acked; not saved", false};
+  return {online ? "Unconfirmed; not saved" : "Offline; not saved", false};  // 2B-1: draft kept
+}
+
+SendResult sendEnigmaMessage() {
   char escaped[EnigmaCrypto::kMaxEscapedLen + 1];
   if (!EnigmaCrypto::normalizeAndEscape(g_composeText, escaped, sizeof(escaped))) {
     g_composeError = "Message too long after Enigma encoding";
-    return;
+    return {nullptr, false};
   }
   if (strlen(escaped) == 0) {
     g_composeError = "No A-Z content";
-    return;
+    return {nullptr, false};
   }
 
   EnigmaKeyConfig senderKey = EnigmaKeys::getSenderKey(g_selectedGroupCode, g_selectedContactKey);
@@ -1336,7 +1421,7 @@ void sendEnigmaMessage() {
                                       sizeof(typePayload));
   if (typePayloadLen == 0) {
     g_composeError = "Message too long after Enigma encoding";
-    return;
+    return {nullptr, false};
   }
 
   char messageId[PacketCodec::kMessageIdLen];
@@ -1359,7 +1444,7 @@ void sendEnigmaMessage() {
   size_t wireLen =
       PacketCodec::encodeMessagePacket(env, typePayload, static_cast<uint16_t>(typePayloadLen), wireBuf,
                                        sizeof(wireBuf));
-  if (wireLen == 0) return;
+  if (wireLen == 0) return {"Can't encode message", false};  // previously silent; draft kept
 
   bool isEveryone = strcmp(g_selectedContactKey, MessageStore::kEveryone) == 0;
   char topicSuffix[24];
@@ -1394,6 +1479,7 @@ void sendEnigmaMessage() {
   // broker did receive without confirming; no automatic retry here.
   if (published || storeOk) clearDraft();
   markIndexDirty();  // a storage attempt was made either way (eviction may have run)
+  return resultForCompletion(online, published, storeOk);
 }
 
 void finalizeComposeChar() {
@@ -1532,12 +1618,22 @@ void handleComposeEvent(const InputEvent& e) {
     if (!g_composeKeyHeld) {
       if (g_composePatternLen > 0) finalizeComposeChar();
       if (g_composeLen > 0) {
-        sendEnigmaMessage();
+        // Phase 2B-2: visible acknowledgement BEFORE any blocking work
+        // (encryption, Identity::nextId()'s NVS write, publish, storage,
+        // index refresh). A fresh attempt supersedes an older validation
+        // message; it is set again below if this attempt fails validation.
+        g_composeError = nullptr;
+        drawSendingNow();
+        g_sendWindowStartMs = e.eventMs;
+        g_sendWindow = SendWindow::OPEN;
+        g_sendRanThisTick = true;
+        setSendStatus(sendEnigmaMessage());
       } else {
         invokeEmptyLineAction(Modes::ENIGMA, g_selectedGroupCode, g_selectedContactKey);
       }
     }
   } else if (e.type == InputEventType::ENCODER_LONG) {
+    g_enigmaChatLeaving = true;  // Phase 2B-2: drop Send feedback at the end of this tick
     TextMessage::clearOpenConversation();
     Menu::goBack();
   }
@@ -1569,6 +1665,7 @@ void handleHistoryFocusEvent(const InputEvent& e) {
   } else if (e.type == InputEventType::COMBINED_REVEAL) {
     if (entry != nullptr) dispatchHistoryMessageEvent(*entry, EVT_COMBINED_REVEAL);
   } else if (e.type == InputEventType::ENCODER_LONG) {
+    g_enigmaChatLeaving = true;  // Phase 2B-2: drop Send feedback at the end of this tick
     TextMessage::clearOpenConversation();
     Menu::goBack();
   }
@@ -1615,8 +1712,52 @@ constexpr uint8_t kMaxShownComposeRows = 10;
 uint8_t g_enigmaChatLastComposeSkipped = 0xFF;
 char g_enigmaChatLastComposeRowText[kMaxShownComposeRows][64] = {{0}};
 
+void markEnigmaChatDirty() { g_enigmaChatDirty = true; }
+
+// Phase 2B-2: synchronous "Sending..." on the status row as it is CURRENTLY
+// on screen -- geometry from the last completed render only when one
+// exists since entry (g_enigmaChatNeedsFullRedraw false => a render
+// finished and g_enigmaChatLastViewportLines matches the pixels);
+// otherwise the content area is cleared and a full redraw stays pending.
+// Recording the text in g_enigmaChatLastErrorLine keeps the row's diff
+// cache consistent, so the outcome later repaints exactly that row.
+void drawSendingNow() {
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t lh = Display::lineHeight();
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  static const char* const kSending = "Sending...";
+  if (!g_enigmaChatNeedsFullRedraw && g_enigmaChatLastViewportLines != kNoViewportLines) {
+    int16_t errorY = static_cast<int16_t>(contentTop + g_enigmaChatLastViewportLines * lh);
+    Display::tft().fillRect(0, errorY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    Display::printLine(2, errorY, kSending);
+    strncpy(g_enigmaChatLastErrorLine, kSending, sizeof(g_enigmaChatLastErrorLine) - 1);
+    g_enigmaChatLastErrorLine[sizeof(g_enigmaChatLastErrorLine) - 1] = '\0';
+  } else {
+    Display::clearContentArea();
+    Display::printLine(2, contentTop, kSending);
+    g_enigmaChatNeedsFullRedraw = true;
+  }
+}
+
+void screenEnigmaChatTick();
+
+// Phase 2B-2: same tick-end handling as text_message.cpp's screenChat().
 void screenEnigmaChat() {
+  g_sendRanThisTick = false;
+  g_enigmaChatLeaving = false;
+  screenEnigmaChatTick();
+  if (g_sendRanThisTick && g_sendWindow == SendWindow::OPEN) {
+    g_sendWindowEndMs = millis();
+    g_sendWindow = SendWindow::BOUNDED;
+  }
+  g_sendRanThisTick = false;
+  if (g_enigmaChatLeaving) resetSendFeedback();
+  g_enigmaChatLeaving = false;
+}
+
+void screenEnigmaChatTick() {
   if (Menu::consumeJustEntered()) {
+    resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
     clearDraft();
     g_historyCursor = kNoHistoryCursor;
     g_historyRowOffset = 0;
@@ -1633,11 +1774,23 @@ void screenEnigmaChat() {
   // codebase (see Display::setFont()'s own header comment).
   Display::setFont(Display::Font::PRIMARY);
 
+  // Phase 2B-2: a timed outcome expires only after it was actually drawn.
+  if (g_sendStatus != nullptr && g_sendStatusTimed && g_sendStatusDrawn &&
+      static_cast<uint32_t>(millis() - g_sendStatusShownMs) >= kSendStatusVisibleMs) {
+    clearSendStatus();
+  }
+
   Input::update();
   InputEvent e;
   bool hadEvent = false;
   while (Input::popEvent(e)) {
+    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window
     hadEvent = true;
+    if (g_sendStatus != nullptr &&
+        (e.type == InputEventType::DOT_PRESS_START || e.type == InputEventType::ENCODER_SHORT) &&
+        isNewerThanSendOutcome(e)) {
+      clearSendStatus();
+    }
     if (e.type == InputEventType::ENCODER_ROTATE) {
       refreshIndexIfNeeded();
       // Hardware Fix #4.3a issue 1: a logical message can span more visual
@@ -1876,8 +2029,12 @@ void screenEnigmaChat() {
   // above them (Hardware Fix #3, Section F/G); historyLayoutChanged forces
   // a full redraw of both since clearContentArea() already wiped them.
   char errorLine[40];
+  bool showingSendStatus = false;
   if (g_composeError != nullptr) {
     snprintf(errorLine, sizeof(errorLine), "%s", g_composeError);
+  } else if (g_sendStatus != nullptr) {  // Phase 2B-2: Send outcome on the same row
+    snprintf(errorLine, sizeof(errorLine), "%s", g_sendStatus);
+    showingSendStatus = true;
   } else {
     errorLine[0] = '\0';
   }
@@ -1886,6 +2043,12 @@ void screenEnigmaChat() {
     if (errorLine[0] != '\0') Display::printLine(2, errorY, errorLine);
     strncpy(g_enigmaChatLastErrorLine, errorLine, sizeof(g_enigmaChatLastErrorLine) - 1);
     g_enigmaChatLastErrorLine[sizeof(g_enigmaChatLastErrorLine) - 1] = '\0';
+  }
+  // Phase 2B-2: the row now shows the outcome; a timed outcome's visible
+  // duration starts here, not before the index refresh/render.
+  if (showingSendStatus && !g_sendStatusDrawn) {
+    g_sendStatusDrawn = true;
+    g_sendStatusShownMs = millis();
   }
 
   bool composeFocusChanged = (composeFocused != g_enigmaChatLastComposeFocused);
