@@ -40,6 +40,10 @@ struct GroupPresenceTable {
 
 GroupPresenceTable g_tables[Settings::kMaxGroups];
 
+// Phase 2C-2: see Presence::changeGeneration(). Bumped only when data that
+// getOnlineContacts()/getRecentContacts() expose actually changes.
+uint32_t g_changeGeneration = 0;
+
 GroupPresenceTable* findTable(const char* group_code) {
   for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
     if (g_tables[i].active && strcmp(g_tables[i].group_code, group_code) == 0) return &g_tables[i];
@@ -173,26 +177,37 @@ RecentContactRecord* claimRecentSlot(RecentContactsForGroup* t, const char* devi
 }
 
 // ONLINE presence observation: may refresh the cached display name.
-void touchRecentOnline(const char* group_code, const char* device_id, const char* name, uint32_t timestamp) {
+// Phase 2C-2: returns whether an exposed Recent Contacts field changed (a
+// new or evicting slot, the name, or the last-seen timestamp).
+bool touchRecentOnline(const char* group_code, const char* device_id, const char* name, uint32_t timestamp) {
   RecentContactsForGroup* t = findOrCreateRecentTable(group_code);
-  if (t == nullptr) return;
+  if (t == nullptr) return false;
   RecentContactRecord* r = findRecentRecord(t, device_id);
+  bool changed = (r == nullptr);
   if (r == nullptr) r = claimRecentSlot(t, device_id);
-  strncpy(r->last_known_name, name, sizeof(r->last_known_name) - 1);
-  r->last_known_name[sizeof(r->last_known_name) - 1] = '\0';
+  char newName[sizeof(r->last_known_name)];
+  strncpy(newName, name, sizeof(newName) - 1);
+  newName[sizeof(newName) - 1] = '\0';
+  if (strcmp(r->last_known_name, newName) != 0 || r->last_seen_timestamp != timestamp) changed = true;
+  memcpy(r->last_known_name, newName, sizeof(newName));
   r->last_seen_timestamp = timestamp;
   saveRecentTables();
+  return changed;
 }
 
 // OFFLINE/LWT observation: last-seen only, never overwrites the cached name
 // with a potentially-stale LWT display_name (Addendum section 6.3).
-void touchRecentOfflineOnly(const char* group_code, const char* device_id, uint32_t timestamp) {
+// Phase 2C-2: returns whether an exposed Recent Contacts field changed.
+bool touchRecentOfflineOnly(const char* group_code, const char* device_id, uint32_t timestamp) {
   RecentContactsForGroup* t = findOrCreateRecentTable(group_code);
-  if (t == nullptr) return;
+  if (t == nullptr) return false;
   RecentContactRecord* r = findRecentRecord(t, device_id);
+  bool changed = (r == nullptr);
   if (r == nullptr) r = claimRecentSlot(t, device_id);
+  if (r->last_seen_timestamp != timestamp) changed = true;
   r->last_seen_timestamp = timestamp;
   saveRecentTables();
+  return changed;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +438,7 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
     rt->active = false;
     saveRecentTables();
   }
+  if (t != nullptr || rt != nullptr) g_changeGeneration++;  // Phase 2C-2: the group's lists are now empty
   // Feature Fix #4.8: the persisted recent-color cache is cleaned up
   // alongside the existing Recent Contacts cleanup above, on the exact
   // same group-delete event.
@@ -435,6 +451,7 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
 
 void serviceInit() {
   loadRecentTables();
+  g_changeGeneration++;  // Phase 2C-2: Recent Contacts replaced from storage
   loadRecentColorsTables();
   registerSettingsChangeHook(onSettingsChanged);
 }
@@ -499,31 +516,50 @@ void handleIncoming(const char* group_code, const char* payload, uint16_t len) {
   GroupPresenceTable* t = findOrCreateTable(group_code);
   if (t == nullptr) return;
 
+  // Phase 2C-2: track whether any field getOnlineContacts()/
+  // getRecentContacts() expose actually changed, so an identical repeated
+  // message (same second) does not bump the generation.
+  bool changed = false;
   if (online) {
     OnlineEntry* e = findOnlineEntry(t, deviceId);
-    if (e == nullptr) e = claimOnlineSlot(t, deviceId);
-    strncpy(e->display_name, displayName, sizeof(e->display_name) - 1);
-    e->display_name[sizeof(e->display_name) - 1] = '\0';
+    if (e == nullptr) {
+      e = claimOnlineSlot(t, deviceId);  // new entry (may evict the least recently observed)
+      changed = true;
+    }
+    char newName[sizeof(e->display_name)];
+    strncpy(newName, displayName, sizeof(newName) - 1);
+    newName[sizeof(newName) - 1] = '\0';
+    if (strcmp(e->display_name, newName) != 0 || e->radio_available != radioAvail) changed = true;
+    memcpy(e->display_name, newName, sizeof(newName));
     e->radio_available = radioAvail;
     e->lastObservedMs = millis();
     // Feature Fix #4.8: a legacy/no-color ONLINE payload leaves the
     // already-cached online color_index alone (it stays whatever it was,
     // e.g. kInvalidColor if never observed) instead of stomping a
     // previously-observed valid color back to unknown.
-    if (IdentityColor::isValid(colorIdx)) e->color_index = colorIdx;
-    touchRecentOnline(group_code, deviceId, displayName, receiptTs);
+    if (IdentityColor::isValid(colorIdx)) {
+      if (e->color_index != colorIdx) changed = true;
+      e->color_index = colorIdx;
+    }
+    if (touchRecentOnline(group_code, deviceId, displayName, receiptTs)) changed = true;
     if (IdentityColor::isValid(colorIdx)) touchRecentColor(group_code, deviceId, colorIdx);
   } else {
     OnlineEntry* e = findOnlineEntry(t, deviceId);
-    if (e != nullptr) e->used = false;
-    touchRecentOfflineOnly(group_code, deviceId, receiptTs);
+    if (e != nullptr) {
+      e->used = false;
+      changed = true;
+    }
+    if (touchRecentOfflineOnly(group_code, deviceId, receiptTs)) changed = true;
     // OFFLINE/LWT: same "never overwrite with unknown" rule as the name
     // cache above -- only ever refresh the recent color cache when this
     // OFFLINE payload actually carries a valid one (e.g. an LWT that was
     // set with a configured color).
     if (IdentityColor::isValid(colorIdx)) touchRecentColor(group_code, deviceId, colorIdx);
   }
+  if (changed) g_changeGeneration++;
 }
+
+uint32_t changeGeneration() { return g_changeGeneration; }
 
 bool publishOnline(const char* group_code) { return publishStatus(group_code, "ONLINE"); }
 // Result intentionally ignored: publishOffline() stays void -- no caller

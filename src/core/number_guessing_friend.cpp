@@ -1,6 +1,7 @@
 #include "core/number_guessing_friend.h"
 
 #include <Arduino.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "core/display.h"
@@ -633,57 +634,135 @@ void recipientTrampoline() {
   Menu::pushScreen(screenFriendChat);
 }
 
+// Builds the recipient rows (keys + final labels) for group_code into the
+// given arrays: online contacts first, then recent offline ones, with a
+// device-id suffix on any duplicate label. Returns the row count.
+uint8_t buildRecipientRows(const char* group_code, char (*keys)[MessageStore::kContactKeyLen], char (*labels)[40]) {
+  uint8_t count = 0;
+
+  Presence::OnlineContact online[20];
+  uint8_t onlineN = Presence::getOnlineContacts(group_code, online, 20);
+  for (uint8_t i = 0; i < onlineN && count < kMaxRecipientItems; i++) {
+    strncpy(keys[count], online[i].device_id, MessageStore::kContactKeyLen - 1);
+    keys[count][MessageStore::kContactKeyLen - 1] = '\0';
+    snprintf(labels[count], 40, "%s", online[i].display_name);
+    count++;
+  }
+
+  Presence::RecentContact recent[20];
+  uint8_t recentN = Presence::getRecentContacts(group_code, recent, 20);
+  for (uint8_t i = 0; i < recentN && count < kMaxRecipientItems; i++) {
+    bool alreadyOnline = false;
+    for (uint8_t j = 0; j < onlineN; j++) {
+      if (strcmp(online[j].device_id, recent[i].device_id) == 0) {
+        alreadyOnline = true;
+        break;
+      }
+    }
+    if (alreadyOnline) continue;
+    strncpy(keys[count], recent[i].device_id, MessageStore::kContactKeyLen - 1);
+    keys[count][MessageStore::kContactKeyLen - 1] = '\0';
+    const char* name = (recent[i].last_known_name[0] != '\0') ? recent[i].last_known_name : recent[i].device_id;
+    snprintf(labels[count], 40, "%s (offline)", name);
+    count++;
+  }
+
+  for (uint8_t i = 0; i < count; i++) {
+    for (uint8_t j = static_cast<uint8_t>(i + 1); j < count; j++) {
+      if (strcmp(labels[i], labels[j]) == 0) {
+        appendDeviceSuffix(labels[i], 40, keys[i]);
+        appendDeviceSuffix(labels[j], 40, keys[j]);
+      }
+    }
+  }
+  return count;
+}
+
+// Phase 2C-2: the list follows presence changes while it is open (it used
+// to be built only on entry). A rebuild is attempted only when
+// Presence::changeGeneration() moved, and applied only when the visible
+// rows actually differ, so identical presence traffic causes no redraw.
+uint32_t g_recipientPresenceGeneration = 0;
+DrawnBeforeGuard g_recipientDotGuard;
+
+bool dropStaleRecipientDot(const InputEvent& e) {
+  return e.type == InputEventType::DOT_RELEASE && guardDrops(g_recipientDotGuard, e);
+}
+
+void configureRecipientMenu(uint8_t selectedIndex) {
+  for (uint8_t i = 0; i < g_recipientItemCount; i++) {
+    g_recipientItems[i] = SettingItem{g_recipientLabelBuf[i], recipientTrampoline};
+  }
+  g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, nullptr, selectedIndex);
+}
+
+// The highlighted row stays on the same contact key when it is still
+// listed. Whenever the visible rows change, confirmations released before
+// the changed list has been drawn are dropped (the user may have been
+// aiming at a row that has since moved, or at a contact no longer listed,
+// whose highlight falls back to the first row); a later press acts on what
+// is shown.
+void refreshRecipientsIfChanged() {
+  uint32_t gen = Presence::changeGeneration();
+  if (gen == g_recipientPresenceGeneration) return;
+  g_recipientPresenceGeneration = gen;
+
+  char selectedKey[MessageStore::kContactKeyLen] = {0};
+  bool hadSelection = g_recipientItemCount > 0 && g_recipientListMenu.selectedIndex() < g_recipientItemCount;
+  if (hadSelection) {
+    memcpy(selectedKey, g_recipientContactKeys[g_recipientListMenu.selectedIndex()], sizeof(selectedKey));
+  }
+
+  struct Rows {
+    char keys[kMaxRecipientItems][MessageStore::kContactKeyLen];
+    char labels[kMaxRecipientItems][40];
+  };
+  Rows* next = static_cast<Rows*>(malloc(sizeof(Rows)));  // transient: only on a presence change
+  if (next != nullptr) {
+    uint8_t n = buildRecipientRows(g_selectedGroupCode, next->keys, next->labels);
+    bool same = (n == g_recipientItemCount);
+    for (uint8_t i = 0; same && i < n; i++) {
+      same = strcmp(next->keys[i], g_recipientContactKeys[i]) == 0 && strcmp(next->labels[i], g_recipientLabelBuf[i]) == 0;
+    }
+    if (!same) {
+      memcpy(g_recipientContactKeys, next->keys, sizeof(next->keys[0]) * n);
+      memcpy(g_recipientLabelBuf, next->labels, sizeof(next->labels[0]) * n);
+      g_recipientItemCount = n;
+    }
+    free(next);
+    if (same) return;
+  } else {
+    // No scratch memory: rebuild in place and treat it as a change.
+    g_recipientItemCount = buildRecipientRows(g_selectedGroupCode, g_recipientContactKeys, g_recipientLabelBuf);
+  }
+
+  uint8_t newIndex = 0;
+  for (uint8_t i = 0; hadSelection && i < g_recipientItemCount; i++) {
+    if (strcmp(g_recipientContactKeys[i], selectedKey) == 0) {
+      newIndex = i;
+      break;
+    }
+  }
+  configureRecipientMenu(newIndex);
+  armGuard(g_recipientDotGuard);
+}
+
 void screenFriendRecipient() {
   if (Menu::consumeJustEntered()) {
-    g_recipientItemCount = 0;
-
-    Presence::OnlineContact online[20];
-    uint8_t onlineN = Presence::getOnlineContacts(g_selectedGroupCode, online, 20);
-    for (uint8_t i = 0; i < onlineN && g_recipientItemCount < kMaxRecipientItems; i++) {
-      strncpy(g_recipientContactKeys[g_recipientItemCount], online[i].device_id,
-              sizeof(g_recipientContactKeys[0]) - 1);
-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "%s",
-               online[i].display_name);
-      g_recipientItems[g_recipientItemCount] =
-          SettingItem{g_recipientLabelBuf[g_recipientItemCount], recipientTrampoline};
-      g_recipientItemCount++;
-    }
-
-    Presence::RecentContact recent[20];
-    uint8_t recentN = Presence::getRecentContacts(g_selectedGroupCode, recent, 20);
-    for (uint8_t i = 0; i < recentN && g_recipientItemCount < kMaxRecipientItems; i++) {
-      bool alreadyOnline = false;
-      for (uint8_t j = 0; j < onlineN; j++) {
-        if (strcmp(online[j].device_id, recent[i].device_id) == 0) {
-          alreadyOnline = true;
-          break;
-        }
-      }
-      if (alreadyOnline) continue;
-      strncpy(g_recipientContactKeys[g_recipientItemCount], recent[i].device_id,
-              sizeof(g_recipientContactKeys[0]) - 1);
-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
-      const char* name = (recent[i].last_known_name[0] != '\0') ? recent[i].last_known_name : recent[i].device_id;
-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "%s (offline)", name);
-      g_recipientItems[g_recipientItemCount] =
-          SettingItem{g_recipientLabelBuf[g_recipientItemCount], recipientTrampoline};
-      g_recipientItemCount++;
-    }
-
-    for (uint8_t i = 0; i < g_recipientItemCount; i++) {
-      for (uint8_t j = static_cast<uint8_t>(i + 1); j < g_recipientItemCount; j++) {
-        if (strcmp(g_recipientLabelBuf[i], g_recipientLabelBuf[j]) == 0) {
-          appendDeviceSuffix(g_recipientLabelBuf[i], sizeof(g_recipientLabelBuf[i]), g_recipientContactKeys[i]);
-          appendDeviceSuffix(g_recipientLabelBuf[j], sizeof(g_recipientLabelBuf[j]), g_recipientContactKeys[j]);
-        }
-      }
-    }
-
-    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount);
+    g_recipientPresenceGeneration = Presence::changeGeneration();
+    g_recipientItemCount = buildRecipientRows(g_selectedGroupCode, g_recipientContactKeys, g_recipientLabelBuf);
+    configureRecipientMenu(0);
+    armGuard(g_recipientDotGuard);
+  } else {
+    refreshRecipientsIfChanged();
   }
   Display::drawStatusBar();
-  g_recipientListMenu.tick("Play with Friend");
+  // Phase 2C-2: opt-in tickOwned(): one confirmation pushes the trampoline
+  // and the list stops, so nothing can move the highlight between the
+  // confirmation and recipientTrampoline() reading it on the next tick.
+  tickGuard(g_recipientDotGuard);
+  bool navigated = g_recipientListMenu.tickOwned("Play with Friend", dropStaleRecipientDot);
+  if (!navigated && g_recipientListMenu.hasDrawnSinceConfigure()) bindGuardAfterDraw(g_recipientDotGuard);
 }
 
 // =============================================================================
@@ -1311,16 +1390,15 @@ void handleGameArrival(const char* group_code, const char* contact_key, const Pa
 // =============================================================================
 // ANSWER screen (Phase 3 section 12)
 // =============================================================================
-enum class AnswerPhase : uint8_t { ENTERING, SHOWING_RESULT };
-AnswerPhase g_answerPhase = AnswerPhase::ENTERING;
 DigitEntryState g_digitEntry;
 MessageRef g_activeGameRef;
 FriendGameState g_activeGame;
 char g_activeChallengeMessageId[PacketCodec::kMessageIdLen];
-NumberGuessing::GuessResult g_pendingResult;
-uint16_t g_pendingGuessValue = 0;
 
-bool g_answerSaved = true;  // Phase 2C-2: the shown wrong-guess result was saved
+// Phase 2C-2: whether the most recent wrong guess was saved. While false,
+// a "Last guess not saved" notice row stays above the history until a
+// later save succeeds or the session ends.
+bool g_answerSaved = true;
 
 void startAnswerSession(const MessageRef& ref, const StoredMessageView& view, const FriendGameState& s) {
   g_answerSaved = true;
@@ -1328,7 +1406,6 @@ void startAnswerSession(const MessageRef& ref, const StoredMessageView& view, co
   g_activeGame = s;
   strncpy(g_activeChallengeMessageId, view.envelope.message_id, sizeof(g_activeChallengeMessageId) - 1);
   g_activeChallengeMessageId[sizeof(g_activeChallengeMessageId) - 1] = '\0';
-  g_answerPhase = AnswerPhase::ENTERING;
   NumberGuessing::resetDigitEntry(&g_digitEntry);
 }
 
@@ -1343,17 +1420,43 @@ bool persistActiveGame() {
 
 bool g_answerDirty = true;
 bool g_answerNeedsFullRedraw = true;
+NumberGuessing::DigitRowRenderState g_answerRowState;
+constexpr uint32_t kNoAnswerHistoryDrawn = 0xFFFFFFFFu;
+uint32_t g_answerLastDrawnAttempts = kNoAnswerHistoryDrawn;
+bool g_answerLastShowedNotice = false;
 
-// Phase 2C-2: synchronous feedback drawn before blocking save/send work.
-void drawAnswerResultNow(uint16_t guessValue, const NumberGuessing::GuessResult& r, const char* status) {
+static const char* const kAnswerGuessLabel = "Guess: ";
+
+// Phase 2C-2: Solo's live layout (screenSoloGuess()) over Friend's own
+// retained history ring -- the editable Guess row pinned to the bottom,
+// the newest attempts directly above it, older ones off the top (the full
+// retained history is in the Result view after solving). Capacity comes
+// from the display geometry. The secret is never drawn; a row shows only
+// an attempt and its A/B result.
+void drawAnswerHistory(int16_t historyTop, int16_t guessY) {
+  int16_t lh = Display::lineHeight();
+  int16_t available = static_cast<int16_t>(guessY - historyTop);
+  uint8_t maxRows = (available > 0) ? static_cast<uint8_t>(available / lh) : 0;
+  uint8_t shown = (g_activeGame.historyCount < maxRows) ? g_activeGame.historyCount : maxRows;
+  uint8_t startIdx = static_cast<uint8_t>(g_activeGame.historyCount - shown);
+  for (uint8_t i = startIdx; i < g_activeGame.historyCount; i++) {
+    int16_t rowY = static_cast<int16_t>(guessY - (shown - (i - startIdx)) * lh);
+    const FriendEntry& g = g_activeGame.history[chronologicalIndex(g_activeGame, i)];
+    NumberGuessing::drawGuessHistoryRow(2, rowY, kAnswerGuessLabel, g.guessValue, g.aCount, g.bCount);
+  }
+}
+
+// Phase 2C-2: full synchronous frame (notice, history, and `status` in the
+// Guess row's place), drawn before blocking save/send work.
+void drawAnswerFrameNow(const char* status) {
   Display::setFont(Display::Font::PRIMARY);
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t guessY = static_cast<int16_t>(Display::kScreenHeight - lh);
   Display::clearContentArea();
-  char line[32];
-  snprintf(line, sizeof(line), "%04u -> %uA%uB", guessValue, r.a, r.b);
-  Display::printLine(2, y, line);
-  Display::printLine(2, static_cast<int16_t>(y + lh), status);
+  if (!g_answerSaved) Display::printLine(2, contentTop, "Last guess not saved");
+  drawAnswerHistory(static_cast<int16_t>(contentTop + (g_answerSaved ? 0 : lh)), guessY);
+  Display::printLine(2, guessY, status);
 }
 
 void exitAnswerConfirmYes() { Menu::goBack(); }  // pops screenAnswer; confirmPromptScreen pops itself too
@@ -1369,9 +1472,9 @@ bool submitAnswerGuess() {
   if (r.a == 4) {
     g_activeGame.state = STATE_UNLOCKED;
     ResultViewStatus status;
-    drawAnswerResultNow(guessValue, r, "Saving...");
+    drawAnswerFrameNow("Saving...");
     status.saved = persistActiveGame();
-    drawAnswerResultNow(guessValue, r, "Sending result...");
+    drawAnswerFrameNow("Sending result...");
     status.send = sendResultChunks(g_activeGameRef.group_code, g_activeGameRef.contact_key,
                                    g_activeChallengeMessageId, g_activeGame);
     startResultView(g_activeGame, &status);
@@ -1380,28 +1483,24 @@ bool submitAnswerGuess() {
     return true;
   }
 
-  // Phase 2C-2: Shorts from here until the final result frame has been
-  // drawn (end of this tick) cannot dismiss it.
+  // Phase 2C-2: the new attempt is shown as a history row at once (no
+  // separate dismissal step) and the Guess row starts empty again. Shorts
+  // released before the post-submit frame (end of this tick) has been
+  // drawn can neither submit nor open the Exit prompt; DOT digit entry is
+  // left as is (a DOT may enter an editable digit).
   armGuard(g_answerShortGuard);
-  g_pendingResult = r;
-  g_pendingGuessValue = guessValue;
-  g_answerPhase = AnswerPhase::SHOWING_RESULT;
-  drawAnswerResultNow(guessValue, r, "Saving...");
+  NumberGuessing::resetDigitEntry(&g_digitEntry);
+  drawAnswerFrameNow("Saving...");
   g_answerSaved = persistActiveGame();
   g_answerNeedsFullRedraw = true;
   g_answerDirty = true;
   return true;
 }
 
-AnswerPhase g_answerLastDrawnPhase = AnswerPhase::ENTERING;
-char g_lastAnswerAttemptLine[32] = {0};
-NumberGuessing::DigitRowRenderState g_answerRowState;
-
 void screenAnswer() {
   if (Menu::consumeJustEntered()) {
     g_answerDirty = true;
     g_answerNeedsFullRedraw = true;
-    NumberGuessing::resetDigitRowRenderState(&g_answerRowState);
     armGuard(g_answerShortGuard);  // Phase 2C-2
   }
   tickGuard(g_answerShortGuard);
@@ -1416,11 +1515,6 @@ void screenAnswer() {
       Menu::goBack();
     } else if (e.type == InputEventType::ENCODER_SHORT && guardDrops(g_answerShortGuard, e)) {
       // Phase 2C-2: released before this screen's current content was drawn.
-    } else if (g_answerPhase == AnswerPhase::SHOWING_RESULT) {
-      if (e.type == InputEventType::ENCODER_SHORT) {
-        g_answerPhase = AnswerPhase::ENTERING;
-        NumberGuessing::resetDigitEntry(&g_digitEntry);
-      }
     } else if (e.type == InputEventType::ENCODER_SHORT) {
       if (g_digitEntry.count == 4) {
         submitAnswerGuess();
@@ -1438,11 +1532,9 @@ void screenAnswer() {
   }
   if (hadEvent) g_answerDirty = true;
 
-  if (g_answerPhase == AnswerPhase::ENTERING) {
-    uint8_t countBefore = g_digitEntry.count;
-    NumberGuessing::tickDigitEntry(&g_digitEntry);
-    if (g_digitEntry.count != countBefore) g_answerDirty = true;
-  }
+  uint8_t countBefore = g_digitEntry.count;
+  NumberGuessing::tickDigitEntry(&g_digitEntry);
+  if (g_digitEntry.count != countBefore) g_answerDirty = true;  // hold-to-delete fired
 
   Display::drawStatusBar();
   if (!g_answerDirty) return;
@@ -1450,48 +1542,27 @@ void screenAnswer() {
 
   Display::setFont(Display::Font::PRIMARY);
   int16_t lh = Display::lineHeight();
-  int16_t y = Display::kStatusBarHeight + 2;
+  int16_t contentTop = Display::kStatusBarHeight + 2;
+  int16_t guessY = static_cast<int16_t>(Display::kScreenHeight - lh);
+  bool showNotice = !g_answerSaved;
+  int16_t historyTop = static_cast<int16_t>(contentTop + (showNotice ? lh : 0));
 
-  // A phase transition (ENTERING <-> SHOWING_RESULT) is a genuine content
-  // replacement -- the whole row layout changes -- so it forces a full
-  // redraw same as first entry (Global Invariant 12's spirit). Within a
-  // phase, only what actually changed is touched.
-  bool phaseChanged = (g_answerPhase != g_answerLastDrawnPhase);
-  bool forceFull = g_answerNeedsFullRedraw || phaseChanged;
-
-  if (g_answerPhase == AnswerPhase::SHOWING_RESULT) {
-    if (forceFull) {
-      Display::clearContentArea();
-      char line[32];
-      snprintf(line, sizeof(line), "%04u -> %uA%uB", g_pendingGuessValue, g_pendingResult.a, g_pendingResult.b);
-      Display::printLine(2, y, line);
-      y += lh;
-      Display::printLine(2, y, g_answerSaved ? "Short: continue" : "Not saved. Short: continue");
-      g_answerNeedsFullRedraw = false;
-    }
-    // Nothing dynamic while showing the result: no further per-tick
-    // diffing needed until the phase changes again.
-  } else {
-    char attemptLine[32];
-    snprintf(attemptLine, sizeof(attemptLine), "Attempt %d", g_activeGame.totalAttempts + 1);
-    if (forceFull) {
-      Display::clearContentArea();
-      Display::printLine(2, y, attemptLine);
-      NumberGuessing::resetDigitRowRenderState(&g_answerRowState);
-      g_answerNeedsFullRedraw = false;
-    } else if (strcmp(attemptLine, g_lastAnswerAttemptLine) != 0) {
-      Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
-      Display::printLine(2, y, attemptLine);
-    }
-    strncpy(g_lastAnswerAttemptLine, attemptLine, sizeof(g_lastAnswerAttemptLine) - 1);
-    g_lastAnswerAttemptLine[sizeof(g_lastAnswerAttemptLine) - 1] = '\0';
-    y += lh;
-
-    NumberGuessing::renderDigitRow(&g_answerRowState, 2, y, "ANSWER: ", g_digitEntry);
+  // Same three-way split as screenSoloGuess(): full draw on entry or after
+  // a submit (and whenever the notice appears/disappears), otherwise only
+  // renderDigitRow()'s own per-cell diffing.
+  bool forceFull = g_answerNeedsFullRedraw || (showNotice != g_answerLastShowedNotice) ||
+                   (g_activeGame.totalAttempts != g_answerLastDrawnAttempts);
+  if (forceFull) {
+    Display::clearContentArea();
+    NumberGuessing::resetDigitRowRenderState(&g_answerRowState);
+    if (showNotice) Display::printLine(2, contentTop, "Last guess not saved");
+    drawAnswerHistory(historyTop, guessY);
+    g_answerNeedsFullRedraw = false;
+    g_answerLastShowedNotice = showNotice;
+    g_answerLastDrawnAttempts = g_activeGame.totalAttempts;
   }
-
-  g_answerLastDrawnPhase = g_answerPhase;
-  if (forceFull) bindGuardAfterDraw(g_answerShortGuard);  // Phase 2C-2: content is now on screen
+  NumberGuessing::renderDigitRow(&g_answerRowState, 2, guessY, kAnswerGuessLabel, g_digitEntry);
+  if (forceFull) bindGuardAfterDraw(g_answerShortGuard);  // Phase 2C-2: the full frame is now on screen
 }
 
 // =============================================================================

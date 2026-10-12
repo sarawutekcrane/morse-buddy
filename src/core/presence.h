@@ -12,6 +12,15 @@ namespace Presence {
 // Called by MqttManager when a raw payload arrives on a presence/+ topic.
 void handleIncoming(const char* group_code, const char* payload, uint16_t len);
 
+// Phase 2C-2: wrapping counter that changes whenever data returned by
+// getOnlineContacts() or getRecentContacts() changes for any group (an
+// entry added, removed or evicted; a name, radio flag, color or last-seen
+// timestamp changed; Recent Contacts loaded at startup; a group deleted).
+// An identical repeated presence message leaves it unchanged. Screens that
+// show those lists compare it with the value they built from and rebuild
+// when it differs; it says nothing about which group changed.
+uint32_t changeGeneration();
+
 // Publishes our own ONLINE/OFFLINE presence to one group (retained, QoS1).
 //
 // Fix Phase 1B: publishOnline() now returns MqttManager::publishRaw()'s own
