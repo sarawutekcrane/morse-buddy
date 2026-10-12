@@ -461,6 +461,38 @@ assuming a hard cutoff.
 | HW-GAME-011 | Duplicate chunk delivery (retry) | Existing dedup logic prevents double-apply | No duplicated history entries |
 | HW-GAME-012 | Reboot mid-game | State persists appropriately | Resumable or cleanly reset per source's actual persistence scope — document actual behavior |
 
+**Implementation status notes (Phase 2C-2). The HW-GAME-010/011 requirements
+above are unchanged; these notes do not redefine PASS.**
+
+- **HW-GAME-010 — open defect, deferred.** The current implementation (sender
+  `sendResultChunks()`, receiver `handleGameResultChunkPacket()`) has no
+  resume or retry. The sender publishes each chunk once, only if the group is
+  connected when the send starts. A failed QoS1 publish closes the connection,
+  so later chunks of that set are refused. Nothing is resent on reopen. The
+  receiver keeps an incomplete set in a reassembly slot with no expiry (slot 0
+  is reused when all four are busy). Deferred reliability work, not
+  implemented: durable result retry, manual resend, and partial-transfer
+  expiry. Verification: not run in Phase 2C-2. Nothing in this phase changes
+  this row's behavior.
+- **HW-GAME-011 — partially covered by source, completion handling
+  deferred.** Duplicate chunk indexes are ignored only while a set is still
+  incomplete. After a set completes, its slot is freed, so a repeated full set
+  is applied again and notifies again. Deferred, not implemented: receiver
+  duplicate-completion handling. Verification: not run.
+- **Sender duplicate submit (Phase 2C-2 candidate, host-tested only).** Before
+  2C-2, two Shorts in one input batch on a correct guess recorded the guess
+  twice and sent the chunk set twice. The 2C-2 candidate evaluates only a
+  LOCKED game with four entered digits, so a solve produces one history entry,
+  one attempt, one save and one chunk-send call. This is verified by host tests
+  against the actual source only. **Hardware validation pending; not
+  hardware-verified.**
+- **Local result status (Phase 2C-2 candidate, host-tested only).** After a
+  solve, the result screen shows `Saved`/`Not saved` and
+  `result offline` / `result acked k/n` / `result encode err`.
+  `acked k/n` counts publish calls that returned true (QoS1 PUBACK) out of the
+  chunks needed. It is not proof of delivery or of reassembly on the friend's
+  device. Hardware validation pending.
+
 ---
 
 ## SECTION 14 — Morse Practice

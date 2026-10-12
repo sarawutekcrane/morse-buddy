@@ -50,6 +50,99 @@ char g_challengeContactKey[MessageStore::kContactKeyLen];
 uint8_t g_pendingRandomSecret[4];
 
 // =============================================================================
+// Phase 2C-2: drawn-before guard. Drops a gated confirmation (one event type
+// from one producer, chosen by the caller) that was physically released at
+// or before the moment this screen's first real draw completed, so a press
+// buffered during blocking work -- or released before the screen was ever
+// visible -- can never act on a screen the user had not yet seen.
+//
+// Classification is per event and absolute, never by ordering: `age` is
+// millis() - e.eventMs and `sinceBoundMs` is the time since the bound, so
+// "age >= sinceBoundMs" means "released at or before the bound" (an equal
+// timestamp is dropped: it cannot be told apart from a press during the
+// draw). No DOT/encoder or within-producer ordering is assumed, no zero
+// sentinel is used (0 is an ordinary millis() value at rollover), and an
+// empty queue or a finished drain never retires the guard, so an old
+// timestamp published late is still dropped.
+//
+// Timestamps (input.cpp): DOT_RELEASE and ENCODER_SHORT carry the atMs
+// their esp_timer sampler read with millis() before queueing the raw edge,
+// so a correctly classified event has 0 <= age.
+//
+// The classification above is guaranteed only under two independent
+// assumptions; neither is enforced by this code:
+//  P (polling): while BOUNDED, consecutive advanceGuard() calls -- the
+//    owning screen's per-tick tickGuard() and every guardDrops() -- are less
+//    than 2^32 ms (~49.7 days) apart, so each uint32 step is exact.
+//  A (event age): an event's actual age (millis() - atMs, unwrapped) when
+//    it is classified is less than 2^32 ms.
+// Queue draining alone does not establish A: Input::update() converts every
+// raw edge only when it runs, and the delay before classification includes
+// the sampler's millis() read being followed late by its enqueue (task
+// scheduling), raw edges waiting for the next Input::update() (main-loop
+// servicing, and only when the top screen calls it), and converted events
+// waiting in the event queue until some screen pops them (including events
+// left queued for the next screen after a navigation). None of these delays
+// is bounded by the source.
+//
+// sinceBoundMs is a 64-bit sum of those uint32 steps and stops growing once
+// it reaches 2^32 (an event with age below 2^32 can no longer be stale), so
+// under P and A there is no half-range blackout and no window that re-opens.
+//
+// Lifecycle: every entry to a guarded screen re-arms its guard (UNTIL_DRAW),
+// and the next actual draw re-binds it, resetting lastMs and sinceBoundMs;
+// values left over from a time the screen was not on top are never used.
+// Outside P or A, classification is not guaranteed: an event may be passed
+// or dropped incorrectly.
+// =============================================================================
+struct DrawnBeforeGuard {
+  enum class State : uint8_t { OFF, UNTIL_DRAW, BOUNDED };
+  State state;
+  uint32_t lastMs;
+  uint64_t sinceBoundMs;
+};
+constexpr uint64_t kGuardSaturationMs = 0x100000000ULL;
+
+void armGuard(DrawnBeforeGuard& g) { g.state = DrawnBeforeGuard::State::UNTIL_DRAW; }
+
+void advanceGuard(DrawnBeforeGuard& g, uint32_t now) {
+  if (g.state != DrawnBeforeGuard::State::BOUNDED) return;
+  if (g.sinceBoundMs < kGuardSaturationMs) g.sinceBoundMs += static_cast<uint32_t>(now - g.lastMs);
+  g.lastMs = now;
+}
+
+// Call only right after the guarded screen's first real draw completed.
+void bindGuardAfterDraw(DrawnBeforeGuard& g) {
+  if (g.state != DrawnBeforeGuard::State::UNTIL_DRAW) return;
+  g.state = DrawnBeforeGuard::State::BOUNDED;
+  g.lastMs = millis();
+  g.sinceBoundMs = 0;
+}
+
+// Called once per tick of the owning screen; assumption P above requires
+// these advances (and guardDrops()'s own) to be under 2^32 ms apart.
+void tickGuard(DrawnBeforeGuard& g) { advanceGuard(g, millis()); }
+
+bool guardDrops(DrawnBeforeGuard& g, const InputEvent& e) {
+  if (g.state == DrawnBeforeGuard::State::OFF) return false;
+  if (g.state == DrawnBeforeGuard::State::UNTIL_DRAW) return true;
+  uint32_t now = millis();
+  advanceGuard(g, now);
+  return static_cast<uint64_t>(static_cast<uint32_t>(now - e.eventMs)) >= g.sinceBoundMs;
+}
+
+// One guard per gated screen; each is re-armed on every entry to it.
+DrawnBeforeGuard g_friendMenuDotGuard;  // Play/Cancel, Set Manually/Random, Quick Switch
+DrawnBeforeGuard g_manualDotGuard;      // Manual entry's send confirmation only
+DrawnBeforeGuard g_randomDotGuard;      // Random confirm
+DrawnBeforeGuard g_answerShortGuard;    // Answer screen (entry and each wrong-guess result)
+DrawnBeforeGuard g_resultDotGuard;      // Result screen's DOT dismissal
+
+bool dropStaleFriendMenuDot(const InputEvent& e) {
+  return e.type == InputEventType::DOT_RELEASE && guardDrops(g_friendMenuDotGuard, e);
+}
+
+// =============================================================================
 // Local payload: game state + FIFO(50) guess history (Addendum section 12;
 // Phase 3 sections 10-13). kMaxLocalPayloadLen is a shared 400-byte cap
 // across every message type (Phase 1/2 constant), so a full 255-attempt
@@ -278,12 +371,40 @@ bool parseChunkPayload(const uint8_t* data, uint16_t len, char* outMsgId, char* 
 // does for Race's redundant/self-healing control traffic. This is an
 // OPEN, unresolved, PRE-EXISTING gap this candidate does not fix -- named
 // precisely here rather than left folded into a blanket "bare send" claim.
-void sendResultChunks(const char* group_code, const char* challenger_contact_key, const char* challenge_message_id,
-                      const FriendGameState& s) {
-  if (!MqttManager::isGroupConnected(group_code)) return;  // best-effort only; no retry for the chunk transfer
+// Phase 2C-2: what the (unchanged, best-effort, no-retry) chunk send below
+// actually observed, for local feedback only. One bit per chunk index.
+constexpr uint8_t kMaxResultChunks = (kMaxFriendHistory + kEntriesPerChunk - 1) / kEntriesPerChunk;
+static_assert(kMaxResultChunks <= 8, "ResultSendOutcome masks are 8 bits");
+struct ResultSendOutcome {
+  bool connectedAtStart;  // isGroupConnected() at entry -- not proof of any publish or transmission
+  uint8_t expected;       // chunks the history needs
+  uint8_t skippedMask;    // chunk not built (payload/header encode failed): publishBinary() not called
+  uint8_t calledMask;     // publishBinary() invoked (it may still refuse on its own connection guard)
+  uint8_t trueMask;       // publishBinary() returned true (QoS1 PUBACK seen; never peer receipt)
+};
 
+// Phase 2C-2: local outcome of the solve that opened the current result
+// view. Only the solve path attaches one; reopening any stored game shows
+// none, so a RAM-only status can never describe a different operation.
+struct ResultViewStatus {
+  bool saved;  // persistActiveGame(): encode + updateTypeLocalPayload() both reported success
+  ResultSendOutcome send;
+};
+
+uint8_t countBits(uint8_t v) {
+  uint8_t n = 0;
+  for (; v != 0; v = static_cast<uint8_t>(v & (v - 1))) n++;
+  return n;
+}
+
+ResultSendOutcome sendResultChunks(const char* group_code, const char* challenger_contact_key,
+                                   const char* challenge_message_id, const FriendGameState& s) {
+  ResultSendOutcome out = {false, 0, 0, 0, 0};
   uint8_t chunkCount = static_cast<uint8_t>((s.historyCount + kEntriesPerChunk - 1) / kEntriesPerChunk);
   if (chunkCount == 0) chunkCount = 1;
+  out.expected = chunkCount;
+  if (!MqttManager::isGroupConnected(group_code)) return out;  // best-effort only; no retry for the chunk transfer
+  out.connectedAtStart = true;
 
   char topicSuffix[24];
   snprintf(topicSuffix, sizeof(topicSuffix), "msg/%s", challenger_contact_key);
@@ -301,17 +422,26 @@ void sendResultChunks(const char* group_code, const char* challenger_contact_key
     uint8_t payload[kChunkMaxPayload];
     size_t payloadLen = buildChunkPayload(challenge_message_id, Identity::deviceId(), c, chunkCount, s.totalAttempts,
                                           ordered, cnt, payload, sizeof(payload));
-    if (payloadLen == 0) continue;
+    const uint8_t bit = static_cast<uint8_t>(1u << c);
+    if (payloadLen == 0) {
+      out.skippedMask |= bit;
+      continue;
+    }
 
     uint8_t wireBuf[PacketCodec::kHeaderSize + kChunkMaxPayload];
     if (!PacketCodec::encodeHeader(PacketCodec::PK_GAME_RESULT_CHUNK, static_cast<uint16_t>(payloadLen), wireBuf,
                                    sizeof(wireBuf))) {
+      out.skippedMask |= bit;
       continue;
     }
     memcpy(wireBuf + PacketCodec::kHeaderSize, payload, payloadLen);
-    MqttManager::publishBinary(group_code, topicSuffix, wireBuf,
-                               static_cast<uint16_t>(PacketCodec::kHeaderSize + payloadLen), false, 1);
+    out.calledMask |= bit;
+    if (MqttManager::publishBinary(group_code, topicSuffix, wireBuf,
+                                   static_cast<uint16_t>(PacketCodec::kHeaderSize + payloadLen), false, 1)) {
+      out.trueMask |= bit;
+    }
   }
+  return out;
 }
 
 // ---- Reassembly (receive side): dedup by chunk_index bitmask ---------------
@@ -846,12 +976,26 @@ void dispatchHistoryMessageEvent(const MessageStore::ConversationIndexEntry& ent
   if (fn != nullptr) fn(ref, eventType);
 }
 
+// Phase 2C-2: an outgoing chat loop (Friend's, or Text/Enigma's empty-line
+// hook) that keeps handling the rest of its batch after this push could
+// call back in before Play/Cancel ever runs. While no navigation happened
+// since our own push, Play/Cancel is still the top screen, so a second
+// call is that same-batch duplicate and is ignored. This does not fix the
+// Text/Enigma loops themselves (e.g. a Back later in the same batch is
+// still handled there and pops Play/Cancel).
+bool g_challengeFlowPushed = false;
+uint32_t g_challengeFlowPushEpoch = 0;
+
 void startChallengeFlow(const char* group_code, const char* contact_key) {
+  if (g_challengeFlowPushed && Menu::navigationEpoch() == g_challengeFlowPushEpoch) return;
   strncpy(g_challengeGroupCode, group_code, sizeof(g_challengeGroupCode) - 1);
   g_challengeGroupCode[sizeof(g_challengeGroupCode) - 1] = '\0';
   strncpy(g_challengeContactKey, contact_key, sizeof(g_challengeContactKey) - 1);
   g_challengeContactKey[sizeof(g_challengeContactKey) - 1] = '\0';
+  uint32_t before = Menu::navigationEpoch();
   Menu::pushScreen(screenPlayOrCancel);
+  g_challengeFlowPushed = (Menu::navigationEpoch() != before);  // false if the stack was full
+  g_challengeFlowPushEpoch = Menu::navigationEpoch();
 }
 
 void handleFriendChatEvent(const InputEvent& e) {
@@ -904,6 +1048,7 @@ void screenFriendChat() {
   Input::update();
   InputEvent e;
   bool hadEvent = false;
+  const uint32_t chatEpoch = Menu::navigationEpoch();
   while (Input::popEvent(e)) {
     hadEvent = true;
     if (e.type == InputEventType::ENCODER_ROTATE) {
@@ -941,6 +1086,12 @@ void screenFriendChat() {
       }
     } else {
       handleFriendChatEvent(e);
+      // Phase 2C-2: the chat is no longer the top screen; the rest of this
+      // batch stays queued for the screen it opened (or returned to).
+      if (Menu::navigationEpoch() != chatEpoch) {
+        g_friendChatDirty = true;
+        return;
+      }
     }
   }
   if (hadEvent) g_friendChatDirty = true;
@@ -1108,7 +1259,7 @@ void renderGameMessage(const StoredMessageView& msg, char* outBuffer, size_t out
 }
 
 void startAnswerSession(const MessageRef& ref, const StoredMessageView& view, const FriendGameState& s);
-void startResultView(const FriendGameState& s);
+void startResultView(const FriendGameState& s, const ResultViewStatus* status);
 
 void onGameMessageEvent(const MessageRef& ref, MessageEventType eventType) {
   if (eventType != EVT_ENCODER_SHORT) return;
@@ -1123,7 +1274,7 @@ void onGameMessageEvent(const MessageRef& ref, MessageEventType eventType) {
     startAnswerSession(ref, view, s);
     Menu::pushScreen(screenAnswer);
   } else {
-    startResultView(s);
+    startResultView(s, nullptr);  // Phase 2C-2: a reopened result carries no send status
     Menu::pushScreen(screenFriendResult);
   }
 }
@@ -1169,7 +1320,10 @@ char g_activeChallengeMessageId[PacketCodec::kMessageIdLen];
 NumberGuessing::GuessResult g_pendingResult;
 uint16_t g_pendingGuessValue = 0;
 
+bool g_answerSaved = true;  // Phase 2C-2: the shown wrong-guess result was saved
+
 void startAnswerSession(const MessageRef& ref, const StoredMessageView& view, const FriendGameState& s) {
+  g_answerSaved = true;
   g_activeGameRef = ref;
   g_activeGame = s;
   strncpy(g_activeChallengeMessageId, view.envelope.message_id, sizeof(g_activeChallengeMessageId) - 1);
@@ -1178,38 +1332,67 @@ void startAnswerSession(const MessageRef& ref, const StoredMessageView& view, co
   NumberGuessing::resetDigitEntry(&g_digitEntry);
 }
 
-void persistActiveGame() {
+// Phase 2C-2: returns whether the save was reported successful (feedback
+// only; same encode and the same single updateTypeLocalPayload() call).
+bool persistActiveGame() {
   uint8_t buf[9 + kMaxFriendHistory * 4];
   size_t len = encodeFriendLocal(g_activeGame, buf, sizeof(buf));
-  if (len > 0) MessageStore::updateTypeLocalPayload(g_activeGameRef, buf, static_cast<uint16_t>(len));
+  if (len == 0) return false;
+  return MessageStore::updateTypeLocalPayload(g_activeGameRef, buf, static_cast<uint16_t>(len));
+}
+
+bool g_answerDirty = true;
+bool g_answerNeedsFullRedraw = true;
+
+// Phase 2C-2: synchronous feedback drawn before blocking save/send work.
+void drawAnswerResultNow(uint16_t guessValue, const NumberGuessing::GuessResult& r, const char* status) {
+  Display::setFont(Display::Font::PRIMARY);
+  int16_t lh = Display::lineHeight();
+  int16_t y = Display::kStatusBarHeight + 2;
+  Display::clearContentArea();
+  char line[32];
+  snprintf(line, sizeof(line), "%04u -> %uA%uB", guessValue, r.a, r.b);
+  Display::printLine(2, y, line);
+  Display::printLine(2, static_cast<int16_t>(y + lh), status);
 }
 
 void exitAnswerConfirmYes() { Menu::goBack(); }  // pops screenAnswer; confirmPromptScreen pops itself too
 
-void submitAnswerGuess() {
+// Phase 2C-2: evaluates only a still-LOCKED game with exactly four entered
+// digits; anything else returns false without evaluating or recording.
+bool submitAnswerGuess() {
+  if (g_activeGame.state != STATE_LOCKED || g_digitEntry.count != 4) return false;
   uint16_t guessValue = digitsToValue(g_digitEntry.digits);
   NumberGuessing::GuessResult r = NumberGuessing::evaluate(g_activeGame.secret, g_digitEntry.digits);
   appendFriendEntry(&g_activeGame, guessValue, r.a, r.b);
 
   if (r.a == 4) {
     g_activeGame.state = STATE_UNLOCKED;
-    persistActiveGame();
-    sendResultChunks(g_activeGameRef.group_code, g_activeGameRef.contact_key, g_activeChallengeMessageId,
-                     g_activeGame);
-    startResultView(g_activeGame);
+    ResultViewStatus status;
+    drawAnswerResultNow(guessValue, r, "Saving...");
+    status.saved = persistActiveGame();
+    drawAnswerResultNow(guessValue, r, "Sending result...");
+    status.send = sendResultChunks(g_activeGameRef.group_code, g_activeGameRef.contact_key,
+                                   g_activeChallengeMessageId, g_activeGame);
+    startResultView(g_activeGame, &status);
     Menu::goBack();
     Menu::pushScreen(screenFriendResult);
-    return;
+    return true;
   }
 
-  persistActiveGame();
+  // Phase 2C-2: Shorts from here until the final result frame has been
+  // drawn (end of this tick) cannot dismiss it.
+  armGuard(g_answerShortGuard);
   g_pendingResult = r;
   g_pendingGuessValue = guessValue;
   g_answerPhase = AnswerPhase::SHOWING_RESULT;
+  drawAnswerResultNow(guessValue, r, "Saving...");
+  g_answerSaved = persistActiveGame();
+  g_answerNeedsFullRedraw = true;
+  g_answerDirty = true;
+  return true;
 }
 
-bool g_answerDirty = true;
-bool g_answerNeedsFullRedraw = true;
 AnswerPhase g_answerLastDrawnPhase = AnswerPhase::ENTERING;
 char g_lastAnswerAttemptLine[32] = {0};
 NumberGuessing::DigitRowRenderState g_answerRowState;
@@ -1219,25 +1402,26 @@ void screenAnswer() {
     g_answerDirty = true;
     g_answerNeedsFullRedraw = true;
     NumberGuessing::resetDigitRowRenderState(&g_answerRowState);
+    armGuard(g_answerShortGuard);  // Phase 2C-2
   }
+  tickGuard(g_answerShortGuard);
 
   Input::update();
   InputEvent e;
   bool hadEvent = false;
+  const uint32_t answerEpoch = Menu::navigationEpoch();
   while (Input::popEvent(e)) {
     hadEvent = true;
     if (Input::isBack(e)) {
       Menu::goBack();
-      continue;
-    }
-    if (g_answerPhase == AnswerPhase::SHOWING_RESULT) {
+    } else if (e.type == InputEventType::ENCODER_SHORT && guardDrops(g_answerShortGuard, e)) {
+      // Phase 2C-2: released before this screen's current content was drawn.
+    } else if (g_answerPhase == AnswerPhase::SHOWING_RESULT) {
       if (e.type == InputEventType::ENCODER_SHORT) {
         g_answerPhase = AnswerPhase::ENTERING;
         NumberGuessing::resetDigitEntry(&g_digitEntry);
       }
-      continue;
-    }
-    if (e.type == InputEventType::ENCODER_SHORT) {
+    } else if (e.type == InputEventType::ENCODER_SHORT) {
       if (g_digitEntry.count == 4) {
         submitAnswerGuess();
       } else {
@@ -1248,6 +1432,9 @@ void screenAnswer() {
     } else {
       NumberGuessing::handleDigitEntryEvent(&g_digitEntry, e);
     }
+    // Phase 2C-2: no longer the top screen -- leave the rest of the batch
+    // queued for the new one and do not draw over it.
+    if (Menu::navigationEpoch() != answerEpoch) return;
   }
   if (hadEvent) g_answerDirty = true;
 
@@ -1279,7 +1466,7 @@ void screenAnswer() {
       snprintf(line, sizeof(line), "%04u -> %uA%uB", g_pendingGuessValue, g_pendingResult.a, g_pendingResult.b);
       Display::printLine(2, y, line);
       y += lh;
-      Display::printLine(2, y, "Short: continue");
+      Display::printLine(2, y, g_answerSaved ? "Short: continue" : "Not saved. Short: continue");
       g_answerNeedsFullRedraw = false;
     }
     // Nothing dynamic while showing the result: no further per-tick
@@ -1304,6 +1491,7 @@ void screenAnswer() {
   }
 
   g_answerLastDrawnPhase = g_answerPhase;
+  if (forceFull) bindGuardAfterDraw(g_answerShortGuard);  // Phase 2C-2: content is now on screen
 }
 
 // =============================================================================
@@ -1312,7 +1500,29 @@ void screenAnswer() {
 FriendGameState g_viewState;
 uint16_t g_friendResultScroll = 0;
 
-void startResultView(const FriendGameState& s) { g_viewState = s; }
+bool g_resultStatusValid = false;  // Phase 2C-2: see ResultViewStatus
+ResultViewStatus g_resultStatus;
+
+void startResultView(const FriendGameState& s, const ResultViewStatus* status) {
+  g_viewState = s;
+  g_resultStatusValid = (status != nullptr);
+  if (status != nullptr) g_resultStatus = *status;
+}
+
+// Phase 2C-2 wording: no stronger than the evidence. "acked k/n" counts
+// publishBinary() true returns (QoS1 PUBACK) out of the chunks needed --
+// never which chunk failed, delivery, or the friend's reassembly.
+void formatResultStatus(const ResultViewStatus& st, char* out, size_t outSize) {
+  const char* save = st.saved ? "Saved" : "Not saved";
+  if (!st.send.connectedAtStart) {
+    snprintf(out, outSize, "%s; result offline", save);  // no publishBinary() call was made
+  } else if (st.send.skippedMask != 0) {
+    snprintf(out, outSize, "%s; result encode err", save);
+  } else {
+    snprintf(out, outSize, "%s; result acked %u/%u", save, static_cast<unsigned>(countBits(st.send.trueMask)),
+             static_cast<unsigned>(st.send.expected));
+  }
+}
 
 // Hardware Fix #3: same three-way redraw split as ListMenu -- full draw
 // only on first entry, a viewport scroll redraws just the row region, and
@@ -1327,18 +1537,25 @@ void screenFriendResult() {
   if (Menu::consumeJustEntered()) {
     g_friendResultScroll = (g_viewState.historyCount > 0) ? static_cast<uint16_t>(g_viewState.historyCount - 1) : 0;
     g_friendResultNeedsFullRedraw = true;
+    armGuard(g_resultDotGuard);  // Phase 2C-2
   }
+  tickGuard(g_resultDotGuard);
   Input::update();
   InputEvent e;
+  const uint32_t resultEpoch = Menu::navigationEpoch();
   while (Input::popEvent(e)) {
     if (e.type == InputEventType::ENCODER_ROTATE) {
       int32_t next = static_cast<int32_t>(g_friendResultScroll) + e.value;
       if (next < 0) next = 0;
       if (next >= g_viewState.historyCount) next = g_viewState.historyCount > 0 ? g_viewState.historyCount - 1 : 0;
       g_friendResultScroll = static_cast<uint16_t>(next);
+    } else if (Input::isMenuConfirm(e) && guardDrops(g_resultDotGuard, e)) {
+      // Phase 2C-2: released before this result was drawn (e.g. during the save/send).
     } else if (Input::isMenuConfirm(e) || Input::isBack(e)) {
+      g_resultStatusValid = false;
       Menu::goBack();
     }
+    if (Menu::navigationEpoch() != resultEpoch) return;  // Phase 2C-2: no longer the top screen
   }
 
   Display::drawStatusBar();
@@ -1346,7 +1563,9 @@ void screenFriendResult() {
   Display::setFont(Display::Font::PRIMARY);
   int16_t lh = Display::lineHeight();
   int16_t titleY = Display::kStatusBarHeight + 2;
-  int16_t rowsTopY = static_cast<int16_t>(titleY + lh);
+  // Phase 2C-2: a solve's local status takes one row under the title.
+  int16_t statusY = static_cast<int16_t>(titleY + lh);
+  int16_t rowsTopY = static_cast<int16_t>(titleY + (g_resultStatusValid ? 2 : 1) * lh);
 
   int16_t remaining = Display::kScreenHeight - rowsTopY;
   uint16_t rows = (remaining > 0) ? static_cast<uint16_t>(remaining / lh) : 0;
@@ -1367,6 +1586,11 @@ void screenFriendResult() {
     char titleLine[32];
     snprintf(titleLine, sizeof(titleLine), "Total attempts: %d", g_viewState.totalAttempts);
     Display::printLine(2, titleY, titleLine);
+    if (g_resultStatusValid) {
+      char statusLine[40];
+      formatResultStatus(g_resultStatus, statusLine, sizeof(statusLine));
+      Display::printLine(2, statusY, statusLine);
+    }
     for (uint16_t i = static_cast<uint16_t>(start); i < g_viewState.historyCount && i < start + rows; i++) {
       int16_t rowY = static_cast<int16_t>(rowsTopY + (i - start) * lh);
       const FriendEntry& g = g_viewState.history[chronologicalIndex(g_viewState, static_cast<uint8_t>(i))];
@@ -1376,6 +1600,7 @@ void screenFriendResult() {
       Display::printLine(labelX, rowY, line);
     }
     g_friendResultNeedsFullRedraw = false;
+    bindGuardAfterDraw(g_resultDotGuard);  // Phase 2C-2: the result is now on screen
   } else if (scrolled) {
     int16_t regionH = static_cast<int16_t>(Display::kScreenHeight - rowsTopY);
     if (regionH < 0) regionH = 0;
@@ -1403,9 +1628,41 @@ void screenFriendResult() {
 // =============================================================================
 // Create new challenge (Phase 3 section 11)
 // =============================================================================
-void cancelChallengeTrampoline() { Menu::goBack(); }
+// Phase 2C-2: this trampoline is reached only as the screen Play/Cancel's
+// PUSH_SCREEN ListMenu pushes on top of itself (kPlayOrCancelItems is its
+// only reference, and Play/Cancel is the top screen when it pushes), so the
+// stack here is [..., chat, Play/Cancel, this]: pop this trampoline, then
+// Play/Cancel, returning to the chat the flow started from.
+void cancelChallengeTrampoline() {
+  Menu::goBack();
+  Menu::goBack();
+}
 
-void sendChallenge(const char* group_code, const char* contact_key, const uint8_t secret[4]) {
+// Phase 2C-2: what sendChallenge() observed (same call order, flags and
+// arguments as before; the Outbox still retries a pending challenge).
+enum class PublishAttempt : uint8_t { NOT_ATTEMPTED, RETURNED_FALSE, RETURNED_TRUE };
+struct ChallengeSendOutcome {
+  bool encoded;            // encodeMessagePacket() produced a packet (nothing published or stored if not)
+  PublishAttempt publish;  // NOT_ATTEMPTED: not encoded, or group not connected
+  bool stored;             // appendStoredMessage() reported success
+};
+
+// Same evidence-limited strings as Text's resultForCompletion().
+const char* challengeOutcomeTitle(const ChallengeSendOutcome& o) {
+  if (!o.encoded) return "Not sent: encode failed";
+  switch (o.publish) {
+    case PublishAttempt::RETURNED_TRUE:
+      return o.stored ? "Server acknowledged" : "Server acked; not saved";
+    case PublishAttempt::RETURNED_FALSE:
+      return o.stored ? "Unconfirmed: queued" : "Unconfirmed; not saved";
+    case PublishAttempt::NOT_ATTEMPTED:
+    default:
+      return o.stored ? "Offline: queued" : "Offline; not saved";
+  }
+}
+
+ChallengeSendOutcome sendChallenge(const char* group_code, const char* contact_key, const uint8_t secret[4]) {
+  ChallengeSendOutcome outcome = {false, PublishAttempt::NOT_ATTEMPTED, false};
   uint8_t typePayload[4];
   size_t typePayloadLen = encodeChallengePayload(secret, typePayload, sizeof(typePayload));
 
@@ -1428,7 +1685,8 @@ void sendChallenge(const char* group_code, const char* contact_key, const uint8_
   uint8_t wireBuf[PacketCodec::kHeaderSize + PacketCodec::kEnvelopeFixedSize + 2 + 16];
   size_t wireLen = PacketCodec::encodeMessagePacket(env, typePayload, static_cast<uint16_t>(typePayloadLen), wireBuf,
                                                     sizeof(wireBuf));
-  if (wireLen == 0) return;
+  if (wireLen == 0) return outcome;
+  outcome.encoded = true;
 
   char topicSuffix[24];
   snprintf(topicSuffix, sizeof(topicSuffix), "msg/%s", contact_key);  // No Everyone for Friend challenges
@@ -1437,6 +1695,7 @@ void sendChallenge(const char* group_code, const char* contact_key, const uint8_
   bool published =
       online && MqttManager::publishBinary(group_code, topicSuffix, wireBuf, static_cast<uint16_t>(wireLen), false, 1);
   uint16_t flags = published ? 0 : MessageStore::FLAG_PENDING_OUTBOX;
+  if (online) outcome.publish = published ? PublishAttempt::RETURNED_TRUE : PublishAttempt::RETURNED_FALSE;
 
   FriendGameState s;
   memset(&s, 0, sizeof(s));
@@ -1446,9 +1705,10 @@ void sendChallenge(const char* group_code, const char* contact_key, const uint8_
   size_t localLen = encodeFriendLocal(s, localBuf, sizeof(localBuf));
 
   MessageRef outRef;
-  MessageStore::appendStoredMessage(group_code, contact_key, MessageStore::Direction::SENT, flags, env.timestamp,
-                                    wireBuf, static_cast<uint16_t>(wireLen), localBuf,
-                                    static_cast<uint16_t>(localLen), &outRef);
+  outcome.stored = MessageStore::appendStoredMessage(group_code, contact_key, MessageStore::Direction::SENT, flags,
+                                                     env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), localBuf,
+                                                     static_cast<uint16_t>(localLen), &outRef);
+  return outcome;
 }
 
 void playNumberGuessingTrampoline() {
@@ -1461,10 +1721,22 @@ const SettingItem kPlayOrCancelItems[] = {
     {"Cancel", cancelChallengeTrampoline},
 };
 ListMenu g_playOrCancelListMenu;
+// Phase 2C-2: the three challenge-flow menus opt in to tickOwned(): one
+// confirmation pushes once and the list stops, and a DOT released before
+// the list was first drawn is dropped.
+void tickFriendFlowMenu(ListMenu& menu, const char* title) {
+  tickGuard(g_friendMenuDotGuard);
+  bool navigated = menu.tickOwned(title, dropStaleFriendMenuDot);
+  if (!navigated && menu.hasDrawnSinceConfigure()) bindGuardAfterDraw(g_friendMenuDotGuard);
+}
+
 void screenPlayOrCancel() {
-  if (Menu::consumeJustEntered()) g_playOrCancelListMenu.configure(kPlayOrCancelItems, 2);
+  if (Menu::consumeJustEntered()) {
+    g_playOrCancelListMenu.configure(kPlayOrCancelItems, 2);
+    armGuard(g_friendMenuDotGuard);
+  }
   Display::drawStatusBar();
-  g_playOrCancelListMenu.tick("Number Guessing");
+  tickFriendFlowMenu(g_playOrCancelListMenu, "Number Guessing");
 }
 
 void trampolineSetManually() {
@@ -1481,13 +1753,23 @@ const SettingItem kSetManuallyOrRandomItems[] = {
 };
 ListMenu g_setManuallyOrRandomListMenu;
 void screenSetManuallyOrRandom() {
-  if (Menu::consumeJustEntered()) g_setManuallyOrRandomListMenu.configure(kSetManuallyOrRandomItems, 2);
+  if (Menu::consumeJustEntered()) {
+    g_setManuallyOrRandomListMenu.configure(kSetManuallyOrRandomItems, 2);
+    armGuard(g_friendMenuDotGuard);
+  }
   Display::drawStatusBar();
-  g_setManuallyOrRandomListMenu.tick("Number Guessing");
+  tickFriendFlowMenu(g_setManuallyOrRandomListMenu, "Number Guessing");
 }
 
+const char* g_quickSwitchTitle = "Challenge Sent";
+
 void finishChallengeCreation(const uint8_t secret[4]) {
-  sendChallenge(g_challengeGroupCode, g_challengeContactKey, secret);
+  // Phase 2C-2: visible acknowledgement before any blocking work (nextId's
+  // NVS write, the QoS1 publish, the store).
+  Display::setFont(Display::Font::PRIMARY);
+  Display::clearContentArea();
+  Display::printLine(2, Display::kStatusBarHeight + 2, "Sending...");
+  g_quickSwitchTitle = challengeOutcomeTitle(sendChallenge(g_challengeGroupCode, g_challengeContactKey, secret));
   Menu::goBack();
   Menu::pushScreen(screenQuickSwitch);
 }
@@ -1503,7 +1785,9 @@ void screenManualEntry() {
     g_manualEntryDirty = true;
     g_manualEntryNeedsFullRedraw = true;
     NumberGuessing::resetDigitRowRenderState(&g_manualEntryRowState);
+    armGuard(g_manualDotGuard);  // Phase 2C-2
   }
+  tickGuard(g_manualDotGuard);
 
   Input::update();
   InputEvent e;
@@ -1512,10 +1796,13 @@ void screenManualEntry() {
     hadEvent = true;
     if (Input::isBack(e)) {
       Menu::goBack();
-      continue;
+      return;  // Phase 2C-2: the rest of the batch belongs to the screen below
     }
     if (e.type == InputEventType::DOT_RELEASE) {
-      bool wasFullNoDelete = (g_digitEntry.count == 4) && !g_digitEntry.deleteFiredThisPress;
+      // Phase 2C-2: a release from before this screen was drawn still
+      // reaches digit entry (unchanged, visible, deletable) but never sends.
+      bool wasFullNoDelete = (g_digitEntry.count == 4) && !g_digitEntry.deleteFiredThisPress &&
+                             !guardDrops(g_manualDotGuard, e);
       NumberGuessing::handleDigitEntryEvent(&g_digitEntry, e);
       if (wasFullNoDelete) {
         finishChallengeCreation(g_digitEntry.digits);
@@ -1539,6 +1826,7 @@ void screenManualEntry() {
   int16_t lh = Display::lineHeight();
   int16_t y = Display::kStatusBarHeight + 2;
 
+  bool fullRedraw = g_manualEntryNeedsFullRedraw;
   if (g_manualEntryNeedsFullRedraw) {
     Display::clearContentArea();
     g_manualEntryNeedsFullRedraw = false;
@@ -1552,6 +1840,7 @@ void screenManualEntry() {
     if (hintShown) Display::printLine(2, y, "DOT: send");
     g_manualEntryLastHintShown = hintShown;
   }
+  if (fullRedraw) bindGuardAfterDraw(g_manualDotGuard);  // Phase 2C-2
 }
 
 constexpr uint32_t kDotConfirmMs = 500;  // same short/hold boundary as digit entry (Addendum 9.5)
@@ -1562,16 +1851,19 @@ void screenRandomConfirm() {
   if (Menu::consumeJustEntered()) {
     generateRandomFriendSecret(g_pendingRandomSecret);
     g_randomConfirmDirty = true;
+    armGuard(g_randomDotGuard);  // Phase 2C-2
   }
+  tickGuard(g_randomDotGuard);
 
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
     if (Input::isBack(e)) {
       Menu::goBack();
-      continue;
+      return;  // Phase 2C-2: the rest of the batch belongs to the screen below
     }
     if (e.type == InputEventType::DOT_RELEASE && e.durationMs < kDotConfirmMs) {
+      if (guardDrops(g_randomDotGuard, e)) continue;  // Phase 2C-2: released before the screen was drawn
       finishChallengeCreation(g_pendingRandomSecret);
       return;
     }
@@ -1588,6 +1880,7 @@ void screenRandomConfirm() {
   Display::printLine(2, y, "Random secret ready");
   y += lh;
   Display::printLine(2, y, "DOT: send");
+  bindGuardAfterDraw(g_randomDotGuard);  // Phase 2C-2
 }
 
 void quickSwitchText() {
@@ -1616,9 +1909,12 @@ const SettingItem kQuickSwitchItems[] = {
 };
 ListMenu g_quickSwitchListMenu;
 void screenQuickSwitch() {
-  if (Menu::consumeJustEntered()) g_quickSwitchListMenu.configure(kQuickSwitchItems, 4);
+  if (Menu::consumeJustEntered()) {
+    g_quickSwitchListMenu.configure(kQuickSwitchItems, 4);
+    armGuard(g_friendMenuDotGuard);
+  }
   Display::drawStatusBar();
-  g_quickSwitchListMenu.tick("Challenge Sent");
+  tickFriendFlowMenu(g_quickSwitchListMenu, g_quickSwitchTitle);  // Phase 2C-2: title is the send outcome
 }
 
 // =============================================================================

@@ -25,7 +25,17 @@ void goBack();
 // list's selection, or call MixedTextEntry::start()).
 bool consumeJustEntered();
 
+// Phase 2C-2: wrapping counter incremented by init() and by every
+// pushScreen()/goBack() that actually changes the stack (a push at max
+// depth and a goBack() at the root change nothing and leave it alone).
+// Comparing values taken before and after handling one event tells a
+// screen whether that event navigated -- including a goBack()+pushScreen()
+// pair that leaves the stack depth unchanged.
+uint32_t navigationEpoch();
+
 }  // namespace Menu
+
+struct InputEvent;
 
 // Returns true while the item it's bound to should show an unread/pending
 // badge marker.
@@ -83,9 +93,31 @@ class ListMenu {
   void configure(const SettingItem* items, uint8_t count, const BadgeFn* badges = nullptr,
                  uint8_t initialSelected = 0, SelectionMode selectionMode = SelectionMode::PUSH_SCREEN);
   void tick(const char* title);
+
+  // Phase 2C-2, opt-in (legacy tick() above is unchanged): returns true to
+  // consume and ignore one popped event before the list sees it.
+  // A filter must not navigate, tick any screen, or touch the input queue
+  // (no Input::update()/popEvent()) -- it only classifies the one event.
+  using InputFilterFn = bool (*)(const InputEvent& e);
+
+  // Same as tick(title), except:
+  //  - each popped event is passed to dropFilter (when non-null) exactly
+  //    once, in FIFO order, before the list handles it; a dropped event is
+  //    consumed like any other popped event, nothing is requeued;
+  //  - as soon as handling an event changed Menu::navigationEpoch(), it
+  //    stops: no further popEvent() and no draw of this outgoing list. The
+  //    remaining events stay queued, in order, for the new top screen.
+  // Returns true iff this call navigated.
+  bool tickOwned(const char* title, InputFilterFn dropFilter);
+
+  // True once the first full draw after configure() has completed.
+  bool hasDrawnSinceConfigure() const { return !needsFullRedraw_; }
+
   uint8_t selectedIndex() const { return selected_; }
 
  private:
+  bool tickImpl(const char* title, InputFilterFn dropFilter, bool stopOnNavigation);
+
   const SettingItem* items_ = nullptr;
   const BadgeFn* badges_ = nullptr;
   uint8_t count_ = 0;

@@ -13,6 +13,7 @@ constexpr uint8_t kMaxStackDepth = 12;
 ScreenHandlerFn g_stack[kMaxStackDepth];
 uint8_t g_stackSize = 0;
 bool g_justEntered = false;
+uint32_t g_navigationEpoch = 0;  // Phase 2C-2: see Menu::navigationEpoch()
 
 // These are one-shot dispatchers, not real screens: they must remove
 // themselves from the navigation stack (goBack) before pushing their
@@ -72,6 +73,7 @@ void init() {
   g_stackSize = 0;
   g_stack[g_stackSize++] = mainMenuScreen;
   g_justEntered = true;
+  g_navigationEpoch++;
 }
 
 void tick() {
@@ -85,6 +87,7 @@ void pushScreen(ScreenHandlerFn fn) {
   if (g_stackSize < kMaxStackDepth) {
     g_stack[g_stackSize++] = fn;
     g_justEntered = true;
+    g_navigationEpoch++;
   }
 }
 
@@ -92,6 +95,7 @@ void goBack() {
   if (g_stackSize > 1) {
     g_stackSize--;
     g_justEntered = true;
+    g_navigationEpoch++;
   }
 }
 
@@ -100,6 +104,8 @@ bool consumeJustEntered() {
   g_justEntered = false;
   return v;
 }
+
+uint32_t navigationEpoch() { return g_navigationEpoch; }
 
 }  // namespace Menu
 
@@ -114,10 +120,16 @@ void ListMenu::configure(const SettingItem* items, uint8_t count, const BadgeFn*
   for (auto& b : lastBadge_) b = false;
 }
 
-void ListMenu::tick(const char* title) {
+void ListMenu::tick(const char* title) { tickImpl(title, nullptr, false); }
+
+bool ListMenu::tickOwned(const char* title, InputFilterFn dropFilter) { return tickImpl(title, dropFilter, true); }
+
+bool ListMenu::tickImpl(const char* title, InputFilterFn dropFilter, bool stopOnNavigation) {
+  const uint32_t epochAtStart = Menu::navigationEpoch();
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
+    if (dropFilter != nullptr && dropFilter(e)) continue;  // Phase 2C-2 (tickOwned only)
     if (e.type == InputEventType::ENCODER_ROTATE && count_ > 0) {
       int16_t next = static_cast<int16_t>(selected_) + e.value;
       if (next < 0) next = static_cast<int16_t>(count_) - 1;
@@ -138,6 +150,8 @@ void ListMenu::tick(const char* title) {
     } else if (Input::isBack(e)) {
       Menu::goBack();
     }
+    // Phase 2C-2 (tickOwned only): this list is no longer the top screen.
+    if (stopOnNavigation && Menu::navigationEpoch() != epochAtStart) return true;
   }
 
   // Badges are polled every tick regardless of redraw state (they're
@@ -199,7 +213,7 @@ void ListMenu::tick(const char* title) {
   bool scrolled = !firstDraw && (startIdx != lastDrawnStartIdx_);
   bool selectionChanged = !firstDraw && !scrolled && (selected_ != lastDrawnSelected_);
 
-  if (!firstDraw && !scrolled && !forceFullBadgeRegion && !anyBadgeChanged && !selectionChanged) return;
+  if (!firstDraw && !scrolled && !forceFullBadgeRegion && !anyBadgeChanged && !selectionChanged) return false;
 
   // Marker column: reserved width is measured from the marker glyph
   // itself (not assumed), and the label always starts at the same fixed X
@@ -267,6 +281,7 @@ void ListMenu::tick(const char* title) {
   }
   lastDrawnStartIdx_ = startIdx;
   lastDrawnSelected_ = selected_;
+  return false;
 }
 
 namespace {
