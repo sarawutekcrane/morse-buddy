@@ -199,10 +199,16 @@ char g_raceHistoryRoundId[kIdLen] = {0};
 // for this, which stops changing once this bounded buffer is full).
 uint16_t g_raceHistoryVersion = 0;
 
+// Same-screen history browsing over this round's retained guesses (the
+// kRaceHistoryCap most recent; older ones were dropped and are not
+// browsable). Any history reset ends browsing.
+NumberGuessing::HistoryBrowseState g_raceBrowse;
+
 void clearRaceGuessHistory() {
   g_raceHistoryCount = 0;
   g_raceHistoryRoundId[0] = '\0';
   g_raceHistoryVersion++;
+  NumberGuessing::resetHistoryBrowse(&g_raceBrowse);
 }
 
 void appendRaceGuess(const uint8_t digits[NumberGuessing::kSecretDigits], NumberGuessing::GuessResult r) {
@@ -713,6 +719,9 @@ bool g_raceGuessLastShowingResult = false;
 bool g_raceGuessLastShowingNotice = false;
 NumberGuessing::DigitRowRenderState g_raceGuessRowState;
 uint16_t g_raceGuessLastHistoryVersion = 0;
+bool g_raceGuessLastBrowsing = false;
+int16_t g_raceGuessLastSelected = -1;
+uint16_t g_raceGuessLastScroll = 0;
 
 // Phase 2A: drops every pending AND visible Guess-screen outcome ("Solved by
 // X" pending or shown, "Round ended" shown, its deadline) plus any not-yet-
@@ -754,6 +763,7 @@ void screenRaceGuessTick() {
     g_raceGuessDirty = true;
     g_raceGuessNeedsFullRedraw = true;
     NumberGuessing::resetDigitRowRenderState(&g_raceGuessRowState);
+    NumberGuessing::resetHistoryBrowse(&g_raceBrowse);
   }
 
   if (g_pendingExternalSolve) {
@@ -819,6 +829,10 @@ void screenRaceGuessTick() {
       break;
     }
     if (g_guessResultText != nullptr) continue;  // freeze input while showing the outcome
+    if (NumberGuessing::handleHistoryBrowseEvent(&g_raceBrowse, g_digitEntry, e, g_raceHistoryCount) !=
+        NumberGuessing::BrowseResult::PASS) {
+      continue;  // same-screen history browsing (a browsing Short returns to digit editing)
+    }
     if (e.type == InputEventType::ENCODER_SHORT) {
       if (g_digitEntry.count == 4) {
         if (!isRoundActive()) continue;  // D2: never evaluate/score/publish a stale round
@@ -879,7 +893,9 @@ void screenRaceGuessTick() {
     // Same three-way split as screenSoloGuess(): full draw on entry/phase
     // change, history region only when a guess was recorded or history was
     // cleared, and otherwise only renderDigitRow()'s own per-cell diffing.
-    bool historyChanged = forceFull || (g_raceHistoryVersion != g_raceGuessLastHistoryVersion);
+    bool browseChanged = g_raceBrowse.browsing != g_raceGuessLastBrowsing ||
+                         g_raceBrowse.selected != g_raceGuessLastSelected || g_raceBrowse.scroll != g_raceGuessLastScroll;
+    bool historyChanged = forceFull || browseChanged || (g_raceHistoryVersion != g_raceGuessLastHistoryVersion);
     if (forceFull) {
       Display::clearContentArea();
       NumberGuessing::resetDigitRowRenderState(&g_raceGuessRowState);
@@ -899,17 +915,32 @@ void screenRaceGuessTick() {
     if (historyChanged) {
       int16_t availableHistoryHeight = static_cast<int16_t>(guessY - historyTop);
       uint8_t maxRows = (availableHistoryHeight > 0) ? static_cast<uint8_t>(availableHistoryHeight / lh) : 0;
-      uint8_t shown = (g_raceHistoryCount < maxRows) ? g_raceHistoryCount : maxRows;
-      uint8_t startIdx = static_cast<uint8_t>(g_raceHistoryCount - shown);
-      for (uint8_t i = startIdx; i < g_raceHistoryCount; i++) {
+      // A notice appearing/expiring changes maxRows: clamping keeps the
+      // selected row inside the window.
+      NumberGuessing::clampHistoryBrowse(&g_raceBrowse, g_raceHistoryCount, maxRows);
+      uint8_t end = static_cast<uint8_t>(g_raceHistoryCount - g_raceBrowse.scroll);
+      uint8_t shown = (end < maxRows) ? end : maxRows;
+      uint8_t startIdx = static_cast<uint8_t>(end - shown);
+      for (uint8_t i = startIdx; i < end; i++) {
         uint8_t rowIndex = static_cast<uint8_t>(i - startIdx);
         int16_t rowY = static_cast<int16_t>(guessY - (shown - rowIndex) * lh);
         const RaceGuessEntry& g = g_raceHistory[i];
         NumberGuessing::drawGuessHistoryRow(2, rowY, kGuessLabel, g.guessValue, g.a, g.b);
+        if (g_raceBrowse.browsing && g_raceBrowse.selected == static_cast<int16_t>(g_raceHistoryCount - 1 - i)) {
+          NumberGuessing::drawHistorySelectionMarker(2, rowY);
+        }
       }
       g_raceGuessLastHistoryVersion = g_raceHistoryVersion;
     }
     NumberGuessing::renderDigitRow(&g_raceGuessRowState, 2, guessY, kGuessLabel, g_digitEntry);
+    bool frontNow = g_raceBrowse.browsing && g_raceBrowse.selected < 0;
+    bool frontBefore = g_raceGuessLastBrowsing && g_raceGuessLastSelected < 0;
+    if (frontNow != frontBefore || (forceFull && frontNow)) {
+      NumberGuessing::drawGuessLabel(2, guessY, kGuessLabel, frontNow);
+    }
+    g_raceGuessLastBrowsing = g_raceBrowse.browsing;
+    g_raceGuessLastSelected = g_raceBrowse.selected;
+    g_raceGuessLastScroll = g_raceBrowse.scroll;
   }
 
   g_raceGuessLastShowingResult = showingResult;

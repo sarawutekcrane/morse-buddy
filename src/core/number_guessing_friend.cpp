@@ -1416,8 +1416,12 @@ char g_activeChallengeMessageId[PacketCodec::kMessageIdLen];
 // later save succeeds or the session ends.
 bool g_answerSaved = true;
 
+// Same-screen history browsing over the retained ring (the 50 most recent
+// attempts; older ones were evicted and are not browsable).
+NumberGuessing::HistoryBrowseState g_answerBrowse;
 void startAnswerSession(const MessageRef& ref, const StoredMessageView& view, const FriendGameState& s) {
   g_answerSaved = true;
+  NumberGuessing::resetHistoryBrowse(&g_answerBrowse);
   g_activeGameRef = ref;
   g_activeGame = s;
   strncpy(g_activeChallengeMessageId, view.envelope.message_id, sizeof(g_activeChallengeMessageId) - 1);
@@ -1440,6 +1444,9 @@ NumberGuessing::DigitRowRenderState g_answerRowState;
 constexpr uint32_t kNoAnswerHistoryDrawn = 0xFFFFFFFFu;
 uint32_t g_answerLastDrawnAttempts = kNoAnswerHistoryDrawn;
 bool g_answerLastShowedNotice = false;
+bool g_answerLastBrowsing = false;
+int16_t g_answerLastSelected = -1;
+uint16_t g_answerLastScroll = 0;
 
 static const char* const kAnswerGuessLabel = "Guess: ";
 
@@ -1453,12 +1460,17 @@ void drawAnswerHistory(int16_t historyTop, int16_t guessY) {
   int16_t lh = Display::lineHeight();
   int16_t available = static_cast<int16_t>(guessY - historyTop);
   uint8_t maxRows = (available > 0) ? static_cast<uint8_t>(available / lh) : 0;
-  uint8_t shown = (g_activeGame.historyCount < maxRows) ? g_activeGame.historyCount : maxRows;
-  uint8_t startIdx = static_cast<uint8_t>(g_activeGame.historyCount - shown);
-  for (uint8_t i = startIdx; i < g_activeGame.historyCount; i++) {
+  NumberGuessing::clampHistoryBrowse(&g_answerBrowse, g_activeGame.historyCount, maxRows);
+  uint8_t end = static_cast<uint8_t>(g_activeGame.historyCount - g_answerBrowse.scroll);  // scrolled window
+  uint8_t shown = (end < maxRows) ? end : maxRows;
+  uint8_t startIdx = static_cast<uint8_t>(end - shown);
+  for (uint8_t i = startIdx; i < end; i++) {
     int16_t rowY = static_cast<int16_t>(guessY - (shown - (i - startIdx)) * lh);
     const FriendEntry& g = g_activeGame.history[chronologicalIndex(g_activeGame, i)];
     NumberGuessing::drawGuessHistoryRow(2, rowY, kAnswerGuessLabel, g.guessValue, g.aCount, g.bCount);
+    if (g_answerBrowse.browsing && g_answerBrowse.selected == static_cast<int16_t>(g_activeGame.historyCount - 1 - i)) {
+      NumberGuessing::drawHistorySelectionMarker(2, rowY);
+    }
   }
 }
 
@@ -1518,6 +1530,7 @@ void screenAnswer() {
     g_answerDirty = true;
     g_answerNeedsFullRedraw = true;
     armGuard(g_answerShortGuard);  // Phase 2C-2
+    NumberGuessing::resetHistoryBrowse(&g_answerBrowse);
   }
   tickGuard(g_answerShortGuard);
 
@@ -1531,6 +1544,9 @@ void screenAnswer() {
       Menu::goBack();
     } else if (e.type == InputEventType::ENCODER_SHORT && guardDrops(g_answerShortGuard, e)) {
       // Phase 2C-2: released before this screen's current content was drawn.
+    } else if (NumberGuessing::handleHistoryBrowseEvent(&g_answerBrowse, g_digitEntry, e, g_activeGame.historyCount) !=
+               NumberGuessing::BrowseResult::PASS) {
+      // Same-screen history browsing (a browsing Short returns to digit editing).
     } else if (e.type == InputEventType::ENCODER_SHORT) {
       if (g_digitEntry.count == 4) {
         submitAnswerGuess();
@@ -1566,8 +1582,10 @@ void screenAnswer() {
   // Same three-way split as screenSoloGuess(): full draw on entry or after
   // a submit (and whenever the notice appears/disappears), otherwise only
   // renderDigitRow()'s own per-cell diffing.
+  bool browseChanged = g_answerBrowse.browsing != g_answerLastBrowsing ||
+                       g_answerBrowse.selected != g_answerLastSelected || g_answerBrowse.scroll != g_answerLastScroll;
   bool forceFull = g_answerNeedsFullRedraw || (showNotice != g_answerLastShowedNotice) ||
-                   (g_activeGame.totalAttempts != g_answerLastDrawnAttempts);
+                   (g_activeGame.totalAttempts != g_answerLastDrawnAttempts) || browseChanged;
   if (forceFull) {
     Display::clearContentArea();
     NumberGuessing::resetDigitRowRenderState(&g_answerRowState);
@@ -1578,6 +1596,12 @@ void screenAnswer() {
     g_answerLastDrawnAttempts = g_activeGame.totalAttempts;
   }
   NumberGuessing::renderDigitRow(&g_answerRowState, 2, guessY, kAnswerGuessLabel, g_digitEntry);
+  if (forceFull && g_answerBrowse.browsing && g_answerBrowse.selected < 0) {
+    NumberGuessing::drawGuessLabel(2, guessY, kAnswerGuessLabel, true);  // cursor at the Guess-row front
+  }
+  g_answerLastBrowsing = g_answerBrowse.browsing;
+  g_answerLastSelected = g_answerBrowse.selected;
+  g_answerLastScroll = g_answerBrowse.scroll;
   if (forceFull) bindGuardAfterDraw(g_answerShortGuard);  // Phase 2C-2: the full frame is now on screen
 }
 

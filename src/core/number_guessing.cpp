@@ -175,6 +175,87 @@ void drawGuessHistoryRow(int16_t x, int16_t y, const char* labelPrefix, uint16_t
   Display::printLine(resultX, y, resultBuf);
 }
 
+void resetHistoryBrowse(HistoryBrowseState* b) {
+  b->browsing = false;
+  b->selected = -1;
+  b->scroll = 0;
+  b->dotOwnedByBrowse = false;
+}
+
+BrowseResult handleHistoryBrowseEvent(HistoryBrowseState* b, const DigitEntryState& entry, const InputEvent& e,
+                                      uint16_t retainedCount) {
+  if (e.type == InputEventType::ENCODER_LONG) return BrowseResult::PASS;  // Back: the screen's own handling
+  if (!b->browsing) {
+    // A DOT press that began while browsing ends here: swallow its release
+    // so it can neither confirm nor (with dotHeld never set) delete a digit.
+    if (e.type == InputEventType::DOT_RELEASE && b->dotOwnedByBrowse) {
+      b->dotOwnedByBrowse = false;
+      return BrowseResult::CONSUMED;
+    }
+    if (e.type != InputEventType::ENCODER_ROTATE || e.value >= 0) return BrowseResult::PASS;
+    bool atBoundary = (entry.count >= kSecretDigits) || (entry.previewDigit == firstAvailableDigit(entry));
+    if (!atBoundary) return BrowseResult::PASS;  // ordinary decreasing digit selection
+    if (entry.dotHeld) return BrowseResult::CONSUMED;  // refused: stay on the visible cell while DOT is held
+    b->browsing = true;
+    b->selected = -1;
+    b->scroll = 0;
+    return BrowseResult::CONSUMED;
+  }
+
+  switch (e.type) {
+    case InputEventType::ENCODER_ROTATE:
+      if (e.value < 0) {
+        if (b->selected + 1 < static_cast<int32_t>(retainedCount)) b->selected++;
+      } else if (b->selected >= 0) {
+        b->selected--;
+      } else {
+        b->browsing = false;
+        b->scroll = 0;
+        return BrowseResult::RETURNED;
+      }
+      return BrowseResult::CONSUMED;
+    case InputEventType::ENCODER_SHORT:
+      b->browsing = false;
+      b->selected = -1;
+      b->scroll = 0;
+      return BrowseResult::RETURNED;
+    case InputEventType::DOT_PRESS_START:
+      b->dotOwnedByBrowse = true;
+      return BrowseResult::CONSUMED;
+    case InputEventType::DOT_RELEASE:
+      b->dotOwnedByBrowse = false;
+      return BrowseResult::CONSUMED;
+    default:
+      return BrowseResult::CONSUMED;  // combined gestures etc.: no effect while browsing
+  }
+}
+
+void clampHistoryBrowse(HistoryBrowseState* b, uint16_t retainedCount, uint16_t visibleRows) {
+  if (!b->browsing) {
+    b->scroll = 0;
+    return;
+  }
+  if (b->selected >= static_cast<int32_t>(retainedCount)) b->selected = static_cast<int16_t>(retainedCount) - 1;
+  if (b->selected < 0 || visibleRows == 0) {
+    b->scroll = 0;
+    return;
+  }
+  uint16_t k = static_cast<uint16_t>(b->selected);
+  if (k < b->scroll) b->scroll = k;
+  if (k >= b->scroll + visibleRows) b->scroll = static_cast<uint16_t>(k - visibleRows + 1);
+}
+
+void drawGuessLabel(int16_t x, int16_t y, const char* labelPrefix, bool highlighted) {
+  Display::tft().fillRect(x, y, Display::textWidth(labelPrefix), Display::lineHeight(), ST77XX_BLACK);
+  if (highlighted) {
+    Display::printLineColored(x, y, labelPrefix, ST77XX_YELLOW);
+  } else {
+    Display::printLine(x, y, labelPrefix);
+  }
+}
+
+void drawHistorySelectionMarker(int16_t x, int16_t y) { Display::printLineColored(x, y, ">", ST77XX_YELLOW); }
+
 }  // namespace NumberGuessing
 
 // =============================================================================
@@ -269,6 +350,11 @@ NumberGuessing::DigitRowRenderState g_soloGuessRowState;
 // already be 0 (e.g. resuming a puzzle with no attempts yet).
 constexpr uint16_t kNoHistorySentinel = 0xFFFF;
 uint16_t g_soloGuessLastHistoryCount = kNoHistorySentinel;
+// Same-screen history browsing (see NumberGuessing::HistoryBrowseState).
+NumberGuessing::HistoryBrowseState g_soloBrowse;
+bool g_soloLastBrowsing = false;
+int16_t g_soloLastSelected = -1;
+uint16_t g_soloLastScroll = 0;
 
 // Hardware Fix #4.3 issue C: canonical live layout --
 //
@@ -291,6 +377,7 @@ void screenSoloGuess() {
     g_soloGuessDirty = true;
     g_soloGuessNeedsFullRedraw = true;
     NumberGuessing::resetDigitRowRenderState(&g_soloGuessRowState);
+    NumberGuessing::resetHistoryBrowse(&g_soloBrowse);
   }
 
   Input::update();
@@ -298,6 +385,11 @@ void screenSoloGuess() {
   bool hadEvent = false;
   while (Input::popEvent(e)) {
     hadEvent = true;
+    // Same-screen history browsing gets first look (Back always passes).
+    if (NumberGuessing::handleHistoryBrowseEvent(&g_soloBrowse, g_digitEntry, e, g_solo.historyCount) !=
+        NumberGuessing::BrowseResult::PASS) {
+      continue;
+    }
     if (e.type == InputEventType::ENCODER_SHORT) {
       if (g_digitEntry.count == 4) {
         submitGuess();
@@ -331,17 +423,24 @@ void screenSoloGuess() {
 
   int16_t availableHistoryHeight = static_cast<int16_t>(guessY - contentTop);
   uint16_t maxHistoryRows = (availableHistoryHeight > 0) ? static_cast<uint16_t>(availableHistoryHeight / lh) : 0;
-  uint16_t shown = (g_solo.historyCount < maxHistoryRows) ? g_solo.historyCount : maxHistoryRows;
-  uint16_t startIdx = static_cast<uint16_t>(g_solo.historyCount - shown);
+  // Browsing scrolls the window over the retained rows (first kMaxHistory
+  // attempts are kept; later attempts are never stored, so never browsable).
+  NumberGuessing::clampHistoryBrowse(&g_soloBrowse, g_solo.historyCount, maxHistoryRows);
+  uint16_t scroll = g_soloBrowse.scroll;
+  uint16_t available = static_cast<uint16_t>(g_solo.historyCount - scroll);
+  uint16_t shown = (available < maxHistoryRows) ? available : maxHistoryRows;
+  uint16_t startIdx = static_cast<uint16_t>(available - shown);
 
   bool firstDraw = g_soloGuessNeedsFullRedraw;
+  bool browseChanged = g_soloBrowse.browsing != g_soloLastBrowsing || g_soloBrowse.selected != g_soloLastSelected ||
+                       g_soloBrowse.scroll != g_soloLastScroll;
   // A new attempt changes which rows are visible (the window scrolls up
   // by one) -- a genuine viewport change, so (like ListMenu's own scroll
   // case) the history region is redrawn in full, but the Guess row below
   // it never is; a plain digit-preview rotation with no new attempt
   // leaves history completely untouched, only the Guess row's own
   // fixed-cell diffing (inside renderDigitRow()) repaints anything.
-  bool historyChanged = firstDraw || (g_solo.historyCount != g_soloGuessLastHistoryCount);
+  bool historyChanged = firstDraw || browseChanged || (g_solo.historyCount != g_soloGuessLastHistoryCount);
 
   if (firstDraw) {
     Display::clearContentArea();
@@ -352,17 +451,28 @@ void screenSoloGuess() {
   }
 
   if (historyChanged) {
-    for (uint16_t i = startIdx; i < g_solo.historyCount; i++) {
+    for (uint16_t i = startIdx; i < available; i++) {
       uint16_t rowIndex = static_cast<uint16_t>(i - startIdx);
       int16_t rowY = static_cast<int16_t>(guessY - (shown - rowIndex) * lh);
       const GuessEntry& g = g_solo.history[i];
       NumberGuessing::drawGuessHistoryRow(2, rowY, kGuessLabel, g.guessValue, g.aCount, g.bCount);
+      if (g_soloBrowse.browsing && g_soloBrowse.selected == static_cast<int16_t>(g_solo.historyCount - 1 - i)) {
+        NumberGuessing::drawHistorySelectionMarker(2, rowY);
+      }
     }
     g_soloGuessLastHistoryCount = g_solo.historyCount;
   }
   g_soloGuessNeedsFullRedraw = false;
 
   NumberGuessing::renderDigitRow(&g_soloGuessRowState, 2, guessY, kGuessLabel, g_digitEntry);
+  bool frontNow = g_soloBrowse.browsing && g_soloBrowse.selected < 0;
+  bool frontBefore = g_soloLastBrowsing && g_soloLastSelected < 0;
+  if (frontNow != frontBefore || (firstDraw && frontNow)) {
+    NumberGuessing::drawGuessLabel(2, guessY, kGuessLabel, frontNow);
+  }
+  g_soloLastBrowsing = g_soloBrowse.browsing;
+  g_soloLastSelected = g_soloBrowse.selected;
+  g_soloLastScroll = g_soloBrowse.scroll;
 }
 
 // Hardware Fix #3: same three-way redraw split as ListMenu -- full draw
