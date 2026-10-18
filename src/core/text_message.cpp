@@ -2160,4 +2160,7 @@ bool isConversationOpen(const char* group_code, const char* contact_key) { retur
 void navigateToChatDirect(const char* group_code, const char* contact_key) {
   navigateToChatDirectImpl(group_code, contact_key);
 }
+void markConversationChanged(const char* group_code, const char* contact_key) {
+  if (strcmp(g_selectedGroupCode, group_code) == 0 && strcmp(g_selectedContactKey, contact_key) == 0) markIndexDirty();
+}
 }  // namespace TextMessage

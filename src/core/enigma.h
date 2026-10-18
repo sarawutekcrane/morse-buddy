@@ -11,4 +11,8 @@ namespace Enigma {
 // direct Chat same contact, skip Contact Menu" — Phase 3 section 11).
 void navigateToChatDirect(const char* group_code, const char* contact_key);
 
+// Phase 2C-2: see TextMessage::markConversationChanged() -- same contract
+// for Enigma's own conversation.
+void markConversationChanged(const char* group_code, const char* contact_key);
+
 }  // namespace Enigma

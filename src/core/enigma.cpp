@@ -2289,4 +2289,8 @@ void navigateToChatDirect(const char* group_code, const char* contact_key) {
   Menu::pushScreen(screenEnigmaChat);
 }
 
+void markConversationChanged(const char* group_code, const char* contact_key) {
+  if (strcmp(g_selectedGroupCode, group_code) == 0 && strcmp(g_selectedContactKey, contact_key) == 0) markIndexDirty();
+}
+
 }  // namespace Enigma

@@ -44,4 +44,10 @@ bool isConversationOpen(const char* group_code, const char* contact_key);
 // 11's closing rule, not to whatever screen the quick-switch was raised from.
 void navigateToChatDirect(const char* group_code, const char* contact_key);
 
+// Phase 2C-2: a stored message in (group_code, contact_key) changed outside
+// this module (e.g. a Number Guessing result completed). If that is Text's
+// own conversation, its index is reloaded on the chat's next tick, the same
+// way an arriving message refreshes it; any other conversation is left alone.
+void markConversationChanged(const char* group_code, const char* contact_key);
+
 }  // namespace TextMessage

@@ -35,8 +35,9 @@ void screenFriendRecipient();
 void screenFriendChat();
 void screenAnswer();
 void screenFriendResult();
-void screenPlayOrCancel();
 void screenSetManuallyOrRandom();
+void startChallengeFlow(const char* group_code, const char* contact_key, bool offerOpenChat);
+void markFriendConversationChanged(const char* group_code, const char* contact_key);
 void screenManualEntry();
 void screenRandomConfirm();
 void screenQuickSwitch();
@@ -392,12 +393,6 @@ struct ResultViewStatus {
   ResultSendOutcome send;
 };
 
-uint8_t countBits(uint8_t v) {
-  uint8_t n = 0;
-  for (; v != 0; v = static_cast<uint8_t>(v & (v - 1))) n++;
-  return n;
-}
-
 ResultSendOutcome sendResultChunks(const char* group_code, const char* challenger_contact_key,
                                    const char* challenge_message_id, const FriendGameState& s) {
   ResultSendOutcome out = {false, 0, 0, 0, 0};
@@ -544,7 +539,17 @@ void handleGameResultChunkPacket(const char* group_code, const char* topic, cons
 
     uint8_t buf[9 + kMaxFriendHistory * 4];
     size_t len = encodeFriendLocal(updated, buf, sizeof(buf));
-    if (len > 0) MessageStore::updateTypeLocalPayload(ref, buf, static_cast<uint16_t>(len));
+    bool stored = len > 0 && MessageStore::updateTypeLocalPayload(ref, buf, static_cast<uint16_t>(len));
+    // Phase 2C-2 F3: the matching conversation in each chat module refreshes
+    // on its next tick, but only when updateTypeLocalPayload() reported
+    // success. A false result triggers no solved-state refresh; what the
+    // stored record then contains depends on how the storage write failed
+    // and is not guaranteed here.
+    if (stored) {
+      markFriendConversationChanged(group_code, senderDeviceId);
+      TextMessage::markConversationChanged(group_code, senderDeviceId);
+      Enigma::markConversationChanged(group_code, senderDeviceId);
+    }
 
     bool conversationOpen = TextMessage::isConversationOpen(group_code, senderDeviceId);
     Notifications::onMessageArrived(group_code, senderDeviceId, ref,
@@ -624,6 +629,9 @@ void appendDeviceSuffix(char* label, size_t labelBufSize, const char* device_id)
   strncat(label, suffix, room);
 }
 
+// Phase 2C-2 F1: choosing a friend opens the new-challenge choice directly
+// (Set Manually / Randomize / Open Chat); the existing conversation stays
+// one row away. The recipient list remains underneath.
 void recipientTrampoline() {
   uint8_t idx = g_recipientListMenu.selectedIndex();
   if (idx < g_recipientItemCount) {
@@ -631,7 +639,7 @@ void recipientTrampoline() {
     g_selectedContactKey[sizeof(g_selectedContactKey) - 1] = '\0';
   }
   Menu::goBack();
-  Menu::pushScreen(screenFriendChat);
+  startChallengeFlow(g_selectedGroupCode, g_selectedContactKey, true);
 }
 
 // Builds the recipient rows (keys + final labels) for group_code into the
@@ -784,6 +792,10 @@ uint16_t g_historyRowOffset = 0;
 bool g_indexDirty = true;
 uint16_t g_indexTotal = 0;
 void markIndexDirty() { g_indexDirty = true; }
+// Phase 2C-2 F3: refresh only when the Friend chat's own conversation matches.
+void markFriendConversationChanged(const char* group_code, const char* contact_key) {
+  if (strcmp(g_selectedGroupCode, group_code) == 0 && strcmp(g_selectedContactKey, contact_key) == 0) markIndexDirty();
+}
 void refreshIndexIfNeeded() {
   if (!g_indexDirty) return;
   g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
@@ -1057,22 +1069,26 @@ void dispatchHistoryMessageEvent(const MessageStore::ConversationIndexEntry& ent
 
 // Phase 2C-2: an outgoing chat loop (Friend's, or Text/Enigma's empty-line
 // hook) that keeps handling the rest of its batch after this push could
-// call back in before Play/Cancel ever runs. While no navigation happened
-// since our own push, Play/Cancel is still the top screen, so a second
-// call is that same-batch duplicate and is ignored. This does not fix the
-// Text/Enigma loops themselves (e.g. a Back later in the same batch is
-// still handled there and pops Play/Cancel).
+// call back in before the choice screen ever runs. While no navigation
+// happened since our own push, the choice screen is still the top screen,
+// so a second call is that same-batch duplicate and is ignored. This does
+// not fix the Text/Enigma loops themselves (e.g. a Back later in the same
+// batch is still handled there and pops the choice screen).
 bool g_challengeFlowPushed = false;
 uint32_t g_challengeFlowPushEpoch = 0;
+// Phase 2C-2 F1: "Open Chat" is offered only when the choice was opened from
+// the recipient list; from an existing chat, Back returns to that chat.
+bool g_challengeOfferOpenChat = false;
 
-void startChallengeFlow(const char* group_code, const char* contact_key) {
+void startChallengeFlow(const char* group_code, const char* contact_key, bool offerOpenChat) {
   if (g_challengeFlowPushed && Menu::navigationEpoch() == g_challengeFlowPushEpoch) return;
+  g_challengeOfferOpenChat = offerOpenChat;
   strncpy(g_challengeGroupCode, group_code, sizeof(g_challengeGroupCode) - 1);
   g_challengeGroupCode[sizeof(g_challengeGroupCode) - 1] = '\0';
   strncpy(g_challengeContactKey, contact_key, sizeof(g_challengeContactKey) - 1);
   g_challengeContactKey[sizeof(g_challengeContactKey) - 1] = '\0';
   uint32_t before = Menu::navigationEpoch();
-  Menu::pushScreen(screenPlayOrCancel);
+  Menu::pushScreen(screenSetManuallyOrRandom);
   g_challengeFlowPushed = (Menu::navigationEpoch() != before);  // false if the stack was full
   g_challengeFlowPushEpoch = Menu::navigationEpoch();
 }
@@ -1088,7 +1104,7 @@ void handleFriendChatEvent(const InputEvent& e) {
     }
   } else {
     if (e.type == InputEventType::ENCODER_SHORT) {
-      startChallengeFlow(g_selectedGroupCode, g_selectedContactKey);
+      startChallengeFlow(g_selectedGroupCode, g_selectedContactKey, false);
     }
   }
 }
@@ -1571,27 +1587,42 @@ void screenAnswer() {
 FriendGameState g_viewState;
 uint16_t g_friendResultScroll = 0;
 
-bool g_resultStatusValid = false;  // Phase 2C-2: see ResultViewStatus
+bool g_resultStatusValid = false;  // Phase 2C-2: a status row is shown (see formatResultStatus())
 ResultViewStatus g_resultStatus;
+char g_resultStatusText[40] = {0};
+
+// Phase 2C-2 F2: one plain-language line, or nothing on routine success
+// (saved, and every needed chunk was published with a true return). A true
+// return is a QoS1 PUBACK from the broker -- never proof the friend received
+// or reassembled the result, so success is not announced at all. Returns
+// whether there is anything to show.
+bool formatResultStatus(const ResultViewStatus& st, char* out, size_t outSize) {
+  uint8_t allBits = static_cast<uint8_t>((1u << st.send.expected) - 1u);
+  bool sendProblem = !st.send.connectedAtStart || st.send.skippedMask != 0 || st.send.trueMask != allBits;
+  if (st.saved && !sendProblem) {
+    out[0] = '\0';
+    return false;
+  }
+  const char* text;
+  if (!sendProblem) {
+    text = "Not saved on this device";
+  } else if (!st.send.connectedAtStart) {  // no publishBinary() call was made
+    text = st.saved ? "Result not sent (offline)" : "Not saved; result not sent";
+  } else if (st.send.skippedMask != 0) {  // at least one chunk could not be built, so never published
+    text = st.saved ? "Result could not be sent" : "Not saved; result not sent";
+  } else {  // a publish call returned false: delivery unknown
+    text = st.saved ? "Result not confirmed" : "Not saved; not confirmed";
+  }
+  snprintf(out, outSize, "%s", text);
+  return true;
+}
 
 void startResultView(const FriendGameState& s, const ResultViewStatus* status) {
   g_viewState = s;
-  g_resultStatusValid = (status != nullptr);
-  if (status != nullptr) g_resultStatus = *status;
-}
-
-// Phase 2C-2 wording: no stronger than the evidence. "acked k/n" counts
-// publishBinary() true returns (QoS1 PUBACK) out of the chunks needed --
-// never which chunk failed, delivery, or the friend's reassembly.
-void formatResultStatus(const ResultViewStatus& st, char* out, size_t outSize) {
-  const char* save = st.saved ? "Saved" : "Not saved";
-  if (!st.send.connectedAtStart) {
-    snprintf(out, outSize, "%s; result offline", save);  // no publishBinary() call was made
-  } else if (st.send.skippedMask != 0) {
-    snprintf(out, outSize, "%s; result encode err", save);
-  } else {
-    snprintf(out, outSize, "%s; result acked %u/%u", save, static_cast<unsigned>(countBits(st.send.trueMask)),
-             static_cast<unsigned>(st.send.expected));
+  g_resultStatusValid = false;
+  if (status != nullptr) {
+    g_resultStatus = *status;
+    g_resultStatusValid = formatResultStatus(*status, g_resultStatusText, sizeof(g_resultStatusText));
   }
 }
 
@@ -1657,11 +1688,7 @@ void screenFriendResult() {
     char titleLine[32];
     snprintf(titleLine, sizeof(titleLine), "Total attempts: %d", g_viewState.totalAttempts);
     Display::printLine(2, titleY, titleLine);
-    if (g_resultStatusValid) {
-      char statusLine[40];
-      formatResultStatus(g_resultStatus, statusLine, sizeof(statusLine));
-      Display::printLine(2, statusY, statusLine);
-    }
+    if (g_resultStatusValid) Display::printLine(2, statusY, g_resultStatusText);
     for (uint16_t i = static_cast<uint16_t>(start); i < g_viewState.historyCount && i < start + rows; i++) {
       int16_t rowY = static_cast<int16_t>(rowsTopY + (i - start) * lh);
       const FriendEntry& g = g_viewState.history[chronologicalIndex(g_viewState, static_cast<uint8_t>(i))];
@@ -1699,16 +1726,6 @@ void screenFriendResult() {
 // =============================================================================
 // Create new challenge (Phase 3 section 11)
 // =============================================================================
-// Phase 2C-2: this trampoline is reached only as the screen Play/Cancel's
-// PUSH_SCREEN ListMenu pushes on top of itself (kPlayOrCancelItems is its
-// only reference, and Play/Cancel is the top screen when it pushes), so the
-// stack here is [..., chat, Play/Cancel, this]: pop this trampoline, then
-// Play/Cancel, returning to the chat the flow started from.
-void cancelChallengeTrampoline() {
-  Menu::goBack();
-  Menu::goBack();
-}
-
 // Phase 2C-2: what sendChallenge() observed (same call order, flags and
 // arguments as before; the Outbox still retries a pending challenge).
 enum class PublishAttempt : uint8_t { NOT_ATTEMPTED, RETURNED_FALSE, RETURNED_TRUE };
@@ -1782,17 +1799,7 @@ ChallengeSendOutcome sendChallenge(const char* group_code, const char* contact_k
   return outcome;
 }
 
-void playNumberGuessingTrampoline() {
-  Menu::goBack();
-  Menu::pushScreen(screenSetManuallyOrRandom);
-}
-
-const SettingItem kPlayOrCancelItems[] = {
-    {"Play Number Guessing", playNumberGuessingTrampoline},
-    {"Cancel", cancelChallengeTrampoline},
-};
-ListMenu g_playOrCancelListMenu;
-// Phase 2C-2: the three challenge-flow menus opt in to tickOwned(): one
+// Phase 2C-2: the challenge-flow menus opt in to tickOwned(): one
 // confirmation pushes once and the list stops, and a DOT released before
 // the list was first drawn is dropped.
 void tickFriendFlowMenu(ListMenu& menu, const char* title) {
@@ -1801,15 +1808,9 @@ void tickFriendFlowMenu(ListMenu& menu, const char* title) {
   if (!navigated && menu.hasDrawnSinceConfigure()) bindGuardAfterDraw(g_friendMenuDotGuard);
 }
 
-void screenPlayOrCancel() {
-  if (Menu::consumeJustEntered()) {
-    g_playOrCancelListMenu.configure(kPlayOrCancelItems, 2);
-    armGuard(g_friendMenuDotGuard);
-  }
-  Display::drawStatusBar();
-  tickFriendFlowMenu(g_playOrCancelListMenu, "Number Guessing");
-}
-
+// Phase 2C-2 F1: the choice screen (this file's only pusher of these
+// trampolines) is the top screen when one is pushed, so each pops itself and
+// leaves the choice screen directly under what it opens.
 void trampolineSetManually() {
   Menu::goBack();
   Menu::pushScreen(screenManualEntry);
@@ -1818,14 +1819,31 @@ void trampolineRandomize() {
   Menu::goBack();
   Menu::pushScreen(screenRandomConfirm);
 }
-const SettingItem kSetManuallyOrRandomItems[] = {
+// Stack here: [..., recipient list, choice, this]. Pop this and the choice
+// screen, then open the existing conversation (as choosing a friend did
+// before), so Back from the chat returns to the recipient list.
+void trampolineOpenChat() {
+  Menu::goBack();
+  Menu::goBack();
+  Menu::pushScreen(screenFriendChat);
+}
+const SettingItem kChallengeChoiceWithChat[] = {
+    {"Set Manually", trampolineSetManually},
+    {"Randomize", trampolineRandomize},
+    {"Open Chat", trampolineOpenChat},
+};
+const SettingItem kChallengeChoiceFromChat[] = {
     {"Set Manually", trampolineSetManually},
     {"Randomize", trampolineRandomize},
 };
 ListMenu g_setManuallyOrRandomListMenu;
 void screenSetManuallyOrRandom() {
   if (Menu::consumeJustEntered()) {
-    g_setManuallyOrRandomListMenu.configure(kSetManuallyOrRandomItems, 2);
+    if (g_challengeOfferOpenChat) {
+      g_setManuallyOrRandomListMenu.configure(kChallengeChoiceWithChat, 3);
+    } else {
+      g_setManuallyOrRandomListMenu.configure(kChallengeChoiceFromChat, 2);
+    }
     armGuard(g_friendMenuDotGuard);
   }
   Display::drawStatusBar();
@@ -1841,6 +1859,11 @@ void finishChallengeCreation(const uint8_t secret[4]) {
   Display::clearContentArea();
   Display::printLine(2, Display::kStatusBarHeight + 2, "Sending...");
   g_quickSwitchTitle = challengeOutcomeTitle(sendChallenge(g_challengeGroupCode, g_challengeContactKey, secret));
+  // Phase 2C-2 F1: Manual/Random entry is only ever opened by the choice
+  // screen's trampolines, which leave the choice screen directly beneath it:
+  // pop both, so Back from Quick Switch returns to where the flow started
+  // (the recipient list or the originating chat).
+  Menu::goBack();
   Menu::goBack();
   Menu::pushScreen(screenQuickSwitch);
 }
@@ -1995,7 +2018,7 @@ void screenQuickSwitch() {
 void handleEmptyLineAction(uint8_t mode, const char* group_code, const char* contact_key) {
   (void)mode;
   if (strcmp(contact_key, MessageStore::kEveryone) == 0) return;  // Everyone: no effect
-  startChallengeFlow(group_code, contact_key);
+  startChallengeFlow(group_code, contact_key, false);
 }
 
 // =============================================================================
