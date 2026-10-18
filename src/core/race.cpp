@@ -239,6 +239,55 @@ constexpr uint8_t kMaxParticipants = 20;
 char g_participants[kMaxParticipants][kDeviceIdLen];
 uint8_t g_participantCount = 0;
 
+// Room participant list focus/scroll. Rotation moves the focus from the
+// action row (g_roomFocusId empty) down through the participants; the
+// focused participant is tracked by device id so it stays put when others
+// join, and is clamped to a neighbor if it is no longer listed. Only the
+// focus moves: no participant row has an action of its own.
+char g_roomFocusId[kDeviceIdLen] = {0};
+uint8_t g_roomFocusIndex = 0;  // last resolved index of g_roomFocusId (clamp target)
+uint8_t g_roomListTop = 0;     // first participant shown
+
+void resetRoomFocus() {
+  g_roomFocusId[0] = '\0';
+  g_roomFocusIndex = 0;
+  g_roomListTop = 0;
+}
+
+// Returns the focused participant's index, or -1 for the action row.
+int16_t resolveRoomFocus() {
+  if (g_roomFocusId[0] == '\0') return -1;
+  for (uint8_t i = 0; i < g_participantCount; i++) {
+    if (strcmp(g_participants[i], g_roomFocusId) == 0) {
+      g_roomFocusIndex = i;
+      return i;
+    }
+  }
+  if (g_participantCount == 0) {
+    resetRoomFocus();
+    return -1;
+  }
+  uint8_t i = (g_roomFocusIndex < g_participantCount) ? g_roomFocusIndex : static_cast<uint8_t>(g_participantCount - 1);
+  strncpy(g_roomFocusId, g_participants[i], kDeviceIdLen - 1);
+  g_roomFocusId[kDeviceIdLen - 1] = '\0';
+  g_roomFocusIndex = i;
+  return i;
+}
+
+// One detent: +1 moves down (towards later participants), -1 up towards the
+// action row. No wraparound.
+void moveRoomFocus(int8_t delta) {
+  int16_t next = static_cast<int16_t>(resolveRoomFocus() + (delta > 0 ? 1 : -1));
+  if (next >= static_cast<int16_t>(g_participantCount)) next = static_cast<int16_t>(g_participantCount) - 1;
+  if (next < 0) {
+    g_roomFocusId[0] = '\0';
+    return;
+  }
+  strncpy(g_roomFocusId, g_participants[next], kDeviceIdLen - 1);
+  g_roomFocusId[kDeviceIdLen - 1] = '\0';
+  g_roomFocusIndex = static_cast<uint8_t>(next);
+}
+
 
 void addParticipant(const char* deviceId) {
   for (uint8_t i = 0; i < g_participantCount; i++) {
@@ -463,6 +512,7 @@ void applyReset() {
   g_haveJoined = false;
   g_hasHadFirstRound = false;
   g_participantCount = 0;
+  resetRoomFocus();
   Notifications::setRaceInvitePending(false);
   // Fix Phase 1C (round 4 correction): applyReset() is the shared reset
   // point for leaving Race Mode (leaveRaceMode()) and for the
@@ -525,6 +575,7 @@ bool publishInvite() {
   g_hasHadFirstRound = false;
   g_phase = RoomPhase::LOBBY_WAITING;
   g_participantCount = 0;
+  resetRoomFocus();
   addParticipant(Identity::deviceId());
 
   uint8_t payload[kIdLen + kDeviceIdLen];
@@ -1008,7 +1059,8 @@ void setRoomActionUnconfirmed(const char* text) {
 // in-progress text BEFORE its blocking work and opens the replayed-Short
 // window (see RaceShortWindow above). A Ready refusal or a no-op press
 // ("Waiting for start...") does no blocking work and opens nothing.
-// Returns true iff it navigated away from the Room (Continue -> Guess).
+// Returns true iff it navigated away from the Room (Start Round or
+// Continue -> Guess).
 bool handleRoomAction(const InputEvent& e) {
   if (g_phase == RoomPhase::NO_LOBBY) {
     if (!MqttManager::isGroupReady(g_groupCode)) {
@@ -1036,9 +1088,20 @@ bool handleRoomAction(const InputEvent& e) {
         return false;  // no publish, no phase change, g_roundId/g_secret untouched
       }
       clearRoomActionStatus();  // same reasoning as the Invite branch above
+      // The window also covers Start Round -> Guess, as for Continue below.
       openRaceShortWindow(e.eventMs);
       drawRoomActionNow("Starting...");
-      if (!publishStartRound()) setRoomActionUnconfirmed("Start unconfirmed");
+      bool published = publishStartRound();
+      if (isRoundActive()) {
+        // The starter plays the round it just established locally. An
+        // unconfirmed publish is reported on Guess, where it is seen; it
+        // says nothing about whether peers received the round, and there is
+        // still no retry or rollback.
+        if (!published) setGuessNotice("Start unconfirmed");
+        enterGuessScreen();
+        return true;
+      }
+      if (!published) setRoomActionUnconfirmed("Start unconfirmed");
     } else if (!g_haveJoined) {
       openRaceShortWindow(e.eventMs);
       drawRoomActionNow("Joining...");
@@ -1106,7 +1169,9 @@ bool g_raceRoomNeedsFullRedraw = true;
 char g_raceRoomLastActionLabel[24] = {0};
 char g_raceRoomLastScoreLine[32] = {0};
 uint8_t g_raceRoomLastOnlineCount = 0xFF;
-char g_raceRoomLastOnlineNames[4][17] = {{0}};
+constexpr uint8_t kMaxRoomRows = 6;  // more than fit at any font; bounds the row caches
+char g_raceRoomLastOnlineNames[kMaxRoomRows][28] = {{0}};
+char g_raceRoomLastTitle[24] = {0};
 
 // Phase 2C-1: synchronous in-progress text on the Room's action row, drawn
 // before the action's blocking work. The row's diff cache is updated so the
@@ -1141,6 +1206,7 @@ void screenRaceRoomTick() {
     RadioTransport::setUiContext(RadioTransport::UiContext::RACE_ROOM);
     setRoomAvailability(true);
     g_raceRoomNeedsFullRedraw = true;
+    resetRoomFocus();  // every Room visit starts on the action row
   }
 
   checkOwnerOnline();
@@ -1166,8 +1232,14 @@ void screenRaceRoomTick() {
       startRoomPtt();
     } else if (e.type == InputEventType::DOT_RELEASE) {
       stopRoomPtt();
+    } else if (e.type == InputEventType::ENCODER_ROTATE) {
+      moveRoomFocus(e.value);  // participant list only; never an action
     } else if (e.type == InputEventType::ENCODER_SHORT) {
-      if (handleRoomAction(e)) break;  // Phase 2C-1: Guess now owns the remaining input
+      if (resolveRoomFocus() >= 0) {
+        g_roomFocusId[0] = '\0';  // a Short on a participant returns focus to the action row
+      } else if (handleRoomAction(e)) {
+        break;  // Phase 2C-1: Guess now owns the remaining input
+      }
     }
   }
 
@@ -1183,8 +1255,35 @@ void screenRaceRoomTick() {
   bool firstDraw = g_raceRoomNeedsFullRedraw;
   if (firstDraw) {
     Display::clearContentArea();
-    Display::printLine(2, titleY, "Race Room");
     g_raceRoomNeedsFullRedraw = false;
+  }
+
+  // Participant window: as many rows as fit below the score row, scrolled
+  // so the focused participant is visible.
+  int16_t remaining = Display::kScreenHeight - rowsTopY;
+  uint8_t rows = (remaining > 0) ? static_cast<uint8_t>(remaining / lh) : 0;
+  if (rows > kMaxRoomRows) rows = kMaxRoomRows;
+  int16_t focus = resolveRoomFocus();
+  uint8_t maxTop = (g_participantCount > rows) ? static_cast<uint8_t>(g_participantCount - rows) : 0;
+  if (focus >= 0 && focus < g_roomListTop) g_roomListTop = static_cast<uint8_t>(focus);
+  if (focus >= 0 && rows > 0 && focus >= g_roomListTop + rows) g_roomListTop = static_cast<uint8_t>(focus - rows + 1);
+  if (g_roomListTop > maxTop) g_roomListTop = maxTop;
+  uint8_t visibleCount = static_cast<uint8_t>(g_participantCount - g_roomListTop);
+  if (visibleCount > rows) visibleCount = rows;
+
+  // Title, with the visible range once the list no longer fits.
+  char title[24];
+  if (g_participantCount > rows && visibleCount > 0) {
+    snprintf(title, sizeof(title), "Race Room  %u-%u/%u", g_roomListTop + 1, g_roomListTop + visibleCount,
+             g_participantCount);
+  } else {
+    snprintf(title, sizeof(title), "Race Room");
+  }
+  if (firstDraw || strcmp(title, g_raceRoomLastTitle) != 0) {
+    if (!firstDraw) Display::tft().fillRect(0, titleY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    Display::printLine(2, titleY, title);
+    strncpy(g_raceRoomLastTitle, title, sizeof(g_raceRoomLastTitle) - 1);
+    g_raceRoomLastTitle[sizeof(g_raceRoomLastTitle) - 1] = '\0';
   }
 
   // Hardware Fix #4 issue 9: a ">" marker (not the word "Short:") shows
@@ -1239,6 +1338,9 @@ void screenRaceRoomTick() {
     actionText = g_haveJoined ? "Continue" : "Join";
     hasAction = true;
   }
+  // The ">" also marks where the focus is: with a participant focused, a
+  // Short only returns focus here, so the action shows no marker.
+  if (focus >= 0) hasAction = false;
   char actionLabel[32];
   snprintf(actionLabel, sizeof(actionLabel), "%s%s", hasAction ? "> " : "", actionText);
   if (firstDraw || strcmp(actionLabel, g_raceRoomLastActionLabel) != 0) {
@@ -1285,22 +1387,18 @@ void screenRaceRoomTick() {
   // than the old fixed 4-row/10px layout assumed, so size the participant
   // list to whatever vertical space is actually left instead of
   // hardcoding a row count (avoids off-screen/overlapping names, item 14).
-  uint8_t shown = (g_participantCount < 4) ? g_participantCount : 4;
-  char shownNames[4][17];
-  for (uint8_t i = 0; i < shown; i++) {
-    Presence::resolveDisplayName(g_groupCode, g_participants[i], shownNames[i], sizeof(shownNames[i]));
-    if (strcmp(g_participants[i], Identity::deviceId()) == 0) {
-      // Mark self compactly; Display::printLine() safely truncates if the
-      // combined text would otherwise overflow the row.
-      char withYou[24];
-      snprintf(withYou, sizeof(withYou), "%s (You)", shownNames[i]);
-      strncpy(shownNames[i], withYou, sizeof(shownNames[i]) - 1);
-      shownNames[i][sizeof(shownNames[i]) - 1] = '\0';
-    }
+  // Participant rows (scrolled window; see above). The focused one carries
+  // the ">" marker.
+  char shownNames[kMaxRoomRows][28];
+  for (uint8_t r = 0; r < visibleCount; r++) {
+    uint8_t i = static_cast<uint8_t>(g_roomListTop + r);
+    char name[17];
+    Presence::resolveDisplayName(g_groupCode, g_participants[i], name, sizeof(name));
+    // Mark self compactly; Display::printLine() safely truncates if the
+    // combined text would otherwise overflow the row.
+    bool self = strcmp(g_participants[i], Identity::deviceId()) == 0;
+    snprintf(shownNames[r], sizeof(shownNames[r]), "%s%s%s", (focus == i) ? "> " : "", name, self ? " (You)" : "");
   }
-  int16_t remaining = Display::kScreenHeight - rowsTopY;
-  uint16_t rows = (remaining > 0) ? static_cast<uint16_t>(remaining / lh) : 0;
-  uint8_t visibleCount = static_cast<uint8_t>((shown < rows) ? shown : rows);
 
   if (firstDraw || visibleCount != g_raceRoomLastOnlineCount) {
     // The set of visible participant slots itself changed (someone
@@ -1434,6 +1532,7 @@ void handleRaceInvitePacket(const char* group_code, const char* topic, const uin
   g_hasHadFirstRound = false;
   g_phase = RoomPhase::LOBBY_WAITING;
   g_participantCount = 0;
+  resetRoomFocus();
   addParticipant(initiator);
   clearRoomActionStatus();  // Phase 2C-1: a notice from before this lobby must not hide "Join"
 
