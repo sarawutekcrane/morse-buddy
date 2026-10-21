@@ -1,0 +1,30 @@
+== toolchain: g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+== repo HEAD: 73884d9c56ab0387e3d52ff00bead8d813a4084d  (working tree:  M src/core/identity.cpp  M src/core/identity.h  M src/core/mqtt_manager.cpp  M src/core/packet_codec.h  M src/core/race.cpp  M src/core/storage_init.cpp  M src/core/storage_init.h ?? src/core/race_protocol.cpp ?? src/core/race_protocol.h )
+== 1. Room protocol E1-E27 + review findings F1-F3: ACTUAL race_protocol.cpp + crc32.cpp, several engines, broker + NVS + identity-counter fault models, ASan+UBSan
+   audited 112 publish logs; 422 receive-queue overflow drops injected
+   1028 checks passed, 0 failed
+== 2. Room UI (R1, R2, R3-R5, review U15-U17): ACTUAL menu.cpp + race.cpp + race_protocol.cpp + identity.cpp; peers are ACTUAL engines
+!! FAILED: compile room
+   injected compiler failure
+== 3. Race Guess history browsing (RB1-RB12, ported to the room protocol): same sources
+   100 checks passed, 0 failed
+== 4. Solo and Friend regressions (unchanged tests): ACTUAL menu, number_guessing(_friend), presence, text_message, enigma
+   52 checks passed, 0 failed
+   336 checks passed, 0 failed
+   warnings in changed/related files (all builds): number_guessing.cpp:174:49: warning: 'snprintf' output may be truncated before the last format character [-Wformat-truncation=] 
+== 5. C++11 / C++17 compile (-fsyntax-only -Wall -Wextra; host fakes incl. fake_sys/) of every changed production file, baseline vs candidate
+   (a compiler error fails the script; warnings are counted and listed)
+   gnu++11 base: compiled, 0 warnings
+!! FAILED: syntax gnu++11 cand race_protocol.cpp
+   injected syntax failure
+   gnu++11 cand: compiled, 0 warnings
+   gnu++17 base: compiled, 0 warnings
+!! FAILED: syntax gnu++17 cand race_protocol.cpp
+   injected syntax failure
+   gnu++17 cand: compiled, 0 warnings
+== 6. Sizes: encoded by the ACTUAL codec (step 1 E16, step 2 U14) and the RAM of the engine on this host
+   sizeof(RoomState)=652 sizeof(Entry)=28 sizeof(Engine)=2152
+     room_=652 buf_=599 rec_(MemberRecord)=84 commit_=64 disc_=288 replyRate_=160 reconcile_=80 p_=80
+   (x86-64 host layout: ESP32 is 32-bit, so pointer members are half the size there; not measured on target)
+== 7. Targeted mutations: SKIPPED (SKIP_MUTATIONS=1)
+== RESULT: FAILED

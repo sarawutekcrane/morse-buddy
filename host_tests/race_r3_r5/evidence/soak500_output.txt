@@ -1,0 +1,3 @@
+audited 592 publish logs; 9769 receive-queue overflow drops injected
+7268 checks passed, 0 failed
+exit 0

@@ -1,0 +1,23 @@
+# Target sizes and static DRAM (from the actual ESP32 build of patch f8ee888e3f34555957c3fd018058d074099ec0c9b4bb68964a23cc8835308be2)
+## sizeof on the ESP32 toolchain (xtensa-esp32-elf-g++ -std=gnu++11 -Os -mlongcalls, tsize/sz.cpp):
+sizeof(RaceProtocol::Engine) = 2108 (0x83c); sizeof(RoomState) = 652 (0x28c); sizeof(Platform) = 40 (0x28)
+Contents of section .rodata:
+ 0000 28000000 8c020000 3c080000           (.......<...    
+## dram0_0_seg (framework tools/sdk/esp32/ld/memory.ld): org = 0x3FFB0000 + 0xdb5c, len = 0x2c200 - 0xdb5c = 124580 bytes
+66:  dram0_0_seg (RW) : org = 0x3FFB0000 + 0xdb5c,
+67-                                     len = 0x2c200 - 0xdb5c
+## candidate firmware.elf
+.dram0.data                                                                                                                                                              31076   1073470304
+.noinit                                                                                                                                                                      0   1073501380
+.dram0.bss                                                                                                                                                               93136   1073501384
+.dram0.heap_start                                                                                                                                                            0   1073594520
+3ffdc098 A _heap_start
+## baseline firmware.elf
+.dram0.data                                                                                                                                                              31076   1073470304
+.noinit                                                                                                                                                                      0   1073501380
+.dram0.bss                                                                                                                                                               93336   1073501384
+.dram0.heap_start                                                                                                                                                            0   1073594720
+3ffdc160 A _heap_start
+baseline 73884d9: static DRAM 124420 of 124580 bytes used; linker-region headroom 160 bytes
+candidate: static DRAM 124220 of 124580 bytes used; linker-region headroom 360 bytes
+## race.cpp.o static data (candidate):   11574	     40	   1287	  12901	   3265	/tmp/claude-0/-home-user-morse-buddy/6c983299-def3-5558-ac59-7534d8753181/scratchpad/fwbuild4/.pio/build/morse_buddy/src/core/race.cpp.o

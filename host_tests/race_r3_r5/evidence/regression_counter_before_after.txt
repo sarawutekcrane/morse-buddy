@@ -1,0 +1,33 @@
+# Shared-counter regression: the SAME test sources (host2c8/identity_test.cpp, host2c8/room_test.cpp)
+# built against the previous candidate (patch sha256 40d7972f..., Race numbers from idCounter)
+# and the current tree (Race numbers from raceSeq, migrated from idCounter). Every FAIL line is shown.
+
+== before: identity_test (ACTUAL identity.cpp)
+FAIL [S2 interleave nextId() and Race reservations across the wrap of the message-id counter] line 71: a Race number came back below the used range after nextId() wrapped: 2
+FAIL [S2 interleave nextId() and Race reservations across the wrap of the message-id counter] line 78: 0 Race numbers reused, 1 decreased
+FAIL [S2 interleave nextId() and Race reservations across the wrap of the message-id counter] line 79: Race did not end exactly at UINT32_MAX (last 120)
+FAIL [S3 exhausted: refused (no wrap), also after reboots and further nextId() calls] line 83: a number was returned after exhaustion: 122
+FAIL [S3 exhausted: refused (no wrap), also after reboots and further nextId() calls] line 86: a number was returned after reboot: 124
+FAIL [S3 exhausted: refused (no wrap), also after reboots and further nextId() calls] line 88: a Race number after a second reboot
+FAIL [S3 exhausted: refused (no wrap), also after reboots and further nextId() calls] line 89: 0 reused, 1 decreased
+   Race numbers handed out: 66 (incl. 4 pre-existing); message-id counter now 125
+FAIL [S6 stored raceSeq unreadable: refused (never restarted from 0 or from idCounter)] line 130: a number despite an unreadable raceSeq: 13
+FAIL [S6 stored raceSeq unreadable: refused (never restarted from 0 or from idCounter)] line 132: after the read recovers 14
+FAIL [S7 idCounter unreadable at migration: refused (never started from 0)] line 139: a number despite an unreadable idCounter: 1
+FAIL [S7 idCounter unreadable at migration: refused (never started from 0)] line 141: migration after recovery 2
+9 checks passed, 11 failed
+   exit status 1
+== before: room_test (ACTUAL race.cpp + race_protocol.cpp + identity.cpp)
+FAIL [U15 actual identity.cpp Race counter write failing (Storage::core): Join sends nothing, shows the storage error] line 532: JOIN sent with an unreserved number (2)
+FAIL [U15 actual identity.cpp Race counter write failing (Storage::core): Join sends nothing, shows the storage error] line 533: '' / 'Waiting for Alice'
+FAIL [U16 actual identity.cpp Race counter exhausted: Invite to Play refused, no wrap (both before and after migration)] line 556: room created with an exhausted Race counter (raceSeq now 4294967295)
+246 checks passed, 3 failed
+   exit status 1
+
+== after: identity_test (ACTUAL identity.cpp)
+   Race numbers handed out: 10 (incl. 4 pre-existing); message-id counter now 6
+20 checks passed, 0 failed
+   exit status 0
+== after: room_test (ACTUAL race.cpp + race_protocol.cpp + identity.cpp)
+249 checks passed, 0 failed
+   exit status 0

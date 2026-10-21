@@ -1,0 +1,30 @@
+# Migration-order regression: the SAME test sources (host2c8/identity_test.cpp, host2c8/room_test.cpp)
+# built against the previous candidate (patch sha256 bc0e0f6a..., lazy migration on the first reservation)
+# and the current tree (migration stored at init(); idCounter unchanged until it is stored). Every FAIL line shown.
+
+== before: identity_test (ACTUAL identity.cpp)
+   Race numbers handed out: 10 (incl. 4 pre-existing); message-id counter now 6
+FAIL [S8 nextId() before the first Race reservation, idCounter = UINT32_MAX (the reported counterexample), with boot] line 159: Race number 1 after nextId() wrapped the migration source
+FAIL [S8 nextId() before the first Race reservation, idCounter = UINT32_MAX (the reported counterexample), with boot] line 161: Race number 2 after a reboot
+FAIL [S8b same, nextId() before any init() migration attempt (nextId() itself protects the source)] line 168: Race number 1: migrated from the wrapped value
+FAIL [S9 migration write failure, then nextId(), then reboot: the source is unchanged until raceSeq is stored] line 182: migration after recovery stored 0
+FAIL [S9b only the raceSeq write fails (idCounter writes would succeed): nextId() still leaves the source alone] line 194: idCounter wrapped (now 0) before raceSeq was stored
+FAIL [S9b only the raceSeq write fails (idCounter writes would succeed): nextId() still leaves the source alone] line 198: Race number 1 after recovery
+FAIL [S10 exhausted migration, then nextId() (wraps idCounter), then reboots: Race stays exhausted] line 204: exhausted migration not stored (raceSeq 0)
+FAIL [S10 exhausted migration, then nextId() (wraps idCounter), then reboots: Race stays exhausted] line 209: Race number 5 after the source wrapped (raceSeq 5)
+FAIL [S11 idCounter unreadable at boot: no migration from a default; nextId() leaves the source alone] line 222: idCounter changed while raceSeq was not stored (now 1)
+FAIL [S11 idCounter unreadable at boot: no migration from a default; nextId() leaves the source alone] line 224: first Race number after the read recovered: 2
+27 checks passed, 10 failed
+   exit status 1
+== before: room_test (ACTUAL race.cpp + race_protocol.cpp + identity.cpp)
+FAIL [U16 actual identity.cpp Race counter exhausted: Invite to Play refused, no wrap (both before and after migration)] line 547: room created from an exhausted counter (raceSeq 0)
+248 checks passed, 1 failed
+   exit status 1
+
+== after: identity_test (ACTUAL identity.cpp)
+   Race numbers handed out: 10 (incl. 4 pre-existing); message-id counter now 6
+37 checks passed, 0 failed
+   exit status 0
+== after: room_test (ACTUAL race.cpp + race_protocol.cpp + identity.cpp)
+249 checks passed, 0 failed
+   exit status 0

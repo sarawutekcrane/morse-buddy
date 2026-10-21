@@ -1,0 +1,21 @@
+# readStored() regression: the SAME test sources (host2c8/identity_test.cpp, host2c8/room_test.cpp)
+# built against the previous candidate (patch sha256 77bb1966..., default-value inference)
+# and the current tree (two reads with different defaults must agree). Every FAIL line shown.
+
+== before: identity_test (ACTUAL identity.cpp)
+FAIL [S12 raceSeq reservation, stored 50, first read fails] line 270: a failed read's default was used: ok 1 out 1 raceSeq 1 (stored 50)
+FAIL [S12 raceSeq reservation, stored 50, first read fails] line 275: after recovery 2 (stored was 50)
+FAIL [S13 idCounter migration at boot, stored 50, first read fails] line 294: a failed read's default was migrated: raceSeq 0, idCounter 50 (stored 50)
+FAIL [S13 idCounter migration at boot, stored 50, first read fails] line 301: first Race number 1 (expected 51)
+81 checks passed, 4 failed
+   exit status 1
+== before: room_test (ACTUAL race.cpp + race_protocol.cpp + identity.cpp)
+249 checks passed, 0 failed
+   exit status 0
+
+== after: identity_test (ACTUAL identity.cpp)
+85 checks passed, 0 failed
+   exit status 0
+== after: room_test (ACTUAL race.cpp + race_protocol.cpp + identity.cpp)
+249 checks passed, 0 failed
+   exit status 0

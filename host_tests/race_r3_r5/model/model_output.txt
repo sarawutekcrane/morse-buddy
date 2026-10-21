@@ -1,0 +1,487 @@
+
+f1 (round 1):
+ F1 room identity = (C, n, nonce32); requests/replies/RS carry it; coordinator
+    answers any other (n, nonce) with UNKNOWN_ROOM. Member: an RS on r2/<C> with a
+    different (n, nonce) -> higher n superseded / equal n different nonce terminal /
+    lower n stale.
+ F2 rm_member stores appliedV; after reboot accept only version >= appliedV;
+    if persisting appliedV fails the RS is still applied in RAM.
+ F3 a JOIN that ends without admission is terminal; no automatic reissue.
+
+f2 (round 2) = f1 with F1 and F2 replaced:
+ G1 identity mismatch never changes member state by itself. A nonce
+    distinguishes identities but does not order them, and n does not order
+    rooms across an identity loss either. An RS on r2/<C> whose (n, nonce)
+    differs from the record -> 'Verifying room...' and a QUERY(seq) to C
+    (rate-limited). C answers every QUERY with REPLY carrying its CURRENT room
+    identity (n, nonce, version) or NONE. The member accepts the reply only if
+    target, coordinator and seq match its outstanding query, then:
+      reply identity == record  -> the mismatched RS was foreign/stale: ignore it
+      reply identity != record, or NONE -> my room is gone: terminal
+      no reply (C unavailable)  -> stay 'Verifying', no state change
+    A genuine replacement is therefore confirmed only by the coordinator's own
+    answer about its current room, never by a snapshot alone.
+ G2 apply-after-durable: a member applies (displays, completes pending ops,
+    acts on) RS version v only after persisting appliedV = v succeeded. If the
+    write fails, nothing is applied: the confirmed state stays at the durable
+    floor, the UI shows 'Storage error - room paused', and the write is retried
+    on the next RS (or periodically). So the confirmed version can never exceed
+    the durable floor, and recovery can never roll it back.
+ F3 unchanged.
+
+f3 (round 3) = f2 plus H1 (QUERY lifecycle):
+ H1 at most one outstanding verification, bound to (group, coordinator, n,
+    nonce, attempt) where 'attempt' is the seq of the request that created the
+    current membership record (JOIN, or room creation). It is invalidated
+    (cleared) on: Leave (any), terminal transition, Join / new-room selection,
+    and reboot. A reply is accepted only if group, coordinator, target and qseq
+    match the outstanding query AND the query's binding still equals the
+    current record. Retry: if no matching reply within the retry interval, a
+    NEW query with a fresh durable qseq REPLACES the outstanding one (the old
+    qseq stops matching) -- never two at once. Replies are therefore usable
+    only for the exact verification that is still outstanding.
+
+[r6] FAIL  1a identity reuse: old JOIN/CLAIM before collision is visible   (as expected)
+      old room (C,40) v16, members ['C', 'M']
+      after identity loss: new room (C,40) v1 nonce=0x0
+      old JOIN from D -> OK
+        VIOLATION: a request for the OLD room changed the NEW room (D admitted)
+      old CLAIM from M -> OK
+        VIOLATION: an OLD-room claim scored in the NEW room
+      old retained (C,40) v16 reaches C -> conflict
+        NOTE: detection came after the effects above; it did not prevent them
+[f1] PASS  1a identity reuse: old JOIN/CLAIM before collision is visible   (as expected)
+      old room (C,40) v16, members ['C', 'M']
+      after identity loss: new room (C,40) v1 nonce=0xb2
+      old JOIN from D -> UNKNOWN_ROOM
+      old CLAIM from M -> UNKNOWN_ROOM
+      old retained (C,40) v16 reaches C -> ignored
+[f2] PASS  1a identity reuse: old JOIN/CLAIM before collision is visible   (as expected)
+      old room (C,40) v16, members ['C', 'M']
+      after identity loss: new room (C,40) v1 nonce=0xb2
+      old JOIN from D -> UNKNOWN_ROOM
+      old CLAIM from M -> UNKNOWN_ROOM
+      old retained (C,40) v16 reaches C -> ignored
+[f3] PASS  1a identity reuse: old JOIN/CLAIM before collision is visible   (as expected)
+      old room (C,40) v16, members ['C', 'M']
+      after identity loss: new room (C,40) v1 nonce=0xb2
+      old JOIN from D -> UNKNOWN_ROOM
+      old CLAIM from M -> UNKNOWN_ROOM
+      old retained (C,40) v16 reaches C -> ignored
+[r7txt] PASS  1a identity reuse: old JOIN/CLAIM before collision is visible   (as expected)
+      old room (C,40) v16, members ['C', 'M']
+      after identity loss: new room (C,40) v1 nonce=0xb2
+      old JOIN from D -> UNKNOWN_ROOM
+      old CLAIM from M -> UNKNOWN_ROOM
+      old retained (C,40) v16 reaches C -> ignored
+[m4] PASS  1a identity reuse: old JOIN/CLAIM before collision is visible   (as expected)
+      old room (C,40) v16, members ['C', 'M']
+      after identity loss: new room (C,40) v1 nonce=0xb2
+      old JOIN from D -> UNKNOWN_ROOM
+      old CLAIM from M -> UNKNOWN_ROOM
+      old retained (C,40) v16 reaches C -> ignored
+
+[r6] FAIL  1b old member, NEW room's snapshot (old->new direction)   (as expected)
+      old (C,40) v16 reaches C (own v25) -> stale-own
+        VIOLATION: collision not detected; C treats a foreign old room as its own stale copy
+      old member M (applied old v16) receives new (C,40) v25 -> applied
+        M: state=MEMBER, ui='', applied v25
+        VIOLATION: M adopted the NEW room's snapshot as its old room
+[f1] PASS  1b old member, NEW room's snapshot (old->new direction)   (as expected)
+      old (C,40) v16 reaches C (own v25) -> ignored
+      old member M (applied old v16) receives new (C,40) v25 -> terminal
+        M: state=NONE, ui='Room closed (room identity changed)', applied v16
+[f2] PASS  1b old member, NEW room's snapshot (old->new direction)   (as expected)
+      old (C,40) v16 reaches C (own v25) -> ignored
+      old member M (applied old v16) receives new (C,40) v25 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)', applied v16
+[f3] PASS  1b old member, NEW room's snapshot (old->new direction)   (as expected)
+      old (C,40) v16 reaches C (own v25) -> ignored
+      old member M (applied old v16) receives new (C,40) v25 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)', applied v16
+[r7txt] PASS  1b old member, NEW room's snapshot (old->new direction)   (as expected)
+      old (C,40) v16 reaches C (own v25) -> ignored
+      old member M (applied old v16) receives new (C,40) v25 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)', applied v16
+[m4] PASS  1b old member, NEW room's snapshot (old->new direction)   (as expected)
+      old (C,40) v16 reaches C (own v25) -> ignored
+      old member M (applied old v16) receives new (C,40) v25 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)', applied v16
+
+[r6] FAIL  2  member reboot: stale retained v18 after applied v20   (as expected)
+      M applied v20 (its score 2); reboot
+      stale retained v18 first -> applied; ui=''
+        VIOLATION: stale v18 treated as current (applied version went 20 -> 18)
+      current v21 -> applied; applied v21
+[f1] PASS  2  member reboot: stale retained v18 after applied v20   (as expected)
+      M applied v20 (its score 2); reboot
+      stale retained v18 first -> stale; ui='Reconnecting...'
+      current v21 -> applied; applied v21
+[f2] PASS  2  member reboot: stale retained v18 after applied v20   (as expected)
+      M applied v20 (its score 2); reboot
+      stale retained v18 first -> stale; ui='Reconnecting...'
+      current v21 -> applied; applied v21
+[f3] PASS  2  member reboot: stale retained v18 after applied v20   (as expected)
+      M applied v20 (its score 2); reboot
+      stale retained v18 first -> stale; ui='Reconnecting...'
+      current v21 -> applied; applied v21
+[r7txt] PASS  2  member reboot: stale retained v18 after applied v20   (as expected)
+      M applied v20 (its score 2); reboot
+      stale retained v18 first -> stale; ui='Reconnecting...'
+      current v21 -> applied; applied v21
+[m4] PASS  2  member reboot: stale retained v18 after applied v20   (as expected)
+      M applied v20 (its score 2); reboot
+      stale retained v18 first -> stale; ui='Reconnecting...'
+      current v21 -> applied; applied v21
+
+[r6] FAIL  3  FULL, reply lost, later snapshot after a leave   (as expected)
+      R's JOIN (basis v2) -> FULL; the reply is LOST
+      P3 leaves -> v4, active=19
+      R receives only v4 -> ui='reissuing JOIN (auto)', state=JOINING
+        auto-reissued JOIN seq102 -> OK
+        VIOLATION: a terminal FULL turned into an automatic admission
+[f1] PASS  3  FULL, reply lost, later snapshot after a leave   (as expected)
+      R's JOIN (basis v2) -> FULL; the reply is LOST
+      P3 leaves -> v4, active=19
+      R receives only v4 -> ui='Could not join - try again', state=NONE
+[f2] PASS  3  FULL, reply lost, later snapshot after a leave   (as expected)
+      R's JOIN (basis v2) -> FULL; the reply is LOST
+      P3 leaves -> v4, active=19
+      R receives only v4 -> ui='Could not join - try again', state=NONE
+[f3] PASS  3  FULL, reply lost, later snapshot after a leave   (as expected)
+      R's JOIN (basis v2) -> FULL; the reply is LOST
+      P3 leaves -> v4, active=19
+      R receives only v4 -> ui='Could not join - try again', state=NONE
+[r7txt] PASS  3  FULL, reply lost, later snapshot after a leave   (as expected)
+      R's JOIN (basis v2) -> FULL; the reply is LOST
+      P3 leaves -> v4, active=19
+      R receives only v4 -> ui='Could not join - try again', state=NONE
+[m4] PASS  3  FULL, reply lost, later snapshot after a leave   (as expected)
+      R's JOIN (basis v2) -> FULL; the reply is LOST
+      P3 leaves -> v4, active=19
+      R receives only v4 -> ui='Could not join - try again', state=NONE
+
+[r6] PASS  C  control: normal reboot   (as expected)
+      coordinator rebooted with intact records; next v3 -> member applied
+[f1] PASS  C  control: normal reboot   (as expected)
+      coordinator rebooted with intact records; next v3 -> member applied
+[f2] PASS  C  control: normal reboot   (as expected)
+      coordinator rebooted with intact records; next v3 -> member applied
+[f3] PASS  C  control: normal reboot   (as expected)
+      coordinator rebooted with intact records; next v3 -> member applied
+[r7txt] PASS  C  control: normal reboot   (as expected)
+      coordinator rebooted with intact records; next v3 -> member applied
+[m4] PASS  C  control: normal reboot   (as expected)
+      coordinator rebooted with intact records; next v3 -> member applied
+
+[r6] PASS  4a NEW-room member, delayed OLD snapshot (new->old direction)   (as expected)
+      M in NEW room (C,40,nonce 0x0) applied v24
+      delayed OLD snapshot (C,40,nonce 0x0) v16 -> stale
+        a delayed reply to an earlier query seq1 arrives -> ignored (not my outstanding query)
+        M: state=MEMBER, ui=''
+[f1] FAIL  4a NEW-room member, delayed OLD snapshot (new->old direction)   (as expected)
+      M in NEW room (C,40,nonce 0xb2) applied v24
+      delayed OLD snapshot (C,40,nonce 0xa1) v16 -> terminal
+        a delayed reply to an earlier query seq1 arrives -> n/a
+        M: state=NONE, ui='Room closed (room identity changed)'
+        VIOLATION: an OLD snapshot closed the NEW room for M
+[f2] PASS  4a NEW-room member, delayed OLD snapshot (new->old direction)   (as expected)
+      M in NEW room (C,40,nonce 0xb2) applied v24
+      delayed OLD snapshot (C,40,nonce 0xa1) v16 -> verify
+        a delayed reply to an earlier query seq1 arrives -> ignored (not my outstanding query)
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+[f3] PASS  4a NEW-room member, delayed OLD snapshot (new->old direction)   (as expected)
+      M in NEW room (C,40,nonce 0xb2) applied v24
+      delayed OLD snapshot (C,40,nonce 0xa1) v16 -> verify
+        a delayed reply to an earlier query seq1 arrives -> ignored (not my outstanding query)
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+[r7txt] PASS  4a NEW-room member, delayed OLD snapshot (new->old direction)   (as expected)
+      M in NEW room (C,40,nonce 0xb2) applied v24
+      delayed OLD snapshot (C,40,nonce 0xa1) v16 -> verify
+        a delayed reply to an earlier query seq1 arrives -> ignored (not my outstanding query)
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+[m4] PASS  4a NEW-room member, delayed OLD snapshot (new->old direction)   (as expected)
+      M in NEW room (C,40,nonce 0xb2) applied v24
+      delayed OLD snapshot (C,40,nonce 0xa1) v16 -> verify
+        a delayed reply to an earlier query seq1 arrives -> ignored (not my outstanding query)
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+
+[r6] FAIL  4b NEW-room member, old snapshot with HIGHER n   (as expected)
+      M in NEW room (C,1) applied v24; old snapshot (C,40) v16 arrives
+        -> terminal
+        M: state=NONE, ui='Room closed (superseded)'
+        VIOLATION: a higher n from before the identity loss 'superseded' the current room
+[f1] FAIL  4b NEW-room member, old snapshot with HIGHER n   (as expected)
+      M in NEW room (C,1) applied v24; old snapshot (C,40) v16 arrives
+        -> terminal
+        M: state=NONE, ui='Room closed (superseded)'
+        VIOLATION: a higher n from before the identity loss 'superseded' the current room
+[f2] PASS  4b NEW-room member, old snapshot with HIGHER n   (as expected)
+      M in NEW room (C,1) applied v24; old snapshot (C,40) v16 arrives
+        -> verify
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+[f3] PASS  4b NEW-room member, old snapshot with HIGHER n   (as expected)
+      M in NEW room (C,1) applied v24; old snapshot (C,40) v16 arrives
+        -> verify
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+[r7txt] PASS  4b NEW-room member, old snapshot with HIGHER n   (as expected)
+      M in NEW room (C,1) applied v24; old snapshot (C,40) v16 arrives
+        -> verify
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+[m4] PASS  4b NEW-room member, old snapshot with HIGHER n   (as expected)
+      M in NEW room (C,1) applied v24; old snapshot (C,40) v16 arrives
+        -> verify
+        QUERY seq102 -> C answers its current room -> confirmed mine (mismatched snapshot was foreign/stale)
+        M: state=MEMBER, ui=''
+
+[r6] PASS  4c genuine replacement (closed 40, new 41) is recognised   (as expected)
+      M (room 40) receives (C,41) v1 -> terminal
+        M: state=NONE, ui='Room closed (superseded)'
+[f1] PASS  4c genuine replacement (closed 40, new 41) is recognised   (as expected)
+      M (room 40) receives (C,41) v1 -> terminal
+        M: state=NONE, ui='Room closed (superseded)'
+[f2] PASS  4c genuine replacement (closed 40, new 41) is recognised   (as expected)
+      M (room 40) receives (C,41) v1 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)'
+[f3] PASS  4c genuine replacement (closed 40, new 41) is recognised   (as expected)
+      M (room 40) receives (C,41) v1 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)'
+[r7txt] PASS  4c genuine replacement (closed 40, new 41) is recognised   (as expected)
+      M (room 40) receives (C,41) v1 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)'
+[m4] PASS  4c genuine replacement (closed 40, new 41) is recognised   (as expected)
+      M (room 40) receives (C,41) v1 -> verify
+        QUERY seq102 -> C answers its current room -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)'
+
+[r6] PASS  4d mismatched snapshot while the coordinator can't answer   (as expected)
+      M (new room) receives old snapshot -> stale
+        M: state=MEMBER, ui=''
+[f1] FAIL  4d mismatched snapshot while the coordinator can't answer   (as expected)
+      M (new room) receives old snapshot -> terminal
+        M: state=NONE, ui='Room closed (room identity changed)'
+        VIOLATION: room ended without the coordinator's confirmation
+[f2] PASS  4d mismatched snapshot while the coordinator can't answer   (as expected)
+      M (new room) receives old snapshot -> verify
+        QUERY sent; coordinator unavailable -> no reply
+        M: state=MEMBER, ui='Verifying room...'
+[f3] PASS  4d mismatched snapshot while the coordinator can't answer   (as expected)
+      M (new room) receives old snapshot -> verify
+        QUERY sent; coordinator unavailable -> no reply
+        M: state=MEMBER, ui='Verifying room...'
+[r7txt] PASS  4d mismatched snapshot while the coordinator can't answer   (as expected)
+      M (new room) receives old snapshot -> verify
+        QUERY sent; coordinator unavailable -> no reply
+        M: state=MEMBER, ui='Verifying room...'
+[m4] PASS  4d mismatched snapshot while the coordinator can't answer   (as expected)
+      M (new room) receives old snapshot -> verify
+        QUERY sent; coordinator unavailable -> no reply
+        M: state=MEMBER, ui='Verifying room...'
+
+[r6] FAIL  5  appliedV write fails, reboot, stale v18   (as expected)
+      v20 arrives while the rm_member write FAILS -> applied; shown v20; durable floor v18; ui=''
+      reboot; retained v18 delivered -> applied; shown history [18, 20, 18]
+        VIOLATION: the confirmed/displayed state went backwards (20 -> 18) after recovery
+[f1] FAIL  5  appliedV write fails, reboot, stale v18   (as expected)
+      v20 arrives while the rm_member write FAILS -> applied; shown v20; durable floor v18; ui=''
+      reboot; retained v18 delivered -> applied; shown history [18, 20, 18]
+        VIOLATION: the confirmed/displayed state went backwards (20 -> 18) after recovery
+[f2] PASS  5  appliedV write fails, reboot, stale v18   (as expected)
+      v20 arrives while the rm_member write FAILS -> not-applied (storage); shown v18; durable floor v18; ui='Storage error - room paused'
+      reboot; retained v18 delivered -> applied; shown history [18, 18]
+[f3] PASS  5  appliedV write fails, reboot, stale v18   (as expected)
+      v20 arrives while the rm_member write FAILS -> not-applied (storage); shown v18; durable floor v18; ui='Storage error - room paused'
+      reboot; retained v18 delivered -> applied; shown history [18, 18]
+[r7txt] PASS  5  appliedV write fails, reboot, stale v18   (as expected)
+      v20 arrives while the rm_member write FAILS -> not-applied (storage); shown v18; durable floor v18; ui='Storage error - room paused'
+      reboot; retained v18 delivered -> duplicate (nothing restored); shown history [18]
+[m4] PASS  5  appliedV write fails, reboot, stale v18   (as expected)
+      v20 arrives while the rm_member write FAILS -> not-applied (storage); shown v18; durable floor v18; ui='Storage error - room paused'
+      reboot; retained v18 delivered -> applied; shown history [18, 18]
+
+[r6] PASS  6  delayed QUERY reply after Leave A and Join B (same coordinator)   (as expected)
+      M in A (C,40,0x0); mismatched snapshot -> terminal; QUERY none
+      M leaves A; C closes A and creates B (C,41,0x0); M joins B -> state MEMBER
+        M: state=MEMBER, ui='Left'
+[f1] PASS  6  delayed QUERY reply after Leave A and Join B (same coordinator)   (as expected)
+      M in A (C,40,0xa1); mismatched snapshot -> terminal; QUERY none
+      M leaves A; C closes A and creates B (C,41,0xb7); M joins B -> state MEMBER
+        M: state=MEMBER, ui='Left'
+[f2] FAIL  6  delayed QUERY reply after Leave A and Join B (same coordinator)   (as expected)
+      M in A (C,40,0xa1); mismatched snapshot -> verify; QUERY seq102
+      M leaves A; C closes A and creates B (C,41,0xb7); M joins B -> state MEMBER
+      delayed reply to the A-era QUERY arrives (says current = A) -> terminal (coordinator's current room is not mine)
+        M: state=NONE, ui='Room closed (room identity changed)'
+        VIOLATION: a reply to a verification from the previous membership ended the new room
+[f3] PASS  6  delayed QUERY reply after Leave A and Join B (same coordinator)   (as expected)
+      M in A (C,40,0xa1); mismatched snapshot -> verify; QUERY seq102
+      M leaves A; C closes A and creates B (C,41,0xb7); M joins B -> state MEMBER
+      delayed reply to the A-era QUERY arrives (says current = A) -> ignored (not my outstanding query)
+        M: state=MEMBER, ui='Left'
+[r7txt] PASS  6  delayed QUERY reply after Leave A and Join B (same coordinator)   (as expected)
+      M in A (C,40,0xa1); mismatched snapshot -> verify; QUERY seq102
+      M leaves A; C closes A and creates B (C,41,0xb7); M joins B -> state MEMBER
+      delayed reply to the A-era QUERY arrives (says current = A) -> ignored (not my outstanding query)
+        M: state=MEMBER, ui='Left'
+[m4] PASS  6  delayed QUERY reply after Leave A and Join B (same coordinator)   (as expected)
+      M in A (C,40,0xa1); mismatched snapshot -> verify; QUERY seq102
+      M leaves A; C closes A and creates B (C,41,0xb7); M joins B -> state MEMBER
+      delayed reply to the A-era QUERY arrives (says current = A) -> ignored (not my outstanding query)
+        M: state=MEMBER, ui='Left'
+
+[r6] PASS  7  lost QUERY: retry by replacement; late/foreign-group replies ignored   (as expected)
+      M (new room) sees an old snapshot -> QUERY none; it is LOST
+      retry interval elapses -> outstanding none; queries sent 0; C received []
+        after the retry window: state=MEMBER, ui='', outstanding=None
+[f1] FAIL  7  lost QUERY: retry by replacement; late/foreign-group replies ignored   (as expected)
+      M (new room) sees an old snapshot -> QUERY none; it is LOST
+      retry interval elapses -> outstanding none; queries sent 0; C received []
+        after the retry window: state=NONE, ui='Room closed (room identity changed)', outstanding=None
+        VIOLATION: verification never completed after a lost QUERY
+[f2] FAIL  7  lost QUERY: retry by replacement; late/foreign-group replies ignored   (as expected)
+      M (new room) sees an old snapshot -> QUERY seq102; it is LOST
+      retry interval elapses -> outstanding seq102; queries sent 1; C received []
+        after the retry window: state=MEMBER, ui='Verifying room...', outstanding=102
+        VIOLATION: verification never completed after a lost QUERY
+      late copy of the seq102 reply -> confirmed mine (mismatched snapshot was foreign/stale)
+[f3] PASS  7  lost QUERY: retry by replacement; late/foreign-group replies ignored   (as expected)
+      M (new room) sees an old snapshot -> QUERY seq102; it is LOST
+      retry interval elapses -> outstanding seq103; queries sent 2; C received [103]
+      reply to seq103 via group G2's connection -> ignored (binding/group mismatch)
+      reply to seq103 via G1 -> confirmed mine (mismatched snapshot was foreign/stale)
+        after the retry window: state=MEMBER, ui='', outstanding=None
+      late copy of the seq102 reply -> ignored (not my outstanding query)
+[r7txt] PASS  7  lost QUERY: retry by replacement; late/foreign-group replies ignored   (as expected)
+      M (new room) sees an old snapshot -> QUERY seq102; it is LOST
+      retry interval elapses -> outstanding seq103; queries sent 2; C received [103]
+      reply to seq103 via group G2's connection -> ignored (binding/group mismatch)
+      reply to seq103 via G1 -> confirmed mine (mismatched snapshot was foreign/stale)
+        after the retry window: state=MEMBER, ui='', outstanding=None
+      late copy of the seq102 reply -> ignored (not my outstanding query)
+[m4] PASS  7  lost QUERY: retry by replacement; late/foreign-group replies ignored   (as expected)
+      M (new room) sees an old snapshot -> QUERY seq102; it is LOST
+      retry interval elapses -> outstanding seq103; queries sent 2; C received [103]
+      reply to seq103 via group G2's connection -> ignored (binding/group mismatch)
+      reply to seq103 via G1 -> confirmed mine (mismatched snapshot was foreign/stale)
+        after the retry window: state=MEMBER, ui='', outstanding=None
+      late copy of the seq102 reply -> ignored (not my outstanding query)
+
+[r6] PASS  8  reboot: QUERY invalidated, durable pending CLAIM resent identically   (as expected)
+      before reboot: pending CLAIM seq102 (round 5, guess 3047); outstanding QUERY None
+      after reboot: outstanding QUERY None; resent CLAIM seq102 round 5 guess 3047
+        coordinator processes the resent CLAIM -> OK
+[f1] PASS  8  reboot: QUERY invalidated, durable pending CLAIM resent identically   (as expected)
+      before reboot: pending CLAIM seq102 (round 5, guess 3047); outstanding QUERY None
+      after reboot: outstanding QUERY None; resent CLAIM seq102 round 5 guess 3047
+        coordinator processes the resent CLAIM -> OK
+[f2] PASS  8  reboot: QUERY invalidated, durable pending CLAIM resent identically   (as expected)
+      before reboot: pending CLAIM seq102 (round 5, guess 3047); outstanding QUERY 103
+      after reboot: outstanding QUERY None; resent CLAIM seq102 round 5 guess 3047
+        coordinator processes the resent CLAIM -> OK
+[f3] PASS  8  reboot: QUERY invalidated, durable pending CLAIM resent identically   (as expected)
+      before reboot: pending CLAIM seq102 (round 5, guess 3047); outstanding QUERY 103
+      after reboot: outstanding QUERY None; resent CLAIM seq102 round 5 guess 3047
+        coordinator processes the resent CLAIM -> OK
+[r7txt] FAIL  8  reboot: QUERY invalidated, durable pending CLAIM resent identically   (as expected)
+      before reboot: pending CLAIM seq102 (round 5, guess 3047); outstanding QUERY 103
+      after reboot: outstanding QUERY None; resent nothing
+        VIOLATION: the durable pending request was not resent identically after reboot
+[m4] PASS  8  reboot: QUERY invalidated, durable pending CLAIM resent identically   (as expected)
+      before reboot: pending CLAIM seq102 (round 5, guess 3047); outstanding QUERY 103
+      after reboot: outstanding QUERY None; resent CLAIM seq102 round 5 guess 3047
+        coordinator processes the resent CLAIM -> OK
+
+[r6] PASS  9  reboot then current state at exactly appliedV   (as expected)
+      reboot; current v20 (== appliedV) delivered -> applied; snapshot restored; ui=''
+[f1] PASS  9  reboot then current state at exactly appliedV   (as expected)
+      reboot; current v20 (== appliedV) delivered -> applied; snapshot restored; ui=''
+[f2] PASS  9  reboot then current state at exactly appliedV   (as expected)
+      reboot; current v20 (== appliedV) delivered -> applied; snapshot restored; ui=''
+[f3] PASS  9  reboot then current state at exactly appliedV   (as expected)
+      reboot; current v20 (== appliedV) delivered -> applied; snapshot restored; ui=''
+[r7txt] FAIL  9  reboot then current state at exactly appliedV   (as expected)
+      reboot; current v20 (== appliedV) delivered -> duplicate (nothing restored); snapshot ABSENT; ui='Reconnecting...'
+        VIOLATION: recovery never completed although the current state was received
+[m4] PASS  9  reboot then current state at exactly appliedV   (as expected)
+      reboot; current v20 (== appliedV) delivered -> applied; snapshot restored; ui=''
+
+[r6] FAIL  10 running: equal version identical -> duplicate, different -> conflict   (as expected)
+      identical v20 again -> applied; different-content v20 -> applied; shown score 9; ui=''
+        VIOLATION: equal-version handling while running is not 'duplicate if identical, conflict otherwise'
+[f1] FAIL  10 running: equal version identical -> duplicate, different -> conflict   (as expected)
+      identical v20 again -> applied; different-content v20 -> applied; shown score 9; ui=''
+        VIOLATION: equal-version handling while running is not 'duplicate if identical, conflict otherwise'
+[f2] FAIL  10 running: equal version identical -> duplicate, different -> conflict   (as expected)
+      identical v20 again -> applied; different-content v20 -> applied; shown score 9; ui=''
+        VIOLATION: equal-version handling while running is not 'duplicate if identical, conflict otherwise'
+[f3] PASS  10 running: equal version identical -> duplicate, different -> conflict   (as expected)
+      identical v20 again -> duplicate; different-content v20 -> conflict; shown score 2; ui='Room data inconsistent'
+[r7txt] PASS  10 running: equal version identical -> duplicate, different -> conflict   (as expected)
+      identical v20 again -> duplicate; different-content v20 -> conflict; shown score 2; ui='Room data inconsistent'
+[m4] PASS  10 running: equal version identical -> duplicate, different -> conflict   (as expected)
+      identical v20 again -> duplicate; different-content v20 -> conflict; shown score 2; ui='Room data inconsistent'
+
+[r6] PASS  11 reboot recovery at exactly appliedV with NVS failing: no write, restored   (as expected)
+      reboot; NVS failing; current v20 == appliedV -> applied; snapshot restored; NVS writes attempted 0; ui=''
+[f1] FAIL  11 reboot recovery at exactly appliedV with NVS failing: no write, restored   (as expected)
+      reboot; NVS failing; current v20 == appliedV -> applied; snapshot restored; NVS writes attempted 1; ui=''
+        VIOLATION: equal-version recovery attempted a write and/or failed to restore
+[f2] FAIL  11 reboot recovery at exactly appliedV with NVS failing: no write, restored   (as expected)
+      reboot; NVS failing; current v20 == appliedV -> not-applied (storage); snapshot ABSENT; NVS writes attempted 1; ui='Storage error - room paused'
+        VIOLATION: equal-version recovery attempted a write and/or failed to restore
+[f3] PASS  11 reboot recovery at exactly appliedV with NVS failing: no write, restored   (as expected)
+      reboot; NVS failing; current v20 == appliedV -> applied; snapshot restored; NVS writes attempted 0; ui=''
+[r7txt] FAIL  11 reboot recovery at exactly appliedV with NVS failing: no write, restored   (as expected)
+      reboot; NVS failing; current v20 == appliedV -> duplicate (nothing restored); snapshot ABSENT; NVS writes attempted 0; ui='Reconnecting...'
+        VIOLATION: equal-version recovery attempted a write and/or failed to restore
+[m4] FAIL  11 reboot recovery at exactly appliedV with NVS failing: no write, restored   (as expected)
+      reboot; NVS failing; current v20 == appliedV -> not-applied (storage); snapshot ABSENT; NVS writes attempted 1; ui='Storage error - room paused'
+        VIOLATION: equal-version recovery attempted a write and/or failed to restore
+
+[r6] FAIL  12 conflict freeze enforced: no later apply/completion; Leave works   (as expected)
+      JOINING at v20; same-version different content -> applied; then v21 (would admit R) -> applied
+        after: shown v21, state=MEMBER, pending=None, ui='Joined', may start=True, may leave=True
+        VIOLATION: conflict not detected
+        VIOLATION: the frozen member advanced its confirmed state or completed a gameplay operation
+        Leave -> state=NONE
+[f1] FAIL  12 conflict freeze enforced: no later apply/completion; Leave works   (as expected)
+      JOINING at v20; same-version different content -> applied; then v21 (would admit R) -> applied
+        after: shown v21, state=MEMBER, pending=None, ui='Joined', may start=True, may leave=True
+        VIOLATION: conflict not detected
+        VIOLATION: the frozen member advanced its confirmed state or completed a gameplay operation
+        Leave -> state=NONE
+[f2] FAIL  12 conflict freeze enforced: no later apply/completion; Leave works   (as expected)
+      JOINING at v20; same-version different content -> applied; then v21 (would admit R) -> applied
+        after: shown v21, state=MEMBER, pending=None, ui='Joined', may start=True, may leave=True
+        VIOLATION: conflict not detected
+        VIOLATION: the frozen member advanced its confirmed state or completed a gameplay operation
+        Leave -> state=NONE
+[f3] PASS  12 conflict freeze enforced: no later apply/completion; Leave works   (as expected)
+      JOINING at v20; same-version different content -> conflict; then v21 (would admit R) -> ignored (frozen: Leave only)
+        after: shown v20, state=JOINING, pending=JOIN, ui='Room data inconsistent', may start=False, may leave=True
+        Leave -> state=NONE
+[r7txt] PASS  12 conflict freeze enforced: no later apply/completion; Leave works   (as expected)
+      JOINING at v20; same-version different content -> conflict; then v21 (would admit R) -> ignored (frozen: Leave only)
+        after: shown v20, state=JOINING, pending=JOIN, ui='Room data inconsistent', may start=False, may leave=True
+        Leave -> state=NONE
+[m4] FAIL  12 conflict freeze enforced: no later apply/completion; Leave works   (as expected)
+      JOINING at v20; same-version different content -> conflict; then v21 (would admit R) -> applied
+        after: shown v21, state=MEMBER, pending=None, ui='Joined', may start=True, may leave=True
+        VIOLATION: the frozen member advanced its confirmed state or completed a gameplay operation
+        Leave -> state=NONE
+
+RESULT: every outcome matches the expectation table (all scenarios pass under f3)
