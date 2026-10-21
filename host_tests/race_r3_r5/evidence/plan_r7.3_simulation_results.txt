@@ -1,0 +1,96 @@
+# Plan r7.3: focused script simulation (simulated esptool/pio; NOT hardware). Scripts extracted unchanged from hardware_test/RACE_R3_R5_ACCEPTANCE_PLAN_R7.3.md
+# by host_tests/race_r3_r5/plan_sim/setup_sim.sh; commit under test 512c0f33595a3ca565ed8a4a3cf9861341f92fa6 (heap diagnostics).
+# Brackets show write_flash and pio run calls made by the case. Every refusal before installation or rollback shows write_flash +0.
+== 0.3 build and stage
+build failure piped through tee                                    exit=1   STOP OK  [write_flash calls +0, pio run calls +2]
+      last line: [FAILED]
+dirty working tree                                                 exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: working tree not clean
+wrong commit (race.cpp hash)                                       exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: sha256sum: WARNING: 1 computed checksum did NOT match
+build and stage images                                             exit=0   PASS OK  [write_flash calls +0, pio run calls +2]
+      check: manifest lists the four images incl. boot_app0.bin: yes
+      check: staged images are read-only (mode bits): yes
+      check: clone still clean after build: yes
+rerun with images already staged                                   exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: <WORKDIR>/out/images exists (i
+== 0.4 backup
+old partition layout                                               exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: device partition layout differs from partitions.csv
+      check: rejected backup has no .meta (unusable for install/rollback): yes
+unreachable port                                                   exit=2   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: Could not open port /dev/nope
+backup device A                                                    exit=0   PASS OK  [write_flash calls +0, pio run calls +0]
+backup device B                                                    exit=0   PASS OK  [write_flash calls +0, pio run calls +0]
+      check: backup A equals device A: yes
+== 0.5 install: every refusal must happen before any write (write_flash +0), and no pio run
+A's backup, device B on the port                                   exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: device on /dev/pB (24:0a:c4:00:00:0b) is not the backed-up device
+DEV=B with A's backup                                              exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: backup is not for device B
+truncated backup                                                   exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: sha256sum: WARNING: 1 computed checksum did NOT match
+altered firmware.bin                                               exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: sha256sum: WARNING: 1 computed checksum did NOT match
+altered bootloader.bin                                             exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: sha256sum: WARNING: 1 computed checksum did NOT match
+altered partitions.bin                                             exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: sha256sum: WARNING: 1 computed checksum did NOT match
+altered boot_app0.bin                                              exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: sha256sum: WARNING: 1 computed checksum did NOT match
+manifest missing boot_app0.bin                                     exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: manifest does not list exactly the four images
+oversize firmware with regenerated manifest                        exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: firmware size
+device partition table changed since backup                        exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: device partition table differs from the staged one
+      check: device A unchanged by all refusals: yes
+      check: device B unchanged by all refusals: yes
+install with the rejected (old-layout) backup                      exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: <WORKDIR>/out/backup-A-240ac40
+write failure piped through tee                                    exit=2   STOP OK  [write_flash calls +1, pio run calls +0]
+      last line: A fatal error occurred: simulated write failure
+silent corruption during write (verify_flash)                      exit=2   STOP OK  [write_flash calls +1, pio run calls +0]
+      last line: Verify failed at 0x10000
+install A (no .pio in the clone; pio run forbidden)                exit=0   PASS OK  [write_flash calls +1, pio run calls +0]
+install B (no .pio in the clone; pio run forbidden)                exit=0   PASS OK  [write_flash calls +1, pio run calls +0]
+      check: A: 0x1000/0x8000/0xE000/0x10000 hold the staged images: yes
+      check: A: ota_1 unchanged: yes
+      check: A: NVS and LittleFS unchanged: yes
+== 9.2 / 9.3 rollback (device-bound backup only)
+9.2: A's backup, device B on the port                              exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: device on /dev/pB (24:0a:c4:00:00:0b) is not the backed-up device
+9.2: tampered backup                                               exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: sha256sum: WARNING: 1 computed checksum did NOT match
+9.2: restore below NVS on device A                                 exit=0   PASS OK  [write_flash calls +1, pio run calls +0]
+      check: A below NVS equals the backup: yes
+      check: A NVS and LittleFS kept from after installation: yes
+9.3: A's backup, device B on the port                              exit=1   STOP OK  [write_flash calls +0, pio run calls +0]
+      last line: STOP: device on /dev/pB (24:0a:c4:00:00:0b) is not the backed-up device
+9.3: full restore on device A                                      exit=0   PASS OK  [write_flash calls +1, pio run calls +0]
+      check: A equals its original image: yes
+      check: B untouched by the refused rollbacks (equals its post-install state): yes
+      check: no command in the plan scripts runs pio run -t upload: yes
+== 29 cases, 0 unexpected
+
+# Serial monitor check (plan 0.6 block, unchanged), run from OUT=<OUT> (outside the project)
+# REPO=/home/user/morse-buddy; the port is a pseudo-terminal that sends three [RACE][HEAP] lines; Ctrl+C ends it
+## terminal output:
+--- Terminal on /dev/pts/0 | 115200 8-N-1
+--- Available filters and text transformations: debug, default, direct, esp32_exception_decoder, hexlify, log2file, nocontrol, printable, send_on_enter, time
+--- More details at https://bit.ly/pio-monitor-filters
+--- Quit: Ctrl+C | Menu: Ctrl+T | Help: Ctrl+T followed by Ctrl+H
+07:03:19.246 > [RACE][HEAP] periodic uptime_s=60 free=150000 min_since_boot=140000 largest_block=110000 (bytes, internal 8-bit)
+07:03:19.747 > [RACE][HEAP] periodic uptime_s=120 free=150000 min_since_boot=140000 largest_block=110000 (bytes, internal 8-bit)
+07:03:20.247 > [RACE][HEAP] periodic uptime_s=180 free=150000 min_since_boot=140000 largest_block=110000 (bytes, internal 8-bit)
+
+exit: 0
+## files in OUT:
+monitor-A-20261021-070313.log
+## heap lines extracted with the plan's command (tr -d '\r' < $LOGF | grep '\[RACE\]\[HEAP\]'):
+07:03:19.246 > [RACE][HEAP] periodic uptime_s=60 free=150000 min_since_boot=140000 largest_block=110000 (bytes, internal 8-bit)
+07:03:19.747 > [RACE][HEAP] periodic uptime_s=120 free=150000 min_since_boot=140000 largest_block=110000 (bytes, internal 8-bit)
+07:03:20.247 > [RACE][HEAP] periodic uptime_s=180 free=150000 min_since_boot=140000 largest_block=110000 (bytes, internal 8-bit)
+## anything written into the project? (logs/ directory, new untracked files):
+no logs/ directory
+?? host_tests/race_r3_r5/fake/esp_heap_caps.h
