@@ -209,6 +209,10 @@ namespace Storage {
 Preferences& core() { return g_corePrefs; } Preferences& solo() { return g_prefs; } Preferences& recent() { return g_prefs; } Preferences& enigma() { return g_prefs; } Preferences& race() { return g_racePrefs; } }
 uint32_t esp_random() { static uint32_t s = 0x1234567u; s = s * 1664525u + 1013904223u; return s; }
 HostSerial Serial;
+void (*g_hostSerialSink)(const char*) = nullptr;
+size_t g_fakeHeapFree = 0, g_fakeHeapMinFree = 0, g_fakeHeapLargest = 0;
+uint32_t g_fakeHeapCapsSeen = 0;
+int g_fakeHeapQueries = 0;
 static char g_scratch[2][4096];
 namespace UiScratch { char* ensure(Slot s, size_t) { return g_scratch[static_cast<int>(s)]; } }
 namespace WifiManager { uint32_t getUnixTime() { return T::unixTime; } bool isNtpSynced() { return true; } }

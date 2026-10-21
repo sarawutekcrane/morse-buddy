@@ -1,6 +1,7 @@
 #include "core/race.h"
 
 #include <Arduino.h>
+#include <esp_heap_caps.h>
 #include <string.h>
 
 #include <new>
@@ -286,6 +287,29 @@ void setRoomAvailability(bool available) {
   Presence::republishOwnPresenceAllGroups();
 }
 
+// ---- Heap diagnostics (serial only; hardware acceptance plan section 8) -----
+// One compact line per reading of the byte-addressable internal heap (the
+// capability the engine's new draws from on this board): free bytes now, the
+// lowest free bytes since boot, and the largest free block. Formatted into a
+// stack buffer (no allocation). Taken at engine allocation, on entering the
+// Room, and otherwise at most once per kHeapLogPeriodMs from the service tick;
+// never per loop or packet. Nothing about rooms, guesses or messages is logged.
+constexpr uint32_t kHeapCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+constexpr uint32_t kHeapLogPeriodMs = 60000;
+constexpr uint32_t kHeapLogMinGapMs = 5000;  // Room entries closer than this to the last reading are not logged
+uint32_t g_heapLogLastMs = 0;
+
+void logRaceHeap(const char* event) {
+  char line[160];
+  uint32_t now = millis();
+  snprintf(line, sizeof(line), "[RACE][HEAP] %s uptime_s=%lu free=%lu min_since_boot=%lu largest_block=%lu (bytes, internal 8-bit)",
+           event, static_cast<unsigned long>(now / 1000),
+           static_cast<unsigned long>(heap_caps_get_free_size(kHeapCaps)),
+           static_cast<unsigned long>(heap_caps_get_minimum_free_size(kHeapCaps)),
+           static_cast<unsigned long>(heap_caps_get_largest_free_block(kHeapCaps)));
+  Serial.println(line);
+  g_heapLogLastMs = now;
+}
 
 // =============================================================================
 // Engine platform: MQTT (PacketCodec header + publishBinary, QoS 1), the
@@ -1076,7 +1100,8 @@ void diffRow(int16_t y, const char* text, char* cache, size_t cacheSize, bool fi
   cache[cacheSize - 1] = '\0';
 }
 
-// A row's label: "> Name (You)", "Join Name's room (3)", "Leave room".
+// A row's label: "> Name (You)", "Join Name (3)" (a discovered room: its
+// coordinator and active participant count), "Leave room" (or "Leave anyway").
 // Scores are drawn right-aligned beside participant names; the label is
 // shortened so it never runs into the score.
 void formatRoomRow(uint8_t i, bool focused, char* out, size_t cap) {
@@ -1136,6 +1161,7 @@ void screenRaceRoomTick() {
     Notifications::setRaceInvitePending(false);
     g_raceRoomNeedsFullRedraw = true;
     resetRoomFocus();  // every Room visit starts on the action row
+    if (millis() - g_heapLogLastMs >= kHeapLogMinGapMs) logRaceHeap("room");
   }
 
   syncRound();
@@ -1370,12 +1396,20 @@ void handleRaceRequestPacket(const char* group_code, const char* topic, const ui
   g_engine->onPacket(group_code, topic, RaceProtocol::kKindRequest, payload, payloadLen);
 }
 
-// Allocates and boots the engine once per boot; a repeated call does nothing
-// (it neither replaces nor re-boots an existing engine). Allocation failure
-// does not abort: Race stays unavailable and its saved records untouched.
+// Allocates and boots the engine (the firmware calls this once per boot). A
+// repeated call preserves an existing engine: it neither replaces nor re-boots
+// it. Allocation failure does not abort: Race stays unavailable, its saved
+// records untouched, and a later call retries the allocation.
 void raceServiceInit() {
   if (g_engine != nullptr) return;
+  logRaceHeap("pre-alloc");
   g_engine = new (std::nothrow) RaceProtocol::Engine();
+  {
+    char event[48];
+    snprintf(event, sizeof(event), "engine-alloc-%s size=%lu", g_engine != nullptr ? "ok" : "FAILED",
+             static_cast<unsigned long>(sizeof(RaceProtocol::Engine)));
+    logRaceHeap(event);
+  }
   if (g_engine == nullptr) return;
   RaceProtocol::Platform p{nullptr,          Identity::deviceId(), platformPublish, platformGroupReady,
                            platformNvsWrite, platformNvsRead,      platformMillis,  platformRandom,
@@ -1385,6 +1419,7 @@ void raceServiceInit() {
 }
 
 void raceServiceTick() {
+  if (millis() - g_heapLogLastMs >= kHeapLogPeriodMs) logRaceHeap("periodic");
   if (g_engine == nullptr) return;
   g_engine->tick();
   syncRound();

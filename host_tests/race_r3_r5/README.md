@@ -153,6 +153,48 @@ of static DRAM, and the engine was a static global.
   - an active engine is kept even if allocation would fail.
 - Allocation failure is injected by replacing the no-throw `operator new` in
   the test binary.
+
+## Heap diagnostics (for hardware acceptance)
+
+`race.cpp` writes one serial line per heap reading:
+
+`[RACE][HEAP] <event> uptime_s=<s> free=<bytes> min_since_boot=<bytes> largest_block=<bytes> (bytes, internal 8-bit)`
+
+- The figures come from `heap_caps_get_free_size`,
+  `heap_caps_get_minimum_free_size` and `heap_caps_get_largest_free_block`
+  for `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`.
+- **Meaning of `min_since_boot`:** `heap_caps_get_minimum_free_size()` adds
+  each matching heap region's own low-water mark (ESP-IDF
+  `esp_heap_caps.h`).
+  - Regions can reach their lows at different times, so the sum can be lower
+    than the free total ever was at any one moment.
+  - It is a conservative ("worst case") indication. It is not the exact
+    minimum, and it doesn't say when the low occurred or what caused it.
+  - The label is only a name. The comment above the diagnostics in
+    `race.cpp` ("the lowest free bytes since boot") is imprecise in the same
+    way; it is left unchanged in this documentation-only revision.
+- **Events:**
+  - `pre-alloc` and `engine-alloc-ok size=N` / `engine-alloc-FAILED size=N`
+    at Race service init (`N` = `sizeof(Engine)`);
+  - `room` on entering the Room (skipped within 5 s of the last reading);
+  - `periodic` from the service tick, at most once per 60 s.
+- The line is formatted into a stack buffer and carries no room, guess,
+  credential or message data.
+- **Tests** (`room_test`):
+  - **U20:** before and after figures, with the fake heap lowered by the
+    allocation size; the exact line shape; the capability mask.
+  - **U20b:** a failed allocation logs FAILED with unchanged figures;
+    repeated init logs nothing.
+  - **U20c:** a burst of 200 packet deliveries logs nothing; 9–10 periodic
+    lines over 600 s, each at least 60 s apart.
+  - **U20d:** Room entry logs once, rate-limited to one per 5 s.
+- room_test grows from 267 to 295 checks. `mutate_room.py` adds 9 H1
+  mutations of the diagnostics. The two F7 init anchors follow the new
+  `pre-alloc` line.
+- The host fake is `fake/esp_heap_caps.h`. Serial lines are captured
+  through `g_hostSerialSink`.
+- These tests check labels, values and rate limits on the host only. They
+  are **not** a hardware heap measurement.
 - The UI suites reboot the service with a test-only helper that deletes the
   engine; the firmware never frees it.
 - Mutations: 10 new F7 mutations, all caught. Missing guards crash (null

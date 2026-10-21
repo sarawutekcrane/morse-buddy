@@ -11,7 +11,9 @@
 #include "core/menu.cpp"
 #include "core/race.cpp"
 #include <cstdio>
+#include <regex>
 #include <string>
+#include <vector>
 #include "race_fixture.h"
 
 static int g_fail = 0, g_pass = 0;
@@ -33,12 +35,22 @@ void Fx::deliverToDevice(const Fx::Msg& m) {
 // The no-throw allocation race.cpp uses for its engine: counted, and made to
 // fail on request (replaces the global nothrow operator new for this binary;
 // the throwing operator new it forwards to pairs with the default delete).
+// With g_heapModel set, a successful allocation also lowers the fake heap
+// figures (esp_heap_caps.h stub) by its size, as the target heap would.
 static bool g_failNothrowNew = false;
 static int g_nothrowNews = 0;
+static bool g_heapModel = false;
 void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
   g_nothrowNews++;
   if (g_failNothrowNew) return nullptr;
-  try { return ::operator new(n); } catch (...) { return nullptr; }
+  void* p = nullptr;
+  try { p = ::operator new(n); } catch (...) { return nullptr; }
+  if (g_heapModel) {
+    g_fakeHeapFree -= n;
+    g_fakeHeapLargest -= n;
+    if (g_fakeHeapFree < g_fakeHeapMinFree) g_fakeHeapMinFree = g_fakeHeapFree;
+  }
+  return p;
 }
 void T_initServices();
 
@@ -708,6 +720,111 @@ static void allocation() {
   CHECK(g_engine == e0, "an active engine was dropped by a repeated init");
 }
 
+// ---- heap diagnostics (serial lines from race.cpp) ---------------------------
+static std::vector<std::string> g_lines;
+static void sinkLine(const char* l) { g_lines.push_back(l); }
+struct HeapLine {
+  bool ok = false;
+  std::string event;
+  unsigned long uptime = 0, free = 0, minFree = 0, largest = 0;
+};
+// The complete line must have exactly this shape: nothing else can be logged.
+static HeapLine parseHeapLine(const std::string& l) {
+  static const std::regex re(
+      "^\\[RACE\\]\\[HEAP\\] (pre-alloc|engine-alloc-(?:ok|FAILED) size=[0-9]+|room|periodic) uptime_s=([0-9]+) "
+      "free=([0-9]+) min_since_boot=([0-9]+) largest_block=([0-9]+) \\(bytes, internal 8-bit\\)$");
+  std::smatch m;
+  HeapLine h;
+  if (l.size() >= 160 || !std::regex_match(l, m, re)) return h;
+  h.ok = true;
+  h.event = m[1];
+  h.uptime = std::stoul(m[2]); h.free = std::stoul(m[3]); h.minFree = std::stoul(m[4]); h.largest = std::stoul(m[5]);
+  return h;
+}
+static size_t countEvent(const char* ev) {
+  size_t n = 0;
+  for (auto& l : g_lines) if (parseHeapLine(l).event == ev) n++;
+  return n;
+}
+
+static void heapDiagnostics() {
+  g_test = "U20 heap diagnostics: allocation result, before/after figures, labels match the values reported";
+  g_hostSerialSink = sinkLine;
+  g_fakeHeapFree = 150000; g_fakeHeapMinFree = 140000; g_fakeHeapLargest = 110000;
+  g_fakeHeapCapsSeen = 0;
+  g_heapModel = true;
+  g_lines.clear();
+  rebootRaceService();
+  const unsigned long sz = sizeof(RaceProtocol::Engine);
+  CHECK(g_engine != nullptr && g_lines.size() == 2, "%zu lines at allocation", g_lines.size());
+  if (g_lines.size() == 2) {
+    HeapLine a = parseHeapLine(g_lines[0]), b = parseHeapLine(g_lines[1]);
+    CHECK(a.ok && a.event == "pre-alloc" && a.free == 150000 && a.minFree == 140000 && a.largest == 110000 &&
+              a.uptime == T::now / 1000,
+          "pre-alloc line: '%s'", g_lines[0].c_str());
+    CHECK(b.ok && b.event == "engine-alloc-ok size=" + std::to_string(sz) && b.free == 150000 - sz &&
+              b.minFree == 140000 && b.largest == 110000 - sz,
+          "post-alloc line: '%s'", g_lines[1].c_str());
+  }
+  CHECK(g_fakeHeapCapsSeen == (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), "capability mask 0x%x",
+        static_cast<unsigned>(g_fakeHeapCapsSeen));
+
+  g_test = "U20b allocation failure is logged as FAILED with unchanged figures; repeated init with an engine logs nothing";
+  g_lines.clear();
+  g_failNothrowNew = true;
+  rebootRaceService();
+  g_failNothrowNew = false;
+  CHECK(g_engine == nullptr && g_lines.size() == 2, "%zu lines", g_lines.size());
+  if (g_lines.size() == 2) {
+    HeapLine a = parseHeapLine(g_lines[0]), b = parseHeapLine(g_lines[1]);
+    CHECK(a.ok && b.ok && b.event == "engine-alloc-FAILED size=" + std::to_string(sz) && b.free == a.free &&
+              b.largest == a.largest && b.minFree == a.minFree,
+          "'%s' / '%s'", g_lines[0].c_str(), g_lines[1].c_str());
+  }
+  rebootRaceService();
+  CHECK(g_engine != nullptr, "engine after retry");
+  g_lines.clear();
+  for (int i = 0; i < 3; i++) raceServiceInit();
+  CHECK(g_lines.empty(), "repeated init logged %zu line(s)", g_lines.size());
+
+  g_test = "U20c periodic readings: at most one per 60 s however many loops and packets; none per packet";
+  g_heapModel = false;
+  memberOf(1);
+  CHECK(peer(0)->eng.startRound(), "peer starts a round");
+  g_lines.clear();
+  int loops0 = 0;
+  uint32_t t0 = T::now;
+  for (int i = 0; i < 200; i++) {  // a burst of inbound room states with no time passing
+    for (auto& kv : Fx::retained) Fx::deliverToDevice(kv.second);
+  }
+  CHECK(g_lines.empty(), "%zu line(s) during a packet burst", g_lines.size());
+  while (T::now - t0 < 600000) { T::now += 95; loopOnce(); loops0++; }
+  size_t periodic = countEvent("periodic");
+  CHECK(periodic >= 9 && periodic <= 10 && periodic == g_lines.size(), "%zu periodic of %zu lines over 600 s and %d loops",
+        periodic, g_lines.size(), loops0);
+  for (size_t i = 1; i < g_lines.size(); i++) {
+    HeapLine p = parseHeapLine(g_lines[i - 1]), q = parseHeapLine(g_lines[i]);
+    CHECK(p.ok && q.ok && q.uptime - p.uptime >= 60, "gap %lu s", q.uptime - p.uptime);
+  }
+
+  g_test = "U20d Room entry reading, rate-limited to one per 5 s; every line well-formed";
+  backP(); tick(2);
+  T::now += 6000;
+  g_lines.clear();
+  Menu::pushScreen(screenRaceRoom); tick(2);
+  CHECK(countEvent("room") == 1, "%zu room line(s) on entry", countEvent("room"));
+  backP(); tick(2);
+  Menu::pushScreen(screenRaceRoom); tick(2);
+  CHECK(countEvent("room") == 1, "a second Room entry within 5 s logged");
+  backP(); tick(2);
+  T::now += 5000;
+  Menu::pushScreen(screenRaceRoom); tick(2);
+  CHECK(countEvent("room") == 2, "%zu room line(s) after 5 s", countEvent("room"));
+  for (auto& l : g_lines) CHECK(parseHeapLine(l).ok, "malformed line '%s'", l.c_str());
+  backP(); tick(2);
+  g_hostSerialSink = nullptr;
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // FAIL lines survive a later crash
   Identity::init();  // the actual identity.cpp: device id from the (fake) MAC
@@ -718,6 +835,7 @@ int main() {
   sizes();
   review();
   allocation();
+  heapDiagnostics();
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }
