@@ -18,6 +18,8 @@ constexpr size_t kHeaderSize = 6;  // magic(2) + version(1) + kind(1) + payload_
 enum PacketKind : uint8_t {
   PK_MESSAGE = 1,
   PK_GAME_RESULT_CHUNK = 2,
+  // 3-7: the pre-room-protocol Race packets. No longer sent or handled;
+  // kept so the numbers are never reused for something else.
   PK_RACE_INVITE = 3,
   PK_RACE_JOIN = 4,
   PK_RACE_ROUND = 5,
@@ -27,6 +29,8 @@ enum PacketKind : uint8_t {
   PK_RADIO_BUSY_REPLY = 9,
   PK_RADIO_SESSION = 10,
   PK_RADIO_AUDIO = 11,
+  PK_RACE_STATE = 12,    // retained Race room state, r2/<coordinator> (race_protocol.h)
+  PK_RACE_REQUEST = 13,  // Race room requests and replies, r2q/<device>
 };
 
 struct Header {

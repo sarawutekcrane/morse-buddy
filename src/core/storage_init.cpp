@@ -16,6 +16,7 @@ Preferences g_recent;
 Preferences g_enigma;
 Preferences g_notify;
 Preferences g_solo;
+Preferences g_race;
 
 constexpr const char* kPartitionLabel = "littlefs";  // matches partitions.csv Name column
 
@@ -78,6 +79,7 @@ void init() {
   g_enigma.begin("mb_enigma", false);
   g_notify.begin("mb_notify", false);
   g_solo.begin("mb_solo", false);
+  g_race.begin("mb_race", false);
 }
 
 Preferences& core() { return g_core; }
@@ -87,6 +89,7 @@ Preferences& recent() { return g_recent; }
 Preferences& enigma() { return g_enigma; }
 Preferences& notify() { return g_notify; }
 Preferences& solo() { return g_solo; }
+Preferences& race() { return g_race; }
 
 void removeGroupDirectoryIfPresent(const char* group_code) {
   // Hardware Diagnostic #4.9k: this function deletes message files/

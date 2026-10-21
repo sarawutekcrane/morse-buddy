@@ -24,7 +24,7 @@ namespace MqttManager {
 
 namespace {
 
-// Fix Phase 1C: explicit per-group setup stage, so a group's 13-subscribe
+// Fix Phase 1C: explicit per-group setup stage, so a group's 10-subscribe
 // sequence can be spread across many ticks (one topic per eligible turn)
 // instead of run to completion inside one blocking connectGroupIfNeeded()
 // call. kNeedConnect is both the initial state and the state every
@@ -33,7 +33,7 @@ namespace {
 enum class SetupStage : uint8_t {
   kNeedConnect,       // not connected; next eligible operation is connect()
   kSubscribing,       // connected; subscribeCursor names the next topic to subscribe
-  kNeedPublishOnline, // all 13 subscriptions succeeded; next op is the ONLINE publish
+  kNeedPublishOnline, // all 10 subscriptions succeeded; next op is the ONLINE publish
   kDone,              // fully Ready (see GroupClient::ready)
 };
 
@@ -443,9 +443,10 @@ void buildClientId(const char* group_code, char* outBuf, size_t outBufSize) {
   snprintf(outBuf, outBufSize, "%s_%08lX", Identity::deviceId(), static_cast<unsigned long>(crc));
 }
 
-// Fix Phase 1C: the 13-topic list, in the SAME order and with the SAME QoS
+// Fix Phase 1C: the topic list (10 since the Race room protocol replaced the
+// five race/* topics with r2/+ and r2q/<own id>; otherwise the same order and QoS
 // as before this candidate -- only WHEN each is attempted changes (staged,
-// one per eligible tick, via doSubscribeOperation() below, not all 13
+// one per eligible tick, via doSubscribeOperation() below, not all 10
 // back-to-back inside one blocking call). Built once (Identity::deviceId()
 // is immutable for the device's lifetime after Identity::init()) rather
 // than reconstructed on every subscribe operation.
@@ -453,7 +454,10 @@ struct TopicSpec {
   char suffix[32];
   int qos;
 };
-constexpr size_t kTopicCount = 13;
+// Race rooms (design r8 section 3): the five old race/* topics are replaced by
+// r2/+ (retained room states) and r2q/<own id> (requests and replies), so the
+// list is 10 topics.
+constexpr size_t kTopicCount = 10;
 const TopicSpec* getTopicSpecs() {
   static TopicSpec specs[kTopicCount];
   static bool built = false;
@@ -484,6 +488,8 @@ const TopicSpec* getTopicSpecs() {
     snprintf(busySuffix, sizeof(busySuffix), "radio/busy/%s", dev);
     char busyReplySuffix[32];
     snprintf(busyReplySuffix, sizeof(busyReplySuffix), "radio/busy_reply/%s", dev);
+    char raceSuffix[24];
+    snprintf(raceSuffix, sizeof(raceSuffix), "r2q/%s", dev);
     char audioSuffix[24];
     snprintf(audioSuffix, sizeof(audioSuffix), "radio/audio/%s", dev);  // truncated by 1 byte, reproduced as-is
 
@@ -493,33 +499,27 @@ const TopicSpec* getTopicSpecs() {
     specs[1].qos = 1;
     snprintf(specs[2].suffix, sizeof(specs[2].suffix), "broadcast");
     specs[2].qos = 1;
-    snprintf(specs[3].suffix, sizeof(specs[3].suffix), "race/invite");
+    snprintf(specs[3].suffix, sizeof(specs[3].suffix), "r2/+");
     specs[3].qos = 1;
-    snprintf(specs[4].suffix, sizeof(specs[4].suffix), "race/join");
+    snprintf(specs[4].suffix, sizeof(specs[4].suffix), "%s", raceSuffix);
     specs[4].qos = 1;
-    snprintf(specs[5].suffix, sizeof(specs[5].suffix), "race/round");
-    specs[5].qos = 1;
-    snprintf(specs[6].suffix, sizeof(specs[6].suffix), "race/solved");
-    specs[6].qos = 1;
-    snprintf(specs[7].suffix, sizeof(specs[7].suffix), "race/reset");
-    specs[7].qos = 1;
-    snprintf(specs[8].suffix, sizeof(specs[8].suffix), "%s", busySuffix);
+    snprintf(specs[5].suffix, sizeof(specs[5].suffix), "%s", busySuffix);
+    specs[5].qos = 0;
+    snprintf(specs[6].suffix, sizeof(specs[6].suffix), "%s", busyReplySuffix);
+    specs[6].qos = 0;
+    snprintf(specs[7].suffix, sizeof(specs[7].suffix), "radio/session");
+    specs[7].qos = 0;
+    snprintf(specs[8].suffix, sizeof(specs[8].suffix), "%s", audioSuffix);
     specs[8].qos = 0;
-    snprintf(specs[9].suffix, sizeof(specs[9].suffix), "%s", busyReplySuffix);
+    snprintf(specs[9].suffix, sizeof(specs[9].suffix), "radio/audio/broadcast");
     specs[9].qos = 0;
-    snprintf(specs[10].suffix, sizeof(specs[10].suffix), "radio/session");
-    specs[10].qos = 0;
-    snprintf(specs[11].suffix, sizeof(specs[11].suffix), "%s", audioSuffix);
-    specs[11].qos = 0;
-    snprintf(specs[12].suffix, sizeof(specs[12].suffix), "radio/audio/broadcast");
-    specs[12].qos = 0;
     built = true;
   }
   return specs;
 }
 
 // Fix Phase 1C: single place every UNFINISHED-setup failure (connect fails;
-// any one of the 13 subscribes fails; publishOnline() returns false or the
+// any one of the 10 subscribes fails; publishOnline() returns false or the
 // connection is no longer up afterward) funnels through. Closes the same
 // gap Hardware Fix #4.9f's cooldown logic closed for the old atomic
 // connectGroupIfNeeded() -- explicitly disconnect()s if the transport is
@@ -603,7 +603,7 @@ void doConnectOperation(GroupClient& gc) {
 // One subscribe per eligible turn, at gc.subscribeCursor. Stops the whole
 // attempt at the first failure (Hardware Fix #4.9f Part B's behavior,
 // unchanged) via handleSetupFailure(); on success, advances the cursor and
-// transitions to kNeedPublishOnline once all 13 have succeeded.
+// transitions to kNeedPublishOnline once all 10 have succeeded.
 void doSubscribeOperation(GroupClient& gc) {
   const TopicSpec* specs = getTopicSpecs();
   const TopicSpec& spec = specs[gc.subscribeCursor];
@@ -1119,7 +1119,7 @@ Registrar g_registrar;
 
 // TRANSPORT-ONLY: true the instant the underlying MQTT connection is up,
 // which (as of Fix Phase 1C's staged setup) can be BEFORE this device's own
-// 13 subscriptions or its ONLINE presence publish have necessarily
+// 10 subscriptions or its ONLINE presence publish have necessarily
 // completed. Meaning UNCHANGED by this candidate -- every existing caller
 // (Outbox flush eligibility, chat/game/race send-gates, group-deletion
 // cleanup) was already written to treat "connected" as "safe to attempt a
@@ -1140,7 +1140,7 @@ bool isAnyGroupConnected() {
   return false;
 }
 
-// Fix Phase 1C, additive: true only once transport is connected AND all 13
+// Fix Phase 1C, additive: true only once transport is connected AND all 10
 // subscriptions succeeded AND Presence::publishOnline() itself returned
 // true with the connection still live afterward (see
 // doPublishOnlineOperation()). This is a STRICTLY STRONGER, separate
@@ -1161,21 +1161,17 @@ bool isAnyGroupConnected() {
 // redundant/out-of-order ONLINE announcement racing the staged setup
 // engine's own single publishOnline() step for the same group). Every
 // other publishRaw()/publishBinary() caller audited for this candidate
-// (chat/game sends, Outbox flush, the race/round retained-clear, and
-// Race's Join/Solved/Reset publishes) does NOT need it -- those really are
+// (chat/game sends, Outbox flush) does NOT need it -- those really are
 // bare outbound publishes with no dependency on this device's own
 // subscriptions, so isGroupConnected() remains sufficient and correct for
 // them, unchanged.
 //
-// Race's Invite and Start Round are the one documented exception (see
-// publishInvite()/publishStartRound() in race.cpp): each anticipates a
-// reply (JOIN, SOLVED respectively) on this device's own subscription. As
-// of round 4, the user ACTION that would trigger either is gated on
-// isGroupReady() at its sole call site (race.cpp's handleRoomAction()),
-// before publishInvite()/publishStartRound() are even entered -- not by
-// passing isGroupReady() into publishRaw()/publishBinary() themselves,
-// which still gate on isGroupConnected() only, exactly like every other
-// caller here.
+// Race rooms are the other documented user (see roomReady() in race.cpp):
+// every room action anticipates the room state or a reply on this device's
+// own r2/+ and r2q/<own id> subscriptions, so the user ACTION is gated on
+// isGroupReady() before the room engine sends anything; the engine itself
+// also waits for isGroupReady() before resending. publishRaw()/
+// publishBinary() themselves still gate on isGroupConnected() only.
 // Fix Phase 1C (corrected): explicitly checks WifiManager::isConnected()
 // first. While WiFi is down, serviceTick() returns immediately (see
 // serviceTick()'s own early return) and never runs the WiFi-recovery

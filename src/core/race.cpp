@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include <new>
+
 #include "core/display.h"
 #include "core/hooks.h"
 #include "core/identity.h"
@@ -14,11 +16,14 @@
 #include "core/number_guessing.h"
 #include "core/packet_codec.h"
 #include "core/presence.h"
+#include "core/race_protocol.h"
 #include "core/radio_audio.h"
 #include "core/radio_transport.h"
 #include "core/settings.h"
 #include "core/sleep.h"
 #include "core/sound_facade.h"
+#include "core/storage_init.h"
+#include "core/wifi_manager.h"
 
 namespace {
 
@@ -35,21 +40,31 @@ void screenRaceGuess();
 void enterGuessScreen();
 void stopRoomPtt();
 void invalidateGuessOutcome();
+bool isRoundActive();
+void setGuessNotice(const char* text);
+
 
 // =============================================================================
-// Room / round state (Phase 4 sections 11-18)
+// Room state (design r8): the room itself -- membership, rounds, scores, the
+// start right -- lives in the RaceProtocol engine (race_protocol.h), which
+// this file drives and renders. Nothing here decides room state.
 // =============================================================================
-enum class RoomPhase : uint8_t { NO_LOBBY, LOBBY_WAITING, ROUND_ACTIVE };
-RoomPhase g_phase = RoomPhase::NO_LOBBY;
-char g_groupCode[33] = {0};
-char g_inviteId[kIdLen] = {0};
-char g_roundId[kIdLen] = {0};
-char g_ownerDeviceId[kDeviceIdLen] = {0};
+// Allocated once, at service init, for the device's lifetime (not static:
+// static DRAM has no room for it). nullptr if that allocation failed: Race is
+// then unavailable for this boot, every path below checks for it, and the
+// saved Race records are neither read nor written.
+RaceProtocol::Engine* g_engine = nullptr;
+char g_groupCode[33] = {0};  // the group whose Room is being viewed
+// Key of the round the Guess screen, its history and its outcome belong to
+// ("<C>/<nonce>/<roundStart>"; empty = no live round), and that round's
+// secret, kept after it ends for the "Solved by X: 1234" outcome.
+constexpr size_t kRoundKeyLen = 40;
+char g_roundId[kRoundKeyLen] = {0};
 uint8_t g_secret[4] = {0};
-bool g_haveJoined = false;
-bool g_hasHadFirstRound = false;
+uint32_t g_roundStart = 0;
 bool g_isRoomScreenActive = false;
 bool g_pendingAutoEnterGuess = false;
+
 
 // Fix Phase 1C (round 4): transient status shown on the Room screen's
 // action-label row when a user's Invite/Start Round press is refused for
@@ -116,10 +131,10 @@ bool beforeDeadline(uint32_t nowMs, uint32_t untilMs) { return static_cast<int32
 //    serialized producer through FIFO queues, so popped Shorts arrive in
 //    non-decreasing release order (see text_message.cpp's SendWindow
 //    comment for the full audit).
-//  - Deliberately NOT closed by a packet-driven reset (RESET / owner
-//    offline): the window only drops Shorts released before its end, so it
-//    cannot swallow any press made in the new context, while clearing it
-//    would let a stale Short trigger Invite in the reset room.
+//  - Deliberately NOT closed by a room-state-driven change (a round ending,
+//    the room closing): the window only drops Shorts released before its
+//    end, so it cannot swallow any press made in the new context, while
+//    clearing it would let a stale Short trigger Invite in the changed room.
 // Only ENCODER_SHORT is affected; Back, rotation and DOT/Morse input are
 // untouched. Residual (as in 2B): a genuinely later press ~49.7 days after
 // start can alias into the interval; that one press is dropped.
@@ -193,7 +208,7 @@ struct RaceGuessEntry {
 constexpr uint8_t kRaceHistoryCap = 8;
 RaceGuessEntry g_raceHistory[kRaceHistoryCap];  // oldest first
 uint8_t g_raceHistoryCount = 0;
-char g_raceHistoryRoundId[kIdLen] = {0};
+char g_raceHistoryRoundId[kRoundKeyLen] = {0};
 // Bumped on every append/clear so the Guess screen can tell "history
 // changed" apart from a plain digit-entry change (Solo uses historyCount
 // for this, which stops changing once this bounded buffer is full).
@@ -224,9 +239,9 @@ void appendRaceGuess(const uint8_t digits[NumberGuessing::kSecretDigits], Number
 }
 
 // Phase 2A (D1): local-only "Solved! 4A0B" acknowledgement shown on the
-// Room's score row after this device's own correct guess. It states the
-// local evaluation result only -- NOT that the SOLVED packet reached the
-// broker or any peer (publishBinary()'s result is still discarded).
+// Room's status row after this device's own correct guess. It states the
+// local evaluation result only -- the confirmed result arrives with the
+// room state (a member's claim may still lose to an earlier one).
 uint32_t g_roomSolvedNoticeUntilMs = 0;
 bool g_roomSolvedNoticeActive = false;
 
@@ -235,15 +250,24 @@ void clearRoomSolvedNotice() {
   g_roomSolvedNoticeUntilMs = 0;
 }
 
-constexpr uint8_t kMaxParticipants = 20;
-char g_participants[kMaxParticipants][kDeviceIdLen];
+
+// Rows below the Room's status row, rebuilt from the engine every tick:
+// the room's ACTIVE participants (with scores) and a "Leave room" row while
+// in a room; otherwise the rooms discovered in this group (Short = Join)
+// followed by the last room's final scores, if any.
+enum class RoomRowKind : uint8_t { PARTICIPANT, DISCOVERED, LEAVE, FINAL };
+constexpr uint8_t kMaxParticipants = RaceProtocol::kMaxEntries + RaceProtocol::kMaxDiscovered + 1;
+char g_participants[kMaxParticipants][kDeviceIdLen];  // row ids (device / coordinator id, "#leave")
+RoomRowKind g_rowKind[kMaxParticipants];
+uint16_t g_rowScore[kMaxParticipants];
 uint8_t g_participantCount = 0;
+const char* const kLeaveRowId = "#leave";
 
 // Room participant list focus/scroll. Rotation moves the focus from the
-// action row (g_roomFocusId empty) down through the participants; the
-// focused participant is tracked by device id so it stays put when others
-// join, and is clamped to a neighbor if it is no longer listed. Only the
-// focus moves: no participant row has an action of its own.
+// action row (g_roomFocusId empty) down through the rows; the focused row
+// is tracked by its id so it stays put when others join, and is clamped to
+// a neighbor if it is no longer listed. A Short on a participant only
+// returns the focus to the action row; discovered-room and Leave rows act.
 char g_roomFocusId[kDeviceIdLen] = {0};
 uint8_t g_roomFocusIndex = 0;  // last resolved index of g_roomFocusId (clamp target)
 uint8_t g_roomListTop = 0;     // first participant shown
@@ -254,83 +278,6 @@ void resetRoomFocus() {
   g_roomListTop = 0;
 }
 
-// Returns the focused participant's index, or -1 for the action row.
-int16_t resolveRoomFocus() {
-  if (g_roomFocusId[0] == '\0') return -1;
-  for (uint8_t i = 0; i < g_participantCount; i++) {
-    if (strcmp(g_participants[i], g_roomFocusId) == 0) {
-      g_roomFocusIndex = i;
-      return i;
-    }
-  }
-  if (g_participantCount == 0) {
-    resetRoomFocus();
-    return -1;
-  }
-  uint8_t i = (g_roomFocusIndex < g_participantCount) ? g_roomFocusIndex : static_cast<uint8_t>(g_participantCount - 1);
-  strncpy(g_roomFocusId, g_participants[i], kDeviceIdLen - 1);
-  g_roomFocusId[kDeviceIdLen - 1] = '\0';
-  g_roomFocusIndex = i;
-  return i;
-}
-
-// One detent: +1 moves down (towards later participants), -1 up towards the
-// action row. No wraparound.
-void moveRoomFocus(int8_t delta) {
-  int16_t next = static_cast<int16_t>(resolveRoomFocus() + (delta > 0 ? 1 : -1));
-  if (next >= static_cast<int16_t>(g_participantCount)) next = static_cast<int16_t>(g_participantCount) - 1;
-  if (next < 0) {
-    g_roomFocusId[0] = '\0';
-    return;
-  }
-  strncpy(g_roomFocusId, g_participants[next], kDeviceIdLen - 1);
-  g_roomFocusId[kDeviceIdLen - 1] = '\0';
-  g_roomFocusIndex = static_cast<uint8_t>(next);
-}
-
-
-void addParticipant(const char* deviceId) {
-  for (uint8_t i = 0; i < g_participantCount; i++) {
-    if (strcmp(g_participants[i], deviceId) == 0) return;
-  }
-  if (g_participantCount < kMaxParticipants) {
-    strncpy(g_participants[g_participantCount], deviceId, kDeviceIdLen - 1);
-    g_participants[g_participantCount][kDeviceIdLen - 1] = '\0';
-    g_participantCount++;
-  }
-}
-
-// ---- Scores: local RAM only (Phase 4 section 16) ---------------------------
-struct ScoreEntry {
-  char device_id[kDeviceIdLen];
-  uint16_t score;
-};
-constexpr uint8_t kMaxScoreEntries = 20;
-ScoreEntry g_scores[kMaxScoreEntries];
-uint8_t g_scoreCount = 0;
-
-ScoreEntry* findOrCreateScoreEntry(const char* deviceId) {
-  for (uint8_t i = 0; i < g_scoreCount; i++) {
-    if (strcmp(g_scores[i].device_id, deviceId) == 0) return &g_scores[i];
-  }
-  if (g_scoreCount < kMaxScoreEntries) {
-    strncpy(g_scores[g_scoreCount].device_id, deviceId, kDeviceIdLen - 1);
-    g_scores[g_scoreCount].device_id[kDeviceIdLen - 1] = '\0';
-    g_scores[g_scoreCount].score = 0;
-    return &g_scores[g_scoreCount++];
-  }
-  return nullptr;
-}
-void incrementScore(const char* deviceId) {
-  ScoreEntry* e = findOrCreateScoreEntry(deviceId);
-  if (e != nullptr) e->score++;
-}
-uint16_t getScore(const char* deviceId) {
-  for (uint8_t i = 0; i < g_scoreCount; i++) {
-    if (strcmp(g_scores[i].device_id, deviceId) == 0) return g_scores[i].score;
-  }
-  return 0;
-}
 
 // ---- Availability helper (Phase 4 section 10) ------------------------------
 void setRoomAvailability(bool available) {
@@ -339,347 +286,77 @@ void setRoomAvailability(bool available) {
   Presence::republishOwnPresenceAllGroups();
 }
 
-// =============================================================================
-// Wire codecs — no numeric fields beyond the raw 4-byte secret, so no
-// endianness helpers are needed here.
-// =============================================================================
-size_t buildInvitePayload(const char* inviteId, const char* initiatorId, uint8_t* out, size_t cap) {
-  size_t need = kIdLen + kDeviceIdLen;
-  if (cap < need) return 0;
-  memset(out, 0, kIdLen);
-  strncpy(reinterpret_cast<char*>(out), inviteId, kIdLen - 1);
-  memset(out + kIdLen, 0, kDeviceIdLen);
-  strncpy(reinterpret_cast<char*>(out + kIdLen), initiatorId, kDeviceIdLen - 1);
-  return need;
-}
-bool parseInvitePayload(const uint8_t* data, uint16_t len, char* outInviteId, char* outInitiatorId) {
-  if (data == nullptr || len < kIdLen + kDeviceIdLen) return false;
-  memcpy(outInviteId, data, kIdLen);
-  outInviteId[kIdLen - 1] = '\0';
-  memcpy(outInitiatorId, data + kIdLen, kDeviceIdLen);
-  outInitiatorId[kDeviceIdLen - 1] = '\0';
-  return true;
-}
-
-size_t buildJoinPayload(const char* inviteId, const char* deviceId, uint8_t* out, size_t cap) {
-  size_t need = kIdLen + kDeviceIdLen;
-  if (cap < need) return 0;
-  memset(out, 0, kIdLen);
-  strncpy(reinterpret_cast<char*>(out), inviteId, kIdLen - 1);
-  memset(out + kIdLen, 0, kDeviceIdLen);
-  strncpy(reinterpret_cast<char*>(out + kIdLen), deviceId, kDeviceIdLen - 1);
-  return need;
-}
-bool parseJoinPayload(const uint8_t* data, uint16_t len, char* outInviteId, char* outDeviceId) {
-  if (data == nullptr || len < kIdLen + kDeviceIdLen) return false;
-  memcpy(outInviteId, data, kIdLen);
-  outInviteId[kIdLen - 1] = '\0';
-  memcpy(outDeviceId, data + kIdLen, kDeviceIdLen);
-  outDeviceId[kDeviceIdLen - 1] = '\0';
-  return true;
-}
-
-size_t buildRoundPayload(const char* inviteId, const char* roundId, const char* starterId, const uint8_t secret[4],
-                         uint8_t* out, size_t cap) {
-  size_t need = kIdLen + kIdLen + kDeviceIdLen + 4;
-  if (cap < need) return 0;
-  size_t pos = 0;
-  memset(out + pos, 0, kIdLen);
-  strncpy(reinterpret_cast<char*>(out + pos), inviteId, kIdLen - 1);
-  pos += kIdLen;
-  memset(out + pos, 0, kIdLen);
-  strncpy(reinterpret_cast<char*>(out + pos), roundId, kIdLen - 1);
-  pos += kIdLen;
-  memset(out + pos, 0, kDeviceIdLen);
-  strncpy(reinterpret_cast<char*>(out + pos), starterId, kDeviceIdLen - 1);
-  pos += kDeviceIdLen;
-  memcpy(out + pos, secret, 4);
-  pos += 4;
-  return pos;
-}
-bool parseRoundPayload(const uint8_t* data, uint16_t len, char* outInviteId, char* outRoundId, char* outStarterId,
-                       uint8_t outSecret[4]) {
-  size_t need = kIdLen + kIdLen + kDeviceIdLen + 4;
-  if (data == nullptr || len < need) return false;
-  size_t pos = 0;
-  memcpy(outInviteId, data + pos, kIdLen);
-  outInviteId[kIdLen - 1] = '\0';
-  pos += kIdLen;
-  memcpy(outRoundId, data + pos, kIdLen);
-  outRoundId[kIdLen - 1] = '\0';
-  pos += kIdLen;
-  memcpy(outStarterId, data + pos, kDeviceIdLen);
-  outStarterId[kDeviceIdLen - 1] = '\0';
-  pos += kDeviceIdLen;
-  memcpy(outSecret, data + pos, 4);
-  return true;
-}
-
-size_t buildSolvedPayload(const char* roundId, const char* winnerId, uint8_t* out, size_t cap) {
-  size_t need = kIdLen + kDeviceIdLen;
-  if (cap < need) return 0;
-  memset(out, 0, kIdLen);
-  strncpy(reinterpret_cast<char*>(out), roundId, kIdLen - 1);
-  memset(out + kIdLen, 0, kDeviceIdLen);
-  strncpy(reinterpret_cast<char*>(out + kIdLen), winnerId, kDeviceIdLen - 1);
-  return need;
-}
-bool parseSolvedPayload(const uint8_t* data, uint16_t len, char* outRoundId, char* outWinnerId) {
-  if (data == nullptr || len < kIdLen + kDeviceIdLen) return false;
-  memcpy(outRoundId, data, kIdLen);
-  outRoundId[kIdLen - 1] = '\0';
-  memcpy(outWinnerId, data + kIdLen, kDeviceIdLen);
-  outWinnerId[kDeviceIdLen - 1] = '\0';
-  return true;
-}
-
-// Fix Phase 1C (corrected): publishBinary()'s bool is discarded here for
-// every caller, unchanged from before this candidate -- an earlier revision
-// of this candidate added a guarded/retried special case for the
-// "race/round" retained clear in onLocalSolve(); that mechanism has been
-// REMOVED (a delayed, unconditional retained clear can overwrite a newer
-// round a PEER has since published -- a roundId-bearing payload does not
-// fully solve this either, since the clear publish still overwrites the
-// broker's retained value for any later subscriber regardless of whether
-// currently-online peers reject it locally) and is not reintroduced here.
-//
-// This means the following are OPEN, UNRESOLVED issues, not accepted
-// limitations and not "safe" by design:
-//  - publishStartRound()'s retained "race/round" publish (via this
-//    function) can silently fail to reach the broker if not connected,
-//    leaving a newcomer with no retained round to adopt.
-//  - onLocalSolve()'s retained clear (below, NOT via this function -- it
-//    calls MqttManager::publishRaw() directly, unconditionally, exactly as
-//    before this candidate) can equally silently fail, leaving a *finished*
-//    round's payload retained indefinitely; a later newcomer's
-//    handleRaceRoundPacket() has no way to distinguish that from a real
-//    still-active round.
-// Neither failure mode is new, and neither is fixed by this candidate.
-//
-// Does staged MQTT setup make either of these WORSE? Every call through
-// this function (and onLocalSolve()'s direct publishRaw() call) still gates
-// purely on transport (MqttManager::isGroupConnected(), unchanged in
-// meaning and evaluated the same way pre- and post-candidate) -- staged
-// setup does not add a new failure trigger to whether a Race publish goes
-// out. The one genuine difference: under the OLD atomic connectGroupIfNeeded(),
-// once a group's transport reported connected(), its 13 subscriptions had
-// (by construction) already finished too, synchronously, before anything
-// else could run -- under staged setup, "connected" can now be observed
-// true for a stretch of wall-clock time while subscriptions are still
-// incomplete. This function's own gating is unaffected either way: every
-// call through it stays on isGroupConnected() only, exactly as before.
-// Two of its callers (Invite, Start Round) DO depend on this device's own
-// subscriptions being live to see their expected reply -- that dependency
-// is not handled here, in this send-only function, but one layer up, at
-// the user-action gate in handleRoomAction() (see publishInvite()'s and
-// publishStartRound()'s own comments below). Every other caller through
-// this function (Join, Solved, Reset) really is send-only with no such
-// dependency. What CAN change here is the total wall-clock time a Race
-// group's transport takes to reconnect after a drop when it is competing
-// with OTHER groups for the shared one-operation-per-tick setup budget
-// (see mqtt_manager.cpp's serviceTick()) -- previously, one group's ENTIRE
-// atomic reconnect finished within the single tick it was picked;
-// under staged setup, several simultaneously-reconnecting groups now share
-// that budget round-robin, so any one of them (Race's group included) can
-// take longer in aggregate to become connected again. That widens the
-// EXISTING window during which a Race publish silently fails for being
-// disconnected -- it does not create a new kind of failure.
-//
-// Race/radio integration is NOT claimed complete by this candidate.
-// Phase 2C-1: now returns publishBinary()'s result (false also if the
-// packet could not be encoded) so Invite/Start/Join can report an
-// unconfirmed outcome locally. false means "not confirmed by this device"
-// (not connected, or no PUBACK) -- not proof the broker/peers got nothing.
-// Callers that ignored it before still ignore it; no retry anywhere.
-bool publishRacePacket(uint8_t kind, const uint8_t* payload, size_t payloadLen, const char* topicSuffix,
-                       bool retained) {
-  uint8_t wireBuf[PacketCodec::kHeaderSize + 96];
-  if (payloadLen + PacketCodec::kHeaderSize > sizeof(wireBuf)) return false;
-  if (!PacketCodec::encodeHeader(kind, static_cast<uint16_t>(payloadLen), wireBuf, sizeof(wireBuf))) return false;
-  memcpy(wireBuf + PacketCodec::kHeaderSize, payload, payloadLen);
-  return MqttManager::publishBinary(g_groupCode, topicSuffix, wireBuf,
-                                    static_cast<uint16_t>(PacketCodec::kHeaderSize + payloadLen), retained, 1);
-}
 
 // =============================================================================
-// Lobby/round actions
+// Engine platform: MQTT (PacketCodec header + publishBinary, QoS 1), the
+// mb_race NVS namespace, esp_random(), Identity's persistent counter.
 // =============================================================================
-void applyReset() {
-  g_phase = RoomPhase::NO_LOBBY;
-  g_inviteId[0] = '\0';
-  g_roundId[0] = '\0';
-  g_ownerDeviceId[0] = '\0';
-  g_haveJoined = false;
-  g_hasHadFirstRound = false;
-  g_participantCount = 0;
-  resetRoomFocus();
-  Notifications::setRaceInvitePending(false);
-  // Fix Phase 1C (round 4 correction): applyReset() is the shared reset
-  // point for leaving Race Mode (leaveRaceMode()) and for the
-  // owner-went-offline reset (checkOwnerOnline()) -- a refusal notice from
-  // before either of those must not survive into whatever this room's
-  // state becomes next.
-  clearRoomActionStatus();
-  // Phase 2A: same reasoning for this round's guess history, any
-  // pending "Solved!" notice, and any pending/visible Guess outcome.
-  clearRaceGuessHistory();
-  clearRoomSolvedNotice();
-  invalidateGuessOutcome();
+bool platformPublish(void*, const char* group, const char* suffix, uint8_t kind, const uint8_t* payload, uint16_t len,
+                     bool retained) {
+  uint8_t wire[PacketCodec::kHeaderSize + RaceProtocol::kStateMaxBytes];  // 6 + 538
+  if (len > RaceProtocol::kStateMaxBytes) return false;
+  if (!PacketCodec::encodeHeader(kind, len, wire, sizeof(wire))) return false;
+  memcpy(wire + PacketCodec::kHeaderSize, payload, len);
+  return MqttManager::publishBinary(group, suffix, wire, static_cast<uint16_t>(PacketCodec::kHeaderSize + len),
+                                    retained, 1);
+}
+bool platformGroupReady(void*, const char* group) { return MqttManager::isGroupReady(group); }
+bool platformNvsWrite(void*, const char* key, const void* data, size_t len) {
+  return Storage::race().putBytes(key, data, len) == len;
+}
+size_t platformNvsRead(void*, const char* key, void* buf, size_t cap) {
+  if (!Storage::race().isKey(key)) return 0;
+  return Storage::race().getBytes(key, buf, cap);
+}
+uint32_t platformMillis(void*) { return millis(); }
+uint32_t platformRandom(void*) { return esp_random(); }
+bool platformNextSeq(void*, uint32_t* out) { return Identity::reserveCounter(out); }
+uint32_t platformUnixTime(void*) { return WifiManager::getUnixTime(); }
+
+bool isSelf(const char* id) { return strcmp(id, Identity::deviceId()) == 0; }
+
+// The engine's room is the one shown when it belongs to the viewed group.
+const RaceProtocol::RoomState* shownRoom() {
+  if (g_engine == nullptr) return nullptr;
+  if (!g_engine->hasRoom() || strcmp(g_engine->roomGroup(), g_groupCode) != 0) return nullptr;
+  return g_engine->view();
 }
 
-void publishReset() {
-  uint8_t payload[kIdLen];
-  memset(payload, 0, sizeof(payload));
-  strncpy(reinterpret_cast<char*>(payload), g_inviteId, kIdLen - 1);
-  publishRacePacket(PacketCodec::PK_RACE_RESET, payload, sizeof(payload), "race/reset", false);
-}
-
-// Fix Phase 1C (re-audited per review point 6): this is NOT a pure
-// send-only action, and classifying it as one would be wrong -- inviting
-// implicitly anticipates receiving PK_RACE_JOIN replies (race/join, one of
-// the 13 subscribed topics) from whoever accepts, on THIS device's own
-// subscription. If that subscription is not yet active when a peer's JOIN
-// is sent (this device's group still mid-staged-setup -- a real
-// possibility precisely because "just entered Race Mode and pressed
-// Invite" is one of the more likely moments for a group to still be
-// reconnecting, e.g. right after a WiFi drop or app cold-boot), plain MQTT
-// does not retroactively deliver a message published before the matching
-// subscribe() took effect -- that JOIN is lost, not delayed, and this
-// device would never learn that peer tried to join.
-//
-// Fix Phase 1C (round 4 correction): the risk above, AT THE MOMENT OF THIS
-// DEVICE'S OWN INVITE PRESS, is now closed -- handleRoomAction() (see its
-// own comment) only enters this function once
-// MqttManager::isGroupReady(g_groupCode) is true, meaning this device's
-// race/join subscription is confirmed already active, checked
-// synchronously immediately before this call with no tick boundary in
-// between where it could regress. This is a real gate, not a retry: a
-// press while not yet Ready is refused with a visible status (see
-// handleRoomAction()), never silently discarded and never auto-resent.
-//
-// What remains open: once Invite succeeds and this device sits in
-// LOBBY_WAITING waiting for a peer's JOIN, a LATER loss of this device's
-// own subscription (e.g. a WiFi drop well after the press) is not covered
-// by a one-time, press-time gate -- a JOIN arriving during that later
-// window is still lost the same way described above. Fixing that would
-// mean either continuously polling own-readiness for the whole waiting
-// period or a retry/resend protocol on the JOIN side, both out of this
-// round's scope. publishStartRound() below has the analogous dependency
-// and the same residual limitation.
-bool publishInvite() {
-  char inviteId[kIdLen];
-  Identity::nextId(inviteId, sizeof(inviteId));
-  strncpy(g_inviteId, inviteId, sizeof(g_inviteId) - 1);
-  strncpy(g_ownerDeviceId, Identity::deviceId(), sizeof(g_ownerDeviceId) - 1);
-  g_haveJoined = true;
-  g_hasHadFirstRound = false;
-  g_phase = RoomPhase::LOBBY_WAITING;
-  g_participantCount = 0;
-  resetRoomFocus();
-  addParticipant(Identity::deviceId());
-
-  uint8_t payload[kIdLen + kDeviceIdLen];
-  size_t len = buildInvitePayload(g_inviteId, Identity::deviceId(), payload, sizeof(payload));
-  return len > 0 && publishRacePacket(PacketCodec::PK_RACE_INVITE, payload, len, "race/invite", false);
-}
-
-bool publishJoin() {
-  g_haveJoined = true;
-  addParticipant(Identity::deviceId());
-  uint8_t payload[kIdLen + kDeviceIdLen];
-  size_t len = buildJoinPayload(g_inviteId, Identity::deviceId(), payload, sizeof(payload));
-  return len > 0 && publishRacePacket(PacketCodec::PK_RACE_JOIN, payload, len, "race/join", false);
-}
-
-void generateRaceSecret(uint8_t out[4]) {
-  bool used[10] = {false};
-  for (int i = 0; i < 4; i++) {
-    int d;
-    do {
-      d = static_cast<int>(random(10));
-    } while (used[d]);
-    used[d] = true;
-    out[i] = static_cast<uint8_t>(d);
+void roundKeyOf(const RaceProtocol::RoomState* v, char* out, size_t cap) {
+  if (v == nullptr || v->phase != RaceProtocol::PHASE_ROUND) {
+    out[0] = '\0';
+    return;
   }
-}
-
-// Fix Phase 1C (round 4 correction): same class of dependency as
-// publishInvite() above -- starting a round anticipates seeing a
-// PK_RACE_SOLVED from whichever participant solves it first, on this
-// device's own race/solved subscription -- and the same fix applies: the
-// risk AT THE MOMENT OF THIS DEVICE'S OWN Start Round press is now closed
-// by handleRoomAction()'s Ready gate, checked synchronously immediately
-// before this call. A press while not yet Ready is refused with a visible
-// status, never silently discarded, never auto-resent. The exposure
-// window was already narrower in practice than Invite's (the owner
-// reaching this action already implies an earlier successful INVITE or
-// JOIN on this same group, so the group is less likely to still be
-// mid-setup than at the very first Invite press), and the same residual
-// limitation as publishInvite() above applies: a LATER loss of this
-// device's own subscription, after Start Round has already succeeded and
-// while waiting for a SOLVED, is not covered by this one-time, press-time
-// gate.
-bool publishStartRound() {
-  char roundId[kIdLen];
-  Identity::nextId(roundId, sizeof(roundId));
-  strncpy(g_roundId, roundId, sizeof(g_roundId) - 1);
-  generateRaceSecret(g_secret);
-  g_hasHadFirstRound = true;
-  g_phase = RoomPhase::ROUND_ACTIVE;
-  // Phase 2A: a new round supersedes the previous round's history, its
-  // notices, and any pending/visible Guess outcome.
-  clearRaceGuessHistory();
-  clearRoomSolvedNotice();
-  invalidateGuessOutcome();
-
-  uint8_t payload[kIdLen + kIdLen + kDeviceIdLen + 4];
-  size_t len = buildRoundPayload(g_inviteId, g_roundId, Identity::deviceId(), g_secret, payload, sizeof(payload));
-  return len > 0 && publishRacePacket(PacketCodec::PK_RACE_ROUND, payload, len, "race/round", true);
-}
-
-void publishSolved() {
-  uint8_t payload[kIdLen + kDeviceIdLen];
-  size_t len = buildSolvedPayload(g_roundId, Identity::deviceId(), payload, sizeof(payload));
-  if (len > 0) publishRacePacket(PacketCodec::PK_RACE_SOLVED, payload, len, "race/solved", false);
-}
-
-void onLocalSolve() {
-  publishSolved();
-  // Reverted to the pre-candidate, unconditional form: a delayed retained
-  // clear risks overwriting a newer round a peer has since published (see
-  // publishRacePacket()'s comment above) -- no guard, no retry. This is a
-  // known, OPEN issue: if this publish fails (not connected), the
-  // *finished* round's payload can stay retained on the broker
-  // indefinitely, with no mechanism in this codebase to reconcile it.
-  MqttManager::publishRaw(g_groupCode, "race/round", "", true, 1);  // zero-length retained: clears it
-  incrementScore(Identity::deviceId());
-  strncpy(g_ownerDeviceId, Identity::deviceId(), sizeof(g_ownerDeviceId) - 1);
-  g_phase = RoomPhase::LOBBY_WAITING;
-  g_roundId[0] = '\0';
-  // Phase 2A (D1): the round is over -- drop its history and show a
-  // local-only, nonblocking acknowledgement on the Room screen (expires on
-  // its own; never gates any Room action). A correct guess is 4A0B by
-  // definition, so the text is fixed.
-  clearRaceGuessHistory();
-  g_roomSolvedNoticeActive = true;
-  g_roomSolvedNoticeUntilMs = millis() + 1500;
-  Menu::goBack();  // back to Room
+  snprintf(out, cap, "%s/%08lX/%lu", v->coordinator, static_cast<unsigned long>(v->nonce),
+           static_cast<unsigned long>(v->roundStart));
 }
 
 // =============================================================================
-// Room voice (Phase 4 section 17): MQTT broadcast transport, scoped by
-// invite_id, gated on actually viewing this Room right now.
+// Room voice (Phase 4 section 17): MQTT broadcast transport, scoped by the
+// room's identity ("<C><nonce>", 20 chars, within the 23-char room key),
+// gated on actually viewing this Room right now.
 // =============================================================================
 uint16_t g_roomVoiceSeq = 0;
 bool g_roomPttActive = false;
 
+// False when no room of the viewed group is shown.
+bool roomVoiceKey(char* out, size_t cap) {
+  const RaceProtocol::RoomState* v = shownRoom();
+  if (v == nullptr) return false;
+  snprintf(out, cap, "%s%08lX", v->coordinator, static_cast<unsigned long>(v->nonce));
+  return true;
+}
+
 void onRoomMicFrame(const int16_t* samples, size_t count) {
-  RadioTransport::publishAudioPacket(g_groupCode, "radio/audio/broadcast", RadioTransport::AUDIO_RACE_ROOM,
-                                     g_inviteId, g_roomVoiceSeq++, samples, count);
+  char key[kIdLen];
+  if (!roomVoiceKey(key, sizeof(key))) return;
+  RadioTransport::publishAudioPacket(g_groupCode, "radio/audio/broadcast", RadioTransport::AUDIO_RACE_ROOM, key,
+                                     g_roomVoiceSeq++, samples, count);
 }
 
 void startRoomPtt() {
-  if (g_roomPttActive || g_phase == RoomPhase::NO_LOBBY) return;
+  char key[kIdLen];
+  if (g_roomPttActive || !roomVoiceKey(key, sizeof(key))) return;
   g_roomPttActive = true;
   g_roomVoiceSeq = 0;
   setRadioAudioActive(true);
@@ -698,7 +375,8 @@ void handleRoomAudioScope(const char* group_code, const char* sender, const char
   (void)sender;
   (void)sequence;
   if (!g_isRoomScreenActive) return;                 // only Room participants currently viewing it
-  if (strcmp(roomKey, g_inviteId) != 0) return;       // not this room
+  char key[kIdLen];
+  if (!roomVoiceKey(key, sizeof(key)) || strcmp(roomKey, key) != 0) return;  // not this room
   RadioAudio::playFrame(samples, sampleCount);
   Sleep::notifyActivity();
 }
@@ -732,8 +410,72 @@ void setGuessNotice(const char* text) {
 
 void exitGuessConfirmYes() { Menu::goBack(); }
 
-// Phase 2A (D2): a guess may only be evaluated against a live round.
-bool isRoundActive() { return g_phase == RoomPhase::ROUND_ACTIVE && g_roundId[0] != '\0'; }
+// Phase 2A (D1) notice: a local correct guess, shown until the result.
+void showLocalSolve() {
+  g_roomSolvedNoticeActive = true;
+  g_roomSolvedNoticeUntilMs = millis() + 1500;
+}
+
+// Follows the engine's confirmed state: binds a newly started round (its
+// history, secret and automatic Guess entry) and turns the end of the bound
+// round into its outcome ("Solved by X" on Guess, or "Round ended").
+void syncRound() {
+  if (g_engine == nullptr) return;
+  const RaceProtocol::RoomState* v = g_engine->view();
+  char key[kRoundKeyLen];
+  roundKeyOf(v, key, sizeof(key));
+  if (strcmp(key, g_roundId) == 0) return;
+  if (g_roundId[0] != '\0') {  // the bound round ended
+    if (v != nullptr && v->resultRound == g_roundStart && v->resultWinner[0] != '\0' &&
+        !isSelf(v->resultWinner)) {
+      Presence::resolveDisplayName(g_engine->roomGroup(), v->resultWinner, g_pendingWinner, sizeof(g_pendingWinner));
+      g_pendingExternalSolve = true;
+    }
+    g_roundId[0] = '\0';
+    clearRaceGuessHistory();
+  }
+  if (key[0] != '\0') {  // a new round: supersedes the previous one's history, notices and outcome
+    strncpy(g_roundId, key, sizeof(g_roundId) - 1);
+    g_roundId[sizeof(g_roundId) - 1] = '\0';
+    memcpy(g_secret, v->secret, 4);
+    g_roundStart = v->roundStart;
+    clearRaceGuessHistory();
+    clearRoomSolvedNotice();
+    invalidateGuessOutcome();
+    clearRoomActionStatus();
+    if (g_engine->state() == RaceProtocol::MS_MEMBER && g_engine->canAct()) g_pendingAutoEnterGuess = true;
+  }
+}
+
+// A correct guess (4A0B) evaluated locally against the shown round: the
+// coordinator commits it directly, a member sends a durable CLAIM. Either
+// way the result reaches the Room through the confirmed state.
+void onLocalSolve(const uint8_t digits[4]) {
+  if (g_engine == nullptr) return;  // unreachable: no round is active without an engine
+  if (!g_engine->submitCorrectGuess(digits)) {
+    setGuessNotice("Not sent - try again");
+    return;
+  }
+  clearRaceGuessHistory();
+  showLocalSolve();
+  syncRound();
+  Menu::goBack();  // back to Room
+}
+
+
+// Phase 2A (D2): a guess may only be evaluated against a live round: the
+// confirmed state's current round, played by an active member with no claim
+// for it outstanding.
+bool isRoundActive() {
+  const RaceProtocol::RoomState* v = shownRoom();
+  if (g_engine == nullptr || v == nullptr || g_roundId[0] == '\0' || g_engine->state() != RaceProtocol::MS_MEMBER ||
+      !g_engine->canAct()) {
+    return false;
+  }
+  char key[kRoundKeyLen];
+  roundKeyOf(v, key, sizeof(key));
+  return strcmp(key, g_roundId) == 0 && g_engine->isMeActive() && !g_engine->claimPending(v->roundStart);
+}
 
 // Phase 2A: binds the guess history and the in-progress digit entry to the
 // current round. When the round differs from the one the history belongs
@@ -816,6 +558,7 @@ void screenRaceGuessTick() {
     NumberGuessing::resetDigitRowRenderState(&g_raceGuessRowState);
     NumberGuessing::resetHistoryBrowse(&g_raceBrowse);
   }
+  syncRound();  // a result or a new round confirmed since the last tick
 
   if (g_pendingExternalSolve) {
     static char buf[40];
@@ -835,8 +578,8 @@ void screenRaceGuessTick() {
     return;
   }
 
-  // Phase 2A (D2): the round this screen was opened for is gone (RESET,
-  // owner-offline reset, or otherwise no longer ROUND_ACTIVE) with no
+  // Phase 2A (D2): the round this screen was opened for is gone (solved
+  // elsewhere, the room closed or paused, or this device no longer in it) with no
   // external-solve notice to show instead -- stop accepting guesses for it.
   // Reuses the timed-notice path above: input freezes, then back to Room.
   if (g_guessResultText == nullptr && !isRoundActive()) {
@@ -890,7 +633,7 @@ void screenRaceGuessTick() {
         NumberGuessing::GuessResult r = NumberGuessing::evaluate(g_secret, g_digitEntry.digits);
         if (r.a == 4) {
           openRaceShortWindow(e.eventMs);  // Phase 2C-1: covers the solve's blocking and Guess -> Room
-          onLocalSolve();
+          onLocalSolve(g_digitEntry.digits);
           return;
         }
         appendRaceGuess(g_digitEntry.digits, r);
@@ -998,150 +741,224 @@ void screenRaceGuessTick() {
   g_raceGuessLastShowingNotice = showingNotice;
 }
 
+
 // =============================================================================
 // Room screen
 // =============================================================================
-// Hardware Fix #4.3 issue D audit: a one-device Invite press was reported as
-// "appearing to do nothing" on hardware. Traced end-to-end -- publishInvite()
-// below is entirely local/synchronous (sets g_inviteId, owner=self,
-// g_haveJoined, g_phase=LOBBY_WAITING, resets and re-adds self to
-// g_participants) before it ever touches the network, and
-// MqttManager::publishBinary() returns immediately (false, non-blocking) when
-// no broker connection is up, so a missing/slow connection cannot stall or
-// skip the state transition. screenRaceRoom() also has no top-level dirty
-// gate (by design, so it keeps reflecting async network/presence events --
-// see the Hardware Fix #3 comment above it); its action-label, score, and
-// participant rows are unconditionally recomputed and diffed every tick, and
-// that render happens in the same screenRaceRoom() call as the
-// ENCODER_SHORT event that triggered handleRoomAction(), so the label
-// ("Invite to Play" -> "Start Round") and the new "<name> (You)" row are
-// guaranteed to be current on the very next frame. No logic or redraw defect
-// was found in this path. The most likely explanation for the observed
-// non-responsiveness is the encoder pushbutton press itself not registering
-// a clean ENCODER_SHORT edge on that hardware unit (a separate GPIO/contact
-// from the CLK/DT rotary pins fixed under issue A, and not touched by that
-// fix), which is indistinguishable to a user from "the feature does
-// nothing" since a dropped press currently produces no visible feedback
-// either way. That finding is unaffected by the round-4 gate added below:
-// this function's OWN early return (not publishInvite()/publishStartRound()
-// stalling) is what now visibly declines the action when not Ready, with
-// its own status text -- a dropped ENCODER_SHORT edge still shows nothing
-// at all, same as before.
-//
-// Fix Phase 1C (round 4): audited both call sites below before placing
-// this gate. handleRoomAction() is the SOLE caller of publishInvite() and
-// publishStartRound() (no other path, automatic or otherwise, reaches
-// them -- confirmed via a whole-file caller search), and this function
-// does nothing after calling either besides returning, so the gate
-// belongs here, at the point where the user's action either proceeds or
-// is refused -- not as a bare early return buried inside
-// publishInvite()/publishStartRound() themselves, which would work
-// equivalently for this caller alone but would leave the "show a status,
-// preserve state" behavior disconnected from the Room screen's own UI
-// state that owns it. Gating here, before either function is entered,
-// means NEITHER function's local state mutation nor its network publish
-// ever runs on a refusal -- there is nothing to "undo".
+// Every row is recomputed from the engine each tick and diffed (Hardware
+// Fix #3): the room changes through confirmed room states arriving at any
+// time, as much as through local input.
 void drawRoomActionNow(const char* text);
 bool handleRoomAction(const InputEvent& e);
 
-// Phase 2C-1: timed local notice for an action whose publish this device
-// could not confirm. Same slot/expiry as the Ready refusal above (1500ms,
-// rollover-safe, cleared by reset / group change / new lobby or round), so
-// it can never hide a usable action label for longer than that. No
-// rollback and no retry: the local state transition already happened
-// exactly as before this change.
+// Phase 2C-1: timed local notice on the action row (1500ms, rollover-safe,
+// cleared by group change and new rounds).
 void setRoomActionUnconfirmed(const char* text) {
   g_roomActionStatusText = text;
   g_roomActionStatusUntilMs = millis() + 1500;
 }
 
-// Phase 2C-1: `e` is the accepted Short. Each action that proceeds draws its
-// in-progress text BEFORE its blocking work and opens the replayed-Short
-// window (see RaceShortWindow above). A Ready refusal or a no-op press
-// ("Waiting for start...") does no blocking work and opens nothing.
-// Returns true iff it navigated away from the Room (Start Round or
-// Continue -> Guess).
-bool handleRoomAction(const InputEvent& e) {
-  if (g_phase == RoomPhase::NO_LOBBY) {
-    if (!MqttManager::isGroupReady(g_groupCode)) {
-      g_roomActionStatusText = "Connecting, try again";
-      g_roomActionStatusUntilMs = millis() + 1500;
-      return false;  // no publish, no phase/participant change, selection untouched
-    }
-    // Fix Phase 1C (round 4 correction): a still-pending refusal notice
-    // from an EARLIER press must not keep showing once this fresh,
-    // Ready-approved attempt is about to actually proceed -- clear it
-    // before entering publishInvite(), not after, so there is no tick in
-    // between where the phase has already changed but the stale notice
-    // could still be selected by screenRaceRoom() (its own status check
-    // runs before recomputing the phase-driven label, so an un-cleared
-    // notice would keep winning even though it's no longer accurate).
-    clearRoomActionStatus();
-    openRaceShortWindow(e.eventMs);
-    drawRoomActionNow("Inviting...");
-    if (!publishInvite()) setRoomActionUnconfirmed("Invite unconfirmed");
-  } else if (g_phase == RoomPhase::LOBBY_WAITING) {
-    if (strcmp(g_ownerDeviceId, Identity::deviceId()) == 0) {
-      if (!MqttManager::isGroupReady(g_groupCode)) {
-        g_roomActionStatusText = "Connecting, try again";
-        g_roomActionStatusUntilMs = millis() + 1500;
-        return false;  // no publish, no phase change, g_roundId/g_secret untouched
-      }
-      clearRoomActionStatus();  // same reasoning as the Invite branch above
-      // The window also covers Start Round -> Guess, as for Continue below.
-      openRaceShortWindow(e.eventMs);
-      drawRoomActionNow("Starting...");
-      bool published = publishStartRound();
-      if (isRoundActive()) {
-        // The starter plays the round it just established locally. An
-        // unconfirmed publish is reported on Guess, where it is seen; it
-        // says nothing about whether peers received the round, and there is
-        // still no retry or rollback.
-        if (!published) setGuessNotice("Start unconfirmed");
-        enterGuessScreen();
-        return true;
-      }
-      if (!published) setRoomActionUnconfirmed("Start unconfirmed");
-    } else if (!g_haveJoined) {
-      openRaceShortWindow(e.eventMs);
-      drawRoomActionNow("Joining...");
-      if (!publishJoin()) setRoomActionUnconfirmed("Join unconfirmed");
-    }
-  } else {  // ROUND_ACTIVE
-    // Continue: the window also covers the Room -> Guess transition, so a
-    // replayed Short can neither push Guess again nor open Guess's Exit
-    // prompt. An unconfirmed Join-before-Continue is shown on Guess.
-    openRaceShortWindow(e.eventMs);
-    if (!g_haveJoined) {
-      drawRoomActionNow("Joining...");
-      // Reported on the destination (Guess), where it is actually seen.
-      if (!publishJoin()) setGuessNotice("Join unconfirmed");
-    }
-    enterGuessScreen();
-    return true;
-  }
+// Fix Phase 1C (round 4): an action that sends anything needs this
+// device's own subscriptions (r2/+, r2q/<own id>) live, so a press while
+// the group is not Ready is refused with a visible status, never queued.
+bool roomReady() {
+  if (MqttManager::isGroupReady(g_groupCode)) return true;
+  setRoomActionUnconfirmed("Connecting, try again");
   return false;
 }
 
-void checkOwnerOnline() {
-  if (g_phase != RoomPhase::LOBBY_WAITING || g_ownerDeviceId[0] == '\0') return;
-  if (strcmp(g_ownerDeviceId, Identity::deviceId()) == 0) return;
-  if (Presence::isContactOnline(g_groupCode, g_ownerDeviceId)) return;
-
-  if (!g_hasHadFirstRound) {
-    for (uint8_t i = 0; i < g_participantCount; i++) {
-      if (strcmp(g_participants[i], g_ownerDeviceId) == 0) continue;
-      if (Presence::isContactOnline(g_groupCode, g_participants[i])) {
-        strncpy(g_ownerDeviceId, g_participants[i], sizeof(g_ownerDeviceId) - 1);
-        return;
-      }
-    }
-  } else {
-    publishReset();
-    applyReset();
+const char* noticeText(RaceProtocol::Notice n) {
+  switch (n) {
+    case RaceProtocol::NOTICE_ROOM_FULL: return "Room full";
+    case RaceProtocol::NOTICE_COULD_NOT_JOIN: return "Couldn't join - try again";
+    case RaceProtocol::NOTICE_ROOM_CLOSED: return "Room closed";
+    case RaceProtocol::NOTICE_NO_LONGER_IN_ROOM: return "You're no longer in this room";
+    case RaceProtocol::NOTICE_START_REFUSED: return "Start not allowed";
+    case RaceProtocol::NOTICE_LATE: return "Already solved";
+    case RaceProtocol::NOTICE_STORAGE_ERROR: return "Storage error";
+    case RaceProtocol::NOTICE_DATA_DAMAGED: return "Room data damaged";
+    case RaceProtocol::NOTICE_NUMBERS_EXHAUSTED: return "Can't create a room";
+    case RaceProtocol::NOTICE_STAYED_LISTED: return "You may stay listed";
+    default: return nullptr;
   }
 }
 
+// Engine notices are shown on the status row for kRoomNoticeMs from their
+// first display, then cleared.
+constexpr uint32_t kRoomNoticeMs = 4000;
+RaceProtocol::Notice g_roomNoticeShown = RaceProtocol::NOTICE_NONE;
+uint32_t g_roomNoticeSinceMs = 0;
+
+// A Leave that could not be stored is refused, never shown as done; one whose
+// final write is still being retried shows "Leaving..." with the storage
+// error until it completes.
+void leaveConfirmYes() {
+  if (g_engine == nullptr) return;
+  bool ok;
+  if (g_engine->state() == RaceProtocol::MS_LEAVING) {
+    ok = g_engine->leaveAnyway() || g_engine->exitPending();
+  } else {
+    ok = g_engine->leave();
+  }
+  if (!ok) setRoomActionUnconfirmed("Storage error - try again");
+}
+
+void startLeaveConfirm() {
+  if (g_engine == nullptr) return;
+  ConfirmPromptConfig cfg;
+  if (g_engine->state() == RaceProtocol::MS_LEAVING) {
+    cfg = ConfirmPromptConfig{"Leave anyway?", "You may stay listed", false, leaveConfirmYes, nullptr};
+  } else if (g_engine->isCoordinator()) {
+    cfg = ConfirmPromptConfig{"Leave room?", "Closes it for everyone", false, leaveConfirmYes, nullptr};
+  } else {
+    cfg = ConfirmPromptConfig{"Leave room?", nullptr, false, leaveConfirmYes, nullptr};
+  }
+  Menu::startConfirmPrompt(cfg);
+  Menu::pushScreen(Menu::confirmPromptScreen);
+}
+
+void addRow(const char* id, RoomRowKind kind, uint16_t score) {
+  if (g_participantCount >= kMaxParticipants) return;
+  strncpy(g_participants[g_participantCount], id, kDeviceIdLen - 1);
+  g_participants[g_participantCount][kDeviceIdLen - 1] = '\0';
+  g_rowKind[g_participantCount] = kind;
+  g_rowScore[g_participantCount] = score;
+  g_participantCount++;
+}
+
+void buildRoomRows() {
+  g_participantCount = 0;
+  if (g_engine == nullptr) return;
+  const RaceProtocol::RoomState* v = shownRoom();
+  if (g_engine->hasRoom()) {
+    if (strcmp(g_engine->roomGroup(), g_groupCode) != 0) return;  // in a room of another group
+    if (v != nullptr) {
+      for (uint8_t i = 0; i < v->count; i++) {
+        if (v->entries[i].flags & RaceProtocol::ENTRY_ACTIVE) {
+          addRow(v->entries[i].id, RoomRowKind::PARTICIPANT, v->entries[i].score);
+        }
+      }
+    }
+    addRow(kLeaveRowId, RoomRowKind::LEAVE, 0);
+    return;
+  }
+  for (uint8_t i = 0; i < RaceProtocol::kMaxDiscovered; i++) {
+    const RaceProtocol::DiscoveredRoom* d = g_engine->discovered(i);
+    if (d != nullptr && strcmp(d->group, g_groupCode) == 0 && d->phase != RaceProtocol::PHASE_CLOSED) {
+      addRow(d->coordinator, RoomRowKind::DISCOVERED, d->active);
+    }
+  }
+  const RaceProtocol::RoomState* f = g_engine->finalView();
+  if (f != nullptr && strcmp(g_engine->roomGroup(), g_groupCode) == 0) {
+    for (uint8_t i = 0; i < f->count; i++) addRow(f->entries[i].id, RoomRowKind::FINAL, f->entries[i].score);
+  }
+}
+
+// Returns the focused row's index, or -1 for the action row.
+int16_t resolveRoomFocus() {
+  if (g_roomFocusId[0] == '\0') return -1;
+  for (uint8_t i = 0; i < g_participantCount; i++) {
+    if (strcmp(g_participants[i], g_roomFocusId) == 0) {
+      g_roomFocusIndex = i;
+      return i;
+    }
+  }
+  if (g_participantCount == 0) {
+    resetRoomFocus();
+    return -1;
+  }
+  uint8_t i = (g_roomFocusIndex < g_participantCount) ? g_roomFocusIndex : static_cast<uint8_t>(g_participantCount - 1);
+  strncpy(g_roomFocusId, g_participants[i], kDeviceIdLen - 1);
+  g_roomFocusId[kDeviceIdLen - 1] = '\0';
+  g_roomFocusIndex = i;
+  return i;
+}
+
+// One detent: +1 moves down (towards later rows), -1 up towards the action
+// row. No wraparound.
+void moveRoomFocus(int8_t delta) {
+  int16_t next = static_cast<int16_t>(resolveRoomFocus() + (delta > 0 ? 1 : -1));
+  if (next >= static_cast<int16_t>(g_participantCount)) next = static_cast<int16_t>(g_participantCount) - 1;
+  if (next < 0) {
+    g_roomFocusId[0] = '\0';
+    return;
+  }
+  strncpy(g_roomFocusId, g_participants[next], kDeviceIdLen - 1);
+  g_roomFocusId[kDeviceIdLen - 1] = '\0';
+  g_roomFocusIndex = static_cast<uint8_t>(next);
+}
+
+// A Short on a focused row. Returns true iff it navigated away.
+bool handleRoomRowShort(int16_t row, const InputEvent& e) {
+  if (g_engine == nullptr) return false;
+  RoomRowKind kind = g_rowKind[row];
+  if (kind == RoomRowKind::LEAVE) {
+    startLeaveConfirm();
+    return true;
+  }
+  if (kind == RoomRowKind::DISCOVERED) {
+    if (!roomReady()) return false;
+    clearRoomActionStatus();
+    openRaceShortWindow(e.eventMs);
+    drawRoomActionNow("Joining...");
+    char coordinator[kDeviceIdLen];
+    strncpy(coordinator, g_participants[row], sizeof(coordinator) - 1);
+    coordinator[sizeof(coordinator) - 1] = '\0';
+    if (!g_engine->join(g_groupCode, coordinator)) setRoomActionUnconfirmed("Couldn't join");
+    resetRoomFocus();
+    return false;
+  }
+  g_roomFocusId[0] = '\0';  // a Short on a participant returns focus to the action row
+  return false;
+}
+
+// Phase 2C-1: `e` is the accepted Short. Each action that proceeds draws its
+// in-progress text BEFORE its blocking work and opens the replayed-Short
+// window (see RaceShortWindow above). A refusal or a no-op press does no
+// blocking work and opens nothing. Returns true iff it navigated away from
+// the Room (Start Round or Continue -> Guess).
+bool handleRoomAction(const InputEvent& e) {
+  if (g_engine == nullptr) return false;  // "Race unavailable": no action
+  if (g_engine->hasRoom() && strcmp(g_engine->roomGroup(), g_groupCode) != 0) return false;
+  const RaceProtocol::RoomState* v = shownRoom();
+  RaceProtocol::MemberState st = g_engine->state();
+  if (st == RaceProtocol::MS_NONE) {  // Invite to Play: create a room coordinated by this device
+    if (!roomReady()) return false;
+    clearRoomActionStatus();
+    openRaceShortWindow(e.eventMs);
+    drawRoomActionNow("Creating...");
+    if (!g_engine->createRoom(g_groupCode)) setRoomActionUnconfirmed("Couldn't create room");
+    return false;
+  }
+  if (st != RaceProtocol::MS_MEMBER || v == nullptr || !g_engine->canAct()) return false;
+  if (v->phase == RaceProtocol::PHASE_LOBBY) {
+    if (!g_engine->canStart()) return false;  // "Waiting for <holder>"
+    if (!roomReady()) return false;
+    clearRoomActionStatus();
+    // The window also covers Start Round -> Guess, as for Continue below.
+    openRaceShortWindow(e.eventMs);
+    drawRoomActionNow("Starting...");
+    if (!g_engine->startRound()) {
+      setRoomActionUnconfirmed("Start failed");
+      return false;
+    }
+    syncRound();
+    if (isRoundActive()) {  // the coordinator's own Start: the round is committed, play it now (R2)
+      g_pendingAutoEnterGuess = false;
+      enterGuessScreen();
+      return true;
+    }
+    return false;  // a member's START request: Guess opens when the round arrives
+  }
+  if (!isRoundActive()) return false;  // claim being confirmed
+  // Continue: the window also covers the Room -> Guess transition, so a
+  // replayed Short can neither push Guess again nor open Guess's Exit prompt.
+  openRaceShortWindow(e.eventMs);
+  enterGuessScreen();
+  return true;
+}
+
+// Back is navigation only (B3): it never changes room membership.
 void leaveRaceMode() {
   g_isRoomScreenActive = false;
   stopRoomPtt();
@@ -1150,27 +967,17 @@ void leaveRaceMode() {
     Presence::setOwnRadioAvailable(false);
     Presence::republishOwnPresenceAllGroups();
   }
-  g_scoreCount = 0;  // "Reset: only when exiting Race Mode to Training Game"
-  applyReset();
   closeRaceShortWindow();  // Phase 2C-1: Race is left (the Room stops handling this batch)
 }
 
-// Hardware Fix #3: this screen is driven by async network/presence events
-// (owner takeover, participants joining, score changes from remote
-// solves) as much as local input. Rather than one combined "anything
-// changed" snapshot that redraws the whole content area, each row (title,
-// action label, score, and each participant slot) is diffed and
-// redrawn independently -- a score change no longer repaints the
-// participant list, an online-count change no longer repaints the score,
-// and a single participant's name change no longer repaints its
-// neighbors (this is the Race Mode Room participant-list screen flagged
-// for extra overlap/clipping review under the larger PRIMARY font).
+// Hardware Fix #3: each row (title, action label, status, and each
+// participant slot) is diffed and redrawn independently.
 bool g_raceRoomNeedsFullRedraw = true;
-char g_raceRoomLastActionLabel[24] = {0};
-char g_raceRoomLastScoreLine[32] = {0};
+char g_raceRoomLastActionLabel[40] = {0};
+char g_raceRoomLastScoreLine[40] = {0};
 uint8_t g_raceRoomLastOnlineCount = 0xFF;
 constexpr uint8_t kMaxRoomRows = 6;  // more than fit at any font; bounds the row caches
-char g_raceRoomLastOnlineNames[kMaxRoomRows][28] = {{0}};
+char g_raceRoomLastOnlineNames[kMaxRoomRows][40] = {{0}};
 char g_raceRoomLastTitle[24] = {0};
 
 // Phase 2C-1: synchronous in-progress text on the Room's action row, drawn
@@ -1192,6 +999,127 @@ void drawRoomActionNow(const char* text) {
   g_raceRoomLastActionLabel[sizeof(g_raceRoomLastActionLabel) - 1] = '\0';
 }
 
+// The action row's text, and whether a Short there does something.
+const char* roomActionText(bool* hasAction, char* buf, size_t cap) {
+  *hasAction = false;
+  if (g_engine == nullptr) return "Race unavailable";
+  if (g_engine->hasRoom() && strcmp(g_engine->roomGroup(), g_groupCode) != 0) return "In a room in another group";
+  const RaceProtocol::RoomState* v = shownRoom();
+  if (g_engine->exitPending()) return "Leaving...";
+  switch (g_engine->state()) {
+    case RaceProtocol::MS_NONE:
+      *hasAction = true;
+      return "Invite to Play";
+    case RaceProtocol::MS_JOINING:
+      return "Joining...";
+    case RaceProtocol::MS_LEAVING:
+      return "Leaving...";
+    default:
+      break;
+  }
+  if (v == nullptr) return "Reconnecting...";
+  if (!g_engine->canAct()) return "Leave only";
+  if (v->phase == RaceProtocol::PHASE_LOBBY) {
+    uint8_t op = 0;
+    if (g_engine->pendingOp(&op) && op == RaceProtocol::OP_START) return "Starting...";
+    if (g_engine->canStart()) {
+      *hasAction = true;
+      return "Start Round";
+    }
+    char name[17];
+    Presence::resolveDisplayName(g_groupCode, RaceProtocol::startHolder(*v), name, sizeof(name));
+    snprintf(buf, cap, "Waiting for %s", name);
+    return buf;
+  }
+  if (g_engine->claimPending(v->roundStart)) return "Confirming...";
+  *hasAction = true;
+  return "Continue";
+}
+
+// The status row (in place of the old local-only score row): problems
+// first, then the local solve notice, then the engine's last notice.
+const char* roomStatusText(char* buf, size_t cap) {
+  if (g_engine == nullptr) return "";
+  if (g_engine->hasRoom() && strcmp(g_engine->roomGroup(), g_groupCode) == 0) {
+    if (g_engine->storagePaused()) return "Storage error - room paused";
+    if (g_engine->frozen()) return "Room data inconsistent";
+    if (g_engine->verifying()) return "Verifying room...";
+    if (g_engine->reconnecting()) return "Reconnecting...";
+    if (g_engine->waitingForCoordinator()) {
+      char name[17];
+      Presence::resolveDisplayName(g_groupCode, shownRoom() ? shownRoom()->coordinator : "", name, sizeof(name));
+      snprintf(buf, cap, "Waiting for %s", name);
+      return buf;
+    }
+  }
+  if (g_roomSolvedNoticeActive && !beforeDeadline(millis(), g_roomSolvedNoticeUntilMs)) clearRoomSolvedNotice();
+  if (g_roomSolvedNoticeActive) return "Solved! 4A0B";
+  RaceProtocol::Notice n = g_engine->notice();
+  if (n != g_roomNoticeShown) {
+    g_roomNoticeShown = n;
+    g_roomNoticeSinceMs = millis();
+  }
+  if (n != RaceProtocol::NOTICE_NONE && static_cast<uint32_t>(millis() - g_roomNoticeSinceMs) >= kRoomNoticeMs) {
+    g_engine->clearNotice();
+    g_roomNoticeShown = RaceProtocol::NOTICE_NONE;
+    n = RaceProtocol::NOTICE_NONE;
+  }
+  const char* t = noticeText(n);
+  return t != nullptr ? t : "";
+}
+
+void diffRow(int16_t y, const char* text, char* cache, size_t cacheSize, bool firstDraw, int16_t lh) {
+  if (!firstDraw && strcmp(text, cache) == 0) return;
+  if (!firstDraw) Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+  Display::printLine(2, y, text);
+  strncpy(cache, text, cacheSize - 1);
+  cache[cacheSize - 1] = '\0';
+}
+
+// A row's label: "> Name (You)", "Join Name's room (3)", "Leave room".
+// Scores are drawn right-aligned beside participant names; the label is
+// shortened so it never runs into the score.
+void formatRoomRow(uint8_t i, bool focused, char* out, size_t cap) {
+  if (g_engine == nullptr) {  // no rows are built without an engine
+    out[0] = '\0';
+    return;
+  }
+  const char* marker = focused ? "> " : "";
+  char name[17];
+  switch (g_rowKind[i]) {
+    case RoomRowKind::LEAVE:
+      snprintf(out, cap, "%s%s", marker, g_engine->state() == RaceProtocol::MS_LEAVING ? "Leave anyway" : "Leave room");
+      return;
+    case RoomRowKind::DISCOVERED:
+      Presence::resolveDisplayName(g_groupCode, g_participants[i], name, sizeof(name));
+      snprintf(out, cap, "%sJoin %s (%u)", marker, name, g_rowScore[i]);
+      return;
+    default:
+      Presence::resolveDisplayName(g_groupCode, g_participants[i], name, sizeof(name));
+      snprintf(out, cap, "%s%s%s", marker, name, isSelf(g_participants[i]) ? " (You)" : "");
+      return;
+  }
+}
+
+void drawRoomRow(int16_t y, uint8_t i, const char* label) {
+  bool scored = g_rowKind[i] == RoomRowKind::PARTICIPANT || g_rowKind[i] == RoomRowKind::FINAL;
+  if (!scored) {
+    Display::printLine(2, y, label);
+    return;
+  }
+  char score[8];
+  snprintf(score, sizeof(score), "%u", g_rowScore[i]);
+  int16_t scoreW = Display::textWidth(score);
+  int16_t scoreX = static_cast<int16_t>(Display::kScreenWidth - 2 - scoreW);
+  char shown[40];
+  strncpy(shown, label, sizeof(shown) - 1);
+  shown[sizeof(shown) - 1] = '\0';
+  size_t n = strlen(shown);
+  while (n > 0 && 2 + Display::textWidth(shown) + 8 > scoreX) shown[--n] = '\0';
+  Display::printLine(2, y, shown);
+  Display::printLine(scoreX, y, score);
+}
+
 void screenRaceRoomTick();
 
 // Phase 2C-1: see screenRaceGuess() -- same tick-end window handling.
@@ -1205,18 +1133,22 @@ void screenRaceRoomTick() {
     g_isRoomScreenActive = true;
     RadioTransport::setUiContext(RadioTransport::UiContext::RACE_ROOM);
     setRoomAvailability(true);
+    Notifications::setRaceInvitePending(false);
     g_raceRoomNeedsFullRedraw = true;
     resetRoomFocus();  // every Room visit starts on the action row
   }
 
-  checkOwnerOnline();
+  syncRound();
   if (g_pendingAutoEnterGuess) {
     g_pendingAutoEnterGuess = false;
-    openRaceShortWindowFromWatermark();  // Phase 2C-1: covers entry blocking + Room -> Guess
-    enterGuessScreen();
-    return;
+    if (isRoundActive()) {
+      openRaceShortWindowFromWatermark();  // Phase 2C-1: covers entry blocking + Room -> Guess
+      enterGuessScreen();
+      return;
+    }
   }
 
+  buildRoomRows();
   Input::update();
   InputEvent e;
   while (Input::popEvent(e)) {
@@ -1233,13 +1165,12 @@ void screenRaceRoomTick() {
     } else if (e.type == InputEventType::DOT_RELEASE) {
       stopRoomPtt();
     } else if (e.type == InputEventType::ENCODER_ROTATE) {
-      moveRoomFocus(e.value);  // participant list only; never an action
+      moveRoomFocus(e.value);
     } else if (e.type == InputEventType::ENCODER_SHORT) {
-      if (resolveRoomFocus() >= 0) {
-        g_roomFocusId[0] = '\0';  // a Short on a participant returns focus to the action row
-      } else if (handleRoomAction(e)) {
-        break;  // Phase 2C-1: Guess now owns the remaining input
-      }
+      int16_t row = resolveRoomFocus();
+      bool away = (row >= 0) ? handleRoomRowShort(row, e) : handleRoomAction(e);
+      if (away) break;  // Phase 2C-1: the next screen owns the remaining input
+      buildRoomRows();
     }
   }
 
@@ -1258,8 +1189,8 @@ void screenRaceRoomTick() {
     g_raceRoomNeedsFullRedraw = false;
   }
 
-  // Participant window: as many rows as fit below the score row, scrolled
-  // so the focused participant is visible.
+  // Row window: as many rows as fit below the status row, scrolled so the
+  // focused row is visible.
   int16_t remaining = Display::kScreenHeight - rowsTopY;
   uint8_t rows = (remaining > 0) ? static_cast<uint8_t>(remaining / lh) : 0;
   if (rows > kMaxRoomRows) rows = kMaxRoomRows;
@@ -1271,163 +1202,73 @@ void screenRaceRoomTick() {
   uint8_t visibleCount = static_cast<uint8_t>(g_participantCount - g_roomListTop);
   if (visibleCount > rows) visibleCount = rows;
 
-  // Title, with the visible range once the list no longer fits.
+  // Title, with the visible range of listed rooms/players (not the Leave
+  // row) once the list no longer fits.
   char title[24];
-  if (g_participantCount > rows && visibleCount > 0) {
-    snprintf(title, sizeof(title), "Race Room  %u-%u/%u", g_roomListTop + 1, g_roomListTop + visibleCount,
-             g_participantCount);
+  uint8_t listed = g_participantCount;
+  if (listed > 0 && g_rowKind[listed - 1] == RoomRowKind::LEAVE) listed--;
+  if (g_participantCount > rows && visibleCount > 0 && listed > 0) {
+    uint8_t first = g_roomListTop + 1 < listed ? static_cast<uint8_t>(g_roomListTop + 1) : listed;
+    uint8_t last = g_roomListTop + visibleCount < listed ? static_cast<uint8_t>(g_roomListTop + visibleCount) : listed;
+    snprintf(title, sizeof(title), "Race Room  %u-%u/%u", first, last, listed);
   } else {
     snprintf(title, sizeof(title), "Race Room");
   }
-  if (firstDraw || strcmp(title, g_raceRoomLastTitle) != 0) {
-    if (!firstDraw) Display::tft().fillRect(0, titleY, Display::kScreenWidth, lh, ST77XX_BLACK);
-    Display::printLine(2, titleY, title);
-    strncpy(g_raceRoomLastTitle, title, sizeof(g_raceRoomLastTitle) - 1);
-    g_raceRoomLastTitle[sizeof(g_raceRoomLastTitle) - 1] = '\0';
-  }
+  diffRow(titleY, title, g_raceRoomLastTitle, sizeof(g_raceRoomLastTitle), firstDraw, lh);
 
-  // Hardware Fix #4 issue 9: a ">" marker (not the word "Short:") shows
-  // when ENCODER_SHORT currently does something local; the one non-action
-  // state ("Waiting for start...") gets no marker at all, so it reads as
-  // unmistakably passive. Every actionText here is a categorically
-  // different single-line status (never a same-label toggle where only a
-  // marker should move), so diffing the combined marker+text line as one
-  // string is the right redraw granularity, not the class of bug Hardware
-  // Fix #3 fixed elsewhere.
+  // Hardware Fix #4 issue 9: a ">" marker shows when ENCODER_SHORT on the
+  // action row currently does something; passive states get no marker.
+  // Fix Phase 1C (round 4): a refused/unconfirmed press overrides the label
+  // with a visible status for a short, rollover-safe window.
+  char actionBuf[32];
   const char* actionText;
   bool hasAction;
-  // Fix Phase 1C (round 4): a refused Invite/Start Round press overrides
-  // the normal action label with a visible status for a short window,
-  // similar in spirit to g_guessResultText's timed display in
-  // screenRaceGuess() above -- expires on its own (no early-return dirty
-  // gate needed here, since this screen already recomputes/diffs
-  // actionLabel every tick by design, see the Hardware Fix #3 comment
-  // above screenRaceRoom()).
-  //
-  // Fix Phase 1C (round 4 correction): unlike g_guessResultText's plain
-  // `millis() >= UntilMs` check, this uses the rollover-safe signed-
-  // difference comparison (same technique as mqtt_manager.cpp's
-  // hasEligibleSetupOperation()) -- a plain `<`/`>=` against millis()
-  // breaks exactly at the uint32_t wraparound: if `now` is within 1500ms
-  // of UINT32_MAX when the notice is set, `now + 1500` wraps to a small
-  // value, and a naive `millis() < UntilMs` would then read false (looks
-  // already expired) immediately, even though the notice was just set.
-  // (Phase 2A: g_guessResultText's expiry now uses the same technique, via
-  // beforeDeadline().)
-  if (g_roomActionStatusText != nullptr && static_cast<int32_t>(millis() - g_roomActionStatusUntilMs) < 0) {
+  if (g_roomActionStatusText != nullptr && beforeDeadline(millis(), g_roomActionStatusUntilMs)) {
     actionText = g_roomActionStatusText;
     hasAction = false;  // not a live action right now -- no ">" marker
-  } else if (g_phase == RoomPhase::NO_LOBBY) {
-    clearRoomActionStatus();
-    actionText = "Invite to Play";
-    hasAction = true;
-  } else if (g_phase == RoomPhase::LOBBY_WAITING) {
-    clearRoomActionStatus();
-    if (strcmp(g_ownerDeviceId, Identity::deviceId()) == 0) {
-      actionText = "Start Round";
-      hasAction = true;
-    } else if (g_haveJoined) {
-      actionText = "Waiting for start...";
-      hasAction = false;
-    } else {
-      actionText = "Join";
-      hasAction = true;
-    }
   } else {
     clearRoomActionStatus();
-    actionText = g_haveJoined ? "Continue" : "Join";
-    hasAction = true;
+    actionText = roomActionText(&hasAction, actionBuf, sizeof(actionBuf));
   }
-  // The ">" also marks where the focus is: with a participant focused, a
-  // Short only returns focus here, so the action shows no marker.
+  // The ">" also marks where the focus is: with a row focused, the action
+  // shows no marker.
   if (focus >= 0) hasAction = false;
-  char actionLabel[32];
+  char actionLabel[40];
   snprintf(actionLabel, sizeof(actionLabel), "%s%s", hasAction ? "> " : "", actionText);
-  if (firstDraw || strcmp(actionLabel, g_raceRoomLastActionLabel) != 0) {
-    int16_t oldW = Display::textWidth(g_raceRoomLastActionLabel);
-    int16_t newW = Display::textWidth(actionLabel);
-    int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
-    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
-    if (eraseW > maxW) eraseW = maxW;
-    if (!firstDraw) Display::tft().fillRect(2, actionY, eraseW, lh, ST77XX_BLACK);
-    Display::printLine(2, actionY, actionLabel);
-    strncpy(g_raceRoomLastActionLabel, actionLabel, sizeof(g_raceRoomLastActionLabel) - 1);
-    g_raceRoomLastActionLabel[sizeof(g_raceRoomLastActionLabel) - 1] = '\0';
-  }
+  diffRow(actionY, actionLabel, g_raceRoomLastActionLabel, sizeof(g_raceRoomLastActionLabel), firstDraw, lh);
 
-  uint16_t score = getScore(Identity::deviceId());
-  // Phase 2A (D1): the local "Solved!" acknowledgement rides on the score
-  // row (not the action row, which stays live so "> Start Round" remains
-  // visible and usable immediately) and expires on its own.
-  if (g_roomSolvedNoticeActive && !beforeDeadline(millis(), g_roomSolvedNoticeUntilMs)) clearRoomSolvedNotice();
-  char scoreLine[32];
-  snprintf(scoreLine, sizeof(scoreLine), "Score: %u%s", score, g_roomSolvedNoticeActive ? "  Solved! 4A0B" : "");
-  if (firstDraw || strcmp(scoreLine, g_raceRoomLastScoreLine) != 0) {
-    int16_t oldW = Display::textWidth(g_raceRoomLastScoreLine);
-    int16_t newW = Display::textWidth(scoreLine);
-    int16_t eraseW = static_cast<int16_t>((oldW > newW ? oldW : newW) + 4);
-    int16_t maxW = static_cast<int16_t>(Display::kScreenWidth - 2);
-    if (eraseW > maxW) eraseW = maxW;
-    if (!firstDraw) Display::tft().fillRect(2, scoreY, eraseW, lh, ST77XX_BLACK);
-    Display::printLine(2, scoreY, scoreLine);
-    strncpy(g_raceRoomLastScoreLine, scoreLine, sizeof(g_raceRoomLastScoreLine) - 1);
-    g_raceRoomLastScoreLine[sizeof(g_raceRoomLastScoreLine) - 1] = '\0';
-  }
+  char statusBuf[40];
+  const char* status = roomStatusText(statusBuf, sizeof(statusBuf));
+  diffRow(scoreY, status, g_raceRoomLastScoreLine, sizeof(g_raceRoomLastScoreLine), firstDraw, lh);
 
-  // Hardware Fix #4 issue 10: race membership comes from g_participants,
-  // the authoritative Race-protocol join list (populated by
-  // publishInvite()/publishJoin()/handleRaceJoinPacket(), and always
-  // includes self once invited/joined) -- never from generic group-online
-  // contacts, which exclude self entirely and would also show group
-  // members who are online but never joined this race. Presence is used
-  // only to resolve a joined device_id into a nicer display name; it never
-  // decides who counts as a participant.
-  //
-  // Dynamic viewport: at the larger PRIMARY line height fewer rows fit
-  // than the old fixed 4-row/10px layout assumed, so size the participant
-  // list to whatever vertical space is actually left instead of
-  // hardcoding a row count (avoids off-screen/overlapping names, item 14).
-  // Participant rows (scrolled window; see above). The focused one carries
-  // the ">" marker.
-  char shownNames[kMaxRoomRows][28];
+  // Rows (scrolled window; see above). The focused one carries the ">"
+  // marker; the diff key includes the score so a score change repaints
+  // only its own row.
+  char shownNames[kMaxRoomRows][40];
   for (uint8_t r = 0; r < visibleCount; r++) {
     uint8_t i = static_cast<uint8_t>(g_roomListTop + r);
-    char name[17];
-    Presence::resolveDisplayName(g_groupCode, g_participants[i], name, sizeof(name));
-    // Mark self compactly; Display::printLine() safely truncates if the
-    // combined text would otherwise overflow the row.
-    bool self = strcmp(g_participants[i], Identity::deviceId()) == 0;
-    snprintf(shownNames[r], sizeof(shownNames[r]), "%s%s%s", (focus == i) ? "> " : "", name, self ? " (You)" : "");
+    char label[32];
+    formatRoomRow(i, focus == i, label, sizeof(label));
+    snprintf(shownNames[r], sizeof(shownNames[r]), "%s\t%u", label, g_rowScore[i]);
   }
-
-  if (firstDraw || visibleCount != g_raceRoomLastOnlineCount) {
-    // The set of visible participant slots itself changed (someone
-    // joined/left, or first draw): a genuine layout change, so the
-    // participant region is redrawn in full -- still never the title,
-    // action, or score rows above it.
-    if (!firstDraw) {
-      int16_t regionH = static_cast<int16_t>(Display::kScreenHeight - rowsTopY);
-      if (regionH < 0) regionH = 0;
-      Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
-    }
-    for (uint8_t i = 0; i < visibleCount; i++) {
-      Display::printLine(2, static_cast<int16_t>(rowsTopY + i * lh), shownNames[i]);
-      strncpy(g_raceRoomLastOnlineNames[i], shownNames[i], sizeof(g_raceRoomLastOnlineNames[i]) - 1);
-      g_raceRoomLastOnlineNames[i][sizeof(g_raceRoomLastOnlineNames[i]) - 1] = '\0';
-    }
-    g_raceRoomLastOnlineCount = visibleCount;
-  } else {
-    // Same visible slot count: diff each row independently so one
-    // participant's name change never repaints the others.
-    for (uint8_t i = 0; i < visibleCount; i++) {
-      if (strcmp(shownNames[i], g_raceRoomLastOnlineNames[i]) == 0) continue;
-      int16_t rowY = static_cast<int16_t>(rowsTopY + i * lh);
-      Display::tft().fillRect(0, rowY, Display::kScreenWidth, lh, ST77XX_BLACK);
-      Display::printLine(2, rowY, shownNames[i]);
-      strncpy(g_raceRoomLastOnlineNames[i], shownNames[i], sizeof(g_raceRoomLastOnlineNames[i]) - 1);
-      g_raceRoomLastOnlineNames[i][sizeof(g_raceRoomLastOnlineNames[i]) - 1] = '\0';
-    }
+  bool layoutChanged = firstDraw || visibleCount != g_raceRoomLastOnlineCount;
+  if (layoutChanged && !firstDraw) {
+    int16_t regionH = static_cast<int16_t>(Display::kScreenHeight - rowsTopY);
+    if (regionH < 0) regionH = 0;
+    Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
   }
+  for (uint8_t r = 0; r < visibleCount; r++) {
+    if (!layoutChanged && strcmp(shownNames[r], g_raceRoomLastOnlineNames[r]) == 0) continue;
+    int16_t rowY = static_cast<int16_t>(rowsTopY + r * lh);
+    if (!layoutChanged) Display::tft().fillRect(0, rowY, Display::kScreenWidth, lh, ST77XX_BLACK);
+    uint8_t i = static_cast<uint8_t>(g_roomListTop + r);
+    char label[32];
+    formatRoomRow(i, focus == i, label, sizeof(label));
+    drawRoomRow(rowY, i, label);
+    strncpy(g_raceRoomLastOnlineNames[r], shownNames[r], sizeof(g_raceRoomLastOnlineNames[r]) - 1);
+    g_raceRoomLastOnlineNames[r][sizeof(g_raceRoomLastOnlineNames[r]) - 1] = '\0';
+  }
+  g_raceRoomLastOnlineCount = visibleCount;
 }
 
 // =============================================================================
@@ -1516,120 +1357,53 @@ void screenRaceEntry() {
 }
 
 // =============================================================================
-// Network packet handlers
+// Network packets and background service: the engine handles both kinds;
+// it is booted once storage is up and ticked every loop.
 // =============================================================================
-void handleRaceInvitePacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
-  (void)topic;
-  char inviteId[kIdLen], initiator[kDeviceIdLen];
-  if (!parseInvitePayload(payload, static_cast<uint16_t>(payloadLen), inviteId, initiator)) return;
-  if (strcmp(initiator, Identity::deviceId()) == 0) return;  // my own echo
-  if (g_phase != RoomPhase::NO_LOBBY) return;                // already in a lobby/round
-
-  strncpy(g_groupCode, group_code, sizeof(g_groupCode) - 1);
-  strncpy(g_inviteId, inviteId, sizeof(g_inviteId) - 1);
-  strncpy(g_ownerDeviceId, initiator, sizeof(g_ownerDeviceId) - 1);
-  g_haveJoined = false;
-  g_hasHadFirstRound = false;
-  g_phase = RoomPhase::LOBBY_WAITING;
-  g_participantCount = 0;
-  resetRoomFocus();
-  addParticipant(initiator);
-  clearRoomActionStatus();  // Phase 2C-1: a notice from before this lobby must not hide "Join"
-
-  Notifications::setRaceInvitePending(true);
-  playTone(1000, 150, SOUND_NOTIFICATION);
+void handleRaceStatePacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
+  if (g_engine == nullptr) return;
+  g_engine->onPacket(group_code, topic, RaceProtocol::kKindState, payload, payloadLen);
 }
 
-void handleRaceJoinPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
-  (void)group_code;
-  (void)topic;
-  char inviteId[kIdLen], deviceId[kDeviceIdLen];
-  if (!parseJoinPayload(payload, static_cast<uint16_t>(payloadLen), inviteId, deviceId)) return;
-  if (strcmp(deviceId, Identity::deviceId()) == 0) return;
-  if (strcmp(inviteId, g_inviteId) != 0) return;
-  addParticipant(deviceId);
+void handleRaceRequestPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
+  if (g_engine == nullptr) return;
+  g_engine->onPacket(group_code, topic, RaceProtocol::kKindRequest, payload, payloadLen);
 }
 
-void handleRaceRoundPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
-  (void)topic;
-  if (payloadLen == 0) return;  // the zero-length "clear" publish — handled via handleRaceSolvedPacket instead
-  char inviteId[kIdLen], roundId[kIdLen], starterId[kDeviceIdLen];
-  uint8_t secret[4];
-  if (!parseRoundPayload(payload, static_cast<uint16_t>(payloadLen), inviteId, roundId, starterId, secret)) return;
+// Allocates and boots the engine once per boot; a repeated call does nothing
+// (it neither replaces nor re-boots an existing engine). Allocation failure
+// does not abort: Race stays unavailable and its saved records untouched.
+void raceServiceInit() {
+  if (g_engine != nullptr) return;
+  g_engine = new (std::nothrow) RaceProtocol::Engine();
+  if (g_engine == nullptr) return;
+  RaceProtocol::Platform p{nullptr,          Identity::deviceId(), platformPublish, platformGroupReady,
+                           platformNvsWrite, platformNvsRead,      platformMillis,  platformRandom,
+                           platformNextSeq,  platformUnixTime};
+  g_engine->init(p);
+  g_engine->boot();
+}
 
-  if (g_phase == RoomPhase::NO_LOBBY) {
-    // Mid-round newcomer / post-reboot: adopt this retained round's lobby
-    // even though we never saw its (non-retained) invite (section 13, 18).
-    strncpy(g_groupCode, group_code, sizeof(g_groupCode) - 1);
-    strncpy(g_inviteId, inviteId, sizeof(g_inviteId) - 1);
-    strncpy(g_ownerDeviceId, starterId, sizeof(g_ownerDeviceId) - 1);
-    g_haveJoined = false;
-    addParticipant(starterId);
-  } else if (strcmp(inviteId, g_inviteId) != 0) {
-    return;  // a round for a different lobby
+void raceServiceTick() {
+  if (g_engine == nullptr) return;
+  g_engine->tick();
+  syncRound();
+  if (g_engine->takeNewRoomNotification()) {  // a room just created in one of my groups
+    Notifications::setRaceInvitePending(true);
+    playTone(1000, 150, SOUND_NOTIFICATION);
   }
-  if (strcmp(roundId, g_roundId) == 0) return;  // already have this exact round (e.g. we're the starter)
-
-  strncpy(g_roundId, roundId, sizeof(g_roundId) - 1);
-  memcpy(g_secret, secret, 4);
-  g_hasHadFirstRound = true;
-  g_phase = RoomPhase::ROUND_ACTIVE;
-  // Phase 2A: a new round supersedes the previous one's history, its
-  // "Solved!" notice, and any pending or visible Guess outcome for it (a
-  // stale "Solved by X" would otherwise be formatted with THIS round's
-  // secret, and a visible one would freeze input and later pop the screen
-  // on its old deadline). Must run before the auto-enter flag is set below.
-  clearRaceGuessHistory();
-  clearRoomSolvedNotice();
-  invalidateGuessOutcome();
-  clearRoomActionStatus();  // Phase 2C-1: nor may an earlier round's notice carry over
-  if (g_haveJoined) g_pendingAutoEnterGuess = true;
-}
-
-void handleRaceSolvedPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
-  (void)group_code;
-  (void)topic;
-  char roundId[kIdLen], winner[kDeviceIdLen];
-  if (!parseSolvedPayload(payload, static_cast<uint16_t>(payloadLen), roundId, winner)) return;
-  if (strcmp(roundId, g_roundId) != 0) return;                // stale/foreign round
-  if (strcmp(winner, Identity::deviceId()) == 0) return;      // our own, already handled locally
-
-  incrementScore(winner);
-  strncpy(g_ownerDeviceId, winner, sizeof(g_ownerDeviceId) - 1);
-  g_phase = RoomPhase::LOBBY_WAITING;
-  g_roundId[0] = '\0';
-  strncpy(g_pendingWinner, winner, sizeof(g_pendingWinner) - 1);
-  g_pendingExternalSolve = true;
-  clearRaceGuessHistory();  // Phase 2A: round over
-}
-
-void handleRaceResetPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
-  (void)group_code;
-  (void)topic;
-  // publishReset() carries the sender's own g_inviteId as the entire
-  // payload; every other Race packet handler validates inviteId/roundId
-  // against our own room before acting (a stale/foreign event is otherwise
-  // ignored per Addendum "stale Race event"). This one didn't -- a RESET
-  // published by a completely different, unrelated room in the same group
-  // (e.g. its owner going offline) would wipe an uninvolved device's own
-  // active room. Reject anything that isn't for our current room.
-  if (payloadLen < kIdLen || g_phase == RoomPhase::NO_LOBBY) return;
-  char inviteId[kIdLen];
-  memcpy(inviteId, payload, kIdLen);
-  inviteId[kIdLen - 1] = '\0';
-  if (strcmp(inviteId, g_inviteId) != 0) return;
-  applyReset();
 }
 
 struct Registrar {
   Registrar() {
     registerGameSubModeHandler(GameSubModes::RACE, screenRaceEntry);
-    registerNetworkPacketHandler(PacketCodec::PK_RACE_INVITE, handleRaceInvitePacket);
-    registerNetworkPacketHandler(PacketCodec::PK_RACE_JOIN, handleRaceJoinPacket);
-    registerNetworkPacketHandler(PacketCodec::PK_RACE_ROUND, handleRaceRoundPacket);
-    registerNetworkPacketHandler(PacketCodec::PK_RACE_SOLVED, handleRaceSolvedPacket);
-    registerNetworkPacketHandler(PacketCodec::PK_RACE_RESET, handleRaceResetPacket);
+    registerNetworkPacketHandler(PacketCodec::PK_RACE_STATE, handleRaceStatePacket);
+    registerNetworkPacketHandler(PacketCodec::PK_RACE_REQUEST, handleRaceRequestPacket);
     RadioTransport::registerAudioScopeHandler(RadioTransport::AUDIO_RACE_ROOM, handleRoomAudioScope);
+    AppService svc;
+    svc.init = raceServiceInit;
+    svc.tick = raceServiceTick;
+    registerAppService(svc);
   }
 };
 Registrar g_registrar;

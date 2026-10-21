@@ -23,6 +23,7 @@ Preferences& recent();
 Preferences& enigma();
 Preferences& notify();
 Preferences& solo();
+Preferences& race();
 
 // Recursively removes /messages/<group_code> if it exists. Safe to call
 // even when no message has ever been written for that group yet.
