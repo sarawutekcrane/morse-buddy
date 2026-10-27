@@ -27,9 +27,19 @@ enum BadgeCategory : uint8_t {
 void onMessageArrived(const char* group_code, const char* contact_key, const MessageRef& ref,
                       uint8_t badgeMask, bool conversationCurrentlyOpen);
 
-// Call when an unread received message becomes the selected history item
-// (or on its explicit DOT action). No-op if it is already read.
+// Call on a received message's explicit DOT action: reads that one message.
+// No-op if it is already read.
 void clearUnread(const char* group_code, const char* contact_key, const MessageRef& ref);
+
+// Call when a history item becomes the selected one, with the open chat's
+// conversation index (MessageStore::getIndexEntry) still loaded: if it is a
+// received message, it and every older received message of the same type in
+// this conversation become read -- older meaning at or above it in the
+// history and stored no later than it. Messages below it, or stored after it,
+// stay unread; other types are untouched. Bounded work here (a few record
+// reads, no rewrite and no NVS write): the flags on flash are cleared in the
+// background, and the request is saved so a reboot doesn't lose it.
+void readUpTo(const char* group_code, const char* contact_key, uint16_t selectedIndex, uint16_t indexTotal);
 
 uint16_t getUnreadCount(const char* group_code, const char* contact_key);
 

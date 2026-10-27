@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <stdlib.h>
+#include <new>
 #include <string.h>
 
 #include "core/identity.h"
@@ -118,8 +119,9 @@ const char* baseName(const char* path) {
 // mid-iteration failure here is NOT detected or reported, only a failure
 // to open the directory in the first place.
 uint16_t listSequences(const char* group_code, const char* contact_key, uint32_t* outSeqs, uint16_t capacity,
-                       bool* outOpenFailed = nullptr) {
+                       bool* outOpenFailed = nullptr, bool* outTruncated = nullptr) {
   if (outOpenFailed != nullptr) *outOpenFailed = false;
+  if (outTruncated != nullptr) *outTruncated = false;
   char dirPath[80];
   buildConversationDir(group_code, contact_key, dirPath, sizeof(dirPath));
   uint16_t count = 0;
@@ -129,14 +131,29 @@ uint16_t listSequences(const char* group_code, const char* contact_key, uint32_t
     if (outOpenFailed != nullptr) *outOpenFailed = true;
     return 0;
   }
-  File f = dir.openNextFile();
-  while (f) {
-    if (!f.isDirectory()) {
-      uint32_t seq = static_cast<uint32_t>(strtoul(baseName(f.path()), nullptr, 10));
-      if (count < capacity) outSeqs[count++] = seq;
+  // Names only (readdir): openNextFile() would open every record just to
+  // read its name. Only "<sequence>.msg" counts -- atomicRewrite()'s
+  // "<sequence>.msg.tmp" would otherwise list the same sequence twice.
+  bool isDir = false;
+  String entry = dir.getNextFileName(&isDir);
+  while (entry.length() > 0) {
+    const char* name = baseName(entry.c_str());
+    size_t len = strlen(name);
+    if (!isDir && len > 4 && strcmp(name + len - 4, ".msg") == 0) {
+      uint32_t seq = static_cast<uint32_t>(strtoul(name, nullptr, 10));
+      if (count < capacity) {
+        outSeqs[count++] = seq;
+      } else if (capacity > 0) {
+        // Over capacity: keep the lowest sequences (replace the highest
+        // kept), so a truncated listing still holds the oldest records.
+        if (outTruncated != nullptr) *outTruncated = true;
+        uint16_t hi = 0;
+        for (uint16_t k = 1; k < count; k++)
+          if (outSeqs[k] > outSeqs[hi]) hi = k;
+        if (seq < outSeqs[hi]) outSeqs[hi] = seq;
+      }
     }
-    f.close();
-    f = dir.openNextFile();
+    entry = dir.getNextFileName(&isDir);
   }
   dir.close();
   return count;
@@ -298,18 +315,19 @@ void forEachConversation(const char* onlyGroup, Fn&& fn, bool* outReliable = nul
       if (outReliable != nullptr) *outReliable = false;
       return;
     }
-    File contactDir = gdir.openNextFile();
-    while (contactDir) {
-      if (contactDir.isDirectory()) {
+    // Names only (readdir), as in listSequences(): opening each entry cost
+    // an open per conversation, and a failed open ended the listing early
+    // while still reporting it complete.
+    bool isDir = false;
+    String entry = gdir.getNextFileName(&isDir);
+    while (entry.length() > 0) {
+      if (isDir) {
         char cnameBuf[kContactKeyLen];
-        strncpy(cnameBuf, baseName(contactDir.path()), sizeof(cnameBuf) - 1);
+        strncpy(cnameBuf, baseName(entry.c_str()), sizeof(cnameBuf) - 1);
         cnameBuf[sizeof(cnameBuf) - 1] = '\0';
-        contactDir.close();
         fn(onlyGroup, cnameBuf);
-      } else {
-        contactDir.close();
       }
-      contactDir = gdir.openNextFile();
+      entry = gdir.getNextFileName(&isDir);
     }
     gdir.close();
     return;
@@ -321,18 +339,16 @@ void forEachConversation(const char* onlyGroup, Fn&& fn, bool* outReliable = nul
     if (outReliable != nullptr) *outReliable = false;
     return;
   }
-  File groupDir = root.openNextFile();
-  while (groupDir) {
-    if (groupDir.isDirectory()) {
+  bool isDir = false;
+  String entry = root.getNextFileName(&isDir);
+  while (entry.length() > 0) {
+    if (isDir) {
       char gnameBuf[33];
-      strncpy(gnameBuf, baseName(groupDir.path()), sizeof(gnameBuf) - 1);
+      strncpy(gnameBuf, baseName(entry.c_str()), sizeof(gnameBuf) - 1);
       gnameBuf[sizeof(gnameBuf) - 1] = '\0';
-      groupDir.close();
       forEachConversation(gnameBuf, fn, outReliable);
-    } else {
-      groupDir.close();
     }
-    groupDir = root.openNextFile();
+    entry = root.getNextFileName(&isDir);
   }
   root.close();
 }
@@ -852,7 +868,9 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   uint32_t countElapsed = millis() - countStart;
 
   uint32_t evictElapsed = kUnmeasuredMs;
-  if (msgCount >= kMaxMessagesPerThread) {
+  // Approved retention: kRetainedMessagesPerThread. One record per append at
+  // most; a longer (older firmware's) history is trimmed in the background.
+  if (msgCount >= kRetainedMessagesPerThread) {
     uint32_t evictStart = millis();
     bool evictOk = evictOldest(group_code, contact_key);
     evictElapsed = millis() - evictStart;
@@ -1402,10 +1420,76 @@ bool findMessageById(const char* group_code, const char* contact_key, const char
   return false;
 }
 
-bool listConversations(ConversationFn fn, void* ctx) {
-  bool reliable = true;
-  forEachConversation(nullptr, [&](const char* g, const char* c) { fn(g, c, ctx); }, &reliable);
-  return reliable;
+uint16_t listMessageSequences(const char* group_code, const char* contact_key, uint32_t* outSeqs, uint16_t capacity,
+                              bool* outReliable, bool* outTruncated) {
+  bool openFailed = false, truncated = false;
+  uint16_t n = listSequences(group_code, contact_key, outSeqs, capacity, &openFailed, &truncated);
+  if (truncated) Serial.printf("[STORE] %s/%s holds more than %u records; listing incomplete (oldest kept)\n", group_code,
+                               contact_key, static_cast<unsigned>(capacity));
+  if (outReliable != nullptr) *outReliable = !openFailed && !truncated;
+  if (outTruncated != nullptr) *outTruncated = truncated;
+  return n;
+}
+
+bool deleteMessage(const MessageRef& ref) {
+  return removeRecordFile(ref.group_code, ref.contact_key, ref.sequence, /*notifyIfUnread=*/false);
+}
+
+struct ConversationWalk {
+  File root;
+  File group;
+  bool inGroup;
+  char groupName[33];
+};
+
+ConversationWalk* beginConversationWalk() {
+  ConversationWalk* w = new (std::nothrow) ConversationWalk;
+  if (w == nullptr) return nullptr;
+  w->inGroup = false;
+  w->groupName[0] = '\0';
+  w->root = LittleFS.open("/messages");  // created by init(): failing to open it is a failure, not "empty"
+  return w;
+}
+
+WalkResult stepConversationWalk(ConversationWalk* w, uint8_t maxEntries, char* outGroup, size_t outGroupSize,
+                                char* outContact, size_t outContactSize) {
+  if (!w->root || !w->root.isDirectory()) return WalkResult::FAILED;
+  for (uint8_t n = 0; n < maxEntries; n++) {
+    bool isDir = false;
+    if (!w->inGroup) {
+      String entry = w->root.getNextFileName(&isDir);
+      if (entry.length() == 0) return WalkResult::END;
+      if (!isDir) continue;
+      strncpy(w->groupName, baseName(entry.c_str()), sizeof(w->groupName) - 1);
+      w->groupName[sizeof(w->groupName) - 1] = '\0';
+      char groupPath[40];
+      buildGroupDir(w->groupName, groupPath, sizeof(groupPath));
+      w->group = LittleFS.open(groupPath);
+      if (!w->group || !w->group.isDirectory()) return WalkResult::FAILED;
+      w->inGroup = true;
+      continue;
+    }
+    String entry = w->group.getNextFileName(&isDir);
+    if (entry.length() == 0) {
+      w->group.close();
+      w->inGroup = false;
+      continue;
+    }
+    if (!isDir) continue;
+    strncpy(outGroup, w->groupName, outGroupSize - 1);
+    outGroup[outGroupSize - 1] = '\0';
+    strncpy(outContact, baseName(entry.c_str()), outContactSize - 1);
+    outContact[outContactSize - 1] = '\0';
+    return WalkResult::FOUND;
+  }
+  return WalkResult::MORE;
+}
+
+void endConversationWalk(ConversationWalk* w) {
+  if (w == nullptr) return;
+  if (w->inGroup) w->group.close();
+  if (w->root) w->root.close();
+  delete w;
 }
 
 uint16_t findMessagesByPredicate(const char* group_code, const char* contact_key, MessagePredicate pred, void* ctx,
@@ -1431,9 +1515,9 @@ uint16_t findMessagesByPredicate(const char* group_code, const char* contact_key
 
   auto scanConversation = [&](const char* g, const char* c) {
     static uint32_t seqs[kMaxMessagesPerThread];
-    bool openFailed = false;
-    uint16_t n = listSequences(g, c, seqs, kMaxMessagesPerThread, &openFailed);
-    if (openFailed) reliable = false;
+    bool openFailed = false, truncated = false;
+    uint16_t n = listSequences(g, c, seqs, kMaxMessagesPerThread, &openFailed, &truncated);
+    if (openFailed || truncated) reliable = false;  // records beyond the listing capacity were not scanned
     for (uint16_t i = 0; i < n; i++) {
       MessageRef ref;
       strncpy(ref.group_code, g, sizeof(ref.group_code) - 1);

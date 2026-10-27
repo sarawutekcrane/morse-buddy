@@ -1067,7 +1067,7 @@ void dispatchHistoryMessageEvent(const MessageStore::ConversationIndexEntry& ent
   if (fn != nullptr) fn(ref, eventType);
 }
 
-// Phase 2C-2: an outgoing chat loop (Friend's, or Text/Enigma's empty-line
+// Phase 2C-2: an outgoing chat loop (Friend's, or a caller of the empty-line
 // hook) that keeps handling the rest of its batch after this push could
 // call back in before the choice screen ever runs. While no navigation
 // happened since our own push, the choice screen is still the top screen,
@@ -2036,8 +2036,10 @@ void screenQuickSwitch() {
 }
 
 // =============================================================================
-// Empty compose-line hook (Phase 3 section 14) — single global slot, shared
-// by Text and Enigma's own empty-line Encoder-short.
+// Empty compose-line hook (Phase 3 section 14) — single global slot. Text and
+// Enigma no longer call it (hardware finding 2 on 23293c5: an empty-draft
+// Send there must not open a game); Friend games start from Training Game >
+// Number Guessing. Kept registered for the hook's own tests.
 // =============================================================================
 void handleEmptyLineAction(uint8_t mode, const char* group_code, const char* contact_key) {
   (void)mode;

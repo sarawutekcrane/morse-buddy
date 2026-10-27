@@ -1628,9 +1628,8 @@ void handleComposeEvent(const InputEvent& e) {
         g_sendWindow = SendWindow::OPEN;
         g_sendRanThisTick = true;
         setSendStatus(sendEnigmaMessage());
-      } else {
-        invokeEmptyLineAction(Modes::ENIGMA, g_selectedGroupCode, g_selectedContactKey);
       }
+      // An empty draft sends nothing and opens nothing (same as Text's chat).
     }
   } else if (e.type == InputEventType::ENCODER_LONG) {
     g_enigmaChatLeaving = true;  // Phase 2B-2: drop Send feedback at the end of this tick
@@ -1671,12 +1670,10 @@ void handleHistoryFocusEvent(const InputEvent& e) {
   }
 }
 
-// A received message is read once it becomes the selected history item --
-// rotated onto, or selected when the chat is (re)entered -- not merely by
-// being in view (hardware finding 3 on 30ed514; same rule as Text's chat).
-// Checked once per newly selected message; the cached index flags only
-// decide whether a load is worth it, and clearUnread() re-checks the
-// stored flag.
+// Selecting a history item (rotating onto it) reads it and every older
+// received message of the same type in this conversation
+// (Notifications::readUpTo; same rule as Text's chat). Being in view, or
+// entering the chat, reads nothing. Checked once per newly selected message.
 bool g_readCheckDone = false;
 uint32_t g_readCheckSequence = 0;
 
@@ -1686,9 +1683,7 @@ void markSelectedHistoryRead() {
   if (entry == nullptr || (g_readCheckDone && entry->sequence == g_readCheckSequence)) return;
   g_readCheckDone = true;
   g_readCheckSequence = entry->sequence;
-  if (entry->flags & MessageStore::FLAG_UNREAD) {
-    Notifications::clearUnread(g_selectedGroupCode, g_selectedContactKey, refForIndexEntry(*entry));
-  }
+  Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, g_historyCursor, g_indexTotal);
 }
 
 bool g_enigmaChatDirty = true;

@@ -17,6 +17,13 @@
 
 namespace MessageStore {
 
+// Messages kept per conversation: an append evicts the oldest non-pending
+// record (lowest sequence) once this many are stored, and Notifications'
+// background trim brings older conversations down to it.
+constexpr uint16_t kRetainedMessagesPerThread = 100;
+// The most records a conversation can hold: the cap of every earlier
+// firmware, so stored history is never larger. Listings are sized for it,
+// and a listing that finds more reports itself incomplete.
 constexpr uint16_t kMaxMessagesPerThread = 300;
 constexpr size_t kContactKeyLen = 17;
 constexpr size_t kMaxLocalPayloadLen = 400;
@@ -124,7 +131,8 @@ void notifyExternalStorageMutationAttempted();
 
 // Appends a new record. wirePacket/wirePacketLen is the exact bytes
 // sent/received; localPayload may be nullptr/0 (TEXT needs none).
-// Enforces per-thread 300 FIFO + global low-space eviction first; returns
+// Enforces the per-thread retention (kRetainedMessagesPerThread, one
+// eviction per append) + global low-space eviction first; returns
 // false only when no evictable (non-pending) record exists anywhere
 // needed to make room — caller shows "Storage Full".
 bool appendStoredMessage(const char* group_code, const char* contact_key, Direction direction, uint16_t flags,
@@ -145,13 +153,38 @@ bool updateTypeLocalPayload(const MessageRef& ref, const uint8_t* localPayload, 
 
 bool findMessageById(const char* group_code, const char* contact_key, const char* message_id, MessageRef* outRef);
 
-// Calls fn(group_code, contact_key, ctx) once for every stored conversation
-// directory. Returns false if a directory could not be opened, so the listing
-// may be incomplete. Reads directory entries only (no message records). Used
-// by Notifications to find conversations with unread messages that its
-// stored summary does not list.
-using ConversationFn = void (*)(const char* group_code, const char* contact_key, void* ctx);
-bool listConversations(ConversationFn fn, void* ctx);
+// An incremental walk over every stored conversation directory, a bounded
+// number of directory entries per call (the number of groups and
+// conversations is not bounded). Holds the open directories between calls,
+// so a caller can spread a walk over many main-loop passes. Conversations
+// created or removed during a walk may or may not be reported; every one
+// that exists throughout the walk is reported exactly once.
+struct ConversationWalk;
+enum class WalkResult : uint8_t { FOUND, MORE, END, FAILED };
+// nullptr if out of memory. The walk starts at the first group.
+ConversationWalk* beginConversationWalk();
+// Reads up to maxEntries directory entries. FOUND: outGroup/outContact name
+// the next conversation. MORE: none found yet, call again. END: every
+// conversation has been reported. FAILED: a directory could not be opened,
+// so the walk is incomplete (end it and start again later).
+WalkResult stepConversationWalk(ConversationWalk* walk, uint8_t maxEntries, char* outGroup, size_t outGroupSize,
+                                char* outContact, size_t outContactSize);
+void endConversationWalk(ConversationWalk* walk);
+
+// The sequence numbers of one conversation's stored messages (directory
+// order, at most capacity of them), from directory entries only -- no record
+// is opened. outReliable is set false if the directory could not be opened
+// or held more than capacity records (the listing is then incomplete). In
+// that second case outTruncated (optional) is set, and the listing holds the
+// capacity LOWEST (oldest) sequences, in no particular order -- enough to
+// trim from the oldest end, never enough to count the conversation.
+// Used by Notifications to read a conversation a few records at a time.
+uint16_t listMessageSequences(const char* group_code, const char* contact_key, uint32_t* outSeqs, uint16_t capacity,
+                              bool* outReliable, bool* outTruncated = nullptr);
+
+// Deletes one stored record. No eviction callback: the caller accounts for
+// it. False if it could not be removed.
+bool deleteMessage(const MessageRef& ref);
 
 using MessagePredicate = bool (*)(const StoredHeader& header, const PacketCodec::MessageEnvelope& envelope,
                                   void* ctx);
