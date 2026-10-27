@@ -361,20 +361,22 @@ static void r_senderChatRefresh() {
 static void r_realChatQueuedShorts() {
   for (int m = 0; m < 2; m++) {
     const bool enigma = (m == 1);
-    g_test = std::string("R17 ") + (enigma ? "Enigma" : "Text") + ": two Shorts in one batch open one challenge choice";
+    g_test = std::string("R17 ") + (enigma ? "Enigma" : "Text") +
+             ": two empty-draft Shorts in one batch open nothing (hardware finding 2 on 23293c5)";
     resetAll(); ScreenHandlerFn chat = openRealChat(enigma);
     uint8_t depth = g_stackSize;
     shortP(T::now); T::now += 1; shortP(T::now); tick(3);
-    CHECK(g_stackSize == depth + 1 && g_stack[depth - 1] == chat, "depth %u -> %u", depth, g_stackSize);
+    CHECK(g_stackSize == depth && g_stack[depth - 1] == chat && T::appendCalls == 0 && pubCalls() == 0,
+          "depth %u -> %u, appends %d, publishes %d", depth, g_stackSize, T::appendCalls, pubCalls());
     g_test = std::string("R18 ") + (enigma ? "Enigma" : "Text") +
-             ": Short then Back in one batch (pre-existing outgoing-loop path) ends on the chat, nothing sent";
+             ": empty-draft Short then Back in one batch: the Short does nothing, Back leaves the chat, nothing sent";
     resetAll(); chat = openRealChat(enigma);
     depth = g_stackSize;
     shortP(T::now); T::now += 1; back(T::now); tick(3);
-    CHECK(g_stackSize == depth && g_stack[depth - 1] == chat && TextMessage::isConversationOpen("GROUP1", "BOBKEY") &&
-              T::appendCalls == 0,
-          "depth %u top-is-chat %d open %d", g_stackSize, g_stack[g_stackSize - 1] == chat,
-          TextMessage::isConversationOpen("GROUP1", "BOBKEY"));
+    CHECK(g_stackSize == depth - 1 && !TextMessage::isConversationOpen("GROUP1", "BOBKEY") && T::appendCalls == 0 &&
+              pubCalls() == 0,
+          "depth %u -> %u open %d appends %d", depth, g_stackSize, TextMessage::isConversationOpen("GROUP1", "BOBKEY"),
+          T::appendCalls);
   }
 }
 static void r_chatDoubleShortToAnswer() {
@@ -1187,27 +1189,20 @@ static void f1_realChats() {
   for (int m = 0; m < 2; m++) {
     const bool enigma = (m == 1);
     const std::string mode = enigma ? "Enigma" : "Text";
-    g_test = "F1f " + mode + ": real empty-line Short opens the choice without Open Chat; Back returns to the chat";
+    g_test = "F1f " + mode + ": empty-draft Short in a direct chat does nothing: no game, no message (hardware finding 2)";
     resetAll(); ScreenHandlerFn chat = openRealChat(enigma);
     uint8_t depth = g_stackSize;
-    shortP(T::now); tick(2);
-    CHECK(nameOf(g_stack[g_stackSize - 1]) == std::string("SetMR") && g_stack[g_stackSize - 2] == chat &&
-              T::visible("Set Manually") && T::visible("Randomize") && !T::visible("Open Chat"),
-          "%s", T::visibleJoined().c_str());
-    back(T::now); tick(2);
-    CHECK(g_stackSize == depth && g_stack[depth - 1] == chat && TextMessage::isConversationOpen("GROUP1", "BOBKEY"),
-          "Back did not return to the %s chat", mode.c_str());
-    g_test = "F1g " + mode + ": send from the real chat; Quick Switch Back returns to that chat";
-    shortP(T::now); tick(2); dot(T::now); tick(3);
-    CHECK(nameOf(g_stack[g_stackSize - 1]) == std::string("Manual"), "%s", stackStr().c_str());
-    setDigits(5, 6, 7, 8); tick(); dot(T::now); tick(2);
-    CHECK(nameOf(g_stack[g_stackSize - 1]) == std::string("QS") && g_stack[g_stackSize - 2] == chat &&
-              T::appendCalls == 1 && T::store.back().ref.contact_key == std::string("BOBKEY") &&
-              T::store.back().ref.group_code == std::string("GROUP1"),
-          "after send: %s", stackStr().c_str());
-    back(T::now); tick(2);
-    CHECK(g_stackSize == depth && g_stack[depth - 1] == chat && TextMessage::isConversationOpen("GROUP1", "BOBKEY"),
-          "Quick Switch Back did not return to the %s chat", mode.c_str());
+    shortP(T::now); tick(3);
+    CHECK(g_stackSize == depth && g_stack[depth - 1] == chat && !T::visible("Set Manually") && !T::visible("Randomize") &&
+              T::appendCalls == 0 && pubCalls() == 0 && count("nextId") == 0 &&
+              TextMessage::isConversationOpen("GROUP1", "BOBKEY"),
+          "stack %s appends %d publishes %d", stackStr().c_str(), T::appendCalls, pubCalls());
+    g_test = "F1g " + mode + ": empty-draft Short in the broadcast chat does nothing either";
+    resetAll(); chat = openRealChat(enigma, "GROUP1", MessageStore::kEveryone);
+    depth = g_stackSize;
+    shortP(T::now); tick(3);
+    CHECK(g_stackSize == depth && g_stack[depth - 1] == chat && T::appendCalls == 0 && pubCalls() == 0,
+          "stack %s appends %d publishes %d", stackStr().c_str(), T::appendCalls, pubCalls());
     g_test = "F1h " + mode + ": a non-empty draft Short sends the draft (no challenge choice)";
     resetAll(); chat = openRealChat(enigma);
     typeDot(); T::now += 400; tick(3);

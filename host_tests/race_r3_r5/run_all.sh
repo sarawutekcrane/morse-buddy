@@ -1,7 +1,8 @@
 #!/bin/bash
 # Race R3-R5 (room protocol, design revision 8) host-test bundle, with the
 # R1/R2, history-browsing, Solo and Friend regressions, and the unread
-# marking and badge suite (hardware finding 3).
+# marking and badge suites (hardware finding 3 on 30ed514; findings 1-3 on
+# 23293c5), one of them against the ACTUAL message store on a host directory.
 # HOST ONLY -- not firmware, ESP32 timing/memory, flash/NVS hardware, broker
 # or multi-device radio validation.
 # Usage: ./run_all.sh from this directory (REPO defaults to the repository root).
@@ -61,6 +62,12 @@ build st -std=gnu++17 $SAN -Wall -Wextra -I "$H" -I "$H/fake" -I "$REPO/src" "$H
 build ft -std=gnu++17 $SAN -Wall -Wextra -I "$H" -I "$H/fake" -I "$REPO/src" "$H/friend_test.cpp" "$H/stubs.cpp" $FCOMMON && run ft
 echo "== 4b. Unread marking and badges (hardware finding 3): ACTUAL menu, notifications, text_message, enigma"
 build nt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -I "$H" -I "$H/fake" -I "$REPO/src" "$H/notify_test.cpp" "$H/stubs.cpp" $FNOTE && run nt
+echo "== 4c. Unread marking against the REAL message store (findings 1 and 3 on 23293c5): ACTUAL storage_messages.cpp on a host directory (fake_fs/), notifications, text_message, enigma, menu"
+FSROOT=$(mktemp -d)
+build stt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_test.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$H/fake_fs/LittleFS.cpp" && {
+  st=0; "$OUT/stt" "$FSROOT/t" > "$OUT/stt.txt" 2>&1 || st=$?
+  grep -E "FAIL|passed" "$OUT/stt.txt" | sed 's/^/   /' || true
+  [ $st -eq 0 ] || fail "stt exited with status $st"; }
 W=$(cat "$OUT"/*.warnings.txt | grep -E '(race|race_protocol|identity|number_guessing|number_guessing_friend)\.(cpp|h):[0-9]+:[0-9]+: warning' | sed 's|.*/src/core/||' | sort -u | tr '\n' ' ' || true)
 echo "   warnings in changed/related files (all builds): ${W:-none}"
 
@@ -86,13 +93,20 @@ done
 echo "== 6. Sizes: encoded by the ACTUAL codec (step 1 E16, step 2 U14) and the RAM of the engine on this host"
 build sizes -std=gnu++17 -I "$REPO/src" "$H/sizes.cpp" && { "$OUT/sizes" | sed 's/^/   /' || fail "sizes"; }
 echo "   (x86-64 host layout: ESP32 is 32-bit, so pointer members are half the size there; not measured on target)"
+echo "== 6b. Storage work per main-loop pass, ACTUAL store, legacy histories written in the record format (measurement, not pass/fail; host time is not device time)"
+build bench -std=gnu++17 -O1 -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_bench.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$H/fake_fs/LittleFS.cpp" && {
+  echo "   -- 8 conversations x 300 messages, 180 s"
+  "$OUT/bench" "$FSROOT/b" 8 300 180 | sed 's/^/   /' || fail "storage bench 8x300"
+  echo "   -- 400 conversations x 20 messages, 120 s"
+  "$OUT/bench" "$FSROOT/c" 400 20 120 | sed 's/^/   /' || fail "storage bench 400x20"; }
+rm -rf "$FSROOT"
 
 if [ "${SKIP_MUTATIONS:-0}" = 1 ]; then
   echo "== 7. Targeted mutations: SKIPPED (SKIP_MUTATIONS=1)"
 else
   echo "== 7. Targeted mutations of race.cpp, race_protocol.cpp and identity.cpp (each must be caught)"
   python3 "$H/mutate_room.py" || fail "mutations (unexplained survivor or build error)"
-  echo "== 7b. Targeted mutations of notifications.cpp, text_message.cpp and enigma.cpp (each must be caught)"
+  echo "== 7b. Targeted mutations of notifications.cpp, text_message.cpp, enigma.cpp and storage_messages.cpp (each must be caught by notify_test or storage_test)"
   python3 "$H/mutate_notify.py" || fail "notification mutations (survivor or build error)"
 fi
 

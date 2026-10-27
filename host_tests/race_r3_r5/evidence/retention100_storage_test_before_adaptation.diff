@@ -1,0 +1,13 @@
+53d52
+<   if (Notifications::g_sweep != nullptr) MessageStore::endConversationWalk(Notifications::g_sweep->walk);
+56,57d54
+<   Notifications::g_recountRetryMs = 0;
+<   Notifications::g_recountFailures = 0;
+260c257
+<             Notifications::g_readUps->items[0].failures == 0,
+---
+>             true /*BEFORE: no failures field*/,
+583c580
+<               Notifications::g_readUps->items[0].failures >= 2,
+---
+>               true /*BEFORE: no failures field*/,

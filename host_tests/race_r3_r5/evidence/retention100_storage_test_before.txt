@@ -1,0 +1,13 @@
+FAIL [ST15 legacy 300-record conversation trimmed in the background to the latest 100; pending outbox kept; contents kept] line 502: kept 300 records; the expected set (pending + latest 98, bytes unchanged): 0
+FAIL [ST16 trimming interrupted by a reboot resumes and ends with exactly the latest 100] line 525: mid 300, after 300, latest 100 kept: 0
+FAIL [ST16 trimming interrupted by a reboot resumes and ends with exactly the latest 100] line 526: count 300 flash 300
+FAIL [ST17 failed deletions are retried later, never skipped: the kept set is still exactly the latest 100] line 548: after recovery: 160 kept, expected set 0, count 160
+FAIL [ST18 trimmed unread records leave the counts and badges consistent with flash (a category fully trimmed goes dark)] line 561: kept 300, flash enigma 200, badge 1, count 200
+FAIL [ST19 read-up rewrites failing far beyond three passes (and across a reboot): never marked done, completes once writes work] line 579: the failing read-up was dropped or marked done (or never retried)
+FAIL [ST19 read-up rewrites failing far beyond three passes (and across a reboot): never marked done, completes once writes work] line 591: after writes work again: 30 left, count 30
+FAIL [ST21 400 conversations in 4 groups: the walk reads a bounded number of directory entries per pass and skips none] line 634: per pass: 404 directory entries
+FAIL [ST22 the open conversation is not trimmed while open (its draft untouched); it is trimmed after leaving] line 648: after leaving: 300 kept
+FAIL [ST23 a conversation beyond the 300-entry listing capacity (copied in by hand): trimmed oldest-first to 100, counts exact] line 660: kept 340 records, sequences 1..340
+FAIL [ST23 a conversation beyond the 300-entry listing capacity (copied in by hand): trimmed oldest-first to 100, counts exact] line 662: count 0, flash 0
+FAIL [ST23b the same with directories listed in reverse name order (LittleFS promises no order)] line 660: kept 340 records, sequences 1..340
+47 checks passed, 12 failed

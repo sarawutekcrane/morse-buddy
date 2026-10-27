@@ -58,12 +58,26 @@ inline void resetRetryClock() { Notifications::g_nextRetryMs = T::now; }
 inline int stateField(const Notifications::Summary* x) { return x->state; }
 // Every piece of volatile notification state goes back to its power-on value:
 // a reboot keeps only the simulated durable storage (g_notifyPrefs, T::store).
-// The sweep's heap object is freed before its pointer is cleared.
+// Heap objects (sweep, job, read-up list) are freed before their pointers
+// are cleared. -DNOTIFY_HEAD builds against 23293c5's notifications.cpp
+// (no jobs or read-ups) for before/after evidence.
 inline void resetVolatile() {
+#ifndef NOTIFY_HEAD
+  if (Notifications::g_sweep != nullptr) MessageStore::endConversationWalk(Notifications::g_sweep->walk);
+#endif
   delete Notifications::g_sweep;
   Notifications::g_sweep = nullptr;
-#ifdef NOTIFY_PENDING2  // the pending2 candidate only
-  Notifications::g_clearPendingOnSave = false;
+#ifndef NOTIFY_HEAD
+  Notifications::g_recountRetryMs = 0;
+  Notifications::g_recountFailures = 0;
+  delete Notifications::g_job;
+  Notifications::g_job = nullptr;
+  delete Notifications::g_readUps;
+  Notifications::g_readUps = nullptr;
+  Notifications::g_readUpsDirty = false;
+  Notifications::g_nextStepMs = T::now;
+  Notifications::g_saveDueMs = 0;
+  Notifications::g_readUpsDueMs = 0;
 #endif
   memset(Notifications::g_summaries, 0, sizeof(Notifications::g_summaries));
   Notifications::g_loadState = Notifications::LOAD_OK;
@@ -177,9 +191,19 @@ static void reboot() {
   NV::resetVolatile();  // durable storage (g_notifyPrefs, T::store) is untouched
   Notifications::loadSummaries();
 }
-// One retry/reconcile interval of the notification service tick.
+// One retry interval (kRetryMs + 1 ms) of main-loop passes, 25 ms apart, each
+// calling the notification service tick (as main.cpp's loop() does).
 static void notifyTick(int n = 1) {
-  for (int i = 0; i < n; i++) { T::now += NV::kRetryMs + 1; NV::serviceTick(); }
+  for (int i = 0; i < n; i++) {
+    uint32_t end = T::now + NV::kRetryMs + 1;
+    while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; NV::serviceTick(); }
+  }
+}
+// The device stays on for 3 s: deferred writes (summary after 2 s, read-up
+// record after 1 s) are made, and background work advances.
+static void stayOn() {
+  uint32_t end = T::now + 3000;
+  while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; NV::serviceTick(); }
 }
 static int stateOf(const char* contact) {
   Notifications::Summary* x = Notifications::findSummary(kG, contact);
@@ -211,19 +235,23 @@ int main() {
   openText();
   CHECK(textBadge() && unread(m), "entering the chat (nothing selected) marked it read");
   rot(-1); tick(2);
+  CHECK(!textBadge(), "selected: badge %d (it follows at once)", textBadge());
+  stayOn();  // the flag on flash is cleared in the background
   CHECK(!textBadge() && !unread(m), "selected: badge %d unread %d", textBadge(), unread(m));
   back();
   CHECK(!textBadge() && !TextMessage::isConversationOpen(kG, kBob), "after Back: badge %d", textBadge());
 
-  g_test = "NR2 unseen messages stay unread: selecting the newest leaves the older one unread";
+  g_test = "NR2 read up to the selection: a newer message stays unread; selecting the newest reads both (finding 1 on 23293c5)";
   reset();
   MessageRef older = arrive(PacketCodec::MSG_TYPE_TEXT, "ONE");
   MessageRef newer = arrive(PacketCodec::MSG_TYPE_TEXT, "TWO");
   openText();
-  rot(-1); tick(2);  // lands on the newest
-  CHECK(!unread(newer) && unread(older) && textBadge(), "newer %d older %d badge %d", unread(newer), unread(older), textBadge());
-  rot(-1); tick(2);  // then the older one
-  CHECK(!unread(older) && !textBadge(), "older %d badge %d", unread(older), textBadge());
+  rot(-1); rot(-1); tick(2);  // two detents in one batch: passes over the newest, lands on the older one
+  stayOn();
+  CHECK(unread(newer) && !unread(older) && textBadge(), "newer %d older %d badge %d", unread(newer), unread(older), textBadge());
+  rot(+1); tick(2);  // now the newest
+  stayOn();
+  CHECK(!unread(newer) && !unread(older) && !textBadge(), "newer %d older %d badge %d", unread(newer), unread(older), textBadge());
   back();
 
   g_test = "NR3 Enigma chat: rotating onto a received Enigma message marks it read";
@@ -233,6 +261,7 @@ int main() {
   openEnigma();
   CHECK(enigmaBadge(), "entering the Enigma chat marked it read");
   rot(-1); tick(2);
+  stayOn();
   CHECK(!enigmaBadge() && !unread(e), "selected: enigma badge %d unread %d", enigmaBadge(), unread(e));
   back();
 
@@ -243,9 +272,11 @@ int main() {
   CHECK(textBadge() && enigmaBadge(), "precondition");
   openText();
   rot(-1); rot(-1); tick(2);  // two detents in one input batch: passes over the Enigma message without drawing it selected
+  stayOn();
   CHECK(!unread(t1) && unread(e1) && !textBadge() && enigmaBadge(),
         "only the message left selected is read: text %d enigma %d badges %d/%d", unread(t1), unread(e1), textBadge(), enigmaBadge());
   rot(+1); tick(2);  // now the Enigma message (Unified Thread) is selected
+  stayOn();
   CHECK(!unread(e1) && !textBadge() && !enigmaBadge(), "badges text %d enigma %d", textBadge(), enigmaBadge());
   back();
   reset();
@@ -260,6 +291,7 @@ int main() {
   CHECK(textBadge() && enigmaBadge(), "game record: text %d enigma %d", textBadge(), enigmaBadge());
   openEnigma();
   rot(-1); tick(2);
+  stayOn();
   CHECK(!unread(g) && !textBadge() && !enigmaBadge(), "selected in Enigma: unread %d text %d enigma %d", unread(g), textBadge(),
         enigmaBadge());
   back();
@@ -270,6 +302,7 @@ int main() {
   openText();
   strcpy(g_composeText, "DRAFT"); g_composeLen = 5;
   rot(-1); tick(2);
+  stayOn();
   uint16_t cursor = g_historyCursor;
   CHECK(!unread(m) && strcmp(g_composeText, "DRAFT") == 0, "draft '%s'", g_composeText);
   MessageRef later = arrive(PacketCodec::MSG_TYPE_TEXT, "LATER");  // arrives while the chat is open
@@ -298,14 +331,18 @@ int main() {
     Notifications::loadSummaries();
     CHECK(textBadge() && enigmaBadge() && Notifications::getUnreadCount(kG, kBob) == 2, "after migration: text %d enigma %d count %u",
           textBadge(), enigmaBadge(), Notifications::getUnreadCount(kG, kBob));
+    CHECK(stateOf(kBob) == NV::SUMMARY_UNRESOLVED, "migration recounts in the background, never at boot: state %d",
+          stateOf(kBob));
+    notifyTick(1);
     CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && countOf(kBob, Notifications::SLOT_TEXT) == 1 &&
               countOf(kBob, Notifications::SLOT_ENIGMA) == 1,
-          "a reliable scan gives exact counts at once: state %d text %u enigma %u", stateOf(kBob), countOf(kBob, Notifications::SLOT_TEXT),
+          "a reliable background scan gives exact counts: state %d text %u enigma %u", stateOf(kBob), countOf(kBob, Notifications::SLOT_TEXT),
           countOf(kBob, Notifications::SLOT_ENIGMA));
     CHECK(g_notifyPrefs.isKey("summary2") && g_notifyPrefs.kv["summary"] == legacyBytes, "summary2 written, old record untouched");
     Notifications::clearUnread(kG, kBob, t1);
     CHECK(!textBadge() && enigmaBadge(), "migrated: reading the Text message leaves only Enigma: text %d enigma %d", textBadge(),
           enigmaBadge());
+    stayOn();
     memset(Notifications::g_summaries, 0, sizeof(Notifications::g_summaries));
     Notifications::loadSummaries();  // a reboot: summary2 is used as stored
     CHECK(!textBadge() && enigmaBadge(), "after reboot: text %d enigma %d", textBadge(), enigmaBadge());
@@ -321,19 +358,22 @@ int main() {
     g_notifyPrefs.putBytes("summary", old, sizeof(old));
     T::scanUnreliable = true;
     reboot();
+    stayOn();
     T::scanUnreliable = false;
     CHECK(enigmaBadge() && !textBadge() && stateOf(kBob) == NV::SUMMARY_UNRESOLVED, "enigma %d text %d state %d",
           enigmaBadge(), textBadge(), stateOf(kBob));
     CHECK(g_notifyPrefs.isKey("summary2"), "the UNRESOLVED state is stored (survives a reboot)");
   }
 
-  g_test = "NR9 an unread record evicted: the conversation is recounted from what remains";
+  g_test = "NR9 an unread record evicted: the conversation is recounted (in the background) from what remains";
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
   e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");
   for (size_t i = 0; i < T::store.size(); i++)
     if (T::store[i].ref.sequence == t1.sequence) { T::store.erase(T::store.begin() + static_cast<long>(i)); break; }
   Notifications::onMessageEvicted(t1, MessageStore::FLAG_UNREAD);
+  CHECK(stateOf(kBob) == NV::SUMMARY_UNRESOLVED && textBadge() && enigmaBadge(), "no recount on the eviction (append) path");
+  notifyTick(1);
   CHECK(!textBadge() && enigmaBadge() && Notifications::getUnreadCount(kG, kBob) == 1, "text %d enigma %d count %u", textBadge(),
         enigmaBadge(), Notifications::getUnreadCount(kG, kBob));
 
@@ -391,12 +431,14 @@ int main() {
   CHECK(textBadge() && enigmaBadge() && countOf(kBob, Notifications::SLOT_TEXT) == 2, "after reboot: text %u",
         countOf(kBob, Notifications::SLOT_TEXT));
   Notifications::clearUnread(kG, kBob, t1); Notifications::clearUnread(kG, kBob, t2); Notifications::clearUnread(kG, kBob, e1);
+  stayOn();
   reboot();
   CHECK(!textBadge() && !enigmaBadge(), "all read, after reboot: text %d enigma %d", textBadge(), enigmaBadge());
 
   g_test = "NR12 existing summary2 unreadable: never replaced from the (stale) legacy record; recovery merges";
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2 now holds Bob: Text 1
+  stayOn();
   putLegacy(kCarol, 5, Notifications::BADGE_ENIGMA);  // a stale legacy record also present
   std::string current = g_notifyPrefs.kv["summary2"];
   legacyBytes = g_notifyPrefs.kv["summary"];
@@ -428,12 +470,16 @@ int main() {
         "still unresolved (no guessed decrement): text %d enigma %d", textBadge(), enigmaBadge());
   notifyTick(2);  // still unreliable: nothing changes
   T::scanUnreliable = false;
-  notifyTick(1);  // reconcile
+  // The recount gave way after repeated unreliable listings and waits out its
+  // backoff (2 s doubling; 16 s after 20 s of failures) before reconciling.
+  CHECK(Notifications::g_recountFailures > 0, "precondition: the recount never gave way");
+  notifyTick(3);  // 30 s: past the backoff in force
   CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && !textBadge() && enigmaBadge(),
         "reconciled: text %d enigma %d (text %u enigma %u game %u)", textBadge(), enigmaBadge(), countOf(kBob, 0), countOf(kBob, 1),
         countOf(kBob, 2));
   Notifications::clearUnread(kG, kBob, e1);
   CHECK(!textBadge() && !enigmaBadge(), "all read: text %d enigma %d", textBadge(), enigmaBadge());
+  stayOn();
   reboot();
   CHECK(!textBadge() && !enigmaBadge(), "after reboot: text %d enigma %d", textBadge(), enigmaBadge());
 
@@ -451,6 +497,7 @@ int main() {
   reboot();
   CHECK(textBadge(), "after reboot the unread message is still counted");
   Notifications::clearUnread(kG, kBob, t1);
+  stayOn();
   reboot();
   CHECK(!textBadge(), "read, after reboot: %d", textBadge());
 
@@ -491,6 +538,7 @@ int main() {
   g_test = "NR17 summary2 unreadable, the only unread message read (no RAM summary), recovery, reboot: no badge";
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2 now holds Bob: Text 1
+  stayOn();
   current = g_notifyPrefs.kv["summary2"];
   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
   reboot();
@@ -509,6 +557,7 @@ int main() {
   g_test = "NR18 summary2 unreadable, the only unread message evicted (no RAM summary), recovery, reboot: no badge";
   reset();
   e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");  // summary2 now holds Bob: Enigma 1
+  stayOn();
   current = g_notifyPrefs.kv["summary2"];
   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
   reboot();
@@ -547,6 +596,7 @@ int main() {
   g_test = "NR20 all 24 RAM entries in use while summary2 is unreadable; a read in a stored conversation is still corrected";
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2: Bob Text 1
+  stayOn();
   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
   reboot();
   {
@@ -586,6 +636,7 @@ int main() {
   reboot();
   CHECK(textBadge(), "after reboot: unread arrival lost");
   Notifications::clearUnread(kG, kBob, t1);
+  stayOn();
   reboot();
   CHECK(!textBadge(), "read, after reboot: %d", textBadge());
 
@@ -595,6 +646,7 @@ int main() {
                    : "NR22 summary2 unreadable, only unread message read, reboot before recovery, then recovery: badge clears";
     reset();
     t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2: Bob Text 1 (COUNTED)
+    stayOn();
     current = g_notifyPrefs.kv["summary2"];
     g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
     reboot();
@@ -619,6 +671,7 @@ int main() {
   g_test = "NR24 recovery at boot (stored record readable again on the next boot): the stale count is verified and clears";
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
+  stayOn();
   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
   reboot();
   Notifications::clearUnread(kG, kBob, t1);
@@ -634,6 +687,7 @@ int main() {
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
   e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");
   arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG2");
+  stayOn();
   T::scanUnreliable = true;
   reboot();
   CHECK(textBadge() && enigmaBadge(), "lit while verifying");
@@ -676,6 +730,7 @@ int main() {
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
   Notifications::clearUnread(kG, kBob, t1);  // summary2: Bob COUNTED, all counts 0
+  stayOn();
   CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && countOf(kBob, Notifications::SLOT_TEXT) == 0, "precondition");
   current = g_notifyPrefs.kv["summary2"];
   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
@@ -694,6 +749,7 @@ int main() {
   g_test = "NR28 conversation in summary2 with another category unread: Enigma arrival while unreadable, reboot before recovery";
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2: Bob Text 1, Enigma 0
+  stayOn();
   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
   reboot();
   e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");
@@ -804,8 +860,10 @@ int main() {
   CHECK(!g_notifyPrefs.isKey("pending2"), "precondition: pending not written");
   g_notifyPrefs.failRead = nullptr;
   g_notifyPrefs.failWrite = nullptr;
+  T::listUnreliable = true;  // and no listing works yet: only the RAM merge can show it
   notifyTick(1);  // the retry load merges RAM: lit at once
   CHECK(textBadge(), "lit right after the merge: %d", textBadge());
+  T::listUnreliable = false;
   notifyTick(2);
   CHECK(countOf(kCarol, Notifications::SLOT_TEXT) == 1, "counted: %u", countOf(kCarol, Notifications::SLOT_TEXT));
 
@@ -814,6 +872,7 @@ int main() {
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
   Notifications::clearUnread(kG, kBob, t1);  // summary2: Bob COUNTED, all zero
+  stayOn();
   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
   reboot();
   MessageRef b2 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT2");
@@ -890,6 +949,21 @@ int main() {
   notifyTick(6);
   CHECK(textBadge() && countOf(kCarol, Notifications::SLOT_TEXT) == 1, "skipped: badge %d text %u", textBadge(),
         countOf(kCarol, Notifications::SLOT_TEXT));
+
+  g_test = "NR39 an UNRESOLVED recount whose listings stay unreliable backs off (bounded retries), then reconciles";
+  reset();
+  t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
+  g_notifyPrefs.kv.clear();
+  putLegacy(kBob, 1, Notifications::BADGE_TEXT);
+  T::scanUnreliable = true;
+  reboot();
+  CHECK(stateOf(kBob) == NV::SUMMARY_UNRESOLVED, "precondition: unresolved");
+  T::listings = 0;
+  notifyTick(12);  // 120 s of unreliable listings
+  CHECK(T::listings < 150, "%u listings in 120 s (no backoff: one per 25 ms step)", T::listings);
+  T::scanUnreliable = false;
+  notifyTick(7);  // past the longest backoff (60 s)
+  CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && textBadge(), "not reconciled: state %d badge %d", stateOf(kBob), textBadge());
 
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

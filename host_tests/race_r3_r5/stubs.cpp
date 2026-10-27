@@ -42,12 +42,13 @@ uint32_t unixTime = 1700000000u;
 bool realGlyphs = false;
 bool scanUnreliable = false;
 bool listUnreliable = false;
+unsigned listings = 0;
 std::function<void(const std::string&)> onDraw;
 void reset() {
   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0;
   connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
-  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; scanUnreliable = false; listUnreliable = false;
+  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; scanUnreliable = false; listUnreliable = false; listings = 0;
 }
 std::string visibleJoined() { std::string s; for (auto& d : screen) { s += d.text; s += '|'; } return s; }
 std::string rowAt(int y) {
@@ -153,6 +154,7 @@ bool publishBinary(const char* group, const char* topic, const uint8_t* data, ui
 }
 }  // namespace MqttManager
 
+#ifndef REAL_MESSAGE_STORE  // the storage integration suite links the ACTUAL storage_messages.cpp instead
 namespace MessageStore {
 static uint32_t g_gen = 0;
 static std::vector<ConversationIndexEntry> g_index;
@@ -220,21 +222,56 @@ uint16_t findMessagesByPredicate(const char*, const char*, MessagePredicate, voi
   if (rel) *rel = true; return 0;
 }
 #endif
-bool listConversations(ConversationFn fn, void* ctx) {  // every distinct (group, contact) in the fake store
-  if (T::listUnreliable) return false;
-  std::vector<std::pair<std::string, std::string>> seen;
+uint16_t listMessageSequences(const char* g, const char* c, uint32_t* out, uint16_t cap, bool* reliable, bool* truncated) {
+  if (reliable) *reliable = !T::listUnreliable && !T::scanUnreliable;
+  if (truncated) *truncated = false;  // the fake store never holds more than a listing
+  T::listings++;
+  if (T::listUnreliable) return 0;
+  uint16_t n = 0;
+  for (auto& r : T::store)
+    if (!strcmp(r.ref.group_code, g) && !strcmp(r.ref.contact_key, c) && n < cap) out[n++] = r.ref.sequence;
+  return n;
+}
+// The conversation walk over the fake store: a snapshot of its distinct
+// (group, contact) pairs taken when the walk begins; T::listUnreliable makes a
+// step fail as a directory that cannot be opened would.
+struct ConversationWalk {
+  std::vector<std::pair<std::string, std::string>> convs;
+  size_t pos = 0;
+};
+ConversationWalk* beginConversationWalk() {
+  ConversationWalk* w = new ConversationWalk;
   for (auto& r : T::store) {
     std::pair<std::string, std::string> k(r.ref.group_code, r.ref.contact_key);
     bool dup = false;
-    for (auto& x : seen) dup = dup || x == k;
-    if (!dup) seen.push_back(k);
+    for (auto& x : w->convs) dup = dup || x == k;
+    if (!dup) w->convs.push_back(k);
   }
-  for (auto& k : seen) fn(k.first.c_str(), k.second.c_str(), ctx);
-  return true;
+  return w;
+}
+WalkResult stepConversationWalk(ConversationWalk* w, uint8_t, char* g, size_t gn, char* c, size_t cn) {
+  if (T::listUnreliable) return WalkResult::FAILED;
+  if (w->pos >= w->convs.size()) return WalkResult::END;
+  snprintf(g, gn, "%s", w->convs[w->pos].first.c_str());
+  snprintf(c, cn, "%s", w->convs[w->pos].second.c_str());
+  w->pos++;
+  return WalkResult::FOUND;
+}
+void endConversationWalk(ConversationWalk* w) { delete w; }
+bool deleteMessage(const MessageRef& ref) {
+  for (size_t i = 0; i < T::store.size(); i++)
+    if (T::store[i].ref.sequence == ref.sequence && !strcmp(T::store[i].ref.group_code, ref.group_code) &&
+        !strcmp(T::store[i].ref.contact_key, ref.contact_key)) {
+      T::store.erase(T::store.begin() + static_cast<long>(i));
+      g_gen++;
+      return true;
+    }
+  return false;
 }
 bool isDuplicateAndRecord(const char*, const char*, const char*) { return false; }
 void buildSenderPrefix(const PacketCodec::MessageEnvelope&, char* out, size_t n) { snprintf(out, n, "Friend"); }
 }  // namespace MessageStore
+#endif  // REAL_MESSAGE_STORE
 
 #ifdef REAL_IDENTITY
 // The Race suites link the ACTUAL src/core/identity.cpp (its persistent
@@ -253,6 +290,7 @@ namespace IdentityColor { bool isValid(uint8_t i) { return i < kColorCount; } ui
 namespace Notifications {
 void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool) { T::notifications++; }
 void clearUnread(const char*, const char*, const MessageRef&) {}
+void readUpTo(const char*, const char*, uint16_t, uint16_t) {}
 }
 #endif
 namespace Settings {
@@ -290,6 +328,7 @@ ScreenHandlerFn getModeHandler(uint8_t m) { return m < 8 ? g_modeHandlers[m] : n
 static AppService g_services[16]; static int g_serviceCount = 0;
 bool registerAppService(const AppService& s) { if (g_serviceCount < 16) g_services[g_serviceCount++] = s; return true; }
 void T_initServices() { for (int i = 0; i < g_serviceCount; i++) if (g_services[i].init) g_services[i].init(); }
+void T_tickServices() { for (int i = 0; i < g_serviceCount; i++) if (g_services[i].tick) g_services[i].tick(); }
 static SettingsChangeHook g_settingsHooks[8]; static int g_settingsHookCount = 0;
 bool registerSettingsChangeHook(SettingsChangeHook fn) { if (g_settingsHookCount < 8) g_settingsHooks[g_settingsHookCount++] = fn; return true; }
 void T_fireSettingsChange(const SettingsChangeInfo& info) { for (int i = 0; i < g_settingsHookCount; i++) g_settingsHooks[i](info); }

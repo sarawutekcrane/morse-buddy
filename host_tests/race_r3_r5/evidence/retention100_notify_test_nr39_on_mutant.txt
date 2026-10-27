@@ -1,0 +1,2 @@
+FAIL [NR39 an UNRESOLVED recount whose listings stay unreliable backs off (bounded retries), then reconciles] line 963: 4009 listings in 120 s (no backoff: one per 25 ms step)
+118 checks passed, 1 failed

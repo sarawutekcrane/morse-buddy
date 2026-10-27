@@ -1,0 +1,3 @@
+FAIL [NR7 migration of the earlier record: per-type counts recounted from the stored messages] line 329: migration recounts in the background, never at boot: state 1
+FAIL [NR9 an unread record evicted: the conversation is recounted (in the background) from what remains] line 370: no recount on the eviction (append) path
+113 checks passed, 2 failed

@@ -1,0 +1,14 @@
+FAIL [ST2 legacy flags: selecting the newest received message reads every older one of that type] line 216: after selecting the newest: unread 47 files 60
+FAIL [ST2 legacy flags: selecting the newest received message reads every older one of that type] line 219: badge still lit
+FAIL [ST2 legacy flags: selecting the newest received message reads every older one of that type] line 221: after reboot: badge 1 unread 47
+FAIL [ST3 read up to selection is scoped to the message type; newer messages stay unread] line 233: older Text not read: a1 1 a2 0
+FAIL [ST5 reboot while the read is still being applied: it resumes after reboot] line 267: after reboot: unread 149 badge 1
+FAIL [ST6 UI work per rotation is bounded: no file rewrite or NVS write during the encoder pass] line 276: per rotation pass: opens 17 writes 1 renames 1 nvs 1
+FAIL [ST7 background work per main-loop pass is bounded, large history (8 x 300); counts converge to flash truth] line 291: per service pass: opens 600 dirEntries 309 writes 0 renames 0 nvs 1
+FAIL [ST8 NVS writes failing: the read is still applied to flash, and stays applied after reboot] line 309: with NVS failing: unread 39
+FAIL [ST8 NVS writes failing: the read is still applied to flash, and stays applied after reboot] line 314: after reboot: unread 39 badge 1
+FAIL [ST9 unreliable directory: background recount retries, then converges] line 323: after the directory recovered: count 0 badge 0
+FAIL [ST11 a record rewrite fails during a read-up: the next pass retries it, nothing is left unread] line 348: left unread 20 (write failures 1)
+FAIL [ST12 a recount already under way when a read-up is selected does not light the badge again] line 372: badge relit 1 now 1 unread 299 state 1
+FAIL [ST13 a leftover <seq>.msg.tmp from an interrupted rewrite never counts its message twice] line 392: count 2 (the .tmp copy counted)
+16 checks passed, 13 failed

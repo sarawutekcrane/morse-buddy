@@ -42,9 +42,11 @@ extern bool realGlyphs;
 // REAL_NOTIFICATIONS builds only: MessageStore::findMessagesByPredicate()
 // scans the fake store; true makes it report the scan as unreliable.
 extern bool scanUnreliable;
-// MessageStore::listConversations(): true makes the listing fail as a
-// directory-open failure would -- no conversations reported, false returned.
+// MessageStore conversation walk and listMessageSequences(): true makes them
+// fail as a directory-open failure would.
 extern bool listUnreliable;
+// listMessageSequences() calls since reset() (REAL_NOTIFICATIONS fake store).
+extern unsigned listings;
 extern std::function<void(const std::string&)> onDraw;  // runs after each printLine (models time passing during a draw)
 void reset();
 std::string visibleJoined();

@@ -1,0 +1,7 @@
+FAIL [R17 Text: two empty-draft Shorts in one batch open nothing (hardware finding 2 on 23293c5)] line 369: depth 3 -> 4, appends 0, publishes 0
+FAIL [R18 Text: empty-draft Short then Back in one batch: the Short does nothing, Back leaves the chat, nothing sent] line 376: depth 3 -> 3 open 1 appends 0
+FAIL [R17 Enigma: two empty-draft Shorts in one batch open nothing (hardware finding 2 on 23293c5)] line 369: depth 3 -> 4, appends 0, publishes 0
+FAIL [R18 Enigma: empty-draft Short then Back in one batch: the Short does nothing, Back leaves the chat, nothing sent] line 376: depth 3 -> 3 open 1 appends 0
+FAIL [F1f Text: empty-draft Short in a direct chat does nothing: no game, no message (hardware finding 2)] line 1196: stack Main>?>?>SetMR appends 0 publishes 0
+FAIL [F1f Enigma: empty-draft Short in a direct chat does nothing: no game, no message (hardware finding 2)] line 1196: stack Main>?>?>SetMR appends 0 publishes 0
+324 checks passed, 6 failed

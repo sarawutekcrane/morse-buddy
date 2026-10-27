@@ -16,6 +16,10 @@ from here; or set `REPO=/path/to/morse-buddy`).
 - test sources, fixtures (`fake/`, `fake_sys/`) and `run_all.sh` here;
 - the executable design model in `model/` (`python3 -I model/race_model.py`,
   exit 0; output in `model/model_output.txt`);
+- `model/handover_model.py`: an exhaustive model of the **proposed**
+  coordinator handover (design only, nothing implemented; not run by
+  `run_all.sh`, since a full run takes hours). Output in
+  `model/handover_model_output.txt`;
 - recorded results and build logs in `evidence/`.
 
 ## Status and remaining limitations
@@ -183,101 +187,71 @@ Investigation: `investigation/`. Before/after:
    - **Tests:** SC1 (0-65535 drawn whole, ending 2 px from the edge) and SC2
      (the real Room shows "1" after a first win).
    - **Mutations:** 1, caught.
-3. **Unread `*` stays.**
-   - **Text and Enigma chats:** a received message is marked read when it
-     becomes the selected history item (`markSelectedHistoryRead()`, once per
-     newly selected message). Messages only in view stay unread, and so does
-     one passed over within a single input batch.
+3. **Unread `*` stays.** (Revised by the 23293c5 findings below.)
+   - **Text and Enigma chats:** selecting a history item (rotating onto it)
+     reads it and every older received message of the same type in that
+     conversation (`Notifications::readUpTo()`). Entering a chat, or a
+     message only being in view, reads nothing.
    - **`notifications.cpp`:** unread counts are kept per stored type (Text,
      Enigma, Game). The Text badge is Text or Game; the Enigma badge is
      Enigma or Game.
    - **Per-conversation state:** COUNTED (exact per-type counts) or
      UNRESOLVED (counts unknown; per-type flags keep the badges lit).
-     UNRESOLVED conversations are recounted from the stored messages, one
-     per 10 s service tick, once a scan is reliable.
+     UNRESOLVED conversations are recounted from the stored messages in the
+     background, once a scan is reliable.
    - **Stored-record loading:**
      - `summary2` is used when present and readable;
-     - if `summary2` is present but unreadable: retried, never overwritten,
-       and never replaced from the older legacy record;
-     - else the legacy `summary` is migrated (each conversation recounted;
-       an unreliable scan gives UNRESOLVED, never an approximate count);
+     - if `summary2` is present but unreadable: retried every 10 s, never
+       overwritten, and never replaced from the older legacy record;
+     - else the legacy `summary` is migrated: each conversation it lists
+       becomes UNRESOLVED with its old categories and is recounted in the
+       background (never an approximate count);
      - if the legacy record is unreadable or has an unexpected length:
        retried, nothing written;
      - while a record is unreadable, arrivals are tracked in RAM and
        merged in as UNRESOLVED once it is read;
-     - after every successful load (at boot, or when an unreadable record
-       becomes readable) a sweep recounts every stored conversation from
-       its messages, one per 10 s tick, using the new
-       `MessageStore::listConversations()`. This includes conversations
-       listed with zero counts; UNRESOLVED ones are left to the reconcile
-       step. It recovers unread messages that the stored summary missed:
-       an arrival while the summary couldn't be read or written, followed
-       by a reboot, or a power loss after the message was stored (unread)
-       but before it was counted. No other record (journal) is kept. An
-       unreliable listing or recount is retried, never skipped;
-     - **recovery time is not guaranteed.** On each 10 s tick:
-       - while the stored record is unreadable, only its retry runs;
-       - otherwise a failed save is retried, then either one UNRESOLVED
-         recount runs or, if none is waiting, one sweep step.
-
-       So N stored conversations need at least N × 10 s, which is a lower
-       bound, not a completion time:
-       - UNRESOLVED recounts take their ticks first;
-       - an unreliable listing or recount repeats the same step on later
-         ticks;
-       - a record that stays unreadable delays the sweep until it loads;
-       - while storage keeps failing, the sweep may not complete at all;
-     - every count read from `summary2` (at boot or by a recovery retry) is
-       verified once: each conversation listed with unread messages becomes
-       UNRESOLVED (badges unchanged) and is recounted from the stored
-       messages, one per 10 s tick. So a read or eviction made while the
-       record was unreadable is corrected even after a reboot before
-       recovery, or when RAM had no free entry to note it. At most 24
-       recounts per load;
+     - every count read from `summary2` is verified once: each conversation
+       listed with unread messages becomes UNRESOLVED (badges unchanged) and
+       is recounted;
+     - after every successful load a sweep recounts every stored
+       conversation (`MessageStore::listConversations()`), including ones
+       listed with zero counts. It recovers unread messages the stored
+       summary missed: an arrival while it couldn't be read or written
+       followed by a reboot, or a power loss after the message was stored
+       (unread) but before it was counted;
      - the legacy record is never written.
-   - **Saves:** a failed save is retried and logged once; RAM stays
-     authoritative meanwhile.
-   - **Eviction** recounts the conversation, or marks it UNRESOLVED if the
-     scan fails.
-   - **Tests:** `notify_test` NR1-NR38 (step 4b; built with
-     `-DREAL_NOTIFICATIONS`). NR11-NR38 cover:
-     - legacy read failure, recovery and reboot;
-     - `summary2` read failure with stale legacy data present;
-     - a mixed Text/Enigma migration whose scan fails;
-     - save-failure retry;
-     - a legacy record of an unexpected length;
-     - eviction with a failing scan;
-     - with no new arrivals, while `summary2` (NR17, NR18) or the legacy
-       record (NR19) is unreadable: the only unread message read (NR17,
-       NR19) or evicted (NR18), then recovery and reboot leave no badge;
-     - all 24 RAM entries in use while unreadable, then a read in a stored
-       conversation (NR20);
-     - a conversation the stored record lacks, arriving while unreadable,
-       survives recovery (NR21);
-     - a read (NR22) or eviction (NR23) while unreadable, then a reboot
-       **before** recovery, then recovery with no arrival or user action;
-     - the record readable again at the next boot (NR24);
-     - verification keeps genuine counts and, while scans fail, the badges
-       (NR25);
-     - an arrival while `summary2` is unreadable, then a reboot before
-       recovery: a conversation absent from `summary2` (NR26), one listed
-       with zero counts (NR27), one with another category unread (NR28),
-       25 new conversations (NR29), and over two unreadable boots (NR32);
-       the `summary2` save failing at recovery (NR31); no reboot (NR33);
-     - recovery that must not depend on any marker having been saved: the
-       review's combined case (NR34), and a power loss between storing a
-       message and counting it (NR36 new conversation, NR37 zero-count
-       one). NR30 and NR35 keep the cases that involved the dropped
-       `pending2` record: they must not affect recovery;
-     - a sweep that meets an unreliable recount, then an unreliable
-       listing, retries until both are reliable (NR38);
-     - `reset()`/`reboot()` return every volatile notification variable to
-       its power-on value (the sweep's heap object is freed first); only
-       the fake NVS and message store survive a reboot.
-   - **Host-test limit:** `storage_messages.cpp` can't be built with these
-     fakes. Its new `listConversations()` is compiled only by the ESP32
-     build; the host tests use a fake one over the fake store.
-   - **Mutations:** `mutate_notify.py`, 30, all caught (step 7b).
+   - **Background work** (recounts, the sweep, applying read-ups): one step
+     at most every 25 ms of main-loop passes. A step is ONE of: one
+     conversation listing (names only, at most 300 entries), up to 4 record
+     reads, one record rewrite, one NVS write, or one retry of an
+     unreadable summary. Nothing on the arrival, read or eviction path
+     scans a conversation.
+   - **Recovery time is not guaranteed.** A recount of a conversation with
+     M records takes at least 1 + M/4 steps; the sweep, all conversations.
+     That is a lower bound, not a completion time: read-ups and UNRESOLVED
+     recounts go first, an unreliable listing or record repeats its step,
+     a summary that stays unreadable holds recounts back until it loads,
+     and while storage keeps failing the work may not complete at all.
+   - **Saves:** the summary is written about 2 s after its first unsaved
+     change (coalesced); a failed write is retried every 10 s without
+     stopping the other work. An unsaved change lost to a power loss is
+     recovered by the sweep from the messages' flags.
+   - **Eviction** of an unread record makes its conversation UNRESOLVED (its
+     badges stay lit) and it is recounted in the background.
+   - **Tests:**
+     - `notify_test` NR1-NR38 (step 4b; fake message store, built with
+       `-DREAL_NOTIFICATIONS`): marking, categories, migration, unreadable
+       records, reboot before recovery, the sweep. Since 23293c5, NR2 tests
+       the read-up rule, `stayOn()` lets deferred writes happen where a test
+       means them to be stored, and `notifyTick()` runs 25 ms service passes
+       over a 10 s retry interval;
+     - `storage_test` ST1-ST14 (step 4c): the same against the ACTUAL
+       `storage_messages.cpp` on a host directory (`fake_fs/`), see below;
+     - `reset()`/`reboot()` in both return every volatile notification
+       variable to its power-on value (heap objects freed first); only the
+       simulated NVS and message store survive a reboot.
+   - **Mutations:** `mutate_notify.py`, 41, all caught by notify_test or
+     storage_test (step 7b).
 
 ESP32 build of the candidate:
 - RAM 124,316 B, flash 1,194,837 B (`evidence/esp32_defectfix_final_build_log.txt`);
@@ -285,6 +259,152 @@ ESP32 build of the candidate:
 - the extra 96 B of static DRAM are the per-type summaries, the notification
   load and recovery state, the round binding and two per-chat read-check
   variables.
+
+## Hardware findings on 23293c5 (device A): fixes
+
+Measured with `storage_bench` (step 6b) and asserted by `storage_test`
+(step 4c): the ACTUAL `storage_messages.cpp`, `notifications.cpp`,
+`text_message.cpp`, `enigma.cpp` and `menu.cpp` on a real host directory
+(`fake_fs/LittleFS.*`: files and directories are real; every open, read,
+write, rename and directory entry is counted; opens can be failed on
+purpose). Host time is not device time; the operation counts carry over.
+
+1. **Unread `*` does not clear.**
+   - Cause: firmware up to 30ed514 cleared a stored message's unread flag
+     only on a DOT action over it (or if it arrived with its chat open), so
+     a long-used device holds a flag on nearly every received message.
+     23293c5 recounts badges from those flags and read them one selected
+     message at a time.
+   - Fix: read up to the selection, scoped to group, contact and message
+     type. Messages shown below the selection, or stored after it, stay
+     unread. The selection records a read-up request (RAM, then the
+     `readup` NVS record, written about 1 s later); the flags on flash are
+     cleared in the background, a few records per step, and re-checked by
+     a second pass before the request is marked done. Recounts treat
+     messages a pending request covers as read. The badge follows at once
+     when what stays unread can be counted from the chat's index with at
+     most 4 record reads.
+2. **Empty-draft Send opens the Number Guessing game** (Text and Enigma,
+   direct chats). Existing behaviour since Phase 3 (also at 30ed514): the
+   empty-line hook started Friend's challenge flow. Now an empty draft sends
+   nothing and opens nothing, as in broadcast. Friend games start from
+   Training Game > Number Guessing > Play with Friend (unchanged); Friend's
+   own chat keeps its empty-line choice. Tests: friend_test R17, R18, F1f,
+   F1g.
+3. **Slower menus and chats.** Measured cause (8 conversations x 300
+   messages, legacy flags), 23293c5 vs the fix:
+   - background: one service call recounted a whole conversation, 600 file
+     opens (an open per directory entry, then one per record), about every
+     10 s per conversation; now at most 4 opens, one listing (300 names, no
+     opens) or one rewrite per step;
+   - encoder rotation onto an old unread message: up to 17 opens plus a
+     record rewrite and an NVS write; now up to 15 opens, no write;
+   - opening a chat: 608 opens (also at 30ed514); now 308, because
+     directory listings read names only (`getNextFileName()`);
+   - also fixed in `storage_messages.cpp`: a listing no longer counts an
+     interrupted rewrite's `<seq>.msg.tmp` as a second record (ST13), and a
+     failed open of one contact directory no longer ends the conversation
+     listing early while reporting it complete (ST9).
+
+`storage_test`: ST1 real round trip; ST2 legacy flags cleared by one
+selection; ST3/ST3b/ST3c type, display-order and storage-order scoping;
+ST4 entering clears nothing; ST5 reboot mid read-up; ST6 encoder pass does
+no rewrite or NVS write; ST7 per-pass bounds and convergence, 8 x 300; ST8
+NVS writes failing; ST9 unreliable directory; ST10 arrival during a
+recount; ST11 failed rewrite retried; ST12 recount under way does not
+relight the badge; ST13 leftover `.tmp`; ST14 one unreadable record.
+
+### Retention 100 and the outstanding review fixes (uncommitted candidate)
+
+- **Retention: 300 -> 100 messages per conversation** (approved).
+  `MessageStore::kRetainedMessagesPerThread = 100`; `kMaxMessagesPerThread`
+  stays 300 as the listing capacity, because conversations written by
+  older firmware hold up to 300 records (it evicted at 300 before every
+  write, so 300 `.msg` files is their bound). Appends evict at 100, one
+  record per append, in the existing order (lowest sequence first, records
+  pending in the outbox kept).
+- **Trimming older history in the background**, including conversations
+  that receive nothing new: the boot sweep (and the sweep after a recovered
+  summary load) visits every conversation, trims it, then recounts it. One
+  deletion per 25 ms step at most, oldest sequence first, pending-outbox
+  records kept, message bytes of the retained records untouched (ST15).
+  A deleted unread record is uncounted only after its deletion succeeded;
+  a failed deletion stops that conversation's trim (nothing is skipped)
+  and the sweep runs another pass after a growing pause (2 s doubling, at
+  most 60 s) (ST17). The conversation open on screen (Text, Enigma or
+  Friend chat: all register through `TextMessage::setOpenConversation()`)
+  is not trimmed until it is left (ST22, draft kept). A conversation with
+  more than 300 records (not producible by older firmware) is reported as
+  an incomplete listing, which keeps the 300 LOWEST sequences, so trimming
+  still proceeds oldest-first and the next pass trims the rest; recounts
+  never accept a truncated listing (ST23/ST23b, also in reverse directory
+  order).
+- **Incremental conversation traversal.** The sweep no longer lists every
+  group/contact in one call: `beginConversationWalk()` /
+  `stepConversationWalk()` read at most 16 directory entries per step
+  (ST21: 400 conversations in 4 groups plus 200 empty group directories,
+  at most 20 directory entries per loop pass, none skipped).
+- **Read-up never marked DONE while something is left.** An attempt is up
+  to 3 passes; if reads or flag writes still fail, the request stays
+  pending (not done), is retried after a growing pause (2 s doubling, at
+  most 60 s), and the other jobs run in between; after a reboot it is
+  loaded again and retried (ST19: writes failing for 600 s and across a
+  reboot, the boot sweep still recounts another conversation, everything
+  clears once writes work). Recounts that give way back off the same way.
+- **Durability of a selection.** The read-up request is in RAM first and
+  reaches NVS in the deferred save about 1 s later. Power lost before that
+  save loses the selection: after reboot the messages are still unread,
+  nothing is wrongly marked read, and the badge and counts follow the
+  flags on flash (ST20). No unconditional reboot durability is claimed.
+- **Listings report truncation**: `listMessageSequences()` and
+  `findMessagesByPredicate()` report an incomplete listing instead of
+  silently dropping records beyond 300.
+
+Legacy histories in the tests are written in the record format directly
+(`legacy_store.h`), each record read back through the ACTUAL
+`MessageStore::loadMessage()`; the current append path cannot build a
+300-record conversation.
+
+New `storage_test` cases: ST15 trim to the newest 100 (pending kept, bytes
+unchanged, counts, per-pass bounds); ST16 trimming across a reboot; ST17
+failed deletions; ST18 unread eviction keeps counts and badges consistent;
+ST19 read-up failures beyond three passes and across a reboot; ST20 power
+loss before the deferred read-up save; ST21 400 conversations; ST22 open
+conversation not trimmed; ST23/ST23b more records than the listing holds;
+ST24 the listing/scan contract beyond capacity (both directory orders);
+ST25 an append at 100 evicts at once; ST26 counts equal flash at every
+loop pass while deletions fail and while trimming proceeds, and the kept
+set is always a contiguous newest run; ST27 an unreadable old record stops
+the trim (nothing newer deleted in its place). `notify_test` NR39: an
+UNRESOLVED recount with unreliable listings backs off (bounded listings).
+
+Evidence (`evidence/`): `run_retention100_output.txt` (full run, all steps
+passed: notification/store mutations 67/67); `esp32_retention100_build_log.txt`
+(RAM 124,340 B, flash 1,198,433 B; static DRAM 124,348 of 124,580 B,
+headroom 232 B); `retention100_storage_test_before.txt` (the new storage
+tests on the previous candidate: 12 checks fail; adapted only as in
+`retention100_storage_test_before_adaptation.diff`; ST24-ST27 were added
+later); `retention100_storage_bench.txt` (30ed514, 23293c5, previous and
+this candidate, 8 x 300 and 400 x 20); `retention100_notify_test_nr39_on_mutant.txt`;
+`devicea_BEFORE_23293c5_*.txt` (device A findings reproduced on 23293c5,
+with that round's tests). Device timing is not verified.
+
+Known limitation: a record that stays unreadable among the oldest blocks
+that conversation's trimming (it is reported and retried every pass, never
+skipped or guessed to be deletable, since it might be pending in the
+outbox); the rest of the sweep continues.
+`notify_test` NR13 now waits out the recount backoff after the scans
+recover (30 s instead of 10 s).
+
+Measurements (`storage_bench`, step 6b; host op counts, not device time):
+
+| workload / build | 30ed514 | 23293c5 | previous candidate | this candidate |
+|---|---|---|---|---|
+| 8 x 300: open chat (legacy history) | 608 opens | 608 | 308 | 308 |
+| 8 x 300: open chat after idle | 608 | 608 | 308 | 108 (trimmed to 100) |
+| 8 x 300: background, max per loop pass | none | 600 opens | 4 opens / 300 entries | 4 opens / 300 entries / 1 remove |
+| 8 x 300: all trimmed to 100 | never | never | never | after 73 s (simulated) |
+| 400 x 20: background, max per loop pass | none | 40 opens / 421 entries | 4 opens / 401 entries | 4 opens / 20 entries |
 
 ## Heap diagnostics (for hardware acceptance)
 

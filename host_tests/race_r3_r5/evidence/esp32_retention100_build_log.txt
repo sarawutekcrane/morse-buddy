@@ -1,0 +1,218 @@
+Processing morse_buddy (platform: espressif32@6.13.0; board: esp32dev; framework: arduino)
+--------------------------------------------------------------------------------
+Library Manager: Installing 256dpi/MQTT @ 2.5.2
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Library Manager: MQTT@2.5.2 has been installed!
+Library Manager: Installing adafruit/Adafruit GFX Library @ ^1.11.9
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Library Manager: Adafruit GFX Library@1.13.0 has been installed!
+Library Manager: Resolving dependencies...
+Library Manager: Installing Adafruit BusIO
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Library Manager: Adafruit BusIO@1.17.4 has been installed!
+Library Manager: Installing adafruit/Adafruit ST7735 and ST7789 Library @ ^1.10.3
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Library Manager: Adafruit ST7735 and ST7789 Library@1.12.0 has been installed!
+Library Manager: Resolving dependencies...
+Library Manager: Installing Adafruit seesaw Library
+Unpacking 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
+Library Manager: Adafruit seesaw Library@1.7.9 has been installed!
+Library Manager: Resolving dependencies...
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32dev.html
+PLATFORM: Espressif 32 (6.13.0) > Espressif ESP32 Dev Module
+HARDWARE: ESP32 240MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20017.241212+sha.dcc1105b 
+ - tool-esptoolpy @ 2.41100.260830 (4.11.0) 
+ - toolchain-xtensa-esp32 @ 8.4.0+2021r2-patch5
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 38 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- MQTT @ 2.5.2
+|-- Adafruit GFX Library @ 1.13.0
+|-- Adafruit ST7735 and ST7789 Library @ 1.12.0
+|-- Adafruit BusIO @ 1.17.4
+|-- SPI @ 2.0.0
+|-- WiFi @ 2.0.0
+|-- LittleFS @ 2.0.0
+|-- HTTPClient @ 2.0.0
+|-- Update @ 2.0.0
+|-- WiFiClientSecure @ 2.0.0
+|-- Preferences @ 2.0.0
+Building in release mode
+Compiling .pio/build/morse_buddy/src/core/crc32.cpp.o
+Compiling .pio/build/morse_buddy/src/core/display.cpp.o
+Compiling .pio/build/morse_buddy/src/core/enigma.cpp.o
+Compiling .pio/build/morse_buddy/src/core/enigma_crypto.cpp.o
+Compiling .pio/build/morse_buddy/src/core/enigma_keys.cpp.o
+Compiling .pio/build/morse_buddy/src/core/hooks.cpp.o
+Compiling .pio/build/morse_buddy/src/core/identity.cpp.o
+Compiling .pio/build/morse_buddy/src/core/identity_color.cpp.o
+Compiling .pio/build/morse_buddy/src/core/input.cpp.o
+Compiling .pio/build/morse_buddy/src/core/menu.cpp.o
+Compiling .pio/build/morse_buddy/src/core/mixed_text_entry.cpp.o
+Compiling .pio/build/morse_buddy/src/core/morse.cpp.o
+Compiling .pio/build/morse_buddy/src/core/morse_practice.cpp.o
+Compiling .pio/build/morse_buddy/src/core/mqtt_manager.cpp.o
+Compiling .pio/build/morse_buddy/src/core/notifications.cpp.o
+Compiling .pio/build/morse_buddy/src/core/number_guessing.cpp.o
+Compiling .pio/build/morse_buddy/src/core/number_guessing_friend.cpp.o
+Compiling .pio/build/morse_buddy/src/core/outbox.cpp.o
+Compiling .pio/build/morse_buddy/src/core/packet_codec.cpp.o
+Compiling .pio/build/morse_buddy/src/core/power.cpp.o
+Compiling .pio/build/morse_buddy/src/core/presence.cpp.o
+Compiling .pio/build/morse_buddy/src/core/race.cpp.o
+Compiling .pio/build/morse_buddy/src/core/race_protocol.cpp.o
+Compiling .pio/build/morse_buddy/src/core/radio.cpp.o
+Compiling .pio/build/morse_buddy/src/core/radio_audio.cpp.o
+Compiling .pio/build/morse_buddy/src/core/radio_transport.cpp.o
+Compiling .pio/build/morse_buddy/src/core/settings.cpp.o
+Compiling .pio/build/morse_buddy/src/core/sleep.cpp.o
+Compiling .pio/build/morse_buddy/src/core/sound_facade.cpp.o
+Compiling .pio/build/morse_buddy/src/core/sound_i2s.cpp.o
+Compiling .pio/build/morse_buddy/src/core/storage_init.cpp.o
+Compiling .pio/build/morse_buddy/src/core/storage_messages.cpp.o
+Compiling .pio/build/morse_buddy/src/core/text_message.cpp.o
+Compiling .pio/build/morse_buddy/src/core/ui_scratch.cpp.o
+Compiling .pio/build/morse_buddy/src/core/wifi_manager.cpp.o
+Compiling .pio/build/morse_buddy/src/main.cpp.o
+Compiling .pio/build/morse_buddy/src/ota/ota_https.cpp.o
+Compiling .pio/build/morse_buddy/src/ota/ota_manager.cpp.o
+Compiling .pio/build/morse_buddy/src/ota/ota_manifest.cpp.o
+Building .pio/build/morse_buddy/bootloader.bin
+Generating partitions .pio/build/morse_buddy/partitions.bin
+Compiling .pio/build/morse_buddy/lib69b/MQTT/MQTTClient.cpp.o
+esptool.py v4.11.0
+Creating esp32 image...
+Merged 1 ELF section
+Successfully created esp32 image.
+Compiling .pio/build/morse_buddy/lib69b/MQTT/lwmqtt/client.c.o
+Compiling .pio/build/morse_buddy/lib69b/MQTT/lwmqtt/helpers.c.o
+Compiling .pio/build/morse_buddy/lib69b/MQTT/lwmqtt/packet.c.o
+Compiling .pio/build/morse_buddy/lib69b/MQTT/lwmqtt/string.c.o
+Compiling .pio/build/morse_buddy/lib767/Wire/Wire.cpp.o
+Archiving .pio/build/morse_buddy/lib69b/libMQTT.a
+Indexing .pio/build/morse_buddy/lib69b/libMQTT.a
+Compiling .pio/build/morse_buddy/liba96/SPI/SPI.cpp.o
+Compiling .pio/build/morse_buddy/lib29d/Adafruit BusIO/Adafruit_BusIO_Register.cpp.o
+Compiling .pio/build/morse_buddy/lib29d/Adafruit BusIO/Adafruit_GenericDevice.cpp.o
+Archiving .pio/build/morse_buddy/lib767/libWire.a
+Indexing .pio/build/morse_buddy/lib767/libWire.a
+Compiling .pio/build/morse_buddy/lib29d/Adafruit BusIO/Adafruit_I2CDevice.cpp.o
+Compiling .pio/build/morse_buddy/lib29d/Adafruit BusIO/Adafruit_SPIDevice.cpp.o
+Archiving .pio/build/morse_buddy/liba96/libSPI.a
+Indexing .pio/build/morse_buddy/liba96/libSPI.a
+Compiling .pio/build/morse_buddy/libd0b/Adafruit GFX Library/Adafruit_GFX.cpp.o
+Compiling .pio/build/morse_buddy/libd0b/Adafruit GFX Library/Adafruit_GrayOLED.cpp.o
+Compiling .pio/build/morse_buddy/libd0b/Adafruit GFX Library/Adafruit_SPITFT.cpp.o
+Archiving .pio/build/morse_buddy/lib29d/libAdafruit BusIO.a
+Indexing .pio/build/morse_buddy/lib29d/libAdafruit BusIO.a
+Compiling .pio/build/morse_buddy/libd0b/Adafruit GFX Library/glcdfont.c.o
+Compiling .pio/build/morse_buddy/lib67c/Adafruit ST7735 and ST7789 Library/Adafruit_ST7735.cpp.o
+Compiling .pio/build/morse_buddy/lib67c/Adafruit ST7735 and ST7789 Library/Adafruit_ST7789.cpp.o
+Compiling .pio/build/morse_buddy/lib67c/Adafruit ST7735 and ST7789 Library/Adafruit_ST7796S.cpp.o
+Compiling .pio/build/morse_buddy/lib67c/Adafruit ST7735 and ST7789 Library/Adafruit_ST77xx.cpp.o
+Archiving .pio/build/morse_buddy/libd0b/libAdafruit GFX Library.a
+Indexing .pio/build/morse_buddy/libd0b/libAdafruit GFX Library.a
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFi.cpp.o
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiAP.cpp.o
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiClient.cpp.o
+Archiving .pio/build/morse_buddy/lib67c/libAdafruit ST7735 and ST7789 Library.a
+Indexing .pio/build/morse_buddy/lib67c/libAdafruit ST7735 and ST7789 Library.a
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiGeneric.cpp.o
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiMulti.cpp.o
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiSTA.cpp.o
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiScan.cpp.o
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiServer.cpp.o
+Compiling .pio/build/morse_buddy/lib789/WiFi/WiFiUdp.cpp.o
+Compiling .pio/build/morse_buddy/lib790/FS/FS.cpp.o
+Compiling .pio/build/morse_buddy/lib790/FS/vfs_api.cpp.o
+Compiling .pio/build/morse_buddy/lib241/LittleFS/LittleFS.cpp.o
+Archiving .pio/build/morse_buddy/lib789/libWiFi.a
+Indexing .pio/build/morse_buddy/lib789/libWiFi.a
+Compiling .pio/build/morse_buddy/lib919/WiFiClientSecure/WiFiClientSecure.cpp.o
+Compiling .pio/build/morse_buddy/lib919/WiFiClientSecure/esp_crt_bundle.c.o
+Archiving .pio/build/morse_buddy/lib241/libLittleFS.a
+Indexing .pio/build/morse_buddy/lib241/libLittleFS.a
+Compiling .pio/build/morse_buddy/lib919/WiFiClientSecure/ssl_client.cpp.o
+Compiling .pio/build/morse_buddy/lib1b5/HTTPClient/HTTPClient.cpp.o
+Archiving .pio/build/morse_buddy/lib790/libFS.a
+Indexing .pio/build/morse_buddy/lib790/libFS.a
+Compiling .pio/build/morse_buddy/liba61/Update/HttpsOTAUpdate.cpp.o
+Compiling .pio/build/morse_buddy/liba61/Update/Updater.cpp.o
+Compiling .pio/build/morse_buddy/libf2c/Preferences/Preferences.cpp.o
+Archiving .pio/build/morse_buddy/lib919/libWiFiClientSecure.a
+Indexing .pio/build/morse_buddy/lib919/libWiFiClientSecure.a
+Archiving .pio/build/morse_buddy/liba61/libUpdate.a
+Compiling .pio/build/morse_buddy/FrameworkArduino/Esp.cpp.o
+Indexing .pio/build/morse_buddy/liba61/libUpdate.a
+Compiling .pio/build/morse_buddy/FrameworkArduino/FirmwareMSC.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/FunctionalInterrupt.cpp.o
+Archiving .pio/build/morse_buddy/lib1b5/libHTTPClient.a
+Indexing .pio/build/morse_buddy/lib1b5/libHTTPClient.a
+Compiling .pio/build/morse_buddy/FrameworkArduino/HWCDC.cpp.o
+Archiving .pio/build/morse_buddy/libf2c/libPreferences.a
+Indexing .pio/build/morse_buddy/libf2c/libPreferences.a
+Compiling .pio/build/morse_buddy/FrameworkArduino/HardwareSerial.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/IPAddress.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/IPv6Address.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/MD5Builder.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/Print.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/Stream.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/StreamString.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/Tone.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/USB.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/USBCDC.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/USBMSC.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/WMath.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/WString.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/base64.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/cbuf.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-adc.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-bt.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-cpu.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-dac.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-gpio.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-i2c-slave.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-i2c.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-ledc.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-matrix.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-misc.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-psram.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-rgb-led.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-rmt.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-sigmadelta.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-spi.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-time.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-timer.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-tinyusb.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-touch.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/esp32-hal-uart.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/firmware_msc_fat.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/libb64/cdecode.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/libb64/cencode.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/main.cpp.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/stdlib_noniso.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/wiring_pulse.c.o
+Compiling .pio/build/morse_buddy/FrameworkArduino/wiring_shift.c.o
+Archiving .pio/build/morse_buddy/libFrameworkArduino.a
+Indexing .pio/build/morse_buddy/libFrameworkArduino.a
+Linking .pio/build/morse_buddy/firmware.elf
+Retrieving maximum program size .pio/build/morse_buddy/firmware.elf
+Checking size .pio/build/morse_buddy/firmware.elf
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [====      ]  37.9% (used 124340 bytes from 327680 bytes)
+Flash: [========  ]  83.1% (used 1198433 bytes from 1441792 bytes)
+Building .pio/build/morse_buddy/firmware.bin with action:
+  "$PYTHONEXE" "$OBJCOPY" --chip esp32 elf2image --flash_mode ${__get_board_flash_mode(__env__)} --flash_freq ${__get_board_f_image(__env__)} --flash_size 4MB --elf-sha256-offset 0xb0 -o $TARGET $SOURCES
+Building .pio/build/morse_buddy/firmware.bin
+esptool.py v4.11.0
+Creating esp32 image...
+Merged 27 ELF sections
+Successfully created esp32 image.
+========================= [SUCCESS] Took 51.73 seconds =========================
+RC=0
