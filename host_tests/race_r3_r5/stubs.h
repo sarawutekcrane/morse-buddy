@@ -34,6 +34,17 @@ extern std::vector<std::string> seq;        // ordered: draws (D:text), nextId, 
 extern int notifications;
 extern std::vector<std::string> indexLoads;  // loadConversationIndex() calls, "group/contact"
 extern uint32_t unixTime;  // WifiManager::getUnixTime()
+// Display fake measurement: false (default) = per-glyph advance widths, no
+// clipping; true = the real FreeSans9pt7b glyph bearings and widths
+// (font_metrics.h) with Adafruit getTextBounds() semantics, and printLine()
+// clipping exactly as display.cpp does. Reset by reset().
+extern bool realGlyphs;
+// REAL_NOTIFICATIONS builds only: MessageStore::findMessagesByPredicate()
+// scans the fake store; true makes it report the scan as unreliable.
+extern bool scanUnreliable;
+// MessageStore::listConversations(): true makes the listing fail as a
+// directory-open failure would -- no conversations reported, false returned.
+extern bool listUnreliable;
 extern std::function<void(const std::string&)> onDraw;  // runs after each printLine (models time passing during a draw)
 void reset();
 std::string visibleJoined();

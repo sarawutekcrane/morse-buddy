@@ -1,0 +1,33 @@
+# Notification migration correction: before/after (HOST ONLY)
+# The same notify_test.cpp, built against:
+#   BEFORE = the first defect-fix candidate's notifications.cpp (sha256 a8079cab156b182c72e2c1d424ee30ead15961ca69817ba3ef7c71ff4c707ab1), with -DNOTIFY_V1:
+#            the internals it lacks (load state, service tick, summary state) are inert stand-ins, so only observable behaviour decides
+#   AFTER  = the corrected notifications.cpp (sha256 29465d493495807432448c136d9567e0f7a79a7e917dd362886413c7033598ac)
+
+## BEFORE
+FAIL [NR8 migration when the store scan is unreliable: UNRESOLVED (badges of the old mask lit), never an approximate count] line 285: enigma 1 text 0 state 1
+FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates and merges; reboot keeps it] line 335: read failure taken as an empty migration: state 0 summary2 1
+FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates and merges; reboot keeps it] line 338: arrival tracked in RAM only: badge 1 summary2 1
+FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates and merges; reboot keeps it] line 341: still retrying
+FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates and merges; reboot keeps it] line 344: recovered: state 1 text 1 enigma 0
+FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates and merges; reboot keeps it] line 350: after reboot: text 1
+FAIL [NR12 existing summary2 unreadable: never replaced from the (stale) legacy record; recovery merges] line 364: legacy data used over summary2: state 0
+FAIL [NR12 existing summary2 unreadable: never replaced from the (stale) legacy record; recovery merges] line 367: summary2 overwritten while unreadable
+FAIL [NR12 existing summary2 unreadable: never replaced from the (stale) legacy record; recovery merges] line 370: merged: text 0 enigma 1 carol 0x55df77a9d9a0
+FAIL [NR13 mixed Text+Enigma, migration scan fails (UNRESOLVED), reads while unresolved, scan recovers, read all, reboot] line 384: unresolved, both lit
+FAIL [NR13 mixed Text+Enigma, migration scan fails (UNRESOLVED), reads while unresolved, scan recovers, read all, reboot] line 386: still unresolved (no guessed decrement): text 1 enigma 1
+FAIL [NR13 mixed Text+Enigma, migration scan fails (UNRESOLVED), reads while unresolved, scan recovers, read all, reboot] line 391: reconciled: text 1 enigma 1 (text 0 enigma 0 game 2)
+FAIL [NR13 mixed Text+Enigma, migration scan fails (UNRESOLVED), reads while unresolved, scan recovers, read all, reboot] line 395: all read: text 1 enigma 1
+FAIL [NR13 mixed Text+Enigma, migration scan fails (UNRESOLVED), reads while unresolved, scan recovers, read all, reboot] line 397: after reboot: text 1 enigma 1
+FAIL [NR14 a failed save is retried; nothing unread is lost once storage recovers (and after reboot)] line 403: badge 1 dirty 0
+FAIL [NR14 a failed save is retried; nothing unread is lost once storage recovers (and after reboot)] line 406: still retrying, still shown
+FAIL [NR14 a failed save is retried; nothing unread is lost once storage recovers (and after reboot)] line 409: saved after recovery
+FAIL [NR14 a failed save is retried; nothing unread is lost once storage recovers (and after reboot)] line 411: after reboot the unread message is still counted
+FAIL [NR15 legacy record of an unexpected length: never migrated or overwritten, retried, unread arrivals still tracked] line 422: state 0
+FAIL [NR15 legacy record of an unexpected length: never migrated or overwritten, retried, unread arrivals still tracked] line 426: badge 1 legacy kept 1
+FAIL [NR16 eviction while scans fail: UNRESOLVED (badges kept), reconciled later] line 438: unresolved, both kept
+FAIL [NR16 eviction while scans fail: UNRESOLVED (badges kept), reconciled later] line 441: reconciled: text 1 enigma 1
+30 checks passed, 22 failed
+
+## AFTER
+52 checks passed, 0 failed

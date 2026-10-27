@@ -1,0 +1,54 @@
+# Hardware findings on 30ed514: before/after evidence for the three defect fixes (HOST ONLY)
+# BEFORE = the same new test files built against src/ at 30ed514 (git archive HEAD).
+# AFTER  = the uncommitted candidate (src diff sha256 8e4388837110d0fa42c60192c16375df977762e0f24cc1d96158a1cdcff673b6).
+# The BEFORE room build adds a one-line forced include declaring Display::fitWidth() (30ed514's display.h lacks it; the host stub defines it). No production file changes.
+
+## room_test (HB1-HB10 guess history, SC1-SC2 score placement): BEFORE
+FAIL [HB1 Guess -> Back -> Leave (Yes, completed) -> Back -> rejoin: the same round shows the device's guess again] line 838: history not restored: count 0 row ''
+FAIL [HB2 the LEAVE is acknowledged late (Back while 'Leaving...', re-enter, then it completes): history kept for the rejoin] line 849: after the late acknowledgement: state 0 count 0
+FAIL [HB2 the LEAVE is acknowledged late (Back while 'Leaving...', re-enter, then it completes): history kept for the rejoin] line 852: count 0
+FAIL [HB3 an engine reboot ('Reconnecting...', then the room state): the same round keeps the history] line 860: count 0
+FAIL [HB6 another coordinator's room whose round has the SAME round number: never shows this room's guess] line 910: left Alice's room, history kept (count 0)
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 0 drawn as 'Alice 0'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 1 drawn as 'Alice '
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 2 drawn as 'Alice 2'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 4 drawn as 'Alice 4'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 9 drawn as 'Alice 9'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 10 drawn as 'Alice 1'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 11 drawn as 'Alice 1'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 12 drawn as 'Alice 1'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 19 drawn as 'Alice 1'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 20 drawn as 'Alice 20'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 21 drawn as 'Alice 21'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 99 drawn as 'Alice 99'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 100 drawn as 'Alice 10'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 111 drawn as 'Alice 11'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 199 drawn as 'Alice 19'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 1000 drawn as 'Alice 100'
+FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2] line 809: score 65535 drawn as 'Alice 65535'
+FAIL [SC2 the real Room after a first win: the winner's row shows score 1 (real glyphs)] line 824: rows 'Alice 0' | 'DEADBEEFAAAA (You) '
+395 checks passed, 23 failed
+
+## room_test: AFTER
+418 checks passed, 0 failed
+
+## notify_test (NR1-NR10 unread marking and badges): BEFORE
+FAIL [NR1 rotating onto a received unread message marks it read and clears the badge] line 120: selected: badge 1 unread 1
+FAIL [NR1 rotating onto a received unread message marks it read and clears the badge] line 122: after Back: badge 1
+FAIL [NR2 unseen messages stay unread: selecting the newest leaves the older one unread] line 130: newer 1 older 1 badge 1
+FAIL [NR2 unseen messages stay unread: selecting the newest leaves the older one unread] line 132: older 1 badge 1
+FAIL [NR3 Enigma chat: rotating onto a received Enigma message marks it read] line 142: selected: enigma badge 1 unread 1
+FAIL [NR4 separate categories: reading the Text message clears only the Text badge] line 152: only the message left selected is read: text 1 enigma 1 badges 1/1
+FAIL [NR4 separate categories: reading the Text message clears only the Text badge] line 155: badges text 1 enigma 1
+FAIL [NR4 separate categories: reading the Text message clears only the Text badge] line 161: Text read, Enigma unread: text badge 1 enigma badge 1
+FAIL [NR5 a Friend game record lights both badges; reading it clears both] line 169: selected in Enigma: unread 1 text 1 enigma 1
+FAIL [NR6 the draft and the selection are kept: selecting (and reading) a message does not touch the draft] line 180: draft 'DRAFT'
+FAIL [NR7 migration of the earlier record: per-type counts recounted from the stored messages] line 207: summary2 written, old record untouched
+FAIL [NR7 migration of the earlier record: per-type counts recounted from the stored messages] line 209: migrated: reading the Text message leaves only Enigma: text 1 enigma 1
+FAIL [NR7 migration of the earlier record: per-type counts recounted from the stored messages] line 213: after reboot: text 1 enigma 1
+FAIL [NR9 an unread record evicted: the conversation is recounted from what remains] line 238: text 1 enigma 1 count 1
+FAIL [NR10 contract: the stored type decides the category, whatever mask the caller announced] line 251: type ENIGMA counted as Enigma: enigma 0 text 1
+12 checks passed, 15 failed
+
+## notify_test: AFTER
+27 checks passed, 0 failed

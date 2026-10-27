@@ -16,7 +16,7 @@ class Preferences {
  public:
   std::map<std::string, std::string> kv;
   std::function<bool(const char*)> failWrite;  // true -> this putBytes fails (nothing written)
-  std::function<bool(const char*)> failRead;   // true -> this read fails (getULong returns its default, like nvs_get_u32 errors)
+  std::function<bool(const char*)> failRead;   // true -> this read fails (getULong returns its default, getBytes 0, like nvs_get_* errors)
   int writes = 0;
   size_t putBytes(const char* key, const void* v, size_t len) {
     writes++;
@@ -26,6 +26,7 @@ class Preferences {
     return len;
   }
   size_t getBytes(const char* key, void* buf, size_t maxLen) {
+    if (failRead && failRead(key)) return 0;  // nvs_get_blob error: getBytes reports 0
     auto it = kv.find(key);
     if (it == kv.end() || it->second.size() > maxLen) return 0;
     memcpy(buf, it->second.data(), it->second.size());

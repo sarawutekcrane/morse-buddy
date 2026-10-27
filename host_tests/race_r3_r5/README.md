@@ -154,6 +154,138 @@ of static DRAM, and the engine was a static global.
 - Allocation failure is injected by replacing the no-throw `operator new` in
   the test binary.
 
+## Hardware findings on 30ed514: defect fixes (uncommitted candidate)
+
+Investigation: `investigation/`. Before/after:
+`evidence/defect_fixes_before_after.txt` (the same new tests, built against
+30ed514's sources and against the candidate).
+
+1. **Guess history lost after Leave and rejoin.**
+   - `race.cpp` now binds the history to the exact round: group,
+     coordinator, n, nonce and the round's start version (`RoundBinding`).
+   - An absent view (Leave completed, joining, Reconnecting) keeps it; any
+     other view (another round, the lobby, another room) discards it.
+   - It stays within one boot; power-cycle persistence is out of scope.
+   - **Tests** (`room_test`):
+     - HB1-HB3: restored after a completed Leave, a late acknowledgement and
+       an engine reboot;
+     - HB4-HB5: discarded for a later round or the lobby;
+     - HB6-HB10: never shown in another room with the same round number,
+       including rooms differing only in coordinator, n or nonce.
+   - **Mutations:** 7, all caught.
+2. **Score 1 not displayed.**
+   - Cause: the score was right-aligned by ink width, but `printLine()`
+     clips by left bearing + ink width; FreeSans "1" has a 3 px bearing.
+   - Fix: new `Display::fitWidth()` (the clip measure), used for the score.
+   - **Host fake:** `T::realGlyphs` makes it measure with the real
+     FreeSans9pt7b glyph table (`font_metrics.h`, from Adafruit GFX 1.12.6)
+     and clip like `display.cpp`.
+   - **Tests:** SC1 (0-65535 drawn whole, ending 2 px from the edge) and SC2
+     (the real Room shows "1" after a first win).
+   - **Mutations:** 1, caught.
+3. **Unread `*` stays.**
+   - **Text and Enigma chats:** a received message is marked read when it
+     becomes the selected history item (`markSelectedHistoryRead()`, once per
+     newly selected message). Messages only in view stay unread, and so does
+     one passed over within a single input batch.
+   - **`notifications.cpp`:** unread counts are kept per stored type (Text,
+     Enigma, Game). The Text badge is Text or Game; the Enigma badge is
+     Enigma or Game.
+   - **Per-conversation state:** COUNTED (exact per-type counts) or
+     UNRESOLVED (counts unknown; per-type flags keep the badges lit).
+     UNRESOLVED conversations are recounted from the stored messages, one
+     per 10 s service tick, once a scan is reliable.
+   - **Stored-record loading:**
+     - `summary2` is used when present and readable;
+     - if `summary2` is present but unreadable: retried, never overwritten,
+       and never replaced from the older legacy record;
+     - else the legacy `summary` is migrated (each conversation recounted;
+       an unreliable scan gives UNRESOLVED, never an approximate count);
+     - if the legacy record is unreadable or has an unexpected length:
+       retried, nothing written;
+     - while a record is unreadable, arrivals are tracked in RAM and
+       merged in as UNRESOLVED once it is read;
+     - after every successful load (at boot, or when an unreadable record
+       becomes readable) a sweep recounts every stored conversation from
+       its messages, one per 10 s tick, using the new
+       `MessageStore::listConversations()`. This includes conversations
+       listed with zero counts; UNRESOLVED ones are left to the reconcile
+       step. It recovers unread messages that the stored summary missed:
+       an arrival while the summary couldn't be read or written, followed
+       by a reboot, or a power loss after the message was stored (unread)
+       but before it was counted. No other record (journal) is kept. An
+       unreliable listing or recount is retried, never skipped;
+     - **recovery time is not guaranteed.** On each 10 s tick:
+       - while the stored record is unreadable, only its retry runs;
+       - otherwise a failed save is retried, then either one UNRESOLVED
+         recount runs or, if none is waiting, one sweep step.
+
+       So N stored conversations need at least N × 10 s, which is a lower
+       bound, not a completion time:
+       - UNRESOLVED recounts take their ticks first;
+       - an unreliable listing or recount repeats the same step on later
+         ticks;
+       - a record that stays unreadable delays the sweep until it loads;
+       - while storage keeps failing, the sweep may not complete at all;
+     - every count read from `summary2` (at boot or by a recovery retry) is
+       verified once: each conversation listed with unread messages becomes
+       UNRESOLVED (badges unchanged) and is recounted from the stored
+       messages, one per 10 s tick. So a read or eviction made while the
+       record was unreadable is corrected even after a reboot before
+       recovery, or when RAM had no free entry to note it. At most 24
+       recounts per load;
+     - the legacy record is never written.
+   - **Saves:** a failed save is retried and logged once; RAM stays
+     authoritative meanwhile.
+   - **Eviction** recounts the conversation, or marks it UNRESOLVED if the
+     scan fails.
+   - **Tests:** `notify_test` NR1-NR38 (step 4b; built with
+     `-DREAL_NOTIFICATIONS`). NR11-NR38 cover:
+     - legacy read failure, recovery and reboot;
+     - `summary2` read failure with stale legacy data present;
+     - a mixed Text/Enigma migration whose scan fails;
+     - save-failure retry;
+     - a legacy record of an unexpected length;
+     - eviction with a failing scan;
+     - with no new arrivals, while `summary2` (NR17, NR18) or the legacy
+       record (NR19) is unreadable: the only unread message read (NR17,
+       NR19) or evicted (NR18), then recovery and reboot leave no badge;
+     - all 24 RAM entries in use while unreadable, then a read in a stored
+       conversation (NR20);
+     - a conversation the stored record lacks, arriving while unreadable,
+       survives recovery (NR21);
+     - a read (NR22) or eviction (NR23) while unreadable, then a reboot
+       **before** recovery, then recovery with no arrival or user action;
+     - the record readable again at the next boot (NR24);
+     - verification keeps genuine counts and, while scans fail, the badges
+       (NR25);
+     - an arrival while `summary2` is unreadable, then a reboot before
+       recovery: a conversation absent from `summary2` (NR26), one listed
+       with zero counts (NR27), one with another category unread (NR28),
+       25 new conversations (NR29), and over two unreadable boots (NR32);
+       the `summary2` save failing at recovery (NR31); no reboot (NR33);
+     - recovery that must not depend on any marker having been saved: the
+       review's combined case (NR34), and a power loss between storing a
+       message and counting it (NR36 new conversation, NR37 zero-count
+       one). NR30 and NR35 keep the cases that involved the dropped
+       `pending2` record: they must not affect recovery;
+     - a sweep that meets an unreliable recount, then an unreliable
+       listing, retries until both are reliable (NR38);
+     - `reset()`/`reboot()` return every volatile notification variable to
+       its power-on value (the sweep's heap object is freed first); only
+       the fake NVS and message store survive a reboot.
+   - **Host-test limit:** `storage_messages.cpp` can't be built with these
+     fakes. Its new `listConversations()` is compiled only by the ESP32
+     build; the host tests use a fake one over the fake store.
+   - **Mutations:** `mutate_notify.py`, 30, all caught (step 7b).
+
+ESP32 build of the candidate:
+- RAM 124,316 B, flash 1,194,837 B (`evidence/esp32_defectfix_final_build_log.txt`);
+- static DRAM 124,324 of 124,580 B, **256 B headroom** (was 352 B at 30ed514);
+- the extra 96 B of static DRAM are the per-type summaries, the notification
+  load and recovery state, the round binding and two per-chat read-check
+  variables.
+
 ## Heap diagnostics (for hardware acceptance)
 
 `race.cpp` writes one serial line per heap reading:

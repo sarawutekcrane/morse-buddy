@@ -1,0 +1,163 @@
+== toolchain: g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+== repo HEAD: 30ed514ffbc0103e6793cbebe87b1309f0fe0143  (working tree:  M host_tests/race_r3_r5/README.md  M host_tests/race_r3_r5/fake/Preferences.h  M host_tests/race_r3_r5/mutate_room.py  M host_tests/race_r3_r5/room_test.cpp  M host_tests/race_r3_r5/run_all.sh  M host_tests/race_r3_r5/stubs.cpp  M host_tests/race_r3_r5/stubs.h  M src/core/display.cpp  M src/core/display.h  M src/core/enigma.cpp  M src/core/notifications.cpp  M src/core/notifications.h  M src/core/race.cpp  M src/core/text_message.cpp ?? host_tests/race_r3_r5/evidence/defect_fixes_before_after.txt ?? host_tests/race_r3_r5/evidence/run_defectfix_output.txt ?? host_tests/race_r3_r5/font_metrics.h ?? host_tests/race_r3_r5/investigation/ ?? host_tests/race_r3_r5/mutate_notify.py ?? host_tests/race_r3_r5/notify_test.cpp )
+== 1. Room protocol E1-E27 + review findings F1-F3: ACTUAL race_protocol.cpp + crc32.cpp, several engines, broker + NVS + identity-counter fault models, ASan+UBSan
+   audited 112 publish logs; 422 receive-queue overflow drops injected
+   1028 checks passed, 0 failed
+== 1b. Race sequence numbers: ACTUAL identity.cpp near UINT32_MAX, interleaved with nextId(), exhaustion, reboots, write/read failures
+      Race numbers handed out: 10 (incl. 4 pre-existing); message-id counter now 6
+   85 checks passed, 0 failed
+== 2. Room UI (R1, R2, R3-R5, review U15-U17): ACTUAL menu.cpp + race.cpp + race_protocol.cpp + identity.cpp; peers are ACTUAL engines
+      wire: RS topic 59, payload 544, RX 610; request RX 126; reply payload 49, RX 115; TX part 66
+   418 checks passed, 0 failed
+== 3. Race Guess history browsing (RB1-RB12, ported to the room protocol): same sources
+   100 checks passed, 0 failed
+== 4. Solo and Friend regressions (unchanged tests): ACTUAL menu, number_guessing(_friend), presence, text_message, enigma
+   52 checks passed, 0 failed
+   336 checks passed, 0 failed
+== 4b. Unread marking and badges (hardware finding 3): ACTUAL menu, notifications, text_message, enigma
+   52 checks passed, 0 failed
+   warnings in changed/related files (all builds): number_guessing.cpp:174:49: warning: 'snprintf' output may be truncated before the last format character [-Wformat-truncation=] 
+== 5. C++11 / C++17 compile (-fsyntax-only -Wall -Wextra; host fakes incl. fake_sys/) of every changed production file, baseline vs candidate
+   (a compiler error fails the script; warnings are counted and listed)
+   /home/user/morse-buddy/host_tests/race_r3_r5/out/base/core/enigma.cpp:69:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++11 base: compiled, 1 warnings
+   /home/user/morse-buddy/src/core/enigma.cpp:69:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++11 cand: compiled, 1 warnings
+   /home/user/morse-buddy/host_tests/race_r3_r5/out/base/core/enigma.cpp:69:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++17 base: compiled, 1 warnings
+   /home/user/morse-buddy/src/core/enigma.cpp:69:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++17 cand: compiled, 1 warnings
+== 6. Sizes: encoded by the ACTUAL codec (step 1 E16, step 2 U14) and the RAM of the engine on this host
+   sizeof(RoomState)=652 sizeof(Entry)=28 sizeof(Engine)=2152
+     room_=652 buf_=599 rec_(MemberRecord)=84 commit_=64 disc_=288 replyRate_=160 reconcile_=80 p_=80
+   (x86-64 host layout: ESP32 is 32-bit, so pointer members are half the size there; not measured on target)
+== 7. Targeted mutations of race.cpp, race_protocol.cpp and identity.cpp (each must be caught)
+  CAUGHT  [proto:0 room:7 browse:0 identity:0]  race.cpp: R2 removed: Start Round stays on the Room   (first: FAIL [R1-3 Short with a participant focused only returns focus to the action (no Start); the next Sh)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: R2: navigation not reported (rest of batch handled by the Room)   (first: FAIL [R2-7 input left after Start Round belongs to Guess: [Short, -1] -> Guess front (browsing), not)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: R2: no replay window for Start Round   (first: FAIL [R2-6 [Start Short, second Short] in one batch: one Guess push; the queued Short is dropped (re)
+  CAUGHT  [proto:0 room:96 browse:0 identity:0]  race.cpp: R1: rotation ignored   (first: FAIL [R1-2 rotation moves the focus down the list and scrolls; clamps at the Leave row; back up to t)
+  CAUGHT  [proto:0 room:84 browse:0 identity:0]  race.cpp: R1: Short on a participant performs the action   (first: FAIL [R1-3 Short with a participant focused only returns focus to the action (no Start); the next Sh)
+  CAUGHT  [proto:0 room:23 browse:0 identity:0]  race.cpp: R1: rotation wraps past the last row   (first: FAIL [R1-2 rotation moves the focus down the list and scrolls; clamps at the Leave row; back up to t)
+  CAUGHT  [proto:0 room:8 browse:0 identity:0]  race.cpp: R1: window does not follow downward focus   (first: FAIL [R1-2 rotation moves the focus down the list and scrolls; clamps at the Leave row; back up to t)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: R1: window does not follow upward focus   (first: FAIL [R1-2 rotation moves the focus down the list and scrolls; clamps at the Leave row; back up to t)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: R1: focus kept by index, not identity   (first: FAIL [R1-6 a participant leaving (through its own Leave): identity tracking and clamp to a neighbour)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: R1: missing row drops focus instead of clamping   (first: FAIL [R1-6 a participant leaving (through its own Leave): identity tracking and clamp to a neighbour)
+  CAUGHT  [proto:0 room:8 browse:0 identity:0]  race.cpp: R1: focus not reset on Room entry   (first: FAIL [R1-8 re-entering the Room (Guess -> Back) starts on the action row] line 250: focus '0EE000000)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: R1: action keeps its marker while a row is focused   (first: FAIL [R1-2 rotation moves the focus down the list and scrolls; clamps at the Leave row; back up to t)
+  CAUGHT  [proto:0 room:5 browse:0 identity:0]  race.cpp: R1: no range on the title   (first: FAIL [R1-1 rows fit the area below the status row; scores beside names; title shows the range] line )
+  CAUGHT  [proto:0 room:10 browse:0 identity:0]  race.cpp: R1: row marker not drawn   (first: FAIL [R1-2 rotation moves the focus down the list and scrolls; clamps at the Leave row; back up to t)
+  CAUGHT  [proto:0 room:5 browse:0 identity:0]  race.cpp: R1: rows not capped by the available area   (first: FAIL [R1-1 rows fit the area below the status row; scores beside names; title shows the range] line )
+  CAUGHT  [proto:0 room:4 browse:0 identity:0]  race.cpp: Back changes membership (Leave on Back)   (first: FAIL [U7 Back is navigation only: Room -> Back -> re-enter keeps membership, scores and the peers' v)
+  CAUGHT  [proto:0 room:7 browse:0 identity:0]  race.cpp: Leave row acts without confirmation   (first: FAIL [U5 Leave row (member): prompt; No keeps membership; Yes leaves only this device] line 414: pro)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: owner prompt does not say it closes the room   (first: FAIL [U6 owner Leave: the prompt says it closes the room; Yes closes it for everyone (final scores k)
+  CAUGHT  [proto:0 room:33 browse:0 identity:0]  race.cpp: scores not drawn beside names   (first: FAIL [R1-1 rows fit the area below the status row; scores beside names; title shows the range] line )
+  CAUGHT  [proto:0 room:25 browse:0 identity:0]  race.cpp: no Leave row   (first: FAIL [R1-2 rotation moves the focus down the list and scrolls; clamps at the Leave row; back up to t)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: frozen state not shown   (first: FAIL [U10 frozen (same-version conflict): 'Room data inconsistent', 'Leave only', no Start/Continue])
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: storage pause not shown   (first: FAIL [U11 storage failure while applying: 'Storage error - room paused'; nothing applied] line 519: )
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: reconnecting not shown on the status row   (first: FAIL [U8 reboot: 'Reconnecting...' (Leave only) until the room state; disconnect changes nothing] li)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: waiting-for-coordinator not shown   (first: FAIL [U9 coordinator unavailable: the pending CLAIM waits (no timeout, no takeover); 'Waiting for Al)
+  CAUGHT  [proto:0 room:5 browse:0 identity:0]  race.cpp: non-holder offered Start Round   (first: FAIL [R2-8 member: Join stays on the Room; a peer's round enters Guess automatically; Continue re-en)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: a frozen member may still guess   (first: FAIL [U10b conflict detected while on Guess: the round ends there ('Round ended'); a correct guess i)
+  CAUGHT  [proto:0 room:41 browse:0 identity:0]  race.cpp: no automatic Guess entry on a new round   (first: FAIL [R2-8 member: Join stays on the Room; a peer's round enters Guess automatically; Continue re-en)
+  CAUGHT  [proto:0 room:1 browse:1 identity:0]  race.cpp: another member's win not shown   (first: FAIL [U3 another member wins: 'Solved by Alice: <secret>' on Guess, then back to the Room; score bes)
+  CAUGHT  [proto:0 room:36 browse:0 identity:0]  race.cpp: discovered row does not join   (first: FAIL [R1-9 the room closing rebuilds the list and resets the focus to the action] line 154: fixture:)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: no notification for a new room   (first: FAIL [U12 discovery: a new room in the group sets the Race invite notification and lists 'Join <name)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: engine notices never shown   (first: FAIL [R1-9 the room closing rebuilds the list and resets the focus to the action] line 258: after cl)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: Ready gate removed   (first: FAIL [R2-5 not Ready: refused on the Room, nothing committed, no navigation] line 325: refusal '> Co)
+  CAUGHT  [proto:0 room:8 browse:3 identity:0]  race.cpp: a correct guess sends no claim   (first: FAIL [U1 a member's correct guess: CLAIM, 'Solved! 4A0B', 'Confirming...', then the confirmed score])
+  CAUGHT  [proto:0 room:1 browse:1 identity:0]  race.cpp: the result never reaches the Guess screen (no sync there)   (first: FAIL [U3 another member wins: 'Solved by Alice: <secret>' on Guess, then back to the Room; score bes)
+  CAUGHT  [proto:2 room:0 browse:0 identity:0]  race_protocol.cpp: model-11: equal-version restore writes NVS   (first: FAIL [E26 reboot then exactly appliedV: restored with NO NVS write (writes failing)] line 892: equal)
+  CAUGHT  [proto:2 room:0 browse:0 identity:0]  race_protocol.cpp: model-12: freeze not enforced (later RS applied)   (first: FAIL [E27/model-12 conflict freeze: Leave only; later packets do not advance or complete] line 930: )
+  CAUGHT  [proto:14 room:4 browse:0 identity:0]  race_protocol.cpp: same-version conflict not detected   (first: FAIL [E27/model-12 conflict freeze: Leave only; later packets do not advance or complete] line 924: )
+  CAUGHT  [proto:3 room:1 browse:0 identity:0]  race_protocol.cpp: G2: applied despite a failed appliedV write   (first: FAIL [E22 appliedV write failure: nothing applied; no displayed rollback across reboot] line 903: ap)
+  CAUGHT  [proto:14 room:0 browse:0 identity:0]  race_protocol.cpp: G1: identity mismatch decided from the snapshot   (first: FAIL [E24 old QUERY reply after Leave A / Join B (same coordinator) is ignored] line 459: verifying)
+  SURVIVED (assessed equivalent: redundant guard) [proto:0 room:0 browse:0 identity:0]  race_protocol.cpp: QUERY binding ignored   (first: -)
+  SURVIVED (assessed equivalent: redundant guard) [proto:0 room:0 browse:0 identity:0]  race_protocol.cpp: QUERY not invalidated by Join   (first: -)
+  CAUGHT  [proto:3 room:0 browse:0 identity:0]  race_protocol.cpp: STALE_BASIS JOIN reissued   (first: FAIL [E1 another device's STALE_BASIS -> NONE "Couldn't join", no reissue] line 1073: STALE_BASIS re)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: no duplicate gate (seq <= lastSeq)   (first: FAIL [E2 ordering by lastSeq with an entry; eviction by departedAt/index; floor] line 371: C committ)
+  CAUGHT  [proto:7 room:0 browse:0 identity:0]  race_protocol.cpp: non-member LEAVE does not raise the floor   (first: FAIL [E1 no-entry cancellation: delayed JOIN rejected after LEAVE, requester offline] line 336: floo)
+  CAUGHT  [proto:6 room:0 browse:0 identity:0]  race_protocol.cpp: START entitlement not checked   (first: FAIL [E12 start holder: presence offline grants nothing; winner Leave -> C; rejoin doesn't restore] )
+  CAUGHT  [proto:24 room:0 browse:0 identity:0]  race_protocol.cpp: winner Leave keeps the start right   (first: FAIL [E17 a rejected START replayed after the winner's Leave never starts a round] line 828: right c)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: eviction ignores departedAt order   (first: FAIL [E2b eviction picks the smallest departedAt and raises evictionFloor] line 391: evicted the old)
+  CAUGHT  [proto:3 room:0 browse:0 identity:0]  race_protocol.cpp: commit record not written (slot only)   (first: FAIL [E6 power cut at every commit step: never published uncommitted, never rolled back] line 553: c)
+  CAUGHT  [proto:19 room:0 browse:0 identity:0]  race_protocol.cpp: FC-A writes no DATA_LOST   (first: FAIL [E7 FC-A: committed slot corrupted -> CLOSED DATA_LOST at V+1; members keep final scores] line )
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: FC-B1 without the consecutive check   (first: FAIL [E19 FC-B1 with the newer slot CLOSED at 0xFFFFFFFF; non-consecutive -> FC-B2] line 1311: non-c)
+  CAUGHT  [proto:9 room:0 browse:0 identity:0]  race_protocol.cpp: 4b: own open room does not repair rm_member   (first: FAIL [E6 power cut at every commit step: never published uncommitted, never rolled back] line 552: c)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: DATA_LOST replaces the member's final scores   (first: FAIL [E7 FC-A: committed slot corrupted -> CLOSED DATA_LOST at V+1; members keep final scores] line )
+  CAUGHT  [proto:4 room:0 browse:0 identity:0]  race_protocol.cpp: exhaustion uses the reserved version   (first: FAIL [E8/E19 limits: exhaustion -> CLOSED at 0xFFFFFFFF; FC-B1 adopts CLOSED at the maximum] line 65)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: reply's current room not checked   (first: FAIL [E4 request replies: each field negative, then positive; cur != record -> gone] line 1134: cur )
+  CAUGHT  [proto:4 room:0 browse:0 identity:0]  race_protocol.cpp: reply group not checked   (first: FAIL [E4 reply validation: wrong group / coordinator / target / seq are ignored] line 446: a mismatc)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race_protocol.cpp: discovery not refreshed while a member (soak finding)   (first: FAIL [R1-9 the room closing rebuilds the list and resets the focus to the action] line 257: focus '0)
+  CAUGHT  [proto:1 room:1 browse:0 identity:0]  race_protocol.cpp: echo not awaited (no republish)   (first: FAIL [E19 FC-B1 with the newer slot CLOSED at 0xFFFFFFFF; non-consecutive -> FC-B2] line 1302: close)
+  CAUGHT  [proto:44 room:8 browse:0 identity:0]  race_protocol.cpp: pending request not resent   (first: FAIL [E5 Leave replaces a pending JOIN] line 529: ended without membership)
+  CAUGHT  [proto:0 room:2 browse:0 identity:1]  identity.cpp: F1: identity counter write result ignored   (first: FAIL [U15 actual identity.cpp Race counter write failing (Storage::core): Join sends nothing, shows )
+  CAUGHT  [proto:0 room:14 browse:15 identity:38]  identity.cpp: F4: Race shares nextId()'s counter again (no isolation)   (first: FAIL [R1-1 rows fit the area below the status row; scores beside names; title shows the range] line )
+  CAUGHT  [proto:0 room:24 browse:1 identity:1]  identity.cpp: F4: Race writes nextId()'s counter again (no isolation)   (first: FAIL [U1 a member's correct guess: CLAIM, 'Solved! 4A0B', 'Confirming...', then the confirmed score])
+  CAUGHT  [proto:0 room:4 browse:0 identity:0]  race.cpp: F7: repeated init allocates a new engine   (first: FAIL [U19 repeated initialization: no new allocation, same engine, no re-boot, no writes, no publish)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: F7: repeated init re-boots the existing engine   (first: FAIL [U19 repeated initialization: no new allocation, same engine, no re-boot, no writes, no publish)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: H1: heap free/largest swapped   (first: FAIL [U20 heap diagnostics: allocation result, before/after figures, labels match the values reporte)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: H1: min_since_boot reports free   (first: FAIL [U20 heap diagnostics: allocation result, before/after figures, labels match the values reporte)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: H1: heap capability not internal   (first: FAIL [U20 heap diagnostics: allocation result, before/after figures, labels match the values reporte)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: H1: allocation failure logged as ok   (first: FAIL [U20b allocation failure is logged as FAILED with unchanged figures; repeated init with an engi)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: H1: pre-alloc reading taken after the allocation   (first: FAIL [U20 heap diagnostics: allocation result, before/after figures, labels match the values reporte)
+  CAUGHT  [proto:0 room:6003 browse:0 identity:0]  race.cpp: H1: periodic reading every tick   (first: FAIL [U20c periodic readings: at most one per 60 s however many loops and packets; none per packet] )
+  CAUGHT  [proto:0 room:103 browse:0 identity:0]  race.cpp: H1: periodic reading every 6 s   (first: FAIL [U20c periodic readings: at most one per 60 s however many loops and packets; none per packet] )
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: H1: Room reading not rate-limited   (first: FAIL [U20d Room entry reading, rate-limited to one per 5 s; every line well-formed] line 1098: a sec)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: H1: uptime reported in ms   (first: FAIL [U20 heap diagnostics: allocation result, before/after figures, labels match the values reporte)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: HB: history binding ignores the room counter n   (first: FAIL [HB9 only the room counter n differs (same coordinator, same nonce, same round number): no old )
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: HB: history binding ignores the nonce   (first: FAIL [HB10 only the nonce differs (the coordinator's storage was erased: n=1 again, same round numbe)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: HB: history binding ignores the coordinator   (first: FAIL [HB8 only the coordinator differs (both rooms n=1, same nonce, same round number): no old guess)
+  CAUGHT  [proto:0 room:1 browse:2 identity:0]  race.cpp: HB: history binding ignores the round   (first: FAIL [HB4 the round ends (Alice wins) and a new round starts while the device is away: rejoining sho)
+  CAUGHT  [proto:0 room:5 browse:0 identity:0]  race.cpp: HB: history discarded when the view disappears   (first: FAIL [HB1 Guess -> Back -> Leave (Yes, completed) -> Back -> rejoin: the same round shows the device)
+  CAUGHT  [proto:0 room:1 browse:2 identity:0]  race.cpp: HB: lobby view (same round key) keeps a stale history   (first: FAIL [HB5 the round ends while the device is away and the room is in the lobby: rejoining discards t)
+  CAUGHT  [proto:0 room:0 browse:2 identity:0]  race.cpp: HB: 'Round ended' does not end browsing   (first: FAIL [RB4 the room closes (owner Leave) while browsing: 'Round ended', input frozen, browsing gone] )
+  CAUGHT  [proto:0 room:18 browse:0 identity:0]  race.cpp: SC: score right-aligned by ink width (clipped by printLine)   (first: FAIL [SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at k)
+  CAUGHT  [proto:0 room:0 browse:0 identity:0]  race.cpp: F7: no guard in the room-state handler   (first: -)
+  CAUGHT  [proto:0 room:0 browse:0 identity:0]  race.cpp: F7: no guard in the request handler   (first: -)
+  CAUGHT  [proto:0 room:0 browse:0 identity:0]  race.cpp: F7: no guard in the service tick   (first: -)
+  CAUGHT  [proto:0 room:0 browse:0 identity:0]  race.cpp: F7: no guard in syncRound   (first: -)
+  CAUGHT  [proto:0 room:0 browse:0 identity:0]  race.cpp: F7: no guard building the rows   (first: -)
+  CAUGHT  [proto:0 room:0 browse:0 identity:0]  race.cpp: F7: no guard in the room action   (first: -)
+  CAUGHT  [proto:0 room:2 browse:0 identity:0]  race.cpp: F7: no 'Race unavailable' text   (first: FAIL [U18 engine allocation fails at boot: 'Race unavailable', Race inert, saved records untouched, )
+  CAUGHT  [proto:0 room:0 browse:0 identity:0]  race.cpp: F7: no guard in shownRoom   (first: -)
+  CAUGHT  [proto:0 room:0 browse:0 identity:24]  identity.cpp: F6: readStored accepts disagreeing reads   (first: FAIL [S6 stored raceSeq unreadable: refused (never restarted from 0 or from idCounter)] line 131: a )
+  CAUGHT  [proto:0 room:0 browse:0 identity:4]  identity.cpp: F6: readStored infers failure from the defaults (previous helper)   (first: FAIL [S12 raceSeq reservation, stored 50, first read fails] line 270: a failed read's default was us)
+  CAUGHT  [proto:0 room:0 browse:0 identity:5]  identity.cpp: F5: no migration at boot (lazy only)   (first: FAIL [S9 migration write failure, then nextId(), then reboot: the source is unchanged until raceSeq )
+  CAUGHT  [proto:0 room:0 browse:0 identity:4]  identity.cpp: F5: nextId() changes idCounter before the floor is stored   (first: FAIL [S9b only the raceSeq write fails (idCounter writes would succeed): nextId() still leaves the s)
+  CAUGHT  [proto:0 room:0 browse:0 identity:14]  identity.cpp: F5: migration from an unreadable idCounter (default 0)   (first: FAIL [S7 idCounter unreadable at migration: refused (never started from 0)] line 140: a number despi)
+  CAUGHT  [proto:0 room:0 browse:0 identity:10]  identity.cpp: F5: unreadable raceSeq restarts at 0   (first: FAIL [S6 stored raceSeq unreadable: refused (never restarted from 0 or from idCounter)] line 131: a )
+  SURVIVED (assessed equivalent: redundant guard) [proto:0 room:0 browse:0 identity:0]  identity.cpp: F5: reservation without the stored floor   (first: -)
+  CAUGHT  [proto:7 room:4 browse:0 identity:0]  race_protocol.cpp: F1: engine ignores a failed reservation (requests)   (first: FAIL [F1a counter write failing: no JOIN/START/CLAIM/LEAVE sent with an unreserved number; numbers n)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: F1: QUERY sent with an unreserved number   (first: FAIL [F1b counter write failing: no QUERY with an unreserved number; still verifying; sent once stor)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: F2: replies processed while frozen   (first: FAIL [F2a pending CLAIM -> same-version conflict -> matching LATE reply: the CLAIM stays pending] li)
+  CAUGHT  [proto:3 room:0 browse:0 identity:0]  race_protocol.cpp: F2: timer activity while frozen   (first: FAIL [F2b frozen with a pending CLAIM and no reply: no timer-driven activity (no resend, no QUERY)] )
+  CAUGHT  [proto:7 room:0 browse:0 identity:0]  race_protocol.cpp: F3: terminal shown before NONE is stored   (first: FAIL [F3a frozen Leave with the NONE write failing: not shown as exited; retried; then durably NONE])
+  CAUGHT  [proto:2 room:0 browse:0 identity:0]  race_protocol.cpp: F3: pending exit never retried   (first: FAIL [F3a frozen Leave with the NONE write failing: not shown as exited; retried; then durably NONE])
+  CAUGHT  [proto:2 room:1 browse:0 identity:0]  race_protocol.cpp: F3: frozen Leave not stored as LEAVING first   (first: FAIL [F3b frozen Leave, NONE write failing, then reboot: the exit is not lost (no silent return to t)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: F3: stale member record never retried   (first: FAIL [F3e completion write (pending CLAIM cleared) failing: retried, durable record catches up witho)
+  CAUGHT  [proto:1 room:0 browse:0 identity:0]  race_protocol.cpp: F3: completion write failure not marked for retry   (first: FAIL [F3e completion write (pending CLAIM cleared) failing: retried, durable record catches up witho)
+  CAUGHT  [proto:0 room:1 browse:0 identity:0]  race.cpp: F3: refused Leave not reported   (first: FAIL [U17 frozen member's Leave with the NONE write failing: shown as leaving + storage error, not a)
+  CAUGHT  [proto:0 room:4 browse:0 identity:0]  race.cpp: F1: platform reservation ignores Identity's result   (first: FAIL [U15 actual identity.cpp Race counter write failing (Storage::core): Join sends nothing, shows )
+  CAUGHT  [proto:6 room:1 browse:0 identity:0]  race_protocol.cpp: member state applied without a durable floor write   (first: FAIL [E22 appliedV write failure: nothing applied; no displayed rollback across reboot] line 903: ap)
+104/107 mutations caught; 3 survivor(s) assessed equivalent; 0 unexplained survivor(s); 0 build error(s)
+== 7b. Targeted mutations of notifications.cpp, text_message.cpp and enigma.cpp (each must be caught)
+  CAUGHT  [notify:7]  text_message.cpp: Text: selection does not mark read   (first: FAIL [NR1 rotating onto a received unread message marks it read and clears the badge] line 174: sele)
+  CAUGHT  [notify:2]  enigma.cpp: Enigma: selection does not mark read   (first: FAIL [NR3 Enigma chat: rotating onto a received Enigma message marks it read] line 196: selected: en)
+  CAUGHT  [notify:3]  text_message.cpp: Text: every message in the chat marked read on entry   (first: FAIL [NR1 rotating onto a received unread message marks it read and clears the badge] line 172: ente)
+  CAUGHT  [notify:1]  notifications.cpp: GAME record does not light the Text badge   (first: FAIL [NR5 a Friend game record lights both badges; reading it clears both] line 220: game record: te)
+  CAUGHT  [notify:10]  notifications.cpp: categories merged again (any unread lights every badge)   (first: FAIL [NR3 Enigma chat: rotating onto a received Enigma message marks it read] line 192: precondition)
+  CAUGHT  [notify:14]  notifications.cpp: clear decrements the wrong category   (first: FAIL [NR1 rotating onto a received unread message marks it read and clears the badge] line 174: sele)
+  CAUGHT  [notify:11]  notifications.cpp: arrival counted under a guessed category when the stored type is known   (first: FAIL [NR1 rotating onto a received unread message marks it read and clears the badge] line 174: sele)
+  CAUGHT  [notify:1]  notifications.cpp: migration skips the recount (old merged count kept as UNRESOLVED)   (first: FAIL [NR7 migration of the earlier record: per-type counts recounted from the stored messages] line )
+  CAUGHT  [notify:6]  notifications.cpp: migration fallback stores an approximate GAME count (first candidate)   (first: FAIL [NR8 migration when the store scan is unreliable: UNRESOLVED (badges of the old mask lit), neve)
+  CAUGHT  [notify:7]  notifications.cpp: legacy read failure taken as an empty migration   (first: FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates a)
+  CAUGHT  [notify:3]  notifications.cpp: unreadable summary2 replaced from the legacy record   (first: FAIL [NR12 existing summary2 unreadable: never replaced from the (stale) legacy record; recovery mer)
+  CAUGHT  [notify:4]  notifications.cpp: saves while the stored record is unreadable   (first: FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates a)
+  CAUGHT  [notify:4]  notifications.cpp: a failed save is not retried   (first: FAIL [NR14 a failed save is retried; nothing unread is lost once storage recovers (and after reboot))
+  CAUGHT  [notify:1]  notifications.cpp: conversations touched while unreadable are not merged   (first: FAIL [NR12 existing summary2 unreadable: never replaced from the (stale) legacy record; recovery mer)
+  CAUGHT  [notify:5]  notifications.cpp: UNRESOLVED conversations are never reconciled   (first: FAIL [NR11 legacy record unreadable at boot: not migrated, summary2 not written; recovery migrates a)
+  CAUGHT  [notify:1]  notifications.cpp: a read in an UNRESOLVED conversation guesses a decrement   (first: FAIL [NR13 mixed Text+Enigma, migration scan fails (UNRESOLVED), reads while unresolved, scan recove)
+  CAUGHT  [notify:2]  notifications.cpp: eviction with a failed scan keeps the stale counts   (first: FAIL [NR16 eviction while scans fail: UNRESOLVED (badges kept), reconciled later] line 438: unresolv)
+17/17 mutations caught; 0 survivor(s); 0 build error(s)
+== RESULT: all steps passed
+exit=0

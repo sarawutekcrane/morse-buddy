@@ -19,6 +19,7 @@
 #include "core/ui_scratch.h"
 #include "core/wifi_manager.h"
 #include "font_adv.h"
+#include "font_metrics.h"
 
 namespace T {
 uint32_t now = 1000;
@@ -38,12 +39,15 @@ std::vector<std::string> seq;
 int notifications = 0;
 std::vector<std::string> indexLoads;
 uint32_t unixTime = 1700000000u;
+bool realGlyphs = false;
+bool scanUnreliable = false;
+bool listUnreliable = false;
 std::function<void(const std::string&)> onDraw;
 void reset() {
   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0;
   connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
-  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u;
+  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; scanUnreliable = false; listUnreliable = false;
 }
 std::string visibleJoined() { std::string s; for (auto& d : screen) { s += d.text; s += '|'; } return s; }
 std::string rowAt(int y) {
@@ -75,9 +79,40 @@ void clearContentArea() { eraseRect(0, kStatusBarHeight, kScreenWidth, kScreenHe
 void drawStatusBar() {}
 void setFont(Font) {}
 int16_t lineHeight() { return 23; }  // FreeSans9pt7b: ink 17 + 2/5 leading (display.cpp computePrimaryMetrics)
-int16_t textWidth(const char* t) { int w = 0; for (; *t; t++) if (*t >= 0x20 && *t <= 0x7E) w += kAdv[*t - 0x20]; return static_cast<int16_t>(w); }
-void printLine(int16_t x, int16_t y, const char* t) { draw(x, y, t); }
-void printLineColored(int16_t x, int16_t y, const char* t, uint16_t c) { draw(x, y, t, c); }
+// Adafruit_GFX::getTextBounds() at x = 0 for one line: x1 = leftmost ink
+// column, w = ink width (0 if no ink).
+static void realBounds(const char* t, int16_t* x1, int16_t* w) {
+  int minx = 0x7FFF, maxx = -1, x = 0;
+  for (; *t; t++) {
+    if (*t < 0x20 || *t > 0x7E) continue;
+    const HostGlyph& g = kFreeSans9Glyphs[*t - 0x20];
+    int gx1 = x + g.xOffset, gx2 = gx1 + g.width - 1;
+    if (g.width > 0) { if (gx1 < minx) minx = gx1; if (gx2 > maxx) maxx = gx2; }
+    x += g.xAdvance;
+  }
+  if (maxx >= minx) { *x1 = static_cast<int16_t>(minx); *w = static_cast<int16_t>(maxx - minx + 1); }
+  else { *x1 = 0; *w = 0; }
+}
+int16_t textWidth(const char* t) {
+  if (T::realGlyphs) { int16_t x1, w; realBounds(t, &x1, &w); return w; }
+  int w = 0; for (; *t; t++) if (*t >= 0x20 && *t <= 0x7E) w += kAdv[*t - 0x20]; return static_cast<int16_t>(w);
+}
+int16_t fitWidth(const char* t) {
+  if (T::realGlyphs) { int16_t x1, w; realBounds(t, &x1, &w); return static_cast<int16_t>(x1 + w); }
+  return textWidth(t);
+}
+// display.cpp printLine(): with real glyphs, drop the last char while the
+// text's fit width exceeds the room left of the screen edge.
+static std::string clipped(int16_t x, const char* t) {
+  std::string b(t);
+  if (!T::realGlyphs) return b;
+  int16_t maxWidth = static_cast<int16_t>(kScreenWidth - x);
+  if (maxWidth <= 0) return std::string();
+  while (!b.empty() && fitWidth(b.c_str()) > maxWidth) b.pop_back();
+  return b;
+}
+void printLine(int16_t x, int16_t y, const char* t) { std::string b = clipped(x, t); draw(x, y, b.c_str()); }
+void printLineColored(int16_t x, int16_t y, const char* t, uint16_t c) { std::string b = clipped(x, t); draw(x, y, b.c_str(), c); }
 void drawLockIcon(int16_t, int16_t, bool, uint16_t) {}
 void drawSelectionCursor(int16_t x, int16_t y) { eraseRect(x, y, 1, 1); T::screen.push_back({T::now, x, y, "#CURSOR"}); T::drawLog.push_back({T::now, x, y, "#CURSOR"}); }
 void drawSenderDivider(int16_t x, int16_t y, const char* t, uint16_t) { draw(x, y, t); }
@@ -168,8 +203,34 @@ bool findMessageById(const char* g, const char* c, const char* id, MessageRef* o
   return false;
 }
 uint32_t getStorageChangeGeneration() { return g_gen; }
+#ifdef REAL_NOTIFICATIONS
+// The notification suite's recounts need a real scan of the fake store.
+uint16_t findMessagesByPredicate(const char* g, const char* c, MessagePredicate pred, void* ctx, MessageRef* out,
+                                 uint16_t cap, bool* rel) {
+  uint16_t n = 0;
+  for (auto& r : T::store) {
+    if ((g && strcmp(r.ref.group_code, g)) || (c && strcmp(r.ref.contact_key, c))) continue;
+    if (pred(r.hdr, r.env, ctx)) { if (n < cap) out[n] = r.ref; n++; }
+  }
+  if (rel) *rel = !T::scanUnreliable;
+  return n;
+}
+#else
 uint16_t findMessagesByPredicate(const char*, const char*, MessagePredicate, void*, MessageRef*, uint16_t, bool* rel) {
   if (rel) *rel = true; return 0;
+}
+#endif
+bool listConversations(ConversationFn fn, void* ctx) {  // every distinct (group, contact) in the fake store
+  if (T::listUnreliable) return false;
+  std::vector<std::pair<std::string, std::string>> seen;
+  for (auto& r : T::store) {
+    std::pair<std::string, std::string> k(r.ref.group_code, r.ref.contact_key);
+    bool dup = false;
+    for (auto& x : seen) dup = dup || x == k;
+    if (!dup) seen.push_back(k);
+  }
+  for (auto& k : seen) fn(k.first.c_str(), k.second.c_str(), ctx);
+  return true;
 }
 bool isDuplicateAndRecord(const char*, const char*, const char*) { return false; }
 void buildSenderPrefix(const PacketCodec::MessageEnvelope&, char* out, size_t n) { snprintf(out, n, "Friend"); }
@@ -188,10 +249,12 @@ void nextId(char* out, size_t n) { snprintf(out, n, "ID%014u", ++g_counter); T::
 }
 #endif
 namespace IdentityColor { bool isValid(uint8_t i) { return i < kColorCount; } uint16_t color565(uint8_t) { return 0; } }
+#ifndef REAL_NOTIFICATIONS
 namespace Notifications {
 void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool) { T::notifications++; }
 void clearUnread(const char*, const char*, const MessageRef&) {}
 }
+#endif
 namespace Settings {
 FamilyGroup getGroup(uint8_t) { FamilyGroup g{}; g.configured = true; strcpy(g.name, "Fam"); strcpy(g.code, "GROUP1"); return g; }
 uint8_t getGroupCount() { return 1; }

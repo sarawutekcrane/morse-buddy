@@ -1,0 +1,50 @@
+# Investigation outputs on commit 30ed514 (host only)
+## race_inv_test (defects 1, 2 state side)
+  H1: state=2 top=Guess roundId='0EE000000001/06FB0846/3' historyCount=0
+  H2: re-entered while LEAVING: action='Leaving...' historyCount=1
+  H2: after the LEAVE completes: state=0 historyCount=0
+  H2: after rejoin: state=2 top=Guess historyCount=0
+  H3: action='> Continue'
+  H3: top=Guess historyCount=1
+  H4: state=3 action='Leaving...' rows='Alice 0'|'DEADBEEFAAAA (You) 0'|'' historyCount=1
+  H4: Short on the action -> top=Room
+  H5: after an engine reboot (Reconnecting, then the room state): state=2 historyCount=0
+  S1 round 1: A(coordinator) score=1 version=4 | B(member) score=1 version=4 | B row 'DEADBEEFAAAA (You) 1'
+  S1 round 2: A(coordinator) score=2 version=6 | B(member) score=2 version=6 | B row 'DEADBEEFAAAA (You) 2'
+68 checks passed, 0 failed
+exit=0
+
+## score_clip_repro (defect 2 rendering; exit 1 = defect present)
+score  textWidth  x1(bearing)  scoreX  maxWidth  fit  printed
+    0          8            1     230        10    9  "0"
+    1          4            3     234         6    7  ""   <-- WRONG
+    2          9            1     229        11   10  "2"
+    3          8            1     230        10    9  "3"
+    4          7            2     231         9    9  "4"
+    5          9            1     229        11   10  "5"
+    6          9            1     229        11   10  "6"
+    7          8            0     230        10    8  "7"
+    8          9            1     229        11   10  "8"
+    9          8            1     230        10    9  "9"
+   10         16            3     222        18   19  "1"   <-- WRONG
+   11         14            3     224        16   17  "1"   <-- WRONG
+   12         17            3     221        19   20  "1"   <-- WRONG
+   19         16            3     222        18   19  "1"   <-- WRONG
+   20         18            1     220        20   19  "20"
+   21         16            1     222        18   17  "21"
+   99         18            1     220        20   19  "99"
+  100         26            3     212        28   29  "10"   <-- WRONG
+  199         26            3     212        28   29  "19"   <-- WRONG
+ 1000         36            3     202        38   39  "100"   <-- WRONG
+8 of 20 scores are not printed as their value
+proposed placement: 0 of 20 scores wrong; every score's last ink column at x = 237
+exit=1
+
+## unread_inv_test (defect 3)
+  N2: chat open=1 unread=1 badge=1
+  N2: cursor on index 0 (message landed on): unread=1 badge=1
+  N2: after Short: chat open=1, cursor=0, unread=1 badge=1
+  N2: after Short and Back: chat still open=0, stack size 2, unread=1 badge=1
+  N5: after reading the Text message: text badge=1 enigma badge=1 unread_count=1
+6 checks passed, 0 failed
+exit=0

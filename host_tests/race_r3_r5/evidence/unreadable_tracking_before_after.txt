@@ -1,0 +1,209 @@
+Unreadable-summary tracking correction: before/after (notify_test built against each notifications.cpp, same test file)
+before = previous candidate notifications.cpp; after = current
+
+== BEFORE
+FAIL [NR17 summary2 unreadable, the only unread message read (no RAM summary), recovery, reboot: no badge] line 460: read not tracked while unreadable: state -1
+FAIL [NR17 summary2 unreadable, the only unread message read (no RAM summary), recovery, reboot: no badge] line 463: recovered: state 1 text 1 badge 1
+FAIL [NR17 summary2 unreadable, the only unread message read (no RAM summary), recovery, reboot: no badge] line 467: after reboot: text 1 enigma 0 (stale count restored)
+FAIL [NR18 summary2 unreadable, the only unread message evicted (no RAM summary), recovery, reboot: no badge] line 477: eviction not tracked while unreadable: state -1 badge 0
+FAIL [NR18 summary2 unreadable, the only unread message evicted (no RAM summary), recovery, reboot: no badge] line 481: recovered: state 1 enigma 1
+FAIL [NR18 summary2 unreadable, the only unread message evicted (no RAM summary), recovery, reboot: no badge] line 485: after reboot: text 0 enigma 1 (stale count restored)
+FAIL [NR19 legacy record unreadable, the only unread message read before recovery, recovery, reboot: no badge] line 496: read: flag 0 badge 0 state -1
+FAIL [NR20 a conversation emptied while unreadable is not reused for another one (its touch survives to recovery)] line 526: Bob's touched entry was reused while unreadable
+FAIL [NR20 a conversation emptied while unreadable is not reused for another one (its touch survives to recovery)] line 529: recovered: Bob text 1 badge 1
+FAIL [NR20 a conversation emptied while unreadable is not reused for another one (its touch survives to recovery)] line 532: after reboot: text 1 (stale count restored)
+61 checks passed, 10 failed
+
+== AFTER
+71 checks passed, 0 failed
+
+== race.cpp + display.cpp + display.h diff vs HEAD, sha256 (unchanged from the previous candidate):
+b0db4259b0c4abd9d7e1f6fa2ff3e71b5dc864948378d8aef808579e0e25038f  -
+
+== ESP32 build (fresh copy of the working tree)
+RAM:   [====      ]  37.9% (used 124308 bytes from 327680 bytes)
+Flash: [========  ]  82.8% (used 1193441 bytes from 1441792 bytes)
+========================= [SUCCESS] Took 50.06 seconds =========================
+static DRAM 124316 of 124580 B, headroom 264 B
+firmware.bin sha256 e987277288e3175727feb280d463838f663a8f19c54a85bed66c6198838396d8
+
+== Correction diff
+--- a/src/core/notifications.cpp
++++ b/src/core/notifications.cpp
+@@ -278,10 +278,13 @@
+   Summary* s = findSummary(group_code, contact_key);
+   if (s != nullptr) return s;
+   // A free entry, else (24 conversations listed: very unlikely) one with
+-  // nothing unread; an UNRESOLVED entry is never reused.
++  // nothing unread; an UNRESOLVED entry is never reused. While the stored
++  // record is unreadable every listed entry is a touched conversation that
++  // retryLoad must merge, so none is reused.
+   for (int pass = 0; pass < 2; pass++) {
+     for (auto& c : g_summaries) {
+-      bool usable = pass == 0 ? c.state == SUMMARY_FREE : (c.state == SUMMARY_COUNTED && totalUnread(c) == 0);
++      bool usable = pass == 0 ? c.state == SUMMARY_FREE
++                              : (g_loadState == LOAD_OK && c.state == SUMMARY_COUNTED && totalUnread(c) == 0);
+       if (!usable) continue;
+       memset(&c, 0, sizeof(c));
+       c.state = SUMMARY_COUNTED;
+@@ -292,6 +295,17 @@
+   return nullptr;
+ }
+ 
++// While the stored record is unreadable, RAM holds only the conversations
++// touched since boot. A read or eviction in a conversation RAM doesn't list
++// still changes what the stored record says, so the conversation is recorded
++// here (UNRESOLVED, no badge of its own) and is recounted from the stored
++// messages once the record is merged back in (retryLoad).
++void noteTouchedWhileUnreadable(const char* group_code, const char* contact_key) {
++  if (g_loadState == LOAD_OK) return;
++  Summary* s = findOrCreateSummary(group_code, contact_key);
++  if (s != nullptr) markUnresolved(s, 0);
++}
++
+ bool hasBadge(uint8_t mask) {
+   for (auto& s : g_summaries) {
+     if (s.state == SUMMARY_FREE) continue;  // COUNTED: counts; UNRESOLVED: category flags -- same test
+@@ -315,7 +329,10 @@
+ void onMessageEvicted(const MessageRef& ref, uint16_t flags) {
+   if (!(flags & MessageStore::FLAG_UNREAD)) return;
+   Summary* s = findSummary(ref.group_code, ref.contact_key);
+-  if (s == nullptr) return;
++  if (s == nullptr) {
++    noteTouchedWhileUnreadable(ref.group_code, ref.contact_key);
++    return;
++  }
+   if (!recountFromStore(s)) markUnresolved(s, 0);
+   saveSummaries();
+ }
+@@ -389,7 +406,10 @@
+ 
+   MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
+   Summary* s = findSummary(group_code, contact_key);
+-  if (s == nullptr) return;
++  if (s == nullptr) {
++    noteTouchedWhileUnreadable(group_code, contact_key);
++    return;
++  }
+   if (s->state == SUMMARY_UNRESOLVED) {
+     if (recountFromStore(s)) saveSummaries();  // else it stays lit until a reliable recount
+     return;
+--- a/host_tests/race_r3_r5/notify_test.cpp
++++ b/host_tests/race_r3_r5/notify_test.cpp
+@@ -441,6 +441,116 @@
+   CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && !textBadge() && enigmaBadge(), "reconciled: text %d enigma %d",
+         textBadge(), enigmaBadge());
+ 
++  // ---- reads and evictions while the stored record is unreadable, no new arrivals ----
++  auto eraseStored = [](const MessageRef& ref) {
++    for (size_t i = 0; i < T::store.size(); i++)
++      if (T::store[i].ref.sequence == ref.sequence) { T::store.erase(T::store.begin() + static_cast<long>(i)); return; }
++  };
++
++  g_test = "NR17 summary2 unreadable, the only unread message read (no RAM summary), recovery, reboot: no badge";
++  reset();
++  t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2 now holds Bob: Text 1
++  current = g_notifyPrefs.kv["summary2"];
++  g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
++  reboot();
++  CHECK(NV::g_loadState == NV::LOAD_RETRY_CURRENT && Notifications::findSummary(kG, kBob) == nullptr, "state %d",
++        NV::g_loadState);
++  Notifications::clearUnread(kG, kBob, t1);
++  CHECK(!unread(t1) && !textBadge() && g_notifyPrefs.kv["summary2"] == current, "read: flag %d badge %d", unread(t1), textBadge());
++  CHECK(stateOf(kBob) == NV::SUMMARY_UNRESOLVED, "read not tracked while unreadable: state %d", stateOf(kBob));
++  g_notifyPrefs.failRead = nullptr;
++  notifyTick(3);  // retry load (merge), then reconcile
++  CHECK(NV::g_loadState == NV::LOAD_OK && stateOf(kBob) == NV::SUMMARY_COUNTED && countOf(kBob, Notifications::SLOT_TEXT) == 0 &&
++            !textBadge(),
++        "recovered: state %d text %u badge %d", stateOf(kBob), countOf(kBob, Notifications::SLOT_TEXT), textBadge());
++  reboot();
++  CHECK(!textBadge() && !enigmaBadge(), "after reboot: text %d enigma %d (stale count restored)", textBadge(), enigmaBadge());
++
++  g_test = "NR18 summary2 unreadable, the only unread message evicted (no RAM summary), recovery, reboot: no badge";
++  reset();
++  e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");  // summary2 now holds Bob: Enigma 1
++  current = g_notifyPrefs.kv["summary2"];
++  g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
++  reboot();
++  eraseStored(e1);
++  Notifications::onMessageEvicted(e1, MessageStore::FLAG_UNREAD);
++  CHECK(stateOf(kBob) == NV::SUMMARY_UNRESOLVED && !enigmaBadge() && g_notifyPrefs.kv["summary2"] == current,
++        "eviction not tracked while unreadable: state %d badge %d", stateOf(kBob), enigmaBadge());
++  g_notifyPrefs.failRead = nullptr;
++  notifyTick(3);
++  CHECK(NV::g_loadState == NV::LOAD_OK && stateOf(kBob) == NV::SUMMARY_COUNTED &&
++            countOf(kBob, Notifications::SLOT_ENIGMA) == 0 && !enigmaBadge(),
++        "recovered: state %d enigma %u", stateOf(kBob), countOf(kBob, Notifications::SLOT_ENIGMA));
++  reboot();
++  CHECK(!textBadge() && !enigmaBadge(), "after reboot: text %d enigma %d (stale count restored)", textBadge(), enigmaBadge());
++
++  g_test = "NR19 legacy record unreadable, the only unread message read before recovery, recovery, reboot: no badge";
++  reset();
++  t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
++  g_notifyPrefs.kv.clear();
++  putLegacy(kBob, 1, Notifications::BADGE_TEXT);
++  g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary") == 0; };
++  reboot();
++  CHECK(NV::g_loadState == NV::LOAD_RETRY_LEGACY && Notifications::findSummary(kG, kBob) == nullptr, "state %d", NV::g_loadState);
++  Notifications::clearUnread(kG, kBob, t1);
++  CHECK(!unread(t1) && !textBadge() && stateOf(kBob) == NV::SUMMARY_UNRESOLVED && !g_notifyPrefs.isKey("summary2"),
++        "read: flag %d badge %d state %d", unread(t1), textBadge(), stateOf(kBob));
++  g_notifyPrefs.failRead = nullptr;
++  T::scanUnreliable = true;  // the migration's own recount fails on the first try too
++  notifyTick(1);
++  CHECK(NV::g_loadState == NV::LOAD_OK && stateOf(kBob) == NV::SUMMARY_UNRESOLVED, "migrated, unresolved: state %d", stateOf(kBob));
++  T::scanUnreliable = false;
++  notifyTick(2);
++  CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && !textBadge() && !enigmaBadge(), "reconciled: state %d text %d enigma %d",
++        stateOf(kBob), textBadge(), enigmaBadge());
++  reboot();
++  CHECK(!textBadge() && !enigmaBadge(), "after reboot: text %d enigma %d", textBadge(), enigmaBadge());
++
++  g_test = "NR20 a conversation emptied while unreadable is not reused for another one (its touch survives to recovery)";
++  reset();
++  t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2: Bob Text 1
++  g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
++  reboot();
++  MessageRef t3 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT2");  // RAM: Bob COUNTED Text 1
++  Notifications::clearUnread(kG, kBob, t1);                        // RAM: Bob Text 0 ...
++  Notifications::clearUnread(kG, kBob, t3);                        // ... and stays 0
++  {
++    char contact[16];
++    for (int i = 0; i < 24; i++) {  // 23 fill the free entries; the 24th needs a reusable one
++      snprintf(contact, sizeof(contact), "F%011d", i);
++      MessageRef ghost{};
++      strcpy(ghost.group_code, kG); strcpy(ghost.contact_key, contact); ghost.sequence = 900000u + static_cast<uint32_t>(i);
++      Notifications::onMessageArrived(kG, contact, ghost, Notifications::BADGE_TEXT, false);
++    }
++  }
++  CHECK(Notifications::findSummary(kG, kBob) != nullptr, "Bob's touched entry was reused while unreadable");
++  g_notifyPrefs.failRead = nullptr;
++  notifyTick(30);  // retry load, then reconcile every touched conversation
++  CHECK(NV::g_loadState == NV::LOAD_OK && countOf(kBob, Notifications::SLOT_TEXT) == 0 && !textBadge(),
++        "recovered: Bob text %u badge %d", countOf(kBob, Notifications::SLOT_TEXT), textBadge());
++  reboot();
++  CHECK(!textBadge(), "after reboot: text %d (stale count restored)", textBadge());
++
++  g_test = "NR21 a conversation the stored record lacks, arriving while it is unreadable, survives recovery and reboot";
++  reset();
++  {
++    Notifications::Summary none[24];
++    memset(none, 0, sizeof(none));
++    g_notifyPrefs.putBytes("summary2", none, sizeof(none));  // a stored record without Bob
++  }
++  g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
++  reboot();
++  t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
++  g_notifyPrefs.failRead = nullptr;
++  notifyTick(3);
++  CHECK(NV::g_loadState == NV::LOAD_OK && countOf(kBob, Notifications::SLOT_TEXT) == 1 && textBadge(),
++        "recovered: Bob text %u badge %d", countOf(kBob, Notifications::SLOT_TEXT), textBadge());
++  reboot();
++  CHECK(textBadge(), "after reboot: unread arrival lost");
++  Notifications::clearUnread(kG, kBob, t1);
++  reboot();
++  CHECK(!textBadge(), "read, after reboot: %d", textBadge());
++
+   printf("%d checks passed, %d failed\n", g_pass, g_fail);
+   return g_fail == 0 ? 0 : 1;
+ }

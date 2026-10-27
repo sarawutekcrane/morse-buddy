@@ -1,0 +1,287 @@
+Verify-on-load correction: before/after (same notify_test.cpp built against each notifications.cpp)
+before = previous candidate (RAM-only tracking); after = current
+
+== BEFORE
+FAIL [NR20 all 24 RAM entries in use while summary2 is unreadable; a read in a stored conversation is still corrected] line 526: recovered: Bob text 1 badge 1
+FAIL [NR20 all 24 RAM entries in use while summary2 is unreadable; a read in a stored conversation is still corrected] line 530: after reboot: text 1 (stale count restored)
+FAIL [NR22 summary2 unreadable, only unread message read, reboot before recovery, then recovery: badge clears] line 572: stale COUNTED kept: Bob text 1 state 1 badge 1
+FAIL [NR22 summary2 unreadable, only unread message read, reboot before recovery, then recovery: badge clears] line 576: after reboot: 1
+FAIL [NR23 summary2 unreadable, only unread message evicted, reboot before recovery, then recovery: badge clears] line 572: stale COUNTED kept: Bob text 1 state 1 badge 1
+FAIL [NR23 summary2 unreadable, only unread message evicted, reboot before recovery, then recovery: badge clears] line 576: after reboot: 1
+FAIL [NR24 recovery at boot (stored record readable again on the next boot): the stale count is verified and clears] line 589: boot-loaded stale count: text 1 badge 1
+FAIL [NR25 verification keeps genuine counts and badges (both categories), with no change while scans fail] line 601: unreliable scan: kept lit, unresolved
+75 checks passed, 8 failed
+
+== AFTER
+83 checks passed, 0 failed
+
+== race.cpp + display.cpp + display.h diff vs HEAD, sha256 (unchanged):
+b0db4259b0c4abd9d7e1f6fa2ff3e71b5dc864948378d8aef808579e0e25038f  -
+
+== Full host suite: RESULT all steps passed (see run_verify_on_load_output.txt)
+
+== ESP32 build (fresh copy of the working tree)
+RAM:   [====      ]  37.9% (used 124308 bytes from 327680 bytes)
+Flash: [========  ]  82.8% (used 1193397 bytes from 1441792 bytes)
+========================= [SUCCESS] Took 54.11 seconds =========================
+static DRAM 124316 of 124580 B, headroom 264 B
+firmware.bin sha256 24a39545251a428952300ad03a9507316e4840e25ffbac5489adeca00a381640
+
+== Correction diff
+--- a/src/core/notifications.cpp
++++ b/src/core/notifications.cpp
+@@ -191,6 +191,19 @@
+   return LOAD_OK;
+ }
+ 
++// A stored count can be stale: a read or eviction while the record could not
++// be read (or written) changed the messages but not the record, and that
++// change may have been lost with RAM at a reboot. So every count read from
++// summary2 is checked once: each conversation listed with unread messages
++// becomes UNRESOLVED (its badge categories stay lit) and reconcileOne()
++// recounts it from the stored messages, one per kRetryMs. Bounded: at most
++// kMaxSummaries recounts per load, and none for conversations with nothing
++// unread (a missing count can't come from a read or an eviction).
++void verifyLoaded(Summary* set) {
++  for (uint8_t i = 0; i < kMaxSummaries; i++)
++    if (set[i].state == SUMMARY_COUNTED && totalUnread(set[i]) > 0) markUnresolved(&set[i], 0);
++}
++
+ Summary* findIn(Summary* set, const char* group_code, const char* contact_key) {
+   for (uint8_t i = 0; i < kMaxSummaries; i++) {
+     Summary& s = set[i];
+@@ -206,7 +219,11 @@
+     Serial.println("[NOTIFY] unread summary unreadable; retrying");
+     return;
+   }
+-  if (migrated) saveSummaries();
++  if (migrated) {
++    saveSummaries();  // migration recounted every conversation already
++  } else {
++    verifyLoaded(g_summaries);
++  }
+ }
+ 
+ // The stored record became readable: every conversation touched in RAM
+@@ -218,6 +235,7 @@
+   bool migrated = false;
+   LoadState st = loadInto(loaded, &migrated);
+   if (st == LOAD_OK) {
++    if (!migrated) verifyLoaded(loaded);
+     for (auto& ram : g_summaries) {
+       if (ram.state == SUMMARY_FREE) continue;
+       uint8_t mask = static_cast<uint8_t>(((ram.unread[SLOT_TEXT] || ram.unread[SLOT_GAME]) ? BADGE_TEXT : 0) |
+@@ -278,13 +296,10 @@
+   Summary* s = findSummary(group_code, contact_key);
+   if (s != nullptr) return s;
+   // A free entry, else (24 conversations listed: very unlikely) one with
+-  // nothing unread; an UNRESOLVED entry is never reused. While the stored
+-  // record is unreadable every listed entry is a touched conversation that
+-  // retryLoad must merge, so none is reused.
++  // nothing unread; an UNRESOLVED entry is never reused.
+   for (int pass = 0; pass < 2; pass++) {
+     for (auto& c : g_summaries) {
+-      bool usable = pass == 0 ? c.state == SUMMARY_FREE
+-                              : (g_loadState == LOAD_OK && c.state == SUMMARY_COUNTED && totalUnread(c) == 0);
++      bool usable = pass == 0 ? c.state == SUMMARY_FREE : (c.state == SUMMARY_COUNTED && totalUnread(c) == 0);
+       if (!usable) continue;
+       memset(&c, 0, sizeof(c));
+       c.state = SUMMARY_COUNTED;
+@@ -295,17 +310,6 @@
+   return nullptr;
+ }
+ 
+-// While the stored record is unreadable, RAM holds only the conversations
+-// touched since boot. A read or eviction in a conversation RAM doesn't list
+-// still changes what the stored record says, so the conversation is recorded
+-// here (UNRESOLVED, no badge of its own) and is recounted from the stored
+-// messages once the record is merged back in (retryLoad).
+-void noteTouchedWhileUnreadable(const char* group_code, const char* contact_key) {
+-  if (g_loadState == LOAD_OK) return;
+-  Summary* s = findOrCreateSummary(group_code, contact_key);
+-  if (s != nullptr) markUnresolved(s, 0);
+-}
+-
+ bool hasBadge(uint8_t mask) {
+   for (auto& s : g_summaries) {
+     if (s.state == SUMMARY_FREE) continue;  // COUNTED: counts; UNRESOLVED: category flags -- same test
+@@ -329,10 +333,7 @@
+ void onMessageEvicted(const MessageRef& ref, uint16_t flags) {
+   if (!(flags & MessageStore::FLAG_UNREAD)) return;
+   Summary* s = findSummary(ref.group_code, ref.contact_key);
+-  if (s == nullptr) {
+-    noteTouchedWhileUnreadable(ref.group_code, ref.contact_key);
+-    return;
+-  }
++  if (s == nullptr) return;  // not listed: nothing stored or in RAM to correct (a loaded record is verified)
+   if (!recountFromStore(s)) markUnresolved(s, 0);
+   saveSummaries();
+ }
+@@ -406,10 +407,7 @@
+ 
+   MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
+   Summary* s = findSummary(group_code, contact_key);
+-  if (s == nullptr) {
+-    noteTouchedWhileUnreadable(group_code, contact_key);
+-    return;
+-  }
++  if (s == nullptr) return;  // not listed: nothing stored or in RAM to correct (a loaded record is verified)
+   if (s->state == SUMMARY_UNRESOLVED) {
+     if (recountFromStore(s)) saveSummaries();  // else it stays lit until a reliable recount
+     return;
+--- a/host_tests/race_r3_r5/notify_test.cpp
++++ b/host_tests/race_r3_r5/notify_test.cpp
+@@ -347,6 +347,7 @@
+         "recovered: state %d text %u enigma %u", stateOf(kBob), countOf(kBob, Notifications::SLOT_TEXT),
+         countOf(kBob, Notifications::SLOT_ENIGMA));
+   reboot();
++  notifyTick(1);  // the loaded count is verified (recounted) once
+   CHECK(textBadge() && enigmaBadge() && countOf(kBob, Notifications::SLOT_TEXT) == 2, "after reboot: text %u",
+         countOf(kBob, Notifications::SLOT_TEXT));
+   Notifications::clearUnread(kG, kBob, t1); Notifications::clearUnread(kG, kBob, t2); Notifications::clearUnread(kG, kBob, e1);
+@@ -457,7 +458,6 @@
+         NV::g_loadState);
+   Notifications::clearUnread(kG, kBob, t1);
+   CHECK(!unread(t1) && !textBadge() && g_notifyPrefs.kv["summary2"] == current, "read: flag %d badge %d", unread(t1), textBadge());
+-  CHECK(stateOf(kBob) == NV::SUMMARY_UNRESOLVED, "read not tracked while unreadable: state %d", stateOf(kBob));
+   g_notifyPrefs.failRead = nullptr;
+   notifyTick(3);  // retry load (merge), then reconcile
+   CHECK(NV::g_loadState == NV::LOAD_OK && stateOf(kBob) == NV::SUMMARY_COUNTED && countOf(kBob, Notifications::SLOT_TEXT) == 0 &&
+@@ -474,8 +474,7 @@
+   reboot();
+   eraseStored(e1);
+   Notifications::onMessageEvicted(e1, MessageStore::FLAG_UNREAD);
+-  CHECK(stateOf(kBob) == NV::SUMMARY_UNRESOLVED && !enigmaBadge() && g_notifyPrefs.kv["summary2"] == current,
+-        "eviction not tracked while unreadable: state %d badge %d", stateOf(kBob), enigmaBadge());
++  CHECK(!enigmaBadge() && g_notifyPrefs.kv["summary2"] == current, "evicted: badge %d", enigmaBadge());
+   g_notifyPrefs.failRead = nullptr;
+   notifyTick(3);
+   CHECK(NV::g_loadState == NV::LOAD_OK && stateOf(kBob) == NV::SUMMARY_COUNTED &&
+@@ -493,8 +492,7 @@
+   reboot();
+   CHECK(NV::g_loadState == NV::LOAD_RETRY_LEGACY && Notifications::findSummary(kG, kBob) == nullptr, "state %d", NV::g_loadState);
+   Notifications::clearUnread(kG, kBob, t1);
+-  CHECK(!unread(t1) && !textBadge() && stateOf(kBob) == NV::SUMMARY_UNRESOLVED && !g_notifyPrefs.isKey("summary2"),
+-        "read: flag %d badge %d state %d", unread(t1), textBadge(), stateOf(kBob));
++  CHECK(!unread(t1) && !textBadge() && !g_notifyPrefs.isKey("summary2"), "read: flag %d badge %d", unread(t1), textBadge());
+   g_notifyPrefs.failRead = nullptr;
+   T::scanUnreliable = true;  // the migration's own recount fails on the first try too
+   notifyTick(1);
+@@ -506,29 +504,29 @@
+   reboot();
+   CHECK(!textBadge() && !enigmaBadge(), "after reboot: text %d enigma %d", textBadge(), enigmaBadge());
+ 
+-  g_test = "NR20 a conversation emptied while unreadable is not reused for another one (its touch survives to recovery)";
++  g_test = "NR20 all 24 RAM entries in use while summary2 is unreadable; a read in a stored conversation is still corrected";
+   reset();
+   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2: Bob Text 1
+   g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
+   reboot();
+-  MessageRef t3 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT2");  // RAM: Bob COUNTED Text 1
+-  Notifications::clearUnread(kG, kBob, t1);                        // RAM: Bob Text 0 ...
+-  Notifications::clearUnread(kG, kBob, t3);                        // ... and stays 0
+   {
+     char contact[16];
+-    for (int i = 0; i < 24; i++) {  // 23 fill the free entries; the 24th needs a reusable one
++    for (int i = 0; i < 24; i++) {  // 24 other conversations fill every RAM entry
+       snprintf(contact, sizeof(contact), "F%011d", i);
+       MessageRef ghost{};
+       strcpy(ghost.group_code, kG); strcpy(ghost.contact_key, contact); ghost.sequence = 900000u + static_cast<uint32_t>(i);
+-      Notifications::onMessageArrived(kG, contact, ghost, Notifications::BADGE_TEXT, false);
++      Notifications::onMessageArrived(kG, contact, ghost, Notifications::BADGE_ENIGMA, false);
+     }
+   }
+-  CHECK(Notifications::findSummary(kG, kBob) != nullptr, "Bob's touched entry was reused while unreadable");
++  CHECK(Notifications::findOrCreateSummary(kG, kBob) == nullptr, "precondition: RAM not full");
++  Notifications::clearUnread(kG, kBob, t1);  // no RAM entry can record it
++  CHECK(!unread(t1), "read");
+   g_notifyPrefs.failRead = nullptr;
+-  notifyTick(30);  // retry load, then reconcile every touched conversation
++  notifyTick(30);  // retry load, then recount every listed conversation
+   CHECK(NV::g_loadState == NV::LOAD_OK && countOf(kBob, Notifications::SLOT_TEXT) == 0 && !textBadge(),
+         "recovered: Bob text %u badge %d", countOf(kBob, Notifications::SLOT_TEXT), textBadge());
+   reboot();
++  notifyTick(30);
+   CHECK(!textBadge(), "after reboot: text %d (stale count restored)", textBadge());
+ 
+   g_test = "NR21 a conversation the stored record lacks, arriving while it is unreadable, survives recovery and reboot";
+@@ -551,6 +549,62 @@
+   reboot();
+   CHECK(!textBadge(), "read, after reboot: %d", textBadge());
+ 
++  // ---- reboot BEFORE recovery: RAM-only state is gone, only the stored record remains ----
++  for (int evict = 0; evict < 2; evict++) {
++    g_test = evict ? "NR23 summary2 unreadable, only unread message evicted, reboot before recovery, then recovery: badge clears"
++                   : "NR22 summary2 unreadable, only unread message read, reboot before recovery, then recovery: badge clears";
++    reset();
++    t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");  // summary2: Bob Text 1 (COUNTED)
++    current = g_notifyPrefs.kv["summary2"];
++    g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
++    reboot();
++    if (evict) {
++      eraseStored(t1);
++      Notifications::onMessageEvicted(t1, MessageStore::FLAG_UNREAD);
++    } else {
++      Notifications::clearUnread(kG, kBob, t1);
++      CHECK(!unread(t1), "read");
++    }
++    reboot();  // before any retryLoad or reconcile: RAM lost
++    CHECK(NV::g_loadState == NV::LOAD_RETRY_CURRENT && g_notifyPrefs.kv["summary2"] == current, "still unreadable, untouched");
++    g_notifyPrefs.failRead = nullptr;  // reads restored; no arrival, no user action from here on
++    notifyTick(3);
++    CHECK(NV::g_loadState == NV::LOAD_OK && countOf(kBob, Notifications::SLOT_TEXT) == 0 && !textBadge(),
++          "stale COUNTED kept: Bob text %u state %d badge %d", countOf(kBob, Notifications::SLOT_TEXT), stateOf(kBob), textBadge());
++    reboot();
++    notifyTick(3);
++    CHECK(!textBadge(), "after reboot: %d", textBadge());
++  }
++
++  g_test = "NR24 recovery at boot (stored record readable again on the next boot): the stale count is verified and clears";
++  reset();
++  t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
++  g_notifyPrefs.failRead = [](const char* k) { return strcmp(k, "summary2") == 0; };
++  reboot();
++  Notifications::clearUnread(kG, kBob, t1);
++  g_notifyPrefs.failRead = nullptr;
++  reboot();  // loads fine at boot: no retryLoad involved
++  CHECK(NV::g_loadState == NV::LOAD_OK, "loaded at boot");
++  notifyTick(1);
++  CHECK(countOf(kBob, Notifications::SLOT_TEXT) == 0 && !textBadge(), "boot-loaded stale count: text %u badge %d",
++        countOf(kBob, Notifications::SLOT_TEXT), textBadge());
++
++  g_test = "NR25 verification keeps genuine counts and badges (both categories), with no change while scans fail";
++  reset();
++  t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
++  e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");
++  arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG2");
++  T::scanUnreliable = true;
++  reboot();
++  CHECK(textBadge() && enigmaBadge(), "lit while verifying");
++  notifyTick(3);
++  CHECK(textBadge() && enigmaBadge() && stateOf(kBob) == NV::SUMMARY_UNRESOLVED, "unreliable scan: kept lit, unresolved");
++  T::scanUnreliable = false;
++  notifyTick(1);
++  CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && countOf(kBob, Notifications::SLOT_TEXT) == 1 &&
++            countOf(kBob, Notifications::SLOT_ENIGMA) == 2 && textBadge() && enigmaBadge(),
++        "verified: text %u enigma %u", countOf(kBob, Notifications::SLOT_TEXT), countOf(kBob, Notifications::SLOT_ENIGMA));
++
+   printf("%d checks passed, %d failed\n", g_pass, g_fail);
+   return g_fail == 0 ? 0 : 1;
+ }
+--- a/host_tests/race_r3_r5/mutate_notify.py
++++ b/host_tests/race_r3_r5/mutate_notify.py
+@@ -25,10 +25,10 @@
+  (NT, "UNRESOLVED conversations are never reconciled", "    if (recountFromStore(&s)) saveSummaries();\n    return;\n  }\n}", "    return;\n  }\n}"),
+  (NT, "a read in an UNRESOLVED conversation guesses a decrement", "  if (s->state == SUMMARY_UNRESOLVED) {\n    if (recountFromStore(s)) saveSummaries();  // else it stays lit until a reliable recount\n    return;\n  }", "  if (s->state == SUMMARY_UNRESOLVED) s->state = SUMMARY_COUNTED;"),
+  (NT, "eviction with a failed scan keeps the stale counts", "  if (!recountFromStore(s)) markUnresolved(s, 0);", "  recountFromStore(s);"),
+- (NT, "read with no RAM summary not tracked while unreadable", "  if (s == nullptr) {\n    noteTouchedWhileUnreadable(group_code, contact_key);\n    return;\n  }", "  if (s == nullptr) return;"),
+- (NT, "eviction with no RAM summary not tracked while unreadable", "  if (s == nullptr) {\n    noteTouchedWhileUnreadable(ref.group_code, ref.contact_key);\n    return;\n  }", "  if (s == nullptr) return;"),
+- (NT, "touched conversation recorded as COUNTED (not UNRESOLVED)", "  if (s != nullptr) markUnresolved(s, 0);\n}", "  (void)s;\n}"),
+- (NT, "a conversation emptied while unreadable is reused", "(g_loadState == LOAD_OK && c.state == SUMMARY_COUNTED && totalUnread(c) == 0)", "(c.state == SUMMARY_COUNTED && totalUnread(c) == 0)"),
++ (NT, "counts loaded at boot are trusted (not verified)", "  } else {\n    verifyLoaded(g_summaries);\n  }", "  }"),
++ (NT, "counts loaded by a recovery retry are trusted (not verified)", "    if (!migrated) verifyLoaded(loaded);\n", ""),
++ (NT, "verification drops the badges until the recount", "markUnresolved(&set[i], 0);", "{ memset(set[i].unread, 0, sizeof(set[i].unread)); set[i].state = SUMMARY_UNRESOLVED; }"),
++ (NT, "verification resets counts to zero (stale value replaced by a guess)", "markUnresolved(&set[i], 0);", "memset(set[i].unread, 0, sizeof(set[i].unread));"),
+  (NT, "touched conversations dropped at recovery when the stored record lacks them", "          if (loaded[i].state == SUMMARY_FREE ||", "          if (false ||"),
+ ]
+ out = os.path.join(H, "out", "mutn")

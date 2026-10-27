@@ -1,0 +1,18 @@
+Final defect-fix candidate: notify_test before/after (same final notify_test.cpp)
+before = previous candidate (pending2 journal; built with -DNOTIFY_PENDING2)
+after  = final candidate (sweep after every successful load)
+
+== BEFORE
+FAIL [NR34 Bob listed with zero counts, Bob arrival while summary2 unreadable, reboot, summary2 readable, pending2 unreadable] line 823: zero-count conversation skipped: badge 0 text 0
+FAIL [NR34 Bob listed with zero counts, Bob arrival while summary2 unreadable, reboot, summary2 readable, pending2 unreadable] line 828: after reboot: 0
+FAIL [NR35 pending2 not writable, arrival while summary2 unreadable, reboot before recovery, recovery] line 847: lost: badge 0 enigma 65535
+FAIL [NR36 power lost between storing the message and recording it (summary2 unreadable, new conversation), then recovery] line 863: lost: badge 0 text 65535
+FAIL [NR37 power lost between storing the message and recording it (summary2 readable, Bob listed with zero counts)] line 873: lost: badge 0 enigma 0
+FAIL [NR38 the sweep meets unreliable listings/recounts: it retries (never skips or ends early) until they are reliable] line 891: skipped: badge 0 text 65535
+106 checks passed, 6 failed
+
+== AFTER
+112 checks passed, 0 failed
+
+== previous candidate with the corrected fixture, before NR34-NR38 were added
+103 checks passed, 0 failed

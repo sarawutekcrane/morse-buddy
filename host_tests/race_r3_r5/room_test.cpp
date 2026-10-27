@@ -747,6 +747,286 @@ static size_t countEvent(const char* ev) {
   return n;
 }
 
+// =============================================================================
+// Guess history binding (hardware finding 1 on 30ed514): the device's own
+// guesses for a round survive Leave and rejoin of exactly that room and
+// round within one boot, and are never shown in any other room or round.
+static int guessRowY(int fromBottom) { return Display::kScreenHeight - lh - fromBottom * lh; }
+static bool has9680() {  // one guess, 9 6 8 0 scoring 1A2B against 9876
+  return g_raceHistoryCount == 1 && g_raceHistory[0].guessValue == 9680 && g_raceHistory[0].a == 1 && g_raceHistory[0].b == 2;
+}
+static bool shows9680() { return T::rowAt(guessRowY(1)) == "9 6 8 0 1A2B"; }
+static void guess9680() {
+  uint8_t d[4] = {9, 6, 8, 0}; memcpy(g_digitEntry.digits, d, 4); g_digitEntry.count = 4; g_raceGuessDirty = true; tick();
+  T::now += 20; shortP(); tick(2);
+}
+// The device in Alice's room, in round 1 (secret 9876), on Guess, with 9 6 8 0 -> 1A2B recorded.
+static void inRoundWithGuess() {
+  memberOf(1);
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "fixture: start"); tick(3);
+  CHECK(top() == screenRaceGuess, "fixture: Guess");
+  guess9680();
+  CHECK(has9680() && shows9680(), "fixture: guess shown '%s'", T::rowAt(guessRowY(1)).c_str());
+}
+static void roomLeaveYes() {
+  for (int i = 0; i < 6; i++) rot(+1);
+  tick(); shortP(); tick(2);
+  rot(+1); press(InputEventType::DOT_RELEASE, T::now); tick(2);
+}
+static void backAndReenterRace() {
+  backP(); tick(2);
+  T::now += 1000; tick();
+  Menu::pushScreen(screenRaceRoom); tick(2);
+}
+// Joins the discovered room listed first (the only one), then reaches its Guess.
+static void rejoinFirstRoom() {
+  CHECK(T::rowAt(rowY(0)).rfind("Join ", 0) == 0, "Join row '%s'", T::rowAt(rowY(0)).c_str());
+  rot(+1); tick(); shortP(); tick(6);
+  if (top() == screenRaceRoom && isRoundActive()) { while (resolveRoomFocus() != -1) { rot(-1); tick(); } shortP(); tick(3); }
+}
+
+// =============================================================================
+// Score placement with the real glyph bearings (hardware finding 2 on
+// 30ed514): every score is drawn whole, its ink ending 2 px from the edge.
+static void scorePlacement() {
+  g_test = "SC1 drawRoomRow() with real FreeSans9pt7b bearings: every score drawn in full, right edge at kScreenWidth - 2";
+  ownerLobby(1);
+  T::realGlyphs = true;
+  const unsigned scores[] = {0, 1, 2, 4, 7, 9, 10, 11, 12, 19, 20, 21, 99, 100, 111, 199, 1000, 65535};
+  int y = rowY(0);
+  for (unsigned v : scores) {
+    g_participantCount = 1;
+    g_rowKind[0] = RoomRowKind::PARTICIPANT;
+    g_rowScore[0] = static_cast<uint16_t>(v);
+    Display::tft().fillRect(0, y, Display::kScreenWidth, lh, ST77XX_BLACK);
+    drawRoomRow(static_cast<int16_t>(y), 0, "Alice");
+    std::string want = std::to_string(v);
+    bool drawn = false;
+    for (auto& d : T::screen) {
+      if (d.y == y && d.text == want) drawn = d.x + Display::fitWidth(want.c_str()) == Display::kScreenWidth - 2;
+    }
+    CHECK(drawn && T::rowAt(y) == "Alice " + want, "score %u drawn as '%s'", v, T::rowAt(y).c_str());
+  }
+  g_test = "SC2 the real Room after a first win: the winner's row shows score 1 (real glyphs)";
+  memberOf(1);
+  T::realGlyphs = true;
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "start"); tick(3);
+  memcpy(g_digitEntry.digits, g_secret, 4); g_digitEntry.count = 4; T::now += 20; shortP(); tick(2);
+  settleMs(3000);
+  Menu::pushScreen(screenRaceRoom); tick(2);
+  bool youOne = false;
+  for (int r = 0; r < 3; r++) {
+    std::string row = T::rowAt(rowY(r));
+    if (row.find("(You)") != std::string::npos) youOne = row.size() >= 2 && row.compare(row.size() - 2, 2, " 1") == 0;
+  }
+  CHECK(youOne, "rows '%s' | '%s'", T::rowAt(rowY(0)).c_str(), T::rowAt(rowY(1)).c_str());
+  T::realGlyphs = false;
+}
+
+static void historyBinding() {
+  g_test = "HB1 Guess -> Back -> Leave (Yes, completed) -> Back -> rejoin: the same round shows the device's guess again";
+  inRoundWithGuess();
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  CHECK(g_engine->state() == RaceProtocol::MS_NONE, "leave completed");
+  backAndReenterRace();
+  rejoinFirstRoom();
+  CHECK(g_engine->state() == RaceProtocol::MS_MEMBER && top() == screenRaceGuess, "rejoined the round");
+  CHECK(has9680() && shows9680(), "history not restored: count %u row '%s'", g_raceHistoryCount, T::rowAt(guessRowY(1)).c_str());
+
+  g_test = "HB2 the LEAVE is acknowledged late (Back while 'Leaving...', re-enter, then it completes): history kept for the rejoin";
+  inRoundWithGuess();
+  backP(); tick(2);
+  Fx::dropIf = [](const Fx::Msg& m) { return m.from == Identity::deviceId(); };
+  roomLeaveYes();
+  CHECK(g_engine->state() == RaceProtocol::MS_LEAVING, "LEAVING");
+  backAndReenterRace();
+  Fx::dropIf = nullptr;
+  settleMs(8000);
+  CHECK(g_engine->state() == RaceProtocol::MS_NONE && has9680(), "after the late acknowledgement: state %d count %u",
+        g_engine->state(), g_raceHistoryCount);
+  rejoinFirstRoom();
+  CHECK(top() == screenRaceGuess && has9680() && shows9680(), "count %u", g_raceHistoryCount);
+
+  g_test = "HB3 an engine reboot ('Reconnecting...', then the room state): the same round keeps the history";
+  inRoundWithGuess();
+  backP(); tick(2);
+  rebootRaceService(); tick(2);
+  for (auto& kv : Fx::retained) Fx::deliverToDevice(kv.second);
+  tick(4);
+  CHECK(isRoundActive() && has9680(), "count %u", g_raceHistoryCount);
+
+  g_test = "HB4 the round ends (Alice wins) and a new round starts while the device is away: rejoining shows no old guesses";
+  inRoundWithGuess();
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  CHECK(peer(0)->eng.submitCorrectGuess(peer(0)->eng.view()->secret), "Alice solves"); tick(2);
+  peer(0)->script = {1, 2, 3, 4};
+  CHECK(peer(0)->eng.startRound(), "round 2"); tick(2);
+  backAndReenterRace();
+  rejoinFirstRoom();
+  CHECK(top() == screenRaceGuess && memcmp(g_secret, "\x01\x02\x03\x04", 4) == 0, "in round 2");
+  CHECK(g_raceHistoryCount == 0 && T::rowAt(guessRowY(1)).empty(), "old round's guess shown: count %u '%s'",
+        g_raceHistoryCount, T::rowAt(guessRowY(1)).c_str());
+
+  g_test = "HB5 the round ends while the device is away and the room is in the lobby: rejoining discards the history";
+  inRoundWithGuess();
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  CHECK(peer(0)->eng.submitCorrectGuess(peer(0)->eng.view()->secret), "Alice solves"); tick(2);
+  backAndReenterRace();
+  rejoinFirstRoom();
+  CHECK(g_engine->state() == RaceProtocol::MS_MEMBER && devRoom() && devRoom()->phase == RaceProtocol::PHASE_LOBBY &&
+            g_raceHistoryCount == 0,
+        "lobby: count %u", g_raceHistoryCount);
+
+  g_test = "HB6 another coordinator's room whose round has the SAME round number: never shows this room's guess";
+  freshDevice(3);  // Alice, Bob, Carol
+  CHECK(peer(0)->eng.createRoom("GROUP1"), "Alice room"); tick(2);
+  CHECK(peer(1)->eng.createRoom("GROUP1"), "Bob room"); tick(2);
+  CHECK(peer(2)->eng.join("GROUP1", kPeerIds[1]), "Carol joins Bob"); tick(2);  // Bob's room: v2
+  {
+    int aliceRow = T::rowAt(rowY(0)).rfind("Join Alice", 0) == 0 ? 0 : 1;
+    for (int i = 0; i <= aliceRow; i++) rot(+1);
+    tick(); shortP(); tick(4);
+  }
+  CHECK(g_engine->state() == RaceProtocol::MS_MEMBER && std::string(g_engine->view()->coordinator) == kPeerIds[0], "in Alice's room");
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "Alice round"); tick(3);
+  peer(1)->script = {9, 8, 7, 6};
+  CHECK(peer(1)->eng.startRound(), "Bob round"); tick(2);
+  CHECK(peer(0)->eng.view()->roundStart == peer(1)->eng.view()->roundStart, "fixture: same round number %u / %u",
+        peer(0)->eng.view()->roundStart, peer(1)->eng.view()->roundStart);
+  guess9680();
+  CHECK(has9680(), "fixture: guess");
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  CHECK(g_engine->state() == RaceProtocol::MS_NONE && has9680(), "left Alice's room, history kept (count %u)", g_raceHistoryCount);
+  backAndReenterRace();
+  {
+    int bobRow = T::rowAt(rowY(0)).rfind("Join Bob", 0) == 0 ? 0 : 1;
+    for (int i = 0; i <= bobRow; i++) rot(+1);
+    tick(); shortP(); tick(6);
+    if (top() == screenRaceRoom && isRoundActive()) { while (resolveRoomFocus() != -1) { rot(-1); tick(); } shortP(); tick(3); }
+  }
+  CHECK(g_engine->state() == RaceProtocol::MS_MEMBER && std::string(g_engine->view()->coordinator) == kPeerIds[1] &&
+            top() == screenRaceGuess,
+        "in Bob's round");
+  CHECK(g_raceHistoryCount == 0 && T::rowAt(guessRowY(1)).empty(), "Alice's guess shown in Bob's room: count %u '%s'",
+        g_raceHistoryCount, T::rowAt(guessRowY(1)).c_str());
+
+  g_test = "HB7 the same coordinator's NEW room (new n and nonce) whose round has the same number: no old guess";
+  inRoundWithGuess();
+  uint32_t oldN = peer(0)->eng.view()->n, oldNonce = peer(0)->eng.view()->nonce, oldStart = peer(0)->eng.view()->roundStart;
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  CHECK(peer(0)->eng.leave(), "Alice closes her room"); tick(2);
+  CHECK(peer(0)->eng.createRoom("GROUP1"), "Alice's new room"); tick(2);
+  backAndReenterRace();
+  rot(+1); tick(); shortP(); tick(4);
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "new room's round"); tick(3);
+  const RaceProtocol::RoomState* nv = peer(0)->eng.view();
+  CHECK(nv->roundStart == oldStart && (nv->n != oldN || nv->nonce != oldNonce), "fixture: same round number, new identity");
+  CHECK(top() == screenRaceGuess && g_raceHistoryCount == 0 && T::rowAt(guessRowY(1)).empty(),
+        "old room's guess shown: count %u '%s'", g_raceHistoryCount, T::rowAt(guessRowY(1)).c_str());
+
+  // HB8-HB10: rooms that differ from the bound one in exactly ONE identity
+  // field (the nonce is scripted), each with the same round number.
+  const uint32_t kNonce = 0x1234ABCDu;
+  g_test = "HB8 only the coordinator differs (both rooms n=1, same nonce, same round number): no old guess";
+  freshDevice(3);  // Alice, Bob, Carol
+  peer(0)->script = {kNonce};
+  CHECK(peer(0)->eng.createRoom("GROUP1"), "Alice room"); tick(2);
+  rot(+1); tick(); shortP(); tick(4);  // the device joins Alice (only room listed)
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "Alice round"); tick(3);
+  guess9680();
+  CHECK(has9680(), "fixture: guess");
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  peer(1)->script = {kNonce};
+  CHECK(peer(1)->eng.createRoom("GROUP1"), "Bob room"); tick(2);
+  CHECK(peer(2)->eng.join("GROUP1", kPeerIds[1]), "Carol joins Bob"); tick(2);
+  peer(1)->script = {9, 8, 7, 6};
+  CHECK(peer(1)->eng.startRound(), "Bob round"); tick(2);
+  CHECK(peer(1)->eng.view()->n == peer(0)->eng.view()->n && peer(1)->eng.view()->nonce == peer(0)->eng.view()->nonce &&
+            peer(1)->eng.view()->roundStart == peer(0)->eng.view()->roundStart,
+        "fixture: only the coordinator differs");
+  backAndReenterRace();
+  {
+    int bobRow = T::rowAt(rowY(0)).rfind("Join Bob", 0) == 0 ? 0 : 1;
+    for (int i = 0; i <= bobRow; i++) rot(+1);
+    tick(); shortP(); tick(6);
+    if (top() == screenRaceRoom && isRoundActive()) { while (resolveRoomFocus() != -1) { rot(-1); tick(); } shortP(); tick(3); }
+  }
+  CHECK(std::string(g_engine->view()->coordinator) == kPeerIds[1] && top() == screenRaceGuess, "in Bob's round");
+  CHECK(g_raceHistoryCount == 0, "count %u", g_raceHistoryCount);
+
+  // The device rejoins during the new room's round (a lobby view would
+  // discard the history whatever the identity); Bob's join makes the round
+  // number equal (create v1, join v2, start v3).
+  g_test = "HB9 only the room counter n differs (same coordinator, same nonce, same round number): no old guess";
+  freshDevice(2);  // Alice, Bob
+  peer(0)->script = {kNonce};
+  CHECK(peer(0)->eng.createRoom("GROUP1"), "Alice room A"); tick(2);
+  rot(+1); tick(); shortP(); tick(4);
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "round A"); tick(3);
+  guess9680();
+  CHECK(has9680(), "fixture: guess");
+  uint32_t nA = peer(0)->eng.view()->n, startA = peer(0)->eng.view()->roundStart;
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  CHECK(peer(0)->eng.leave(), "close A"); tick(2); settleMs(1000);
+  peer(0)->script = {kNonce};
+  CHECK(peer(0)->eng.createRoom("GROUP1"), "Alice room B"); tick(2);
+  CHECK(peer(1)->eng.join("GROUP1", kPeerIds[0]), "Bob joins B"); tick(2);
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "round B"); tick(2);
+  CHECK(peer(0)->eng.view()->n != nA && peer(0)->eng.view()->nonce == kNonce && peer(0)->eng.view()->roundStart == startA,
+        "fixture: only n differs");
+  backAndReenterRace();
+  rejoinFirstRoom();
+  CHECK(top() == screenRaceGuess && g_raceHistoryCount == 0, "count %u", g_raceHistoryCount);
+
+  g_test = "HB10 only the nonce differs (the coordinator's storage was erased: n=1 again, same round number): no old guess";
+  freshDevice(2);
+  peer(0)->script = {kNonce};
+  CHECK(peer(0)->eng.createRoom("GROUP1"), "Alice room"); tick(2);
+  nA = peer(0)->eng.view()->n;
+  rot(+1); tick(); shortP(); tick(4);
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "round"); tick(3);
+  startA = peer(0)->eng.view()->roundStart;
+  guess9680();
+  CHECK(has9680(), "fixture: guess");
+  backP(); tick(2);
+  roomLeaveYes();
+  settleMs(2000);
+  peer(0)->nvs.clear(); peer(0)->seqCounter = 0;  // erase
+  peer(0)->eng = RaceProtocol::Engine(); peer(0)->start(); tick(2);
+  peer(0)->script = {kNonce + 1};
+  CHECK(peer(0)->eng.createRoom("GROUP1"), "Alice room after erase"); tick(2);
+  CHECK(peer(1)->eng.join("GROUP1", kPeerIds[0]), "Bob joins"); tick(2);
+  peer(0)->script = {9, 8, 7, 6};
+  CHECK(peer(0)->eng.startRound(), "round after erase"); tick(2);
+  CHECK(peer(0)->eng.view()->n == nA && peer(0)->eng.view()->nonce != kNonce && peer(0)->eng.view()->roundStart == startA,
+        "fixture: only the nonce differs (n %u/%u start %u/%u)", peer(0)->eng.view()->n, nA, peer(0)->eng.view()->roundStart, startA);
+  backAndReenterRace();
+  rejoinFirstRoom();
+  CHECK(top() == screenRaceGuess && g_raceHistoryCount == 0, "count %u", g_raceHistoryCount);
+}
+
 static void heapDiagnostics() {
   g_test = "U20 heap diagnostics: allocation result, before/after figures, labels match the values reported";
   g_hostSerialSink = sinkLine;
@@ -835,6 +1115,8 @@ int main() {
   sizes();
   review();
   allocation();
+  historyBinding();
+  scorePlacement();
   heapDiagnostics();
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
