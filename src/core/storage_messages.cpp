@@ -1402,6 +1402,12 @@ bool findMessageById(const char* group_code, const char* contact_key, const char
   return false;
 }
 
+bool listConversations(ConversationFn fn, void* ctx) {
+  bool reliable = true;
+  forEachConversation(nullptr, [&](const char* g, const char* c) { fn(g, c, ctx); }, &reliable);
+  return reliable;
+}
+
 uint16_t findMessagesByPredicate(const char* group_code, const char* contact_key, MessagePredicate pred, void* ctx,
                                  MessageRef* outRefs, uint16_t outRefsCapacity, bool* outScanReliable) {
   // Hardware Diagnostic #4.9h follow-up: initialized conservatively before

@@ -198,9 +198,12 @@ bool isReplayedRaceShort(const InputEvent& e) {
 // device's own submitted guesses in the current round. Local RAM only
 // (never persisted, never published), bounded: once full the oldest entry
 // is dropped, which only ever affects rows already scrolled off screen
-// (the Guess screen shows at most ~5 at PRIMARY line height). Keyed by the
-// round it belongs to, so a stale result can never be shown against a
-// different round's secret; cleared on every round end/reset/group change.
+// (the Guess screen shows at most ~5 at PRIMARY line height). Bound to the
+// exact round it belongs to (RoundBinding below), so a stale result can
+// never be shown against a different room's or round's secret. It survives
+// the view of that round briefly disappearing (Leave and rejoin, joining,
+// Reconnecting) within this boot, and is cleared once the room shows any
+// other round or none, on a local solve, and on a group change.
 struct RaceGuessEntry {
   uint16_t guessValue;
   uint8_t a;
@@ -209,7 +212,15 @@ struct RaceGuessEntry {
 constexpr uint8_t kRaceHistoryCap = 8;
 RaceGuessEntry g_raceHistory[kRaceHistoryCap];  // oldest first
 uint8_t g_raceHistoryCount = 0;
-char g_raceHistoryRoundId[kRoundKeyLen] = {0};
+// The room's full identity (group, coordinator, n, nonce) plus the round's
+// start version; valid == false: the history belongs to no round.
+struct RoundBinding {
+  bool valid;
+  char group[RaceProtocol::kGroupLen];
+  char coordinator[RaceProtocol::kIdChars + 1];
+  uint32_t n, nonce, roundStart;
+};
+RoundBinding g_raceHistoryRound = {};
 // Bumped on every append/clear so the Guess screen can tell "history
 // changed" apart from a plain digit-entry change (Solo uses historyCount
 // for this, which stops changing once this bounded buffer is full).
@@ -222,7 +233,7 @@ NumberGuessing::HistoryBrowseState g_raceBrowse;
 
 void clearRaceGuessHistory() {
   g_raceHistoryCount = 0;
-  g_raceHistoryRoundId[0] = '\0';
+  g_raceHistoryRound.valid = false;
   g_raceHistoryVersion++;
   NumberGuessing::resetHistoryBrowse(&g_raceBrowse);
 }
@@ -355,6 +366,34 @@ void roundKeyOf(const RaceProtocol::RoomState* v, char* out, size_t cap) {
            static_cast<unsigned long>(v->roundStart));
 }
 
+// The binding of the live round in the engine's room (invalid when there is
+// no room view or no round in progress).
+RoundBinding bindingOf(const RaceProtocol::RoomState* v) {
+  RoundBinding b = {};
+  if (g_engine == nullptr || v == nullptr || v->phase != RaceProtocol::PHASE_ROUND) return b;
+  b.valid = true;
+  strncpy(b.group, g_engine->roomGroup(), sizeof(b.group) - 1);
+  strncpy(b.coordinator, v->coordinator, sizeof(b.coordinator) - 1);
+  b.n = v->n;
+  b.nonce = v->nonce;
+  b.roundStart = v->roundStart;
+  return b;
+}
+
+bool sameBinding(const RoundBinding& a, const RoundBinding& b) {
+  return a.valid && b.valid && strcmp(a.group, b.group) == 0 && strcmp(a.coordinator, b.coordinator) == 0 &&
+         a.n == b.n && a.nonce == b.nonce && a.roundStart == b.roundStart;
+}
+
+// Applies the engine's view to the guess history. No view (Leave completed,
+// rejoining, Reconnecting) says nothing about the bound round, so the
+// history is kept; any view other than exactly the bound round (a later
+// round, the lobby or a result, a closed room, another room) discards it.
+void reconcileRaceHistory(const RaceProtocol::RoomState* v) {
+  if (v == nullptr || !g_raceHistoryRound.valid) return;
+  if (!sameBinding(bindingOf(v), g_raceHistoryRound)) clearRaceGuessHistory();
+}
+
 // =============================================================================
 // Room voice (Phase 4 section 17): MQTT broadcast transport, scoped by the
 // room's identity ("<C><nonce>", 20 chars, within the 23-char room key),
@@ -448,6 +487,7 @@ void syncRound() {
   const RaceProtocol::RoomState* v = g_engine->view();
   char key[kRoundKeyLen];
   roundKeyOf(v, key, sizeof(key));
+  reconcileRaceHistory(v);  // on every view, also when the round key is unchanged (e.g. rejoining into the lobby)
   if (strcmp(key, g_roundId) == 0) return;
   if (g_roundId[0] != '\0') {  // the bound round ended
     if (v != nullptr && v->resultRound == g_roundStart && v->resultWinner[0] != '\0' &&
@@ -456,14 +496,12 @@ void syncRound() {
       g_pendingExternalSolve = true;
     }
     g_roundId[0] = '\0';
-    clearRaceGuessHistory();
   }
-  if (key[0] != '\0') {  // a new round: supersedes the previous one's history, notices and outcome
+  if (key[0] != '\0') {  // a newly bound round: supersedes the previous one's notices and outcome
     strncpy(g_roundId, key, sizeof(g_roundId) - 1);
     g_roundId[sizeof(g_roundId) - 1] = '\0';
     memcpy(g_secret, v->secret, 4);
     g_roundStart = v->roundStart;
-    clearRaceGuessHistory();
     clearRoomSolvedNotice();
     invalidateGuessOutcome();
     clearRoomActionStatus();
@@ -503,15 +541,16 @@ bool isRoundActive() {
 
 // Phase 2A: binds the guess history and the in-progress digit entry to the
 // current round. When the round differs from the one the history belongs
-// to, both are discarded, so neither a previous round's results nor its
-// half-typed digits can carry over into (or be submitted against) the new
-// round. Same round -> no-op (history survives Room <-> Guess re-entry).
+// to (room identity or round), both are discarded, so neither a previous
+// round's results nor its half-typed digits can carry over into (or be
+// submitted against) another round. Same round -> no-op (history survives
+// Room <-> Guess re-entry, and Leave and rejoin of this round).
 // Returns true if anything was reset.
 bool syncGuessRound() {
-  if (strcmp(g_raceHistoryRoundId, g_roundId) == 0) return false;
+  RoundBinding b = bindingOf(g_engine != nullptr ? g_engine->view() : nullptr);
+  if (sameBinding(b, g_raceHistoryRound) || (!b.valid && !g_raceHistoryRound.valid)) return false;
   clearRaceGuessHistory();
-  strncpy(g_raceHistoryRoundId, g_roundId, sizeof(g_raceHistoryRoundId) - 1);
-  g_raceHistoryRoundId[sizeof(g_raceHistoryRoundId) - 1] = '\0';
+  g_raceHistoryRound = b;
   NumberGuessing::resetDigitEntry(&g_digitEntry);
   return true;
 }
@@ -607,7 +646,8 @@ void screenRaceGuessTick() {
   // external-solve notice to show instead -- stop accepting guesses for it.
   // Reuses the timed-notice path above: input freezes, then back to Room.
   if (g_guessResultText == nullptr && !isRoundActive()) {
-    clearRaceGuessHistory();
+    reconcileRaceHistory(g_engine != nullptr ? g_engine->view() : nullptr);
+    NumberGuessing::resetHistoryBrowse(&g_raceBrowse);  // browsing ends with the screen, kept history or not
     g_guessResultText = "Round ended";
     g_guessResultUntilMs = millis() + 1500;
     g_raceGuessDirty = true;
@@ -1134,7 +1174,10 @@ void drawRoomRow(int16_t y, uint8_t i, const char* label) {
   }
   char score[8];
   snprintf(score, sizeof(score), "%u", g_rowScore[i]);
-  int16_t scoreW = Display::textWidth(score);
+  // fitWidth(), the measure printLine() clips with: aligning by ink width
+  // alone put a leading "1" (3 px left bearing) past the edge, so a score of
+  // 1 was clipped away and 10-19 showed as "1".
+  int16_t scoreW = Display::fitWidth(score);
   int16_t scoreX = static_cast<int16_t>(Display::kScreenWidth - 2 - scoreW);
   char shown[40];
   strncpy(shown, label, sizeof(shown) - 1);

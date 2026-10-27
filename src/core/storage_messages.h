@@ -145,6 +145,14 @@ bool updateTypeLocalPayload(const MessageRef& ref, const uint8_t* localPayload, 
 
 bool findMessageById(const char* group_code, const char* contact_key, const char* message_id, MessageRef* outRef);
 
+// Calls fn(group_code, contact_key, ctx) once for every stored conversation
+// directory. Returns false if a directory could not be opened, so the listing
+// may be incomplete. Reads directory entries only (no message records). Used
+// by Notifications to find conversations with unread messages that its
+// stored summary does not list.
+using ConversationFn = void (*)(const char* group_code, const char* contact_key, void* ctx);
+bool listConversations(ConversationFn fn, void* ctx);
+
 using MessagePredicate = bool (*)(const StoredHeader& header, const PacketCodec::MessageEnvelope& envelope,
                                   void* ctx);
 

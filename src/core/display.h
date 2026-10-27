@@ -94,12 +94,20 @@ void printLineColored(int16_t x, int16_t topY, const char* text, uint16_t color5
 // where the drawn ink's rightmost pixel actually ends up when drawn at a
 // nonzero origin_x; a font with a positive left bearing needs slightly
 // more room than that. printLine() clips its own single-line draws using
-// a stricter internal measurement precisely because of this gap -- a
-// caller doing its OWN fit/clip check against a nonzero drawing origin
-// (rather than pure right-alignment/centering math, where this ink-width
-// value is what's wanted) should budget a few extra pixels of margin
-// rather than treating textWidth() as an exact drawn-extent guarantee.
+// a stricter internal measurement precisely because of this gap (see
+// fitWidth() below) -- a caller doing its OWN fit/clip check against a
+// nonzero drawing origin should budget a few extra pixels of margin rather
+// than treating textWidth() as an exact drawn-extent guarantee. To
+// right-align, use fitWidth(), not this.
 int16_t textWidth(const char* text);
+
+// The extent printLine() measures when it clips: from the drawing origin
+// to the drawn ink's rightmost pixel (the first glyph's left bearing plus
+// the ink width). Text drawn at x = right - fitWidth(text) ends exactly at
+// `right` and is never clipped by printLine() as long as right <=
+// kScreenWidth -- the right-alignment measure (e.g. "1" in FreeSans9pt7b
+// has a 3 px left bearing, which textWidth() leaves out).
+int16_t fitWidth(const char* text);
 
 // Fixed-size (kLockIconCellWidth x kLockIconCellHeight) status icon: a tiny
 // padlock drawn with TFT primitives, not a font glyph (the installed GFX

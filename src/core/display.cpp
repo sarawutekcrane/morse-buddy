@@ -95,11 +95,12 @@ void computePrimaryMetrics() {
 // nonzero X, which is exactly what let a string pass printLine()'s old
 // fit check while its actual drawn ink still reached past kScreenWidth,
 // triggering the driver's own auto-wrap for the last glyph(s) (Hardware
-// Diagnostic #4.9m's reported artifact). Used ONLY internally, by
-// printLine()'s clip loop and wrapLineAt()'s own fit check below -- never
-// exposed outside this file, so it cannot change any existing
-// Display::textWidth() consumer's behavior (sender-divider placement,
-// menu marker/badge widths, dirty-diff old/new width comparisons, etc.).
+// Diagnostic #4.9m's reported artifact). Used by printLine()'s clip loop
+// and wrapLineAt()'s own fit check below, and exposed read-only as
+// Display::fitWidth() for right-alignment; Display::textWidth() itself is
+// unchanged, so no existing consumer's behavior changes (sender-divider
+// placement, menu marker/badge widths, dirty-diff old/new width
+// comparisons, etc.).
 int16_t measureFitWidth(const char* text) {
   int16_t x1, y1;
   uint16_t w, h;
@@ -230,6 +231,8 @@ int16_t textWidth(const char* text) {
   g_tft.getTextBounds(text, 0, (g_currentFont == Font::PRIMARY) ? 50 : 0, &x1, &y1, &w, &h);
   return static_cast<int16_t>(w);
 }
+
+int16_t fitWidth(const char* text) { return measureFitWidth(text); }
 
 void printLine(int16_t x, int16_t topY, const char* text) {
   char buf[kPrintLineBufferSize];

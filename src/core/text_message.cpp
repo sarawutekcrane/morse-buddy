@@ -1224,6 +1224,26 @@ void handleHistoryFocusEvent(const InputEvent& e) {
   }
 }
 
+// A received message is read once it becomes the selected history item --
+// rotated onto, or selected when the chat is (re)entered -- not merely by
+// being in view (hardware finding 3 on 30ed514: only the DOT action above
+// marked it read). Checked once per newly selected message; the cached
+// index flags only decide whether a load is worth it, and clearUnread()
+// re-checks the stored flag.
+bool g_readCheckDone = false;
+uint32_t g_readCheckSequence = 0;
+
+void markSelectedHistoryRead() {
+  if (g_historyCursor == kNoHistoryCursor) return;
+  const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(g_historyCursor);
+  if (entry == nullptr || (g_readCheckDone && entry->sequence == g_readCheckSequence)) return;
+  g_readCheckDone = true;
+  g_readCheckSequence = entry->sequence;
+  if (entry->flags & MessageStore::FLAG_UNREAD) {
+    Notifications::clearUnread(g_selectedGroupCode, g_selectedContactKey, refForIndexEntry(*entry));
+  }
+}
+
 bool g_chatRenderDirty = true;
 
 // Hardware Fix #3: same three-way redraw split as ListMenu, plus a
@@ -1430,6 +1450,7 @@ void screenChatTick() {
     // across entries.
     g_chatViewportCacheValid = false;
     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
+    g_readCheckDone = false;  // a selection after (re)entry is checked afresh
   }
 
   // Phase 2B-2: a timed outcome expires only after it was actually drawn.
@@ -1509,6 +1530,7 @@ void screenChatTick() {
     if (g_historyCursor != kNoHistoryCursor) historyFocusTouchedThisPass = true;
   }
   if (hadEvent) g_chatRenderDirty = true;
+  markSelectedHistoryRead();
 
   // Word-boundary resolution is no longer a per-tick check (Hardware Fix
   // #4.1): it only happens at the next DOT_PRESS_START, in

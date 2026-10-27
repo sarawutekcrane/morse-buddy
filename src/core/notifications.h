@@ -19,12 +19,16 @@ enum BadgeCategory : uint8_t {
 
 // Call right after appendStoredMessage() for an incoming record. If the
 // exact conversation is currently open, this saves it as read (no
-// tone/badge); otherwise it marks UNREAD, updates the per-conversation
-// summary, sounds the notification tone, and resets the Sleep timer.
+// tone/badge); otherwise it marks UNREAD, counts it in the per-conversation
+// summary under its stored message type, sounds the notification tone, and
+// resets the Sleep timer. The badges follow the stored type (TEXT -> Text,
+// ENIGMA -> Enigma, GAME -> both); badgeMask is used only if the record
+// cannot be read back.
 void onMessageArrived(const char* group_code, const char* contact_key, const MessageRef& ref,
                       uint8_t badgeMask, bool conversationCurrentlyOpen);
 
-// Call when the cursor lands on an unread history line.
+// Call when an unread received message becomes the selected history item
+// (or on its explicit DOT action). No-op if it is already read.
 void clearUnread(const char* group_code, const char* contact_key, const MessageRef& ref);
 
 uint16_t getUnreadCount(const char* group_code, const char* contact_key);
