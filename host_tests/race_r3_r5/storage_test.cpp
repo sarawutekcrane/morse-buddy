@@ -998,7 +998,12 @@ int main(int argc, char** argv) {
   powerOn();
   {
     openText(kBob);
-    for (int i = 0; i < 2000; i++) loopPass();  // the sweep recounts (and feeds) Everyone meanwhile
+    int taken = 0;
+    for (int i = 0; i < 2000; i++) {  // the sweep recounts (and feeds) Everyone meanwhile
+      loopPass();
+      if (!MessageStore::isIndexCurrent(kG, kBob)) taken++;
+    }
+    CHECK(taken == 0, "the open chat's index was not current in %d passes (taken by a feed)", taken);
     bool ok = g_indexTotal == 20;
     for (uint16_t i = 0; i < g_indexTotal && ok; i++) {
       const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
@@ -1189,6 +1194,79 @@ int main(int argc, char** argv) {
     CHECK(kept == freshIndex(kBob), "variant %d: the chat's index differs from a fresh load", variant);
   }
 
+  g_test = "CE11 an arrival in Everyone during its stepped load is followed (no restart): shown, every record read once";
+  freshDevice();
+  everyoneHistory(90);
+  powerOn(); runFor(120);
+  {
+    coldIndex();
+    FsStats a = g_fs;
+    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+    loopPass(5);
+    MessageRef r = arrive(MessageStore::kEveryone, PacketCodec::MSG_TYPE_TEXT, 1800000000u);
+    for (int i = 0; i < 3000 && g_indexDirty; i++) loopPass();
+    loopPass();
+    uint64_t opens = g_fs.fileOpens - a.fileOpens;
+    bool listed = false;
+    for (uint16_t i = 0; i < g_indexTotal; i++) listed = listed || MessageStore::getIndexEntry(i)->sequence == r.sequence;
+    printf("   CE11 measured: %llu opens to load 90 records with an arrival during the load\n", (unsigned long long)opens);
+    CHECK(listed && g_indexTotal == 91 && opens <= 90 + 12, "listed %d (%u entries), %llu opens", listed, g_indexTotal,
+          (unsigned long long)opens);
+    back();
+  }
+
+  g_test = "CE22b the shared feed (no chat open), step by step: an unreadable or out-of-step record, or a mutation of its conversation, leaves it unused; a mutation elsewhere does not";
+  for (int variant = 0; variant < 5; variant++) {
+    freshDevice();
+    everyoneHistory(30);
+    for (int i = 0; i < 10; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+    coldIndex();
+    uint32_t seqs[MessageStore::kMaxMessagesPerThread];
+    bool reliable = false;
+    uint16_t n = MessageStore::listMessageSequences(kG, MessageStore::kEveryone, seqs, MessageStore::kMaxMessagesPerThread, &reliable);
+    bool began = MessageStore::beginIndexFeed(kG, MessageStore::kEveryone, seqs, n, reliable, false);
+    for (uint16_t i = 0; i < n; i++) {
+      if (i == 15 && variant == 1) arrive(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000000u);
+      if (i == 15 && variant == 2) arrive(MessageStore::kEveryone, PacketCodec::MSG_TYPE_TEXT, 1800000000u);
+      MessageRef ref{};
+      strcpy(ref.group_code, kG);
+      strcpy(ref.contact_key, MessageStore::kEveryone);
+      ref.sequence = seqs[variant == 4 && i == 15 ? 16 : i];
+      StoredMessageView view;
+      bool ok = MessageStore::loadMessage(ref, &view) && !(variant == 3 && i == 15);
+      MessageStore::feedIndexRecord(kG, MessageStore::kEveryone, ref.sequence, ok ? &view.header : nullptr,
+                                    ok ? view.envelope.message_id : nullptr);
+    }
+    uint16_t c = 0;
+    FsStats a = g_fs;
+    bool ready = MessageStore::stepConversationIndex(kG, MessageStore::kEveryone, 0, &c, nullptr, nullptr);
+    uint64_t reads = g_fs.fileOpens - a.fileOpens;
+    auto kept = ready ? snapshotIndex(c) : decltype(snapshotIndex(0))();
+    auto fresh = freshIndex(MessageStore::kEveryone);
+    bool expectUsable = variant <= 1;
+    CHECK(began && ready == expectUsable && (!ready || (kept == fresh && reads == 0)),
+          "variant %d: feed began %d, used %d (expected %d) with %llu reads, equal to a fresh load %d", variant, began, ready,
+          expectUsable, (unsigned long long)reads, kept == fresh);
+  }
+
+  g_test = "CE24 a load that met an unreadable record is not cached: once the record reads again, the next entry lists it";
+  freshDevice();
+  everyoneHistory(30);
+  powerOn(); runFor(60);
+  {
+    coldIndex();
+    LittleFS.failOpen = [](const std::string& p) { return p.find("/EVERYONE/00000007.msg") != std::string::npos; };
+    openText(MessageStore::kEveryone);
+    uint16_t during = g_indexTotal;
+    back();
+    LittleFS.failOpen = nullptr;
+    openText(MessageStore::kEveryone);
+    auto kept = snapshotIndex(g_indexTotal);
+    back();
+    CHECK(during == 29 && kept == freshIndex(MessageStore::kEveryone) && kept.size() == 30, "while unreadable %u entries; after %zu",
+          during, kept.size());
+  }
+
   // ---- device-cost model: 63 ms per file open (device A's measured cost) ----
   auto deviceCost = []() { LittleFS.onFileOpen = [](const std::string&) { T::now += 63; }; };
   auto modelEntry = [&](const char* label, int afterBootMs, int maxPasses) {
@@ -1202,6 +1280,28 @@ int main(int argc, char** argv) {
            p.passesToContent, simulated, (unsigned long long)p.maxPassOpens, (unsigned long long)bootMax.opens);
     return std::make_tuple(p, simulated, bootMax);
   };
+
+  g_test = "DM1b the broadcast chat opened right after boot: the sweep and the outbox pass read nothing while it loads";
+  freshDevice();
+  everyoneHistory(90);
+  for (int i = 0; i < 100; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, false, 1700000000u + i * 60);
+  powerOn();
+  {
+    loopPass(5);
+    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+    loopPass();  // the chat's first step (the services ran before it)
+    uint64_t svcOpens = 0;
+    int passes = 0;
+    for (; passes < 3000 && g_indexDirty; passes++) {
+      FsStats a = g_fs;
+      T::now += 20;
+      T_tickServices();
+      svcOpens += g_fs.fileOpens - a.fileOpens;
+      Menu::tick();
+    }
+    CHECK(passes > 5 && svcOpens == 0, "%llu background opens during %d loading passes", (unsigned long long)svcOpens, passes);
+    back();
+  }
 
   g_test = "DM1 device-cost model: the broadcast chat opened 1 s after boot (sweep and outbox pass still running) -- bounded opens per pass until drawn";
   freshDevice();
@@ -1537,11 +1637,11 @@ int main(int argc, char** argv) {
           pubsFor("msg/" + std::string(kBob)));
   }
 
-  g_test = "OB5 more pending records than the queue holds (40): every one published (a further pass finds the rest), each once";
+  g_test = "OB5 more pending records than the queue holds (40, after the boot pass): every one published (a further pass finds the rest), each once";
   freshDevice();
   {
+    powerOn(); runFor(30);  // the boot pass is done
     T::connected = false;
-    powerOn(); runFor(5);
     for (int i = 0; i < 40; i++) storePending(kBob, 1700009000u + i);
     T::connected = true;
     runFor(180);

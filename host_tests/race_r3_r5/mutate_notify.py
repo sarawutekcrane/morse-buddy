@@ -133,13 +133,13 @@ muts = [
  (TX, "Text: held events bypass isReplayedSend()", "    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window\n    if (backQueued", "    if (!fromHeld && isReplayedSend(e)) continue;\n    if (backQueued"),
  (TX, "Text: the event that could not be held is lost", "        unheld = q;\n        haveUnheld = true;\n        break;", "        break;"),
  (TX, "Text: a full buffer does not complete the index (input waits)", "        uint32_t completeStart = millis();\n        completeIndexNow();", "        uint32_t completeStart = millis();\n        g_heldInput.clear();"),
- (TX, "Text: a queued Back waits for the rotations before it", "  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||", "  bool backQueued = false && g_heldInput.contains(InputEventType::ENCODER_LONG) ||"),
+ (TX, "Text: a queued Back waits for the rotations before it", "    if (backQueued && e.type != InputEventType::ENCODER_LONG &&\n        (droppingBeforeBack || e.type == InputEventType::ENCODER_ROTATE || g_historyCursor != kNoHistoryCursor)) {\n      droppingBeforeBack = true;\n      continue;", "    if (false) {\n      droppingBeforeBack = true;\n      continue;"),
  (TX, "Text: the selection does not follow its message", "void followCursorMessage() {\n", "void followCursorMessage() {\n  return;\n"),
  (TX, "Text: an index the store could not keep current is not reloaded", "  if (!MessageStore::isIndexCurrent(g_selectedGroupCode, g_selectedContactKey)) {\n    markIndexDirty();\n    return true;\n  }", "  if (false) {\n  }"),
  (EN, "Enigma: input while loading is dropped, not held", "      if (!g_heldInput.hold(q)) {\n        completeIndexNow();", "      if (true) continue;\n      if (!g_heldInput.hold(q)) {\n        completeIndexNow();"),
  (EN, "Enigma: Back while loading waits for the load", "      if (q.type == InputEventType::ENCODER_LONG) {\n        g_heldInput.clear();\n        g_enigmaChatLeaving = true;", "      if (false) {\n        g_heldInput.clear();\n        g_enigmaChatLeaving = true;"),
  (EN, "Enigma: replayed Shorts not dropped at dispatch", "    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window\n    if (backQueued", "    if (backQueued"),
- (EN, "Enigma: a queued Back waits for the rotations before it", "  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||", "  bool backQueued = false && g_heldInput.contains(InputEventType::ENCODER_LONG) ||"),
+ (EN, "Enigma: a queued Back waits for the rotations before it", "      droppingBeforeBack = true;  // a Back is waiting: history-side work before it is skipped\n      continue;", "      droppingBeforeBack = true;"),
  # ---- Outbox: incremental, header-only, durable ----
  (OB, "a pending write is not queued directly", "void serviceInit() { MessageStore::setOnPendingWrittenCallback(onPendingWritten); }", "void serviceInit() {}"),
  (OB, "the pass runs again and again (not once per boot)", "    bool due = !g_passDone || externalChange || g_queueOverflowed ||", "    bool due = true || externalChange || g_queueOverflowed ||"),
@@ -153,6 +153,8 @@ muts = [
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
+ "the feed ignores the open chat (replaces the index it draws from)": "a current open-chat index is still protected by the cache check, and a stale one is reloaded by the chat's per-pass re-sync (CE23) anyway: the flag only saves that reload (cost, not correctness)",
+ "an unreadable record is fed as read": "without the explicit nullptr feed the next fed record is out of step, which drops the feed; either way the fed index is never used and the chat loads itself",
 }
 out = os.path.join(H, "out", "mutn")
 _bad = [m[1] for m in muts if open(R + "/" + m[0]).read().count(m[2]) != 1]
