@@ -913,9 +913,11 @@ int main(int argc, char** argv) {
     FsStats a = g_fs;
     MessageRef r = arrive(MessageStore::kEveryone, PacketCodec::MSG_TYPE_TEXT, 1700003000u);  // at 100: evicts the oldest
     runFor(2);
+    uint64_t opens = g_fs.fileOpens - a.fileOpens;
+    printf("   CE3 measured: %llu opens to store an arrival (with its eviction) and show it in the open chat\n", (unsigned long long)opens);
+    CHECK(opens <= 12, "%llu opens: the open chat reloaded its index", (unsigned long long)opens);
     rot(-1); rot(-1);  // selects; the read-up rewrites flags
     runFor(10);
-    uint64_t opens = g_fs.fileOpens - a.fileOpens;
     auto kept = snapshotIndex(g_indexTotal);
     uint16_t total = g_indexTotal;
     back();
@@ -1182,7 +1184,9 @@ int main(int argc, char** argv) {
     for (uint16_t i = 0; i < g_indexTotal; i++) listed = listed || MessageStore::getIndexEntry(i)->sequence == older.sequence;
     CHECK(same && listed && g_indexTotal == 11 && isUnread(older), "variant %d: still on its message %d, the new one listed %d (%u), still unread %d",
           variant, same, listed, g_indexTotal, isUnread(older));
+    auto kept = snapshotIndex(g_indexTotal);
     back();
+    CHECK(kept == freshIndex(kBob), "variant %d: the chat's index differs from a fresh load", variant);
   }
 
   // ---- device-cost model: 63 ms per file open (device A's measured cost) ----
@@ -1320,7 +1324,8 @@ int main(int argc, char** argv) {
     T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 10));
     T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 10));  // replayed
     size_t before = std::count(T::seq.begin(), T::seq.end(), std::string("nextId"));
-    for (int i = 0; i < 3000 && (g_indexDirty || !T::raw.empty()); i++) loopPass();
+    for (int i = 0; i < 3000 && (g_indexDirty || !T::raw.empty() || T::visibleJoined().find("Loading messages") != std::string::npos); i++)
+      loopPass();
     loopPass(20);
     size_t attempts = std::count(T::seq.begin(), T::seq.end(), std::string("nextId")) - before;
     LittleFS.failOpen = nullptr;
@@ -1339,10 +1344,10 @@ int main(int argc, char** argv) {
     size_t n = sendWithReplay(false, true);
     CHECK(n == 1, "%zu send attempts", n);
   }
-  g_test = "IN4c Enigma: a Send and its replayed Short, both received while loading: at most one send attempt";
+  g_test = "IN4c Enigma: a Send and its replayed Short, both received while loading: one send attempt";
   {
     size_t n = sendWithReplay(true, false);
-    CHECK(n <= 1, "%zu send attempts", n);
+    CHECK(n == 1, "%zu send attempts", n);
   }
 
   g_test = "IN5 one Morse sequence (SOS) keyed while the chat loads gives the same draft as keyed live (device-cost model, 63 ms per open)";
@@ -1434,9 +1439,10 @@ int main(int argc, char** argv) {
   }
 
   g_test = "IN7 Back while the chat loads leaves at once (held input dropped with it)";
-  coldEveryone();
-  {
-    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+  for (int enigma = 0; enigma < 2; enigma++) {
+    coldEveryone();
+    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
     loopPass();
     for (int i = 0; i < 10; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
     loopPass();
@@ -1444,8 +1450,8 @@ int main(int argc, char** argv) {
     FsStats a = g_fs;
     loopPass();
     CHECK(!TextMessage::isAnyConversationOpen() && g_heldInput.empty() && g_fs.fileOpens - a.fileOpens <= 4,
-          "left %d, held left %d, %llu opens", !TextMessage::isAnyConversationOpen(), !g_heldInput.empty(),
-          (unsigned long long)(g_fs.fileOpens - a.fileOpens));
+          "%s: left %d, held left %d, %llu opens", enigma ? "Enigma" : "Text", !TextMessage::isAnyConversationOpen(),
+          !g_heldInput.empty(), (unsigned long long)(g_fs.fileOpens - a.fileOpens));
     loopPass(3);
   }
 
@@ -1473,6 +1479,10 @@ int main(int argc, char** argv) {
     CHECK(pendingCount(kBob) == 0 && pubsFor("msg/" + std::string(kBob)) == 5, "pending left %d, published %d", pendingCount(kBob),
           pubsFor("msg/" + std::string(kBob)));
     CHECK(g_svcMax.opens <= 8, "max %llu opens in a service pass", (unsigned long long)g_svcMax.opens);
+    FsStats a = g_fs;
+    runFor(60);
+    CHECK(g_fs.fileOpens == a.fileOpens, "%llu opens while idle after the pass (the pass ran again)",
+          (unsigned long long)(g_fs.fileOpens - a.fileOpens));
   }
 
   g_test = "OB2 a send while offline is queued directly: published on connection with no storage pass";

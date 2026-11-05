@@ -6,11 +6,11 @@
 # mutation must fail at least one of them.
 import os, subprocess, sys, shutil, tempfile
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
-NT, TX, EN, SM = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp"
+NT, TX, EN, SM, OB = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp"
 muts = [
  # ---- reading in the chats ----
- (TX, "Text: selection does not mark read", "  if (hadEvent) g_chatRenderDirty = true;\n  markSelectedHistoryRead();\n", "  if (hadEvent) g_chatRenderDirty = true;\n"),
- (EN, "Enigma: selection does not mark read", "  if (hadEvent) g_enigmaChatDirty = true;\n  markSelectedHistoryRead();\n", "  if (hadEvent) g_enigmaChatDirty = true;\n"),
+ (TX, "Text: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
+ (EN, "Enigma: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
  (TX, "Text: every message in the chat marked read on entry", "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n",
   "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n    for (uint16_t k = 0; k < MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey); k++) Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, k, MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey));\n"),
  # ---- categories ----
@@ -70,7 +70,7 @@ muts = [
  (NT, "the open conversation is trimmed", "  if (TextMessage::isConversationOpen(j.group_code, j.contact_key)) {", "  if (false) {"),
  (NT, "several deletions per step", "    return;  // at most one deletion per step", "    continue;"),
  (NT, "the walk reads every directory entry in one step", "constexpr uint8_t kWalkEntriesPerStep = 16;", "constexpr uint8_t kWalkEntriesPerStep = 255;"),
- (NT, "an unreadable record is skipped (recount applied anyway)", "      j.unreliable = true;\n      continue;", "      continue;"),
+ (NT, "an unreadable record is skipped (recount applied anyway)", "      j.unreliable = true;\n      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord(", "      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord("),
  (NT, "an arrival does not restart a recount under way", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {\n  conversationChanged(group_code, contact_key);", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {"),
  (NT, "a whole conversation per step (unbounded)", "constexpr uint8_t kLoadsPerStep = 4;", "constexpr uint8_t kLoadsPerStep = 255;"),
  (NT, "several rewrites per step", "      j.rewrites++;\n      return;  // at most one rewrite per step", "      j.rewrites++;"),
@@ -84,7 +84,76 @@ muts = [
  (SM, "the walk stops at the first group", "      w->group.close();\n      w->inGroup = false;\n      continue;", "      w->group.close();\n      w->inGroup = false;\n      return WalkResult::END;"),
  (SM, "deleteMessage leaves the record on flash", "bool deleteMessage(const MessageRef& ref) {", "bool deleteMessage(const MessageRef& ref) {\n  (void)ref; return true;"),
  (SM, "listing counts an interrupted rewrite's .tmp as a second record", "    if (!isDir && len > 4 && strcmp(name + len - 4, \".msg\") == 0) {", "    if (!isDir) {"),
+ # ---- chat entry, round 2: record cache ----
+ (SM, "a store write is not written through to the record cache", "void writeThroughCachedRecord(const MessageRef& ref, bool ok) {\n", "void writeThroughCachedRecord(const MessageRef& ref, bool ok) {\n  return;\n"),
+ (SM, "a removed record stays in the record cache", "  dropCachedRecord(group_code, contact_key, seq);\n  afterRecordRemove(", "  afterRecordRemove("),
+ (SM, "an external change keeps the record cache", "  dropAllCachedRecords();\n  g_externalMutations++;", "  g_externalMutations++;"),
+ (SM, "the record cache ignores the conversation", "    if (c.valid && c.seq == seq && strcmp(c.contact, contact_key) == 0 && strcmp(c.group, group_code) == 0) return &c;", "    if (c.valid && c.seq == seq && strcmp(c.group, group_code) == 0) return &c;"),
+ (SM, "drawn rows are not kept (no record cache)", "  if (!fromCache) keepCachedRecord(ref, g_loadBuffer, len);\n", ""),
+ (SM, "a failed write keeps the cached bytes", "  if (!ok || g_rewriteLen == 0 || !fillCachedRecord(*c, g_rewriteScratch, g_rewriteLen)) c->valid = false;", "  if (ok && g_rewriteLen > 0 && !fillCachedRecord(*c, g_rewriteScratch, g_rewriteLen)) c->valid = false;"),
+ # ---- the shared index kept current ----
+ (SM, "a mutation elsewhere makes the shared index stale", "  if (keepWorking && !target) g_indexCacheGeneration = g_storageChangeGeneration;\n", ""),
+ (SM, "the open conversation's own writes are not patched in (its index goes stale)", "  if (p.working && patchIndexWrite(g_index, &g_indexCount, kMaxMessagesPerThread, e)) g_indexCacheGeneration = p.generation;\n", ""),
+ (SM, "a removal is not patched out of the shared index", "  if (p.working) {\n    patchIndexRemove(g_index, &g_indexCount, seq);\n    g_indexCacheGeneration = p.generation;", "  if (p.working) {\n    g_indexCacheGeneration = p.generation;"),
+ (SM, "a patched entry is appended instead of sorted in", "  uint16_t at = *count;\n  for (uint16_t i = 0; i < *count; i++) {\n    if (indexEntryAfter(arr[i], e)) {", "  uint16_t at = *count;\n  for (uint16_t i = 0; i < 0; i++) {\n    if (indexEntryAfter(arr[i], e)) {"),
+ (SM, "a failed write is patched in as if it succeeded", "  if (!ok || !p.active || p.generation != g_storageChangeGeneration) return;  // stale: reloaded at the next use", "  if (!p.active || p.generation != g_storageChangeGeneration) return;"),
+ (SM, "a write during a stepped load is not followed", "    if (fine) g_loader.generation = p.generation;\n", ""),
+ (SM, "an external change keeps every index current", "  bool known = group_code != nullptr && contact_key != nullptr;", "  bool known = true;\n  if (group_code == nullptr) { group_code = \"\"; contact_key = \"\"; }"),
+ # ---- the parked index ----
+ (SM, "the parked index is never swapped back", "  return g_parked != nullptr && g_parked->valid && parkedHolds(group_code, contact_key);", "  (void)group_code; (void)contact_key; return false;"),
+ (SM, "the outgoing index is not parked", "  if (!isIndexTarget(group_code, contact_key)) parkWorkingIndex();\n", ""),
+ (SM, "a mutation elsewhere drops the parked index", "  if (keepParked) g_parked->generation = g_storageChangeGeneration;\n", ""),
+ (SM, "the parked conversation's own writes are not patched in", "  if (p.parked && patchIndexWrite(g_parked->entries, &g_parked->count, kParkedCapacity, e)) g_parked->generation = p.generation;\n", ""),
+ (SM, "a parked removal is not patched out", "    patchIndexRemove(g_parked->entries, &g_parked->count, seq);\n    g_parked->generation = p.generation;", "    g_parked->generation = p.generation;"),
+ # ---- the recount feeds the index ----
+ (NT, "the recount does not feed the chat index", "      MessageStore::beginIndexFeed(j.group_code, j.contact_key, j.seqs, j.n, true, TextMessage::isAnyConversationOpen());\n", ""),
+ (NT, "the feed ignores the open chat (replaces the index it draws from)", "      MessageStore::beginIndexFeed(j.group_code, j.contact_key, j.seqs, j.n, true, TextMessage::isAnyConversationOpen());\n", "      MessageStore::beginIndexFeed(j.group_code, j.contact_key, j.seqs, j.n, true, false);\n"),
+ (NT, "an unreadable record is fed as read", "      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord(ref.group_code, ref.contact_key, ref.sequence, nullptr, nullptr);\n", ""),
+ (SM, "a feed overwrites a current cached index", "  if (sharedInUse || (g_indexCacheValid && g_indexCacheGeneration == now) ||", "  if (sharedInUse ||"),
+ (SM, "a fed record out of step is accepted", "  if (g_loader.pos >= g_loader.n || g_loaderSeqs[g_loader.pos] != seq ||\n      g_loader.generation != getStorageChangeGeneration()) {", "  if (g_loader.pos >= g_loader.n) {"),
+ (SM, "no parked feed while a chat holds the shared index", "    return beginParkedFeed(group_code, contact_key, seqs, n, listingReliable);", "    return false;"),
+ (SM, "a mutation elsewhere drops the parked feed", "  if (keepParkedFeed) g_parked->feedGeneration = g_storageChangeGeneration;\n", ""),
+ (SM, "a mutation of the fed conversation keeps the parked feed", "  bool keepParkedFeed = known && g_parked != nullptr && g_parked->feeding && g_parked->feedGeneration == before &&\n                        !parkedHolds(group_code, contact_key);", "  bool keepParkedFeed = known && g_parked != nullptr && g_parked->feeding && g_parked->feedGeneration == before;"),
+ (SM, "an unreadable record still completes the parked feed", "    p.valid = p.feedReliable;", "    p.valid = true;"),
+ (SM, "an out-of-step record is fed to the parked index", "  if (p.feedPos >= p.feedN || p.feedSeqs[p.feedPos] != seq || p.feedGeneration != getStorageChangeGeneration()) {", "  if (p.feedPos >= p.feedN) {"),
+ (SM, "the parked feed overwrites a current parked index", "  if (g_parked != nullptr && g_parked->valid && g_parked->generation == now) return false;  // current: kept\n", ""),
+ (SM, "records are not fed to the parked index", "    feedParkedRecord(seq, hdr, message_id);\n    return;", "    return;"),
+ # ---- bounded, time-budgeted steps; Everyone first ----
+ (SM, "an index load reads a whole conversation per step", "    if (k > 0 && millis() - stepStart >= kIndexStepBudgetMs) break;\n    uint32_t seq = g_loaderSeqs[g_loader.pos++];", "    uint32_t seq = g_loaderSeqs[g_loader.pos++];"),
+ (SM, "a stepped load is never cached", "  if (g_loader.reliable && g_loader.generation == g_storageChangeGeneration) {\n    g_indexCacheGeneration", "  if (false) {\n    g_indexCacheGeneration"),
+ (SM, "a load that met an unreadable record is cached", "      g_loader.reliable = false;  // left out, as the one-call load did; not cached\n", ""),
+ (SM, "background work never waits for a loading chat", "  return g_loader.active && !g_loader.fed && millis() - g_loader.lastStepMs < kChatLoadingMs;", "  return false;"),
+ (NT, "Notifications does not pause while a chat loads", "  if (MessageStore::chatIndexLoading()) return;\n  if (g_loadState", "  if (g_loadState"),
+ (NT, "a recount step ignores the time budget", "  for (uint8_t loads = 0; loads < kLoadsPerStep && j.pos < j.n; loads++) {\n    if (loads > 0 && millis() - stepStart >= kStepBudgetMs) return;\n    MessageRef ref;", "  for (uint8_t loads = 0; loads < kLoadsPerStep && j.pos < j.n; loads++) {\n    MessageRef ref;"),
+ (NT, "Everyone is not visited first", "    if (!g_sweep->everyoneDone) {", "    if (false) {"),
+ (NT, "the walk visits Everyone again", "    if (strcmp(contact, MessageStore::kEveryone) == 0 && isConfiguredGroup(group)) return;  // visited first\n", ""),
+ # ---- input while the index loads ----
+ (TX, "Text: input while loading is dropped, not held", "      if (!g_heldInput.hold(q)) {\n        // Full, or no memory", "      if (true) continue;\n      if (!g_heldInput.hold(q)) {\n        // Full, or no memory"),
+ (TX, "Text: Back while loading waits for the load", "      if (q.type == InputEventType::ENCODER_LONG) {\n        g_heldInput.clear();\n        g_chatIsOpen = false;", "      if (false) {\n        g_heldInput.clear();\n        g_chatIsOpen = false;"),
+ (TX, "Text: held events bypass isReplayedSend()", "    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window\n    if (backQueued", "    if (!fromHeld && isReplayedSend(e)) continue;\n    if (backQueued"),
+ (TX, "Text: the event that could not be held is lost", "        unheld = q;\n        haveUnheld = true;\n        break;", "        break;"),
+ (TX, "Text: a full buffer does not complete the index (input waits)", "        uint32_t completeStart = millis();\n        completeIndexNow();", "        uint32_t completeStart = millis();\n        g_heldInput.clear();"),
+ (TX, "Text: a queued Back waits for the rotations before it", "  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||", "  bool backQueued = false && g_heldInput.contains(InputEventType::ENCODER_LONG) ||"),
+ (TX, "Text: the selection does not follow its message", "void followCursorMessage() {\n", "void followCursorMessage() {\n  return;\n"),
+ (TX, "Text: an index the store could not keep current is not reloaded", "  if (!MessageStore::isIndexCurrent(g_selectedGroupCode, g_selectedContactKey)) {\n    markIndexDirty();\n    return true;\n  }", "  if (false) {\n  }"),
+ (EN, "Enigma: input while loading is dropped, not held", "      if (!g_heldInput.hold(q)) {\n        completeIndexNow();", "      if (true) continue;\n      if (!g_heldInput.hold(q)) {\n        completeIndexNow();"),
+ (EN, "Enigma: Back while loading waits for the load", "      if (q.type == InputEventType::ENCODER_LONG) {\n        g_heldInput.clear();\n        g_enigmaChatLeaving = true;", "      if (false) {\n        g_heldInput.clear();\n        g_enigmaChatLeaving = true;"),
+ (EN, "Enigma: replayed Shorts not dropped at dispatch", "    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window\n    if (backQueued", "    if (backQueued"),
+ (EN, "Enigma: a queued Back waits for the rotations before it", "  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||", "  bool backQueued = false && g_heldInput.contains(InputEventType::ENCODER_LONG) ||"),
+ # ---- Outbox: incremental, header-only, durable ----
+ (OB, "a pending write is not queued directly", "void serviceInit() { MessageStore::setOnPendingWrittenCallback(onPendingWritten); }", "void serviceInit() {}"),
+ (OB, "the pass runs again and again (not once per boot)", "    bool due = !g_passDone || externalChange || g_queueOverflowed ||", "    bool due = true || externalChange || g_queueOverflowed ||"),
+ (OB, "the pass ignores changes made outside the store", "    bool externalChange = MessageStore::getExternalMutationCount() != g_externalSeen;", "    bool externalChange = false;"),
+ (OB, "an unreadable record does not make the pass incomplete", "        p.incomplete = true;  // unreadable (or removed since the listing): the next pass looks again\n", ""),
+ (OB, "a full queue is not remembered (the rest never found)", "  if (g_queue->count >= kQueueSize) {\n    g_queueOverflowed = true;", "  if (g_queue->count >= kQueueSize) {"),
+ (OB, "a failed publish clears the pending flag", "  if (!ok) {\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return true;\n  }", "  if (!ok) {\n    MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);\n    dropFront();\n    return true;\n  }"),
+ (OB, "a record queued while offline is dropped", "    if (g_queue->count > 1) {\n      dropFront();\n      enqueue(ref);\n    }", "    dropFront();\n    return false;"),
+ (OB, "a whole pass in one step (unbounded)", "constexpr uint8_t kReadsPerStep = 4;", "constexpr uint8_t kReadsPerStep = 255;"),
+ (OB, "the pass skips records it found pending", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;\n        enqueue(ref);", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;"),
 ]
+# Survivors assessed equivalent (no behaviour a test can observe), with the reason.
+equivalent = {
+}
 out = os.path.join(H, "out", "mutn")
 _bad = [m[1] for m in muts if open(R + "/" + m[0]).read().count(m[2]) != 1]
 if _bad:
@@ -102,7 +171,6 @@ stubsFake = cc(H + "/stubs.cpp", base, "stubs_fake")
 fsBase = ["-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE", "-I", H + "/fake_fs", "-I", H, "-I", H + "/fake", "-I", REPO + "/src"]
 stubsReal = cc(H + "/stubs.cpp", fsBase, "stubs_real")
 lfs = cc(H + "/fake_fs/LittleFS.cpp", ["-I", H + "/fake_fs"], "littlefs")
-fsroot = tempfile.mkdtemp(prefix="mutn_fs_")
 
 def run(binary, args):
     try:
@@ -111,27 +179,45 @@ def run(binary, args):
     except subprocess.TimeoutExpired:
         return 124, ["TIMEOUT"]
 
-caught, survivors, build_errors = 0, [], 0
+import concurrent.futures, threading
 only = sys.argv[1:]
-for target, name, old, new in muts:
-    if only and not any(o in name for o in only): continue
+todo = [m for m in muts if not only or any(o in m[1] for o in only)]
+_print_lock = threading.Lock()
+
+def one(k, mut):
+    target, name, old, new = mut
+    out = os.path.join(H, "out", "mutn%d" % k)
     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
-    for x in (NT, TX, EN, SM, "notifications.h", "storage_messages.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
-    p = out + "/core/" + target; s = open(p).read()
-    open(p, "w").write(s.replace(old, new))
+    for x in (NT, TX, EN, SM, OB, "notifications.h", "storage_messages.h", "held_input.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+    p = out + "/core/" + target; src = open(p).read()
+    open(p, "w").write(src.replace(old, new))
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])
     b1 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS"] + inc + [H + "/notify_test.cpp", out + "/core/" + EN, stubsFake] + common + ["-o", out + "/n"], capture_output=True, text=True)
     incfs = sum([["-I", i] for i in (H + "/fake_fs", H, H + "/fake", out, REPO + "/src")], [])
-    b2 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE"] + incfs + [H + "/storage_test.cpp", out + "/core/" + EN, out + "/core/" + SM, stubsReal, lfs] + common + ["-o", out + "/s"], capture_output=True, text=True)
+    b2 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE"] + incfs + [H + "/storage_test.cpp", out + "/core/" + EN, out + "/core/" + SM, out + "/core/" + OB, stubsReal, lfs] + common + ["-o", out + "/s"], capture_output=True, text=True)
     if b1.returncode or b2.returncode:
-        print(f"  COMPILE-ERR  {name}: {(b1.stderr or b2.stderr)[:300]}"); build_errors += 1; continue
+        with _print_lock: print(f"  COMPILE-ERR  {name}: {(b1.stderr or b2.stderr)[:300]}", flush=True)
+        shutil.rmtree(out, ignore_errors=True)
+        return name, None
+    fsroot = tempfile.mkdtemp(prefix="mutn_fs_")
     rc1, f1 = run(out + "/n", [])
     rc2, f2 = run(out + "/s", [fsroot])
-    ok = rc1 != 0 or rc2 != 0; caught += ok
-    if not ok: survivors.append(name)
+    shutil.rmtree(fsroot, ignore_errors=True)
+    shutil.rmtree(out, ignore_errors=True)
+    ok = rc1 != 0 or rc2 != 0
     first = (f1 or f2 or ["-"])[0][:100]
-    print(f"  {'CAUGHT ' if ok else 'SURVIVED'} [notify:{len(f1)} storage:{len(f2)}]  {target}: {name}   (first: {first})", flush=True)
-shutil.rmtree(fsroot, ignore_errors=True)
-n = len([m for m in muts if not only or any(o in m[1] for o in only)])
-print(f"{caught}/{n} mutations caught; {len(survivors)} survivor(s); {build_errors} build error(s)")
-sys.exit(1 if survivors or build_errors else 0)
+    tag = 'CAUGHT ' if ok else (f'SURVIVED (assessed equivalent: {equivalent[name]})' if name in equivalent else 'SURVIVED')
+    with _print_lock: print(f"  {tag} [notify:{len(f1)} storage:{len(f2)}]  {target}: {name}   (first: {first})", flush=True)
+    return name, ok
+
+caught, survivors, build_errors = 0, [], 0
+workers = int(os.environ.get("MUT_JOBS", "3"))
+with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+    for name, ok in ex.map(lambda km: one(*km), enumerate(todo)):
+        if ok is None: build_errors += 1
+        elif ok: caught += 1
+        else: survivors.append(name)
+n = len(todo)
+eq = len([x for x in survivors if x in equivalent])
+print(f"{caught}/{n} mutations caught; {eq} survivor(s) assessed equivalent; {len(survivors) - eq} unexplained survivor(s); {build_errors} build error(s)")
+sys.exit(1 if (len(survivors) - eq) or build_errors else 0)
