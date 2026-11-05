@@ -1,5 +1,5 @@
 == toolchain: g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
-== repo HEAD: 43df542a2d4d35ad9f96059ecc59bd1a46dae2dd  (working tree:  M host_tests/race_r3_r5/mutate_notify.py  M host_tests/race_r3_r5/stubs.cpp  M src/core/enigma.cpp  M src/core/input.cpp  M src/core/input.h  M src/core/text_message.cpp )
+== repo HEAD: cbc49609e36852f8c9ede89c167efb5cfec54b0f  (working tree: )
 == 1. Room protocol E1-E27 + review findings F1-F3: ACTUAL race_protocol.cpp + crc32.cpp, several engines, broker + NVS + identity-counter fault models, ASan+UBSan
    audited 112 publish logs; 422 receive-queue overflow drops injected
    1028 checks passed, 0 failed
@@ -17,7 +17,7 @@
 == 4b. Unread marking and badges (hardware finding 3): ACTUAL menu, notifications, text_message, enigma
    119 checks passed, 0 failed
 == 4c. Unread marking against the REAL message store (findings 1 and 3 on 23293c5): ACTUAL storage_messages.cpp on a host directory (fake_fs/), notifications, text_message, enigma, menu
-   170 checks passed, 0 failed
+   172 checks passed, 0 failed
    warnings in changed/related files (all builds): number_guessing.cpp:174:49: warning: 'snprintf' output may be truncated before the last format character [-Wformat-truncation=] 
 == 5. C++11 / C++17 compile (-fsyntax-only -Wall -Wextra; host fakes incl. fake_sys/) of every changed production file, baseline vs candidate
    (a compiler error fails the script; warnings are counted and listed)
@@ -36,38 +36,38 @@
 == 6b. Storage work per main-loop pass, ACTUAL store, legacy histories written in the record format (measurement, not pass/fail; host time is not device time)
    -- 8 conversations x 300 messages, 180 s
    history: 8 conversations x 300 messages (4 of 5 received, all received ones flagged unread as legacy firmware left them)
-   B0 boot: service init              opens=0 dirEntries=0 writes=0 nvs=0 hostUs=13
-   B0b open chat at boot (until drawn) calls=150  per-call max: opens=8 dirEntries=300 writes=0 renames=0 removes=0 nvs=0 hostUs=725  | calls>8opens=0  totals: opens=304 dirEntries=302 writes=0 removes=0 nvs=0
+   B0 boot: service init              opens=0 dirEntries=0 writes=0 nvs=0 hostUs=10
+   B0b open chat at boot (until drawn) calls=150  per-call max: opens=8 dirEntries=300 writes=0 renames=0 removes=0 nvs=0 hostUs=1001  | calls>8opens=0  totals: opens=304 dirEntries=300 writes=0 removes=0 nvs=0
       records on flash at boot: 2400 (largest conversation 300)
       every conversation at <=100 records after 73.0 s (simulated); now 800 records
-   B1 idle: services per loop pass    calls=9000  per-call max: opens=8 dirEntries=301 writes=0 renames=0 removes=1 nvs=1 hostUs=684  | calls>8opens=0  totals: opens=6192 dirEntries=4816 writes=0 removes=1600 nvs=8
+   B1 idle: services per loop pass    calls=9000  per-call max: opens=4 dirEntries=300 writes=0 renames=0 removes=1 nvs=1 hostUs=881  | calls>8opens=0  totals: opens=6192 dirEntries=5116 writes=0 removes=1600 nvs=8
    B1 idle: Main Menu per loop pass   calls=9000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=1  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
       after 180s idle: Text badge=1
-   B2 open chat (until drawn)         calls=4  per-call max: opens=4 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=35  | calls>8opens=0  totals: opens=4 dirEntries=0 writes=0 removes=0 nvs=0
-   B2 rotate x20: UI per pass         calls=20  per-call max: opens=1 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=19  | calls>8opens=0  totals: opens=16 dirEntries=0 writes=0 removes=0 nvs=0
-   B2 rotate x20: services per pass   calls=20  per-call max: opens=4 dirEntries=100 writes=1 renames=1 removes=1 nvs=0 hostUs=500  | calls>8opens=0  totals: opens=22 dirEntries=100 writes=7 removes=7 nvs=0
-   B2 then idle in chat: services     calls=9000  per-call max: opens=4 dirEntries=100 writes=1 renames=1 removes=1 nvs=1 hostUs=325  | calls>8opens=0  totals: opens=400 dirEntries=200 writes=73 removes=73 nvs=4
-   B2 then idle in chat: UI (redraws) calls=9000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=29  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 open chat (until drawn)         calls=4  per-call max: opens=4 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=38  | calls>8opens=0  totals: opens=4 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 rotate x20: UI per pass         calls=20  per-call max: opens=1 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=20  | calls>8opens=0  totals: opens=16 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 rotate x20: services per pass   calls=20  per-call max: opens=4 dirEntries=100 writes=1 renames=1 removes=1 nvs=0 hostUs=318  | calls>8opens=0  totals: opens=22 dirEntries=100 writes=7 removes=7 nvs=0
+   B2 then idle in chat: services     calls=9000  per-call max: opens=4 dirEntries=100 writes=1 renames=1 removes=1 nvs=1 hostUs=241  | calls>8opens=0  totals: opens=400 dirEntries=200 writes=73 removes=73 nvs=4
+   B2 then idle in chat: UI (redraws) calls=9000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=17  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
       unread on flash in EVERYONE after rotation + 180s: 0 (of 240 received)
    B3 Main Menu rotate x20: UI        calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
    B3 Main Menu rotate x20: services  calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
       Text badge now=1
    -- 400 conversations x 20 messages, 120 s
    history: 400 conversations x 20 messages (4 of 5 received, all received ones flagged unread as legacy firmware left them)
-   B0 boot: service init              opens=0 dirEntries=0 writes=0 nvs=0 hostUs=8
-   B0b open chat at boot (until drawn) calls=10  per-call max: opens=8 dirEntries=20 writes=0 renames=0 removes=0 nvs=0 hostUs=382  | calls>8opens=0  totals: opens=24 dirEntries=22 writes=0 removes=0 nvs=0
+   B0 boot: service init              opens=0 dirEntries=0 writes=0 nvs=0 hostUs=10
+   B0b open chat at boot (until drawn) calls=10  per-call max: opens=8 dirEntries=20 writes=0 renames=0 removes=0 nvs=0 hostUs=180  | calls>8opens=0  totals: opens=24 dirEntries=20 writes=0 removes=0 nvs=0
       records on flash at boot: 8000 (largest conversation 20)
       every conversation at <=100 records after 1.0 s (simulated); now 8000 records
-   B1 idle: services per loop pass    calls=6000  per-call max: opens=8 dirEntries=40 writes=0 renames=0 removes=0 nvs=1 hostUs=412  | calls>8opens=0  totals: opens=14656 dirEntries=22012 writes=0 removes=0 nvs=4
-   B1 idle: Main Menu per loop pass   calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=1  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   B1 idle: services per loop pass    calls=6000  per-call max: opens=4 dirEntries=20 writes=0 renames=0 removes=0 nvs=1 hostUs=303  | calls>8opens=0  totals: opens=14656 dirEntries=22032 writes=0 removes=0 nvs=4
+   B1 idle: Main Menu per loop pass   calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=21  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
       after 120s idle: Text badge=1
-   B2 open chat (until drawn)         calls=4  per-call max: opens=4 dirEntries=1 writes=0 renames=0 removes=0 nvs=0 hostUs=54  | calls>8opens=0  totals: opens=4 dirEntries=1 writes=0 removes=0 nvs=0
-   B2 rotate x20: UI per pass         calls=20  per-call max: opens=1 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=16  | calls>8opens=0  totals: opens=16 dirEntries=0 writes=0 removes=0 nvs=0
-   B2 rotate x20: services per pass   calls=20  per-call max: opens=4 dirEntries=20 writes=0 renames=0 removes=0 nvs=0 hostUs=46  | calls>8opens=0  totals: opens=20 dirEntries=60 writes=0 removes=0 nvs=0
-   B2 then idle in chat: services     calls=6000  per-call max: opens=4 dirEntries=20 writes=1 renames=1 removes=1 nvs=1 hostUs=522  | calls>8opens=0  totals: opens=1364 dirEntries=2727 writes=16 removes=16 nvs=3
-   B2 then idle in chat: UI (redraws) calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=14  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 open chat (until drawn)         calls=4  per-call max: opens=4 dirEntries=1 writes=0 renames=0 removes=0 nvs=0 hostUs=44  | calls>8opens=0  totals: opens=4 dirEntries=1 writes=0 removes=0 nvs=0
+   B2 rotate x20: UI per pass         calls=20  per-call max: opens=1 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=11  | calls>8opens=0  totals: opens=16 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 rotate x20: services per pass   calls=20  per-call max: opens=4 dirEntries=20 writes=0 renames=0 removes=0 nvs=0 hostUs=49  | calls>8opens=0  totals: opens=20 dirEntries=60 writes=0 removes=0 nvs=0
+   B2 then idle in chat: services     calls=6000  per-call max: opens=4 dirEntries=20 writes=1 renames=1 removes=1 nvs=1 hostUs=899  | calls>8opens=0  totals: opens=1364 dirEntries=2727 writes=16 removes=16 nvs=3
+   B2 then idle in chat: UI (redraws) calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=5  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
       unread on flash in EVERYONE after rotation + 120s: 0 (of 16 received)
-   B3 Main Menu rotate x20: UI        calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   B3 Main Menu rotate x20: UI        calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=1  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
    B3 Main Menu rotate x20: services  calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
       Text badge now=1
 == 7. Targeted mutations: SKIPPED (SKIP_MUTATIONS=1)

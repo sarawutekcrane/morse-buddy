@@ -26,18 +26,28 @@ Dependency Graph
 |-- WiFiClientSecure @ 2.0.0
 |-- Preferences @ 2.0.0
 Building in release mode
+Compiling .pio/build/morse_buddy/src/core/display.cpp.o
 Compiling .pio/build/morse_buddy/src/core/enigma.cpp.o
-Compiling .pio/build/morse_buddy/src/core/input.cpp.o
+Compiling .pio/build/morse_buddy/src/core/hooks.cpp.o
 Compiling .pio/build/morse_buddy/src/core/menu.cpp.o
 Compiling .pio/build/morse_buddy/src/core/mixed_text_entry.cpp.o
 Compiling .pio/build/morse_buddy/src/core/morse_practice.cpp.o
+Compiling .pio/build/morse_buddy/src/core/mqtt_manager.cpp.o
+Compiling .pio/build/morse_buddy/src/core/notifications.cpp.o
 Compiling .pio/build/morse_buddy/src/core/number_guessing.cpp.o
 Compiling .pio/build/morse_buddy/src/core/number_guessing_friend.cpp.o
+Compiling .pio/build/morse_buddy/src/core/outbox.cpp.o
+Compiling .pio/build/morse_buddy/src/core/presence.cpp.o
 Compiling .pio/build/morse_buddy/src/core/race.cpp.o
 Compiling .pio/build/morse_buddy/src/core/radio.cpp.o
+Compiling .pio/build/morse_buddy/src/core/radio_audio.cpp.o
+Compiling .pio/build/morse_buddy/src/core/radio_transport.cpp.o
 Compiling .pio/build/morse_buddy/src/core/settings.cpp.o
-Compiling .pio/build/morse_buddy/src/core/storage_init.cpp.o
+Compiling .pio/build/morse_buddy/src/core/sleep.cpp.o
+Compiling .pio/build/morse_buddy/src/core/sound_i2s.cpp.o
+Compiling .pio/build/morse_buddy/src/core/storage_messages.cpp.o
 Compiling .pio/build/morse_buddy/src/core/text_message.cpp.o
+Compiling .pio/build/morse_buddy/src/core/wifi_manager.cpp.o
 Compiling .pio/build/morse_buddy/src/main.cpp.o
 Compiling .pio/build/morse_buddy/src/ota/ota_manager.cpp.o
 Linking .pio/build/morse_buddy/firmware.elf
@@ -45,7 +55,7 @@ Retrieving maximum program size .pio/build/morse_buddy/firmware.elf
 Checking size .pio/build/morse_buddy/firmware.elf
 Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
 RAM:   [====      ]  38.0% (used 124516 bytes from 327680 bytes)
-Flash: [========  ]  83.7% (used 1207385 bytes from 1441792 bytes)
+Flash: [========  ]  83.8% (used 1207545 bytes from 1441792 bytes)
 Building .pio/build/morse_buddy/firmware.bin with action:
   "$PYTHONEXE" "$OBJCOPY" --chip esp32 elf2image --flash_mode ${__get_board_flash_mode(__env__)} --flash_freq ${__get_board_f_image(__env__)} --flash_size 4MB --elf-sha256-offset 0xb0 -o $TARGET $SOURCES
 Building .pio/build/morse_buddy/firmware.bin
@@ -53,5 +63,5 @@ esptool.py v4.11.0
 Creating esp32 image...
 Merged 27 ELF sections
 Successfully created esp32 image.
-========================= [SUCCESS] Took 11.64 seconds =========================
+========================= [SUCCESS] Took 18.58 seconds =========================
 RC=0

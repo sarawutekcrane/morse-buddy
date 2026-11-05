@@ -203,6 +203,56 @@ index 4ba577d..adfcb4a 100644
  
    Display::drawStatusBar();
    if (!g_enigmaChatDirty) return;
+diff --git a/src/core/hooks.cpp b/src/core/hooks.cpp
+index a3b918b..1960825 100644
+--- a/src/core/hooks.cpp
++++ b/src/core/hooks.cpp
+@@ -306,7 +306,29 @@ void initRegisteredServices() {
+   }
+ }
+ 
++namespace {
++bool g_storageStepClaimed = false;
++uint8_t g_storageStepWaiting = 0;          // readers turned away this round
++uint8_t g_storageStepWaitingLastRound = 0;
++uint8_t g_storageStepLastWinner = 0;
++}  // namespace
++
++bool claimBackgroundStorageStep(BackgroundReader who) {
++  uint8_t bit = static_cast<uint8_t>(who);
++  bool othersWaited = (g_storageStepWaitingLastRound & static_cast<uint8_t>(~bit)) != 0;
++  if (g_storageStepClaimed || (g_storageStepLastWinner == bit && othersWaited)) {
++    g_storageStepWaiting |= bit;
++    return false;
++  }
++  g_storageStepClaimed = true;
++  g_storageStepLastWinner = bit;
++  return true;
++}
++
+ void tickRegisteredServices() {
++  g_storageStepWaitingLastRound = g_storageStepWaiting;
++  g_storageStepWaiting = 0;
++  g_storageStepClaimed = false;
+   for (uint8_t i = 0; i < g_appServiceCount; i++) {
+     if (g_appServices[i].tick != nullptr) g_appServices[i].tick();
+   }
+diff --git a/src/core/hooks.h b/src/core/hooks.h
+index c1d7b52..2d87750 100644
+--- a/src/core/hooks.h
++++ b/src/core/hooks.h
+@@ -200,3 +200,11 @@ static const uint8_t kMaxAppServices = 16;
+ bool registerAppService(const AppService& service);
+ void initRegisteredServices();
+ void tickRegisteredServices();
++
++// Background storage readers (the Notifications sweep and jobs, the
++// Outbox's pass) take turns: at most one of them does a storage step per
++// round of tickRegisteredServices(), so their bounded steps never add up in
++// one main-loop pass. A reader that got the last turn yields if another was
++// waiting. False: skip this step (try again next round).
++enum BackgroundReader : uint8_t { BG_NOTIFICATIONS = 1, BG_OUTBOX = 2 };
++bool claimBackgroundStorageStep(BackgroundReader who);
 diff --git a/src/core/input.cpp b/src/core/input.cpp
 index 66a1a87..d89e33f 100644
 --- a/src/core/input.cpp
@@ -273,8 +323,24 @@ index be351ee..bbc06cf 100644
  // True if `e` is a general-navigation confirm: DOT/DASH released before the
  // 2000ms special-command threshold (Addendum section 9.3).
  bool isMenuConfirm(const InputEvent& e);
+diff --git a/src/core/notifications.cpp b/src/core/notifications.cpp
+index 6d74d07..755bf27 100644
+--- a/src/core/notifications.cpp
++++ b/src/core/notifications.cpp
+@@ -934,6 +934,11 @@ void serviceTick() {
+     writeReadUps();
+     return;
+   }
++  // One background storage step per main-loop pass, shared with the Outbox.
++  if (!claimBackgroundStorageStep(BG_NOTIFICATIONS)) {
++    g_nextStepMs = now;  // not this pass: the next one
++    return;
++  }
+   if (g_job != nullptr) {
+     stepJob();
+     return;
 diff --git a/src/core/outbox.cpp b/src/core/outbox.cpp
-index 0b8586b..83a540e 100644
+index 0b8586b..05f6a1c 100644
 --- a/src/core/outbox.cpp
 +++ b/src/core/outbox.cpp
 @@ -33,6 +33,13 @@ namespace {
@@ -458,7 +524,7 @@ index 0b8586b..83a540e 100644
    g_pass->startMs = millis();
    g_pass->walk = MessageStore::beginConversationWalk();
    if (g_pass->walk == nullptr) g_pass->incomplete = true;
-@@ -243,8 +310,12 @@ void serviceTick() {
+@@ -243,12 +310,23 @@ void serviceTick() {
    if (publishStep()) return;
    if (MessageStore::chatIndexLoading()) return;  // a chat loading its index goes first (as in Notifications)
    if (g_pass == nullptr) {
@@ -473,6 +539,17 @@ index 0b8586b..83a540e 100644
                 (g_passAgain && static_cast<int32_t>(now - g_passAgainAtMs) >= 0);
      // As before: storage is looked through only once a group is connected
      // (nothing could be published before).
+     if (!due || !MqttManager::isAnyGroupConnected()) return;
++  }
++  // One background storage step per main-loop pass, shared with Notifications.
++  if (!claimBackgroundStorageStep(BG_OUTBOX)) {
++    g_nextStepMs = now;  // not this pass: the next one
++    return;
++  }
++  if (g_pass == nullptr) {
+     startPass();
+     if (g_pass == nullptr) return;
+   }
 diff --git a/src/core/text_message.cpp b/src/core/text_message.cpp
 index 03c4a13..ecb06c0 100644
 --- a/src/core/text_message.cpp
