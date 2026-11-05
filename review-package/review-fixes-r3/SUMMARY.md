@@ -69,8 +69,9 @@ IN2 and IN3 no longer accept a full synchronous completion as passing.
   - on `cbc4960`: **172 passed, 0 failed** (`evidence/storage_test_on_cbc4960.txt`).
 - **Full `run_all.sh` suites:** all passed (`evidence/run_all_suites_cbc4960.txt`).
 - **Mutations**, run alone, with no other job touching their output directories:
-  - `mutate_notify.py`: MUTN (`evidence/mutate_notify.txt`)
-  - `mutate_room.py`: MUTR (`evidence/mutate_room.txt`)
+  - `mutate_notify.py` (store, both chats, Notifications, Outbox; new mutants for every fixed path): **145/147 caught**, 0 unexplained. The 2 survivors were assessed equivalent before this round; the reasons are in the script (`evidence/mutate_notify.txt`).
+  - An earlier run on `ccb542f` left 8 survivors and 1 broken mutant; each led to a test fix (IN2d, IN8 with a rotation, the Send-replay waits, rebooting the Outbox in tests), and the shared background step came out of that.
+  - `mutate_room.py`: **104/107 caught**, 0 unexplained; the 3 survivors are its existing "redundant guard" equivalents (`evidence/mutate_room.txt`).
 
 ## ESP32 build (`evidence/esp32/`)
 
