@@ -829,6 +829,13 @@ void update() {
   updateCombinedHold(now);
 }
 
+bool hasQueuedEvent(InputEventType type) {
+  for (uint8_t i = 0; i < g_queueCount; i++) {
+    if (g_queue[(g_queueHead + i) % kQueueSize].type == type) return true;
+  }
+  return false;
+}
+
 bool popEvent(InputEvent& outEvent) {
   if (g_queueCount == 0) {
     outEvent = InputEvent{};

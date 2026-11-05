@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include <new>
+
 #include "core/hooks.h"
 #include "core/mqtt_manager.h"
 #include "core/packet_codec.h"
@@ -12,196 +14,251 @@ namespace Outbox {
 
 namespace {
 
-constexpr uint32_t kScanIntervalMs = 5000;
-constexpr uint16_t kMaxBatch = 32;
-uint32_t g_lastScanMs = 0;
+// Device A on 2ed04b6: "[PERF][OUTBOX] scan 5143 ms found=0" -- one call
+// (findMessagesByPredicate() over every conversation) loaded every stored
+// record to find none pending, blocking the main loop for 5 s. Now:
+//  - a pass over storage finds the records left pending on flash (a send
+//    that could not be published, durable across reboots and power loss).
+//    It is incremental like the Notifications sweep: one step per kStepMs,
+//    each at most kWalkEntriesPerStep directory entries, one conversation
+//    listing (names only), or up to kReadsPerStep header-only reads, ending
+//    early once kStepBudgetMs is spent. It runs once after boot (once a
+//    group is connected, as the earlier scan did), and again after a change made outside
+//    the store (MessageStore::getExternalMutationCount()); a pass that could
+//    not read everything is repeated after kRetryMs. Nothing is skipped
+//    silently.
+//  - a record written pending later is queued at once
+//    (MessageStore::setOnPendingWrittenCallback()): a send never causes a
+//    scan.
+//  - queued records are published one per step while their group is
+//    connected (retried after kRetryMs otherwise); the pending flag is
+//    cleared on success, as before.
+// The queue and the pass state live on the heap while in use. A record
+// that does not fit the queue stays pending on flash and is found again by
+// the next pass.
+constexpr uint32_t kStepMs = 25;
+constexpr uint32_t kStepBudgetMs = 20;
+constexpr uint8_t kWalkEntriesPerStep = 16;
+constexpr uint8_t kReadsPerStep = 4;
+constexpr uint8_t kQueueSize = 16;
+constexpr uint32_t kRetryMs = 5000;
 
-// Hardware Diagnostic #4.9h, corrected by #4.9u: caches "the last
-// COMPLETE scan found ZERO pending messages, and nothing has changed
-// since that could have affected that answer" so repeated empty scans
-// (hardware evidence: ~1575-1577ms each, blocking the main loop every
-// kScanIntervalMs with nothing to actually send) can be skipped entirely
-// instead of re-walking and re-decoding every stored message on every
-// tick. Starts INVALID on every boot -- the first scan after boot always
-// runs for real; this only removes the redundant repeats of an
-// already-known answer. Reuse is keyed on MessageStore's SEPARATE
-// Outbox-change generation (getOutboxChangeGeneration()), not the general
-// storage-change generation -- #4.9u deliberately does not bump the
-// Outbox generation for a successful write that was never pending, so a
-// stream of ordinary (non-pending) message appends no longer invalidates
-// this cache the way it used to, while any append/flag-change/deletion
-// that DOES affect pending status still does. See scanAndFlush() for
-// exactly how this is established/invalidated, and serviceTick() for the
-// only place it's consulted to skip work (tryFlushNow() never skips -- an
-// explicit manual flush request always performs a real scan).
-bool g_emptyScanCacheValid = false;
-uint32_t g_emptyScanCacheGeneration = 0;
+struct Queue {
+  MessageRef refs[kQueueSize];
+  uint8_t count;
+};
+Queue* g_queue = nullptr;
+bool g_queueOverflowed = false;  // something pending was not queued: another pass finds it
+uint32_t g_publishRetryAtMs = 0;
 
-bool isPendingPredicate(const MessageStore::StoredHeader& header, const PacketCodec::MessageEnvelope& envelope,
-                        void* ctx) {
-  (void)envelope;
-  (void)ctx;
-  return (header.flags & MessageStore::FLAG_PENDING_OUTBOX) != 0;
+struct Pass {
+  MessageStore::ConversationWalk* walk;
+  char group[PacketCodec::kGroupCodeLen];
+  char contact[MessageStore::kContactKeyLen];
+  bool haveConversation;
+  bool listed;
+  bool incomplete;
+  uint16_t n, pos;
+  uint32_t externalAtStart;
+  uint32_t startMs, busyMs;
+  uint16_t records, found;
+  uint32_t seqs[MessageStore::kMaxMessagesPerThread];
+};
+Pass* g_pass = nullptr;
+bool g_passDone = false;          // a complete pass ran since boot (and since the last external change)
+uint32_t g_externalSeen = 0;      // getExternalMutationCount() a complete pass covered
+uint32_t g_passAgainAtMs = 0;     // after an incomplete pass, or an overflowed queue
+bool g_passAgain = false;
+uint32_t g_nextStepMs = 0;
+
+bool sameRef(const MessageRef& a, const MessageRef& b) {
+  return a.sequence == b.sequence && strcmp(a.contact_key, b.contact_key) == 0 && strcmp(a.group_code, b.group_code) == 0;
 }
 
-// Hardware Diagnostic #4.9e Part B3, extended by #4.9h: instrumentation
-// only in the scan/publish/flush timings themselves -- no change to their
-// behavior. A QoS1 MqttManager::publishBinary() can synchronously wait
-// for the broker's PUBACK within the MQTT command timeout (Part C: do not
-// assume publish/subscribe are non-blocking), and this loop can run that
-// wait up to kMaxBatch (32) times in a row for one call, so per-publish +
-// whole-flush timing shows whether that's actually happening on hardware.
-//
-// #4.9h also establishes/invalidates the empty-scan cache here, in the
-// one place an actual scan happens, so serviceTick() and tryFlushNow()
-// (both call this) can never disagree about what a real scan found.
-void scanAndFlush() {
-  // Snapshot BOTH generations BEFORE scanning: only if neither moves
-  // between here and the scan's completion is a zero-result scan safe to
-  // trust as "still true" going forward. Hardware Diagnostic #4.9u: the
-  // general storage generation is kept as a check (do not weaken scan
-  // reliability -- any mutation during the scan window still refuses to
-  // cache, even one that would not itself have affected pending status),
-  // and the Outbox generation is ADDED as the one actually stored/compared
-  // for reuse below and in serviceTick().
-  uint32_t generationBefore = MessageStore::getStorageChangeGeneration();
-  uint32_t outboxGenerationBefore = MessageStore::getOutboxChangeGeneration();
-
-  uint32_t flushStart = millis();
-
-  MessageRef refs[kMaxBatch];
-  uint32_t scanStart = millis();
-  // Hardware Diagnostic #4.9h follow-up: conservatively initialized false
-  // before the call, matching findMessagesByPredicate()'s own "initialize
-  // conservatively" guarantee -- only that call setting it true means the
-  // scan (including a zero result) can be trusted as complete.
-  bool scanReliable = false;
-  uint16_t n = MessageStore::findMessagesByPredicate(nullptr, nullptr, isPendingPredicate, nullptr, refs, kMaxBatch,
-                                                      &scanReliable);
-  uint32_t scanElapsed = millis() - scanStart;
-  if (scanElapsed >= 20) {
-    Serial.printf("[PERF][OUTBOX] scan %lu ms found=%u\n", static_cast<unsigned long>(scanElapsed),
-                  static_cast<unsigned>(n));
-  }
-  // n is findMessagesByPredicate()'s TRUE total match count across every
-  // conversation -- it keeps counting past outRefsCapacity (kMaxBatch)
-  // rather than capping there (see its own header comment) -- so `n == 0`
-  // below means "genuinely nothing pending anywhere," never "the first
-  // kMaxBatch happened to be empty" while more exist beyond the batch.
-  uint16_t limit = (n < kMaxBatch) ? n : kMaxBatch;
-
-  for (uint16_t i = 0; i < limit; i++) {
-    if (!MqttManager::isGroupConnected(refs[i].group_code)) continue;  // still offline; retry later
-
-    StoredMessageView view;
-    if (!MessageStore::loadMessage(refs[i], &view)) continue;
-
-    char suffixBuf[24];
-    const char* suffix;
-    if (strcmp(refs[i].contact_key, MessageStore::kEveryone) == 0) {
-      suffix = "broadcast";
-    } else {
-      snprintf(suffixBuf, sizeof(suffixBuf), "msg/%s", refs[i].contact_key);
-      suffix = suffixBuf;
+void enqueue(const MessageRef& ref) {
+  if (g_queue == nullptr) {
+    g_queue = new (std::nothrow) Queue;
+    if (g_queue == nullptr) {
+      g_queueOverflowed = true;
+      return;
     }
-
-    uint32_t publishStart = millis();
-    bool ok = MqttManager::publishBinary(refs[i].group_code, suffix, view.wirePacket, view.wirePacketLen,
-                                         /*retained=*/false, /*qos=*/1);
-    uint32_t publishElapsed = millis() - publishStart;
-    if (publishElapsed >= 20) {
-      Serial.printf("[PERF][OUTBOX] publish %lu ms group=%s ok=%d\n", static_cast<unsigned long>(publishElapsed),
-                    refs[i].group_code, ok ? 1 : 0);
-    }
-    if (ok) {
-      // Hardware Diagnostic #4.9h follow-up: correcting an earlier,
-      // inaccurate claim here -- atomicRewrite() does NOT guarantee the
-      // flag "stays set on disk" if this call fails; it removes the
-      // existing final file before renaming the new one into place, so a
-      // failure partway through can leave the record's on-disk state
-      // genuinely uncertain (unchanged, gone, or a partial write), not
-      // simply "still pending." What IS guaranteed is that atomicRewrite()
-      // bumps the storage generation unconditionally before attempting
-      // this, whether it succeeds or fails, so the empty-scan cache below
-      // is never left trusting a stale answer regardless of the outcome --
-      // see storage_messages.cpp's atomicRewrite()/g_storageChangeGeneration
-      // comments for that invariant, which this file does not alter.
-      MessageStore::updateLocalFlags(refs[i], 0, MessageStore::FLAG_PENDING_OUTBOX);
-    }
+    g_queue->count = 0;
   }
-
-  uint32_t flushElapsed = millis() - flushStart;
-  if (flushElapsed >= 20) {
-    Serial.printf("[PERF][OUTBOX] flush %lu ms attempted=%u\n", static_cast<unsigned long>(flushElapsed),
-                  static_cast<unsigned>(limit));
+  for (uint8_t i = 0; i < g_queue->count; i++) {
+    if (sameRef(g_queue->refs[i], ref)) return;
   }
+  if (g_queue->count >= kQueueSize) {
+    g_queueOverflowed = true;
+    return;
+  }
+  g_queue->refs[g_queue->count++] = ref;
+}
 
-  // Hardware Diagnostic #4.9h, corrected by the #4.9h follow-up and #4.9u:
-  // only a scan that found ZERO matches AND was itself reliable (no
-  // detected directory-open or record-load/decode failure -- see
-  // findMessagesByPredicate()'s outScanReliable) AND saw BOTH generations
-  // unchanged across its own duration may establish the empty-scan cache.
-  // A zero result from an UNRELIABLE scan (a transient read/open failure
-  // hid a record rather than one genuinely not existing) must NOT be
-  // cached -- caching it would hide a pending message until some
-  // unrelated mutation or a reboot instead of being retried on the next
-  // scheduled scan. The general storage generation is still checked here
-  // (unweakened) even though this scan already succeeded at publishing
-  // and clearing flags for everything it found: if a mutation happened
-  // during the scan window that this cache-establishment logic cannot
-  // itself distinguish as harmless, it conservatively refuses to cache
-  // rather than assume. Every other outcome (n != 0, scanReliable ==
-  // false, or either generation moved for any reason) conservatively
-  // marks the cache invalid rather than leaving it ambiguous, so a later
-  // real change -- or a later successful retry of a failed scan -- can
-  // never be masked by a stale "empty" belief. The OUTBOX generation
-  // (not the general one) is what gets stored, since that is what
-  // serviceTick() below compares against for reuse.
-  uint32_t generationAfter = MessageStore::getStorageChangeGeneration();
-  uint32_t outboxGenerationAfter = MessageStore::getOutboxChangeGeneration();
-  if (n == 0 && scanReliable && generationAfter == generationBefore &&
-      outboxGenerationAfter == outboxGenerationBefore) {
-    g_emptyScanCacheValid = true;
-    g_emptyScanCacheGeneration = outboxGenerationAfter;
+void dropFront() {
+  for (uint8_t i = 1; i < g_queue->count; i++) g_queue->refs[i - 1] = g_queue->refs[i];
+  g_queue->count--;
+  if (g_queue->count == 0) {
+    delete g_queue;
+    g_queue = nullptr;
+  }
+}
+
+void onPendingWritten(const MessageRef& ref) { enqueue(ref); }
+
+// Publishes the oldest queued record if its group is connected. True if
+// this step did storage or network work.
+bool publishStep() {
+  if (g_queue == nullptr) return false;
+  if (static_cast<int32_t>(millis() - g_publishRetryAtMs) < 0) return false;
+  MessageRef ref = g_queue->refs[0];
+  if (!MqttManager::isGroupConnected(ref.group_code)) {
+    // Still offline: the rest of the queue first, this one later.
+    if (g_queue->count > 1) {
+      dropFront();
+      enqueue(ref);
+    }
+    g_publishRetryAtMs = millis() + kRetryMs;
+    return false;
+  }
+  StoredMessageView view;
+  if (!MessageStore::loadMessage(ref, &view) || !(view.header.flags & MessageStore::FLAG_PENDING_OUTBOX)) {
+    dropFront();  // gone, or already published
+    return true;
+  }
+  const char* suffix;
+  char suffixBuf[24];
+  if (strcmp(ref.contact_key, MessageStore::kEveryone) == 0) {
+    suffix = "broadcast";
   } else {
-    g_emptyScanCacheValid = false;
+    snprintf(suffixBuf, sizeof(suffixBuf), "msg/%s", ref.contact_key);
+    suffix = suffixBuf;
   }
+  uint32_t publishStart = millis();
+  bool ok = MqttManager::publishBinary(ref.group_code, suffix, view.wirePacket, view.wirePacketLen,
+                                       /*retained=*/false, /*qos=*/1);
+  uint32_t publishElapsed = millis() - publishStart;
+  if (publishElapsed >= 20) {
+    Serial.printf("[PERF][OUTBOX] publish %lu ms group=%s ok=%d\n", static_cast<unsigned long>(publishElapsed),
+                  ref.group_code, ok ? 1 : 0);
+  }
+  if (!ok) {
+    g_publishRetryAtMs = millis() + kRetryMs;
+    return true;
+  }
+  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);
+  dropFront();
+  return true;
 }
+
+void endPass() {
+  uint32_t external = MessageStore::getExternalMutationCount();
+  bool complete = !g_pass->incomplete && external == g_pass->externalAtStart;
+  uint32_t wallMs = millis() - g_pass->startMs;
+  if (g_pass->busyMs >= 20 || wallMs >= 20) {
+    Serial.printf("[PERF][OUTBOX] pass wall=%lu ms busy=%lu ms records=%u found=%u complete=%d\n",
+                  static_cast<unsigned long>(wallMs), static_cast<unsigned long>(g_pass->busyMs),
+                  static_cast<unsigned>(g_pass->records), static_cast<unsigned>(g_pass->found), complete ? 1 : 0);
+  }
+  MessageStore::endConversationWalk(g_pass->walk);
+  if (complete) {
+    g_passDone = true;
+    g_externalSeen = g_pass->externalAtStart;
+  } else {
+    g_passAgain = true;
+    g_passAgainAtMs = millis() + kRetryMs;
+  }
+  delete g_pass;
+  g_pass = nullptr;
+}
+
+void startPass() {
+  g_pass = new (std::nothrow) Pass;
+  if (g_pass == nullptr) return;  // tried again at the next step
+  memset(g_pass, 0, sizeof(Pass));
+  g_pass->externalAtStart = MessageStore::getExternalMutationCount();
+  g_pass->startMs = millis();
+  g_pass->walk = MessageStore::beginConversationWalk();
+  if (g_pass->walk == nullptr) g_pass->incomplete = true;
+  g_passAgain = false;
+  if (g_queueOverflowed) g_queueOverflowed = false;  // this pass finds what did not fit
+}
+
+// One bounded step of the pass.
+void passStep() {
+  uint32_t stepStart = millis();
+  Pass& p = *g_pass;
+  if (p.walk == nullptr) {
+    endPass();
+    return;
+  }
+  if (!p.haveConversation) {
+    MessageStore::WalkResult r = MessageStore::stepConversationWalk(p.walk, kWalkEntriesPerStep, p.group, sizeof(p.group),
+                                                                    p.contact, sizeof(p.contact));
+    if (r == MessageStore::WalkResult::FOUND) {
+      p.haveConversation = true;
+      p.listed = false;
+    } else if (r != MessageStore::WalkResult::MORE) {
+      if (r == MessageStore::WalkResult::FAILED) p.incomplete = true;
+      p.busyMs += millis() - stepStart;
+      endPass();
+      return;
+    }
+  } else if (!p.listed) {
+    bool reliable = false;
+    p.n = MessageStore::listMessageSequences(p.group, p.contact, p.seqs, MessageStore::kMaxMessagesPerThread, &reliable);
+    if (!reliable) p.incomplete = true;  // what was listed is still checked
+    p.pos = 0;
+    p.listed = true;
+  } else {
+    MessageRef ref;
+    strncpy(ref.group_code, p.group, sizeof(ref.group_code) - 1);
+    ref.group_code[sizeof(ref.group_code) - 1] = '\0';
+    strncpy(ref.contact_key, p.contact, sizeof(ref.contact_key) - 1);
+    ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
+    for (uint8_t k = 0; k < kReadsPerStep && p.pos < p.n; k++) {
+      if (k > 0 && millis() - stepStart >= kStepBudgetMs) break;
+      ref.sequence = p.seqs[p.pos++];
+      MessageStore::StoredHeader hdr;
+      if (!MessageStore::readMessageHeader(ref, &hdr)) {
+        p.incomplete = true;  // unreadable (or removed since the listing): the next pass looks again
+        continue;
+      }
+      p.records++;
+      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {
+        p.found++;
+        enqueue(ref);
+      }
+    }
+    if (p.pos >= p.n) p.haveConversation = false;
+  }
+  p.busyMs += millis() - stepStart;
+}
+
+void serviceInit() { MessageStore::setOnPendingWrittenCallback(onPendingWritten); }
 
 void serviceTick() {
   uint32_t now = millis();
-  if (now - g_lastScanMs < kScanIntervalMs) return;
-  g_lastScanMs = now;
-  if (!MqttManager::isAnyGroupConnected()) return;
-
-  // Hardware Diagnostic #4.9h, corrected by #4.9u: skip the expensive
-  // scan+decode work only when a previous COMPLETE scan already found
-  // zero pending messages and nothing has changed since that could have
-  // affected that answer -- this removes the repeated ~1575ms empty scan
-  // the hardware evidence showed happening every kScanIntervalMs with
-  // nothing to actually send, without touching the 5000ms cadence itself
-  // (g_lastScanMs above is updated exactly as before, on every eligible
-  // tick, whether this ends up skipping or not). Reuse is keyed on
-  // MessageStore's Outbox-change generation, NOT the general
-  // storage-change generation: a tick following a pending append, a flag
-  // change, an eviction, a deletion, or a failed write still always runs
-  // for real, since each of those bumps the Outbox generation too -- but
-  // a tick following only ordinary (non-pending) successful message
-  // writes since the cache was established can now be skipped, since
-  // #4.9u's atomicRewrite() deliberately does not bump the Outbox
-  // generation for that case. The very first scan after boot is never
-  // skipped (g_emptyScanCacheValid starts false).
-  if (g_emptyScanCacheValid && MessageStore::getOutboxChangeGeneration() == g_emptyScanCacheGeneration) {
-    return;
+  if (static_cast<int32_t>(now - g_nextStepMs) < 0) return;
+  g_nextStepMs = now + kStepMs;
+  if (publishStep()) return;
+  if (MessageStore::chatIndexLoading()) return;  // a chat loading its index goes first (as in Notifications)
+  if (g_pass == nullptr) {
+    bool externalChange = MessageStore::getExternalMutationCount() != g_externalSeen;
+    bool due = !g_passDone || externalChange || g_queueOverflowed ||
+               (g_passAgain && static_cast<int32_t>(now - g_passAgainAtMs) >= 0);
+    // As before: storage is looked through only once a group is connected
+    // (nothing could be published before).
+    if (!due || !MqttManager::isAnyGroupConnected()) return;
+    startPass();
+    if (g_pass == nullptr) return;
   }
-
-  scanAndFlush();
+  passStep();
 }
 
 struct Registrar {
   Registrar() {
     AppService svc;
-    svc.init = nullptr;
+    svc.init = serviceInit;
     svc.tick = serviceTick;
     registerAppService(svc);
   }
@@ -210,12 +267,13 @@ Registrar g_registrar;
 
 }  // namespace
 
-// Hardware Diagnostic #4.9h: always performs a real scan -- deliberately
-// bypasses the empty-scan cache serviceTick() consults, since an explicit
-// manual flush request should never be silently skipped by a possibly
-// stale-feeling cache. scanAndFlush() still updates that cache correctly
-// at the end (same bookkeeping either caller reaches it through), so this
-// never leaves the cache in a state serviceTick() would misread.
-void tryFlushNow() { scanAndFlush(); }
+// Publishes what is queued now (each record once), without waiting for the
+// service's steps.
+void tryFlushNow() {
+  for (uint8_t i = 0; g_queue != nullptr && i < kQueueSize; i++) {
+    g_publishRetryAtMs = 0;
+    if (!publishStep()) break;
+  }
+}
 
 }  // namespace Outbox

@@ -1,8 +1,10 @@
 #pragma once
 // Local Outbox retry (Addendum section 7.9, Phase 2 section 8). Registers
-// its own AppService; scans for PENDING_OUTBOX records and republishes
-// them once the owning group is connected, clearing the flag atomically
-// on success.
+// its own AppService: a record written pending is queued directly, and an
+// incremental pass of header-only reads (once per boot after connecting,
+// and after a change made outside the store) finds the ones left pending on
+// flash. Queued records are republished once the owning group is
+// connected, the flag cleared on success.
 
 namespace Outbox {
 

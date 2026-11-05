@@ -188,12 +188,13 @@ bool chatIndexLoading();
 // hands them to the index instead of the chat reading them again. Begins a
 // feed of the listed sequences (in this order); false if none was begun
 // (unreliable listing, or that conversation's index is already current).
-// When a chat holds the shared index, the feed builds the parked index.
+// When a chat holds the shared index (sharedInUse: a chat is open, and
+// draws from it), the feed builds the parked index.
 // A record that could not be read is fed with hdr == nullptr (the index is
 // then not cached). A record fed out of order, or a mutation of that
 // conversation meanwhile, drops the feed.
 bool beginIndexFeed(const char* group_code, const char* contact_key, const uint32_t* seqs, uint16_t n,
-                    bool listingReliable);
+                    bool listingReliable, bool sharedInUse);
 void feedIndexRecord(const char* group_code, const char* contact_key, uint32_t seq, const StoredHeader* hdr,
                      const char* message_id);
 
@@ -231,6 +232,9 @@ void endConversationWalk(ConversationWalk* walk);
 // Used by Notifications to read a conversation a few records at a time.
 uint16_t listMessageSequences(const char* group_code, const char* contact_key, uint32_t* outSeqs, uint16_t capacity,
                               bool* outReliable, bool* outTruncated = nullptr);
+
+// True if the conversation's directory exists (one directory open).
+bool conversationExists(const char* group_code, const char* contact_key);
 
 // Deletes one stored record. No eviction callback: the caller accounts for
 // it. False if it could not be removed.

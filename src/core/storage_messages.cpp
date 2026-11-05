@@ -1832,11 +1832,12 @@ void feedParkedRecord(uint32_t seq, const StoredHeader* hdr, const char* message
 }  // namespace
 
 bool beginIndexFeed(const char* group_code, const char* contact_key, const uint32_t* seqs, uint16_t n,
-                    bool listingReliable) {
-  // Into the shared index only when it holds nothing current and no chat is
-  // loading it; otherwise into the parked one.
+                    bool listingReliable, bool sharedInUse) {
+  // Into the shared index only when no chat draws from it, it holds nothing
+  // current and no chat is loading it; otherwise into the parked one.
   uint32_t now = getStorageChangeGeneration();
-  if ((g_indexCacheValid && g_indexCacheGeneration == now) || (g_loader.active && !g_loader.fed && g_loader.generation == now)) {
+  if (sharedInUse || (g_indexCacheValid && g_indexCacheGeneration == now) ||
+      (g_loader.active && !g_loader.fed && g_loader.generation == now)) {
     if (isIndexTarget(group_code, contact_key)) return false;  // that conversation is already the shared index
     return beginParkedFeed(group_code, contact_key, seqs, n, listingReliable);
   }
@@ -1927,6 +1928,15 @@ uint16_t listMessageSequences(const char* group_code, const char* contact_key, u
   if (outReliable != nullptr) *outReliable = !openFailed && !truncated;
   if (outTruncated != nullptr) *outTruncated = truncated;
   return n;
+}
+
+bool conversationExists(const char* group_code, const char* contact_key) {
+  char dirPath[80];
+  buildConversationDir(group_code, contact_key, dirPath, sizeof(dirPath));
+  File dir = LittleFS.open(dirPath);
+  bool exists = dir && dir.isDirectory();
+  if (dir) dir.close();
+  return exists;
 }
 
 bool deleteMessage(const MessageRef& ref) {

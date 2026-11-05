@@ -63,6 +63,10 @@ void update();
 // generated this tick. Returns false (type NONE) when the queue is empty.
 bool popEvent(InputEvent& outEvent);
 
+// True if an event of this type is queued (not popped yet). Lets a screen
+// see a Back waiting behind other input.
+bool hasQueuedEvent(InputEventType type);
+
 // True if `e` is a general-navigation confirm: DOT/DASH released before the
 // 2000ms special-command threshold (Addendum section 9.3).
 bool isMenuConfirm(const InputEvent& e);

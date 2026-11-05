@@ -201,8 +201,15 @@ static void back() {
   T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
   loopPass(3);
 }
-static void openText(const char* contact) { TextMessage::navigateToChatDirect(kG, contact); loopPass(3); }
-static void openEnigma(const char* contact) { Enigma::navigateToChatDirect(kG, contact); loopPass(3); }
+// Opens a chat and waits until it is drawn (its index may load over several
+// passes; input given while "Loading messages..." shows is held).
+static void waitChatDrawn() {
+  loopPass(3);
+  for (int i = 0; i < 3000 && T::visibleJoined().find("Loading messages") != std::string::npos; i++) loopPass();
+  loopPass();
+}
+static void openText(const char* contact) { TextMessage::navigateToChatDirect(kG, contact); waitChatDrawn(); }
+static void openEnigma(const char* contact) { Enigma::navigateToChatDirect(kG, contact); waitChatDrawn(); }
 
 static void menuStub() {}
 static void powerOn() {  // first boot of a test: empty NVS unless the test wrote some
@@ -483,6 +490,7 @@ int main(int argc, char** argv) {
   // ---- retention: the latest 100 per conversation (approved reduction from 300) ----
   g_test = "ST15 legacy 300-record conversation trimmed in the background to the latest 100; pending outbox kept; contents kept";
   freshDevice();
+  T::connected = false;  // offline: the Outbox would publish the pending records (and rewrite their flags)
   {
     std::vector<MessageRef> pending;
     for (int i = 0; i < 300; i++) {
@@ -509,6 +517,7 @@ int main(int argc, char** argv) {
     CHECK(g_svcMax.opens <= 8 && g_svcMax.removes <= 1, "per pass: opens %llu removes %llu", (unsigned long long)g_svcMax.opens,
           (unsigned long long)g_svcMax.removes);
   }
+  T::connected = true;
 
   g_test = "ST16 trimming interrupted by a reboot resumes and ends with exactly the latest 100";
   freshDevice();

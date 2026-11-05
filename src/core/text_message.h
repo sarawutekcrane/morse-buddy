@@ -36,6 +36,9 @@ bool registerIncomingMessageHandler(uint8_t messageType, IncomingMessageHandlerF
 void setOpenConversation(const char* group_code, const char* contact_key);
 void clearOpenConversation();
 bool isConversationOpen(const char* group_code, const char* contact_key);
+// True while any chat (Text, Enigma or Friend) is open: it draws from the
+// shared conversation index (MessageStore::beginIndexFeed()).
+bool isAnyConversationOpen();
 
 // Used by Number Guessing's post-challenge-send quick-switch ("Text: direct
 // Chat same contact" — Phase 3 section 11). Resets the navigation stack and

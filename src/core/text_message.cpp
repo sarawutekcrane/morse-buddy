@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "core/display.h"
+#include "core/held_input.h"
 #include "core/hooks.h"
 #include "core/identity.h"
 #include "core/identity_color.h"
@@ -96,10 +97,40 @@ uint16_t g_indexTotal = 0;
 
 void markIndexDirty() { g_indexDirty = true; }
 
+// Chat-entry latency (device A on 2ed04b6: the broadcast chat took about
+// 4.4 s to open, all of it reading the index in one pass): the index is
+// stepped once per main-loop pass, a few records at most
+// (MessageStore::stepConversationIndex(), time-budgeted). Until it is
+// complete the chat shows "Loading messages..." (or keeps the history it
+// already drew this visit), holds its input in order (g_heldInput) and
+// replays it once the index is ready. Back leaves at once.
+constexpr uint8_t kIndexReadsPerPass = 4;
+HeldInput g_heldInput;
+bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
+bool g_chatDrawnThisVisit = false;
+
 void refreshIndexIfNeeded() {
+  if (!g_indexDirty) return;
+  uint16_t count = 0;
+  if (MessageStore::stepConversationIndex(g_selectedGroupCode, g_selectedContactKey, kIndexReadsPerPass, &count, nullptr,
+                                          nullptr)) {
+    g_indexTotal = count;
+    g_indexDirty = false;
+  }
+}
+
+// The index, complete now (in this pass): for input that cannot wait.
+void completeIndexNow() {
   if (!g_indexDirty) return;
   g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
   g_indexDirty = false;
+}
+
+void drawChatLoading() {
+  Display::setFont(Display::Font::PRIMARY);
+  Display::clearContentArea();
+  Display::printLine(static_cast<int16_t>(2 + Display::kCursorCellWidth), Display::kStatusBarHeight + 2,
+                     "Loading messages...");
 }
 
 // =============================================================================
@@ -491,7 +522,7 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out, bool* o
   if (entry != nullptr) {
     MessageRef ref = refForIndexEntry(*entry);
     StoredMessageView view;
-    if (MessageStore::loadMessage(ref, &view)) {
+    if (MessageStore::loadMessageForDisplay(ref, &view)) {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
       if (renderFn != nullptr) {
         renderFn(view, scratch, kHistoryLineBufCap);
@@ -1448,6 +1479,9 @@ void screenChatTick() {
     g_chatViewportCacheValid = false;
     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
     g_readCheckDone = false;  // a selection after (re)entry is checked afresh
+    g_heldInput.clear();
+    g_chatLoadingShown = false;
+    g_chatDrawnThisVisit = false;
   }
 
   // Phase 2B-2: a timed outcome expires only after it was actually drawn.
@@ -1461,11 +1495,100 @@ void screenChatTick() {
   // depends on the active font (Hardware Fix #4.4 issue C).
   Display::setFont(Display::Font::PRIMARY);
 
+  // One step of the index load (nothing when it is current).
+  bool topReloaded = false;
+  if (g_indexDirty) {
+    uint32_t topRefreshStart = millis();
+    refreshIndexIfNeeded();
+    indexRefreshElapsed += millis() - topRefreshStart;
+    indexReloadOccurred = true;
+    topReloaded = !g_indexDirty;
+  }
   Input::update();
+  // An event that could not be held while loading: processed first, live.
+  InputEvent unheld;
+  bool haveUnheld = false;
+  if (g_indexDirty) {
+    // Still loading: input is held in order; Back leaves at once (what was
+    // held is dropped with it, as leaving would have dropped it).
+    InputEvent q;
+    while (Input::popEvent(q)) {
+      if (q.type == InputEventType::ENCODER_LONG) {
+        g_heldInput.clear();
+        g_chatIsOpen = false;
+        Menu::goBack();
+        emitChatScreenPerf("loading-back");
+        return;
+      }
+      if (!g_heldInput.hold(q)) {
+        // Full, or no memory: the index is completed in this pass instead
+        // (one blocking load), and this event and the rest go live.
+        uint32_t completeStart = millis();
+        completeIndexNow();
+        indexRefreshElapsed += millis() - completeStart;
+        unheld = q;
+        haveUnheld = true;
+        break;
+      }
+    }
+    if (g_indexDirty) {
+      Display::drawStatusBar();
+      if (!g_chatDrawnThisVisit && !g_chatLoadingShown) {
+        drawChatLoading();
+        g_chatLoadingShown = true;
+      }
+      emitChatScreenPerf("loading");
+      return;
+    }
+  }
+  if (g_chatLoadingShown) {
+    g_chatLoadingShown = false;
+    g_chatNeedsFullRedraw = true;
+    g_chatRenderDirty = true;
+  }
+  // Held input first (in order), then the one that could not be held, then
+  // what arrived since. Every event goes through isReplayedSend() at
+  // dispatch, held or not, so a Short replayed from a Send window is
+  // dropped either way.
+  auto nextEvent = [&](InputEvent& out, bool* fromHeld) -> bool {
+    *fromHeld = false;
+    if (g_heldInput.pop(out)) {
+      *fromHeld = true;
+      return true;
+    }
+    if (haveUnheld) {
+      haveUnheld = false;
+      out = unheld;
+      return true;
+    }
+    return Input::popEvent(out);
+  };
+  // A Back already queued: the history-side events before it are not worth
+  // the reads they would cost (rotations would load and measure rows the
+  // user is leaving); from the first such event on, nothing before the Back
+  // is handled. Compose-side input before it (keys, a Send) still is.
+  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||
+                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG) ||
+                    (haveUnheld && unheld.type == InputEventType::ENCODER_LONG);
+  bool droppingBeforeBack = false;
   InputEvent e;
   bool hadEvent = false;
-  while (Input::popEvent(e)) {
+  bool fromHeld = false;
+  while (nextEvent(e, &fromHeld)) {
     if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window
+    if (backQueued && e.type != InputEventType::ENCODER_LONG &&
+        (droppingBeforeBack || e.type == InputEventType::ENCODER_ROTATE || g_historyCursor != kNoHistoryCursor)) {
+      droppingBeforeBack = true;
+      continue;
+    }
+    // Something in this batch made the index stale (a Send, a deletion):
+    // it is completed before the next event uses it.
+    if (g_indexDirty) {
+      uint32_t midRefreshStart = millis();
+      completeIndexNow();
+      indexRefreshElapsed += millis() - midRefreshStart;
+      indexReloadOccurred = true;
+    }
     hadEvent = true;
     if (g_sendStatus != nullptr &&
         (e.type == InputEventType::DOT_PRESS_START || e.type == InputEventType::ENCODER_SHORT) &&
@@ -1480,7 +1603,7 @@ void screenChatTick() {
     if (e.type == InputEventType::ENCODER_ROTATE) {
       bool rotateRefreshWasDirty = g_indexDirty;
       uint32_t rotateRefreshStart = millis();
-      refreshIndexIfNeeded();
+      completeIndexNow();
       indexRefreshElapsed += millis() - rotateRefreshStart;
       if (rotateRefreshWasDirty) indexReloadOccurred = true;
       // Hardware Fix #4.4 issue C: a logical message can span more visual
@@ -1525,9 +1648,21 @@ void screenChatTick() {
     // and leaving it again within the same batch (e.g. two ENCODER_ROTATE
     // events in one tick), which a single end-of-loop check would miss.
     if (g_historyCursor != kNoHistoryCursor) historyFocusTouchedThisPass = true;
+    if (!g_chatIsOpen) break;  // left (Back): the rest is not this chat's
+  }
+  (void)fromHeld;
+  g_heldInput.releaseIfEmpty();
+  if (!g_chatIsOpen) {
+    // Left: what was still queued behind the Back is dropped, as the chat
+    // that would have handled it is gone.
+    g_heldInput.clear();
+    InputEvent rest;
+    while (Input::popEvent(rest)) {
+    }
+    emitChatScreenPerf("left");
+    return;
   }
   if (hadEvent) g_chatRenderDirty = true;
-  markSelectedHistoryRead();
 
   // Word-boundary resolution is no longer a per-tick check (Hardware Fix
   // #4.1): it only happens at the next DOT_PRESS_START, in
@@ -1551,14 +1686,15 @@ void screenChatTick() {
     }
   }
 
-  bool wasIndexDirty = g_indexDirty;
+  bool wasIndexDirty = g_indexDirty || topReloaded;
   uint32_t finalRefreshStart = millis();
-  refreshIndexIfNeeded();
+  completeIndexNow();
   indexRefreshElapsed += millis() - finalRefreshStart;
   if (wasIndexDirty) {
     g_chatRenderDirty = true;  // index actually reloaded: content may have changed
     indexReloadOccurred = true;
   }
+  markSelectedHistoryRead();  // against the complete index
 
   Display::drawStatusBar();
   if (!g_chatRenderDirty) {
@@ -1863,6 +1999,7 @@ void screenChatTick() {
       }
     }
     g_chatNeedsFullRedraw = false;
+    g_chatDrawnThisVisit = true;  // a later reload keeps this on screen instead of "Loading messages..."
   } else if (selectionOnlyChanged && viewportLines > 0) {
     // Guarded on viewportLines > 0 so a focused message never gets its
     // cursor marker drawn into the compose region below just because the
@@ -2176,6 +2313,7 @@ void setOpenConversation(const char* group_code, const char* contact_key) {
 }
 void clearOpenConversation() { clearOpenConversationImpl(); }
 bool isConversationOpen(const char* group_code, const char* contact_key) { return isChatOpenFor(group_code, contact_key); }
+bool isAnyConversationOpen() { return g_chatIsOpen; }
 void navigateToChatDirect(const char* group_code, const char* contact_key) {
   navigateToChatDirectImpl(group_code, contact_key);
 }

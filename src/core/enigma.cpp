@@ -6,6 +6,7 @@
 #include "core/display.h"
 #include "core/enigma_crypto.h"
 #include "core/enigma_keys.h"
+#include "core/held_input.h"
 #include "core/hooks.h"
 #include "core/identity.h"
 #include "core/identity_color.h"
@@ -902,10 +903,36 @@ bool g_indexDirty = true;
 uint16_t g_indexTotal = 0;
 
 void markIndexDirty() { g_indexDirty = true; }
+
+// Chat-entry latency: the same stepped index load, held input and prompt
+// Back as text_message.cpp's chat (see its refreshIndexIfNeeded()).
+constexpr uint8_t kIndexReadsPerPass = 4;
+HeldInput g_heldInput;
+bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
+bool g_chatDrawnThisVisit = false;
+
 void refreshIndexIfNeeded() {
+  if (!g_indexDirty) return;
+  uint16_t count = 0;
+  if (MessageStore::stepConversationIndex(g_selectedGroupCode, g_selectedContactKey, kIndexReadsPerPass, &count, nullptr,
+                                          nullptr)) {
+    g_indexTotal = count;
+    g_indexDirty = false;
+  }
+}
+
+// The index, complete now (in this pass): for input that cannot wait.
+void completeIndexNow() {
   if (!g_indexDirty) return;
   g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
   g_indexDirty = false;
+}
+
+void drawEnigmaChatLoading() {
+  Display::setFont(Display::Font::PRIMARY);
+  Display::clearContentArea();
+  Display::printLine(static_cast<int16_t>(2 + Display::kCursorCellWidth), Display::kStatusBarHeight + 2,
+                     "Loading messages...");
 }
 
 // True while the pattern currently being keyed (g_composePattern) is known
@@ -1059,7 +1086,7 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   if (entry != nullptr) {
     MessageRef ref = refForIndexEntry(*entry);
     StoredMessageView view;
-    if (MessageStore::loadMessage(ref, &view)) {
+    if (MessageStore::loadMessageForDisplay(ref, &view)) {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
       if (renderFn != nullptr) renderFn(view, out->lineBuf, sizeof(out->lineBuf));
       MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
@@ -1781,6 +1808,9 @@ void screenEnigmaChatTick() {
     markIndexDirty();
     g_enigmaChatDirty = true;
     g_enigmaChatNeedsFullRedraw = true;
+    g_heldInput.clear();
+    g_chatLoadingShown = false;
+    g_chatDrawnThisVisit = false;
   }
 
   // Needed before input handling below: deciding how far ENCODER_ROTATE can
@@ -1796,11 +1826,72 @@ void screenEnigmaChatTick() {
     clearSendStatus();
   }
 
+  // One step of the index load (nothing when it is current).
+  bool topReloaded = false;
+  if (g_indexDirty) {
+    refreshIndexIfNeeded();
+    topReloaded = !g_indexDirty;
+  }
   Input::update();
+  InputEvent unheld;
+  bool haveUnheld = false;
+  if (g_indexDirty) {
+    // Still loading: input is held in order; Back leaves at once.
+    InputEvent q;
+    while (Input::popEvent(q)) {
+      if (q.type == InputEventType::ENCODER_LONG) {
+        g_heldInput.clear();
+        g_enigmaChatLeaving = true;
+        TextMessage::clearOpenConversation();
+        Menu::goBack();
+        return;
+      }
+      if (!g_heldInput.hold(q)) {
+        completeIndexNow();  // full, or no memory: completed in this pass instead
+        unheld = q;
+        haveUnheld = true;
+        break;
+      }
+    }
+    if (g_indexDirty) {
+      Display::drawStatusBar();
+      if (!g_chatDrawnThisVisit && !g_chatLoadingShown) {
+        drawEnigmaChatLoading();
+        g_chatLoadingShown = true;
+      }
+      return;
+    }
+  }
+  if (g_chatLoadingShown) {
+    g_chatLoadingShown = false;
+    g_enigmaChatNeedsFullRedraw = true;
+    g_enigmaChatDirty = true;
+  }
+  // Held input first, then the one that could not be held, then what arrived
+  // since -- every event through isReplayedSend() at dispatch.
+  auto nextEvent = [&](InputEvent& out) -> bool {
+    if (g_heldInput.pop(out)) return true;
+    if (haveUnheld) {
+      haveUnheld = false;
+      out = unheld;
+      return true;
+    }
+    return Input::popEvent(out);
+  };
+  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||
+                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG) ||
+                    (haveUnheld && unheld.type == InputEventType::ENCODER_LONG);
+  bool droppingBeforeBack = false;
   InputEvent e;
   bool hadEvent = false;
-  while (Input::popEvent(e)) {
+  while (nextEvent(e)) {
     if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window
+    if (backQueued && e.type != InputEventType::ENCODER_LONG &&
+        (droppingBeforeBack || e.type == InputEventType::ENCODER_ROTATE || g_historyCursor != kNoHistoryCursor)) {
+      droppingBeforeBack = true;  // a Back is waiting: history-side work before it is skipped
+      continue;
+    }
+    if (g_indexDirty) completeIndexNow();  // made stale earlier in this batch
     hadEvent = true;
     if (g_sendStatus != nullptr &&
         (e.type == InputEventType::DOT_PRESS_START || e.type == InputEventType::ENCODER_SHORT) &&
@@ -1808,7 +1899,7 @@ void screenEnigmaChatTick() {
       clearSendStatus();
     }
     if (e.type == InputEventType::ENCODER_ROTATE) {
-      refreshIndexIfNeeded();
+      completeIndexNow();
       // Hardware Fix #4.3a issue 1: a logical message can span more visual
       // rows than the viewport, so rotating steps through THAT message's
       // own rows (g_historyRowOffset) before moving to the next/previous
@@ -1848,9 +1939,17 @@ void screenEnigmaChatTick() {
     } else {
       handleComposeEvent(e);
     }
+    if (g_enigmaChatLeaving) break;  // left (Back)
+  }
+  g_heldInput.releaseIfEmpty();
+  if (g_enigmaChatLeaving) {
+    g_heldInput.clear();
+    InputEvent rest;
+    while (Input::popEvent(rest)) {
+    }
+    return;
   }
   if (hadEvent) g_enigmaChatDirty = true;
-  markSelectedHistoryRead();
 
   // Word-boundary resolution is no longer a per-tick check (Hardware Fix
   // #4.1): it only happens at the next DOT_PRESS_START, in
@@ -1869,9 +1968,10 @@ void screenEnigmaChatTick() {
     }
   }
 
-  bool wasIndexDirty = g_indexDirty;
-  refreshIndexIfNeeded();
+  bool wasIndexDirty = g_indexDirty || topReloaded;
+  completeIndexNow();
   if (wasIndexDirty) g_enigmaChatDirty = true;
+  markSelectedHistoryRead();  // against the complete index
 
   Display::drawStatusBar();
   if (!g_enigmaChatDirty) return;
@@ -2025,6 +2125,7 @@ void screenEnigmaChatTick() {
       }
     }
     g_enigmaChatNeedsFullRedraw = false;
+    g_chatDrawnThisVisit = true;  // a later reload keeps this on screen instead of "Loading messages..."
   } else if (selectionOnlyChanged && viewportLines > 0) {
     // Hardware Fix #4.3a issue 1 audit: guarded on viewportLines > 0 so a
     // focused message never gets its cursor marker drawn into the

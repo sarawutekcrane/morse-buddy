@@ -128,6 +128,7 @@ bool wrapLineAt(const char* text, size_t from, int16_t, uint16_t* s, uint16_t* l
 namespace Input {
 void update() { T::updateCount++; while (!T::raw.empty()) { T::inputQ.push_back(T::raw.front()); T::raw.pop_front(); } }
 bool popEvent(InputEvent& e) { if (T::inputQ.empty()) { e = InputEvent{}; return false; } e = T::inputQ.front(); T::inputQ.pop_front(); return true; }
+bool hasQueuedEvent(InputEventType type) { for (auto& e : T::inputQ) if (e.type == type) return true; return false; }
 // Same predicates as src/core/input.cpp:843-849.
 bool isMenuConfirm(const InputEvent& e) { return e.type == InputEventType::DOT_RELEASE && e.durationMs < Morse::kSpecialCommandMs; }
 bool isBack(const InputEvent& e) { return e.type == InputEventType::ENCODER_LONG; }
@@ -135,6 +136,7 @@ bool isBack(const InputEvent& e) { return e.type == InputEventType::ENCODER_LONG
 
 namespace MqttManager {
 bool isGroupConnected(const char*) { return T::connected; }
+bool isAnyGroupConnected() { return T::connected; }
 bool isGroupReady(const char*) { return T::connected; }
 bool publishRaw(const char*, const char* topic, const char* payload, bool retained, int qos) {
   T::seq.push_back(std::string("publishRaw ") + topic + " " + payload + (retained ? " R" : " -") + std::to_string(qos));
@@ -200,6 +202,28 @@ uint16_t loadConversationIndex(const char* g, const char* c) {
   return static_cast<uint16_t>(g_index.size());
 }
 const ConversationIndexEntry* getIndexEntry(uint16_t i) { return i < g_index.size() ? &g_index[i] : nullptr; }
+// The fake store loads in one step (no cost model): ready at once.
+bool stepConversationIndex(const char* g, const char* c, uint8_t, uint16_t* count, uint16_t* read, uint16_t* total) {
+  uint16_t n = loadConversationIndex(g, c);
+  if (count) *count = n;
+  if (read) *read = n;
+  if (total) *total = n;
+  return true;
+}
+bool chatIndexLoading() { return false; }
+bool beginIndexFeed(const char*, const char*, const uint32_t*, uint16_t, bool, bool) { return false; }
+void feedIndexRecord(const char*, const char*, uint32_t, const StoredHeader*, const char*) {}
+bool loadMessageForDisplay(const MessageRef& ref, StoredMessageView* v) { return loadMessage(ref, v); }
+bool readMessageHeader(const MessageRef& ref, StoredHeader* h) {
+  StoredMessageView v;
+  if (!loadMessage(ref, &v)) return false;
+  *h = v.header;
+  return true;
+}
+bool conversationExists(const char* g, const char* c) {
+  for (auto& r : T::store) if (!strcmp(r.ref.group_code, g) && !strcmp(r.ref.contact_key, c)) return true;
+  return false;
+}
 bool findMessageById(const char* g, const char* c, const char* id, MessageRef* out) {
   for (auto& r : T::store) if (!strcmp(r.ref.group_code, g) && !strcmp(r.ref.contact_key, c) && !strcmp(r.env.message_id, id)) { *out = r.ref; return true; }
   return false;

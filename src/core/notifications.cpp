@@ -8,6 +8,7 @@
 #include "core/hooks.h"
 #include "core/menu.h"
 #include "core/modes.h"
+#include "core/settings.h"
 #include "core/sleep.h"
 #include "core/sound_facade.h"
 #include "core/storage_init.h"
@@ -128,6 +129,9 @@ struct ReadUpRecord {
 // trimmed until it is left.
 constexpr uint32_t kStepMs = 25;
 constexpr uint8_t kLoadsPerStep = 4;
+// A step also ends once this much time went into it (device A on 2ed04b6:
+// about 63 ms per record open, so 4 reads were 250-480 ms passes).
+constexpr uint32_t kStepBudgetMs = 20;
 constexpr uint8_t kCountLoads = 4;       // record reads a selection may spend to count what stays unread
 constexpr uint32_t kSaveDelayMs = 2000;  // summary writes are coalesced
 constexpr uint32_t kReadUpSaveDelayMs = 1000;
@@ -137,7 +141,13 @@ constexpr uint8_t kJobAttempts = 5;      // unreliable listings or passes before
 constexpr uint32_t kBackoffMinMs = 2000;
 constexpr uint32_t kBackoffMaxMs = 60000;
 
+// Each pass first visits every configured group's broadcast conversation
+// (Everyone: the chat most likely opened first after boot), whose recount
+// then feeds that chat's index (MessageStore::beginIndexFeed()); the walk
+// skips those afterwards.
 struct Sweep {
+  uint8_t everyoneNext;                  // the next configured group whose Everyone is visited
+  bool everyoneDone;                     // every group's Everyone visited this pass
   MessageStore::ConversationWalk* walk;  // nullptr between passes
   bool incomplete;                       // this pass left something for the next one
   uint32_t nextPassMs;                   // a pass after an incomplete one starts no earlier
@@ -471,6 +481,8 @@ void startSweep() {
     g_sweep->walk = nullptr;
     g_sweep->incomplete = false;
   }
+  g_sweep->everyoneNext = 0;
+  g_sweep->everyoneDone = false;
   g_sweep->nextPassMs = millis();
   g_sweep->backoffMs = kBackoffMinMs;
 }
@@ -595,10 +607,31 @@ void continueWithRecount(Job& j) {
 // most kWalkEntriesPerStep directory entries; a conversation found starts a
 // trim (then a recount) of it. A pass that left something undone is
 // followed by another after a growing pause.
+bool isConfiguredGroup(const char* group_code) {
+  for (uint8_t i = 0; i < Settings::getGroupCount(); i++) {
+    Settings::FamilyGroup g = Settings::getGroup(i);
+    if (g.configured && strcmp(g.code, group_code) == 0) return true;
+  }
+  return false;
+}
+
 void sweepStep() {
   uint32_t now = millis();
   if (g_sweep->walk == nullptr) {
     if (static_cast<int32_t>(now - g_sweep->nextPassMs) < 0) return;
+    if (!g_sweep->everyoneDone) {
+      // One configured group's Everyone per step (one existence check).
+      while (g_sweep->everyoneNext < Settings::getGroupCount()) {
+        Settings::FamilyGroup g = Settings::getGroup(g_sweep->everyoneNext++);
+        if (!g.configured) continue;
+        if (!MessageStore::conversationExists(g.code, MessageStore::kEveryone)) return;
+        g_job = newJob(JOB_TRIM, g.code, MessageStore::kEveryone);
+        if (g_job != nullptr) g_job->fromSweep = true;
+        else g_sweep->incomplete = true;
+        return;
+      }
+      g_sweep->everyoneDone = true;
+    }
     g_sweep->walk = MessageStore::beginConversationWalk();  // nullptr (no memory): tried again at the next step
     return;
   }
@@ -607,6 +640,7 @@ void sweepStep() {
       MessageStore::stepConversationWalk(g_sweep->walk, kWalkEntriesPerStep, group, sizeof(group), contact, sizeof(contact));
   if (r == MessageStore::WalkResult::MORE) return;
   if (r == MessageStore::WalkResult::FOUND) {
+    if (strcmp(contact, MessageStore::kEveryone) == 0 && isConfiguredGroup(group)) return;  // visited first
     g_job = newJob(JOB_TRIM, group, contact);
     if (g_job != nullptr) g_job->fromSweep = true;
     else g_sweep->incomplete = true;
@@ -622,6 +656,8 @@ void sweepStep() {
   }
   Serial.println("[NOTIFY] sweep pass incomplete; another follows");
   g_sweep->incomplete = false;
+  g_sweep->everyoneNext = 0;
+  g_sweep->everyoneDone = false;
   g_sweep->nextPassMs = now + g_sweep->backoffMs;
   g_sweep->backoffMs = g_sweep->backoffMs * 2 < kBackoffMaxMs ? g_sweep->backoffMs * 2 : kBackoffMaxMs;
 }
@@ -732,7 +768,9 @@ void stepTrim(Job& j) {
   ref.group_code[sizeof(ref.group_code) - 1] = '\0';
   strncpy(ref.contact_key, j.contact_key, sizeof(ref.contact_key) - 1);
   ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
+  uint32_t stepStart = millis();
   for (uint8_t loads = 0; loads < kLoadsPerStep && j.pos < j.n; loads++) {
+    if (loads > 0 && millis() - stepStart >= kStepBudgetMs) return;
     ref.sequence = j.seqs[j.pos];
     StoredMessageView view;
     if (!MessageStore::loadMessage(ref, &view)) {
@@ -814,6 +852,10 @@ void stepJob() {
       }
       return;
     }
+    // A recount reads every record in listing order: the conversation's
+    // chat index is built from those same reads.
+    if (j.kind == JOB_RECOUNT)
+      MessageStore::beginIndexFeed(j.group_code, j.contact_key, j.seqs, j.n, true, TextMessage::isAnyConversationOpen());
     if (j.kind == JOB_TRIM) {
       sortAscending(j.seqs, j.n);  // oldest first: the order appends evict in
       j.excess = j.n > MessageStore::kRetainedMessagesPerThread
@@ -827,7 +869,9 @@ void stepJob() {
     stepTrim(j);
     return;
   }
+  uint32_t stepStart = millis();
   for (uint8_t loads = 0; loads < kLoadsPerStep && j.pos < j.n; loads++) {
+    if (loads > 0 && millis() - stepStart >= kStepBudgetMs) return;
     MessageRef ref;
     strncpy(ref.group_code, j.group_code, sizeof(ref.group_code) - 1);
     ref.group_code[sizeof(ref.group_code) - 1] = '\0';
@@ -838,8 +882,11 @@ void stepJob() {
     if (!MessageStore::loadMessage(ref, &view)) {
       // Evicted since the listing (eviction restarts a recount) or unreadable.
       j.unreliable = true;
+      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord(ref.group_code, ref.contact_key, ref.sequence, nullptr, nullptr);
       continue;
     }
+    if (j.kind == JOB_RECOUNT)
+      MessageStore::feedIndexRecord(ref.group_code, ref.contact_key, ref.sequence, &view.header, view.envelope.message_id);
     if (view.header.direction != MessageStore::Direction::RECEIVED || !(view.header.flags & MessageStore::FLAG_UNREAD)) continue;
     if (j.kind == JOB_RECOUNT) {
       int slot = slotForType(view.envelope.message_type);
@@ -871,6 +918,8 @@ void serviceTick() {
   uint32_t now = millis();
   if (static_cast<int32_t>(now - g_nextStepMs) < 0) return;
   g_nextStepMs = now + kStepMs;
+  // A chat loading its index goes first: its reads are what the user waits for.
+  if (MessageStore::chatIndexLoading()) return;
   if (g_loadState != LOAD_OK && static_cast<int32_t>(now - g_nextRetryMs) >= 0) {
     g_nextRetryMs = now + kRetryMs;
     retryLoad();

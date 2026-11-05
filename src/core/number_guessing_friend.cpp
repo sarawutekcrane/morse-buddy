@@ -907,7 +907,7 @@ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
   if (entry != nullptr) {
     MessageRef ref = refForIndexEntry(*entry);
     StoredMessageView view;
-    if (MessageStore::loadMessage(ref, &view)) {
+    if (MessageStore::loadMessageForDisplay(ref, &view)) {
       RenderFn renderFn = getMessageRenderFn(view.envelope.message_type);
       if (renderFn != nullptr) renderFn(view, scratch, kHistoryLineBufCap);
       MessageStore::buildSenderPrefix(view.envelope, out->senderPrefix, sizeof(out->senderPrefix));
