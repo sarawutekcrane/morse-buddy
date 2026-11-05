@@ -12,6 +12,8 @@ bool stepConversationIndex(const char* g, const char* c, uint8_t, uint16_t* coun
 // No sweep-fed index on 2ed04b6: a feed is refused.
 bool beginIndexFeed(const char*, const char*, const uint32_t*, uint16_t, bool, bool) { return false; }
 void feedIndexRecord(const char*, const char*, uint32_t, const StoredHeader*, const char*) {}
+// CE16 only: 2ed04b6 has no feed that could take an open chat's index.
+bool isIndexCurrent(const char*, const char*) { return true; }
 }  // namespace MessageStore
 namespace TextMessage {
 // The conversations the tests open.

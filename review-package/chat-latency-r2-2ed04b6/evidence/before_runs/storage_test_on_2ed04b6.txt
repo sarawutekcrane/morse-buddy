@@ -12,35 +12,43 @@ FAIL [CE2b after visiting another chat: the index was parked and is swapped back
 FAIL [CE3 the open chat's own changes (an arrival, a read-up rewriting flags, an eviction) are patched in: the index equals a fresh load] line 926: patched index equal to a fresh load 0 (100 entries)
 FAIL [CE13 caches follow flash exactly: after display loads, read-ups, arrivals with eviction, a payload rewrite, a failed write and a deletion, every record served equals its file] line 976: the chat's index differs from a fresh load (100 vs 98 entries)
    CE17 measured: 80 file opens for the boot sweep of 80 records
-FAIL [CE19 a parked index follows its conversation (arrivals with eviction, a flag rewrite) and is swapped back equal to a fresh load] line 1073: swapped back 1 with 100 reads; equal to a fresh load 1 (100 entries)
+FAIL [CE19 a parked index follows its conversation (arrivals with eviction, a flag rewrite) and is swapped back equal to a fresh load] line 1078: swapped back 1 with 100 reads; equal to a fresh load 1 (100 entries)
    CE21 variant 0 measured: 98 opens on entry, content after 1 passes
-FAIL [CE21 a 1:1 chat opened right after boot holds the shared index: the sweep's recount builds Everyone's parked index, entered without reloading and equal to a fresh load] line 1132: variant 0: content after 1 passes, 98 opens (no reload)
+FAIL [CE21 a 1:1 chat opened right after boot holds the shared index: the sweep's recount builds Everyone's parked index, entered without reloading and equal to a fresh load] line 1137: variant 0: content after 1 passes, 98 opens (no reload)
    CE21 variant 1 measured: 98 opens on entry, content after 1 passes
-FAIL [CE21 a 1:1 chat opened right after boot holds the shared index: the sweep's recount builds Everyone's parked index, entered without reloading and equal to a fresh load] line 1132: variant 1: content after 1 passes, 98 opens (no reload)
+FAIL [CE21 a 1:1 chat opened right after boot holds the shared index: the sweep's recount builds Everyone's parked index, entered without reloading and equal to a fresh load] line 1137: variant 1: content after 1 passes, 98 opens (no reload)
    CE21 variant 2 measured: 99 opens on entry, content after 1 passes
-FAIL [CE21 a 1:1 chat opened right after boot holds the shared index: the sweep's recount builds Everyone's parked index, entered without reloading and equal to a fresh load] line 1132: variant 2: content after 1 passes, 99 opens (no reload)
-FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1165: variant 0: feed began 0, used 1 (expected 1) with 30 reads, equal to a fresh load 1
-FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1165: variant 1: feed began 0, used 1 (expected 1) with 30 reads, equal to a fresh load 1
-FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1165: variant 2: feed began 0, used 1 (expected 0) with 31 reads, equal to a fresh load 1
-FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1165: variant 3: feed began 0, used 1 (expected 0) with 30 reads, equal to a fresh load 1
-FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1165: variant 4: feed began 0, used 1 (expected 0) with 30 reads, equal to a fresh load 1
-FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1185: variant 0: still on its message 1, the new one listed 0 (10), still unread 1
-FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1189: variant 0: the chat's index differs from a fresh load
-FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1185: variant 1: still on its message 1, the new one listed 0 (10), still unread 1
-FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1189: variant 1: the chat's index differs from a fresh load
+FAIL [CE21 a 1:1 chat opened right after boot holds the shared index: the sweep's recount builds Everyone's parked index, entered without reloading and equal to a fresh load] line 1137: variant 2: content after 1 passes, 99 opens (no reload)
+FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1170: variant 0: feed began 0, used 1 (expected 1) with 30 reads, equal to a fresh load 1
+FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1170: variant 1: feed began 0, used 1 (expected 1) with 30 reads, equal to a fresh load 1
+FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1170: variant 2: feed began 0, used 1 (expected 0) with 31 reads, equal to a fresh load 1
+FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1170: variant 3: feed began 0, used 1 (expected 0) with 30 reads, equal to a fresh load 1
+FAIL [CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not] line 1170: variant 4: feed began 0, used 1 (expected 0) with 30 reads, equal to a fresh load 1
+FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1190: variant 0: still on its message 1, the new one listed 0 (10), still unread 1
+FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1194: variant 0: the chat's index differs from a fresh load
+FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1190: variant 1: still on its message 1, the new one listed 0 (10), still unread 1
+FAIL [CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read] line 1194: variant 1: the chat's index differs from a fresh load
+   CE11 measured: 100 opens to load 90 records with an arrival during the load
+FAIL [CE11 an arrival in Everyone during its stepped load is followed (no restart): shown, every record read once] line 1213: listed 0 (90 entries), 100 opens
+FAIL [CE22b the shared feed (no chat open), step by step: an unreadable or out-of-step record, or a mutation of its conversation, leaves it unused; a mutation elsewhere does not] line 1247: variant 0: feed began 0, used 1 (expected 1) with 30 reads, equal to a fresh load 1
+FAIL [CE22b the shared feed (no chat open), step by step: an unreadable or out-of-step record, or a mutation of its conversation, leaves it unused; a mutation elsewhere does not] line 1247: variant 1: feed began 0, used 1 (expected 1) with 30 reads, equal to a fresh load 1
+FAIL [CE22b the shared feed (no chat open), step by step: an unreadable or out-of-step record, or a mutation of its conversation, leaves it unused; a mutation elsewhere does not] line 1247: variant 2: feed began 0, used 1 (expected 0) with 31 reads, equal to a fresh load 1
+FAIL [CE22b the shared feed (no chat open), step by step: an unreadable or out-of-step record, or a mutation of its conversation, leaves it unused; a mutation elsewhere does not] line 1247: variant 3: feed began 0, used 1 (expected 0) with 30 reads, equal to a fresh load 1
+FAIL [CE22b the shared feed (no chat open), step by step: an unreadable or out-of-step record, or a mutation of its conversation, leaves it unused; a mutation elsewhere does not] line 1247: variant 4: feed began 0, used 1 (expected 0) with 30 reads, equal to a fresh load 1
+FAIL [DM1b the broadcast chat opened right after boot: the sweep and the outbox pass read nothing while it loads] line 1302: 0 background opens during 0 loading passes
    DM1 1 s after boot: chat drawn after 1 passes, 6446 ms simulated, max 102 opens per pass (boot passes before: max 194)
-FAIL [DM1 device-cost model: the broadcast chat opened 1 s after boot (sweep and outbox pass still running) -- bounded opens per pass until drawn] line 1215: drawn after 1 passes, max 102 opens in a pass
-FAIL [DM1 device-cost model: the broadcast chat opened 1 s after boot (sweep and outbox pass still running) -- bounded opens per pass until drawn] line 1217: boot passes before the chat: max 194 opens
+FAIL [DM1 device-cost model: the broadcast chat opened 1 s after boot (sweep and outbox pass still running) -- bounded opens per pass until drawn] line 1315: drawn after 1 passes, max 102 opens in a pass
+FAIL [DM1 device-cost model: the broadcast chat opened 1 s after boot (sweep and outbox pass still running) -- bounded opens per pass until drawn] line 1317: boot passes before the chat: max 194 opens
    DM2 after boot work settled: chat drawn after 1 passes, 6194 ms simulated, max 98 opens per pass (boot passes before: max 194)
-FAIL [DM2 device-cost model: the broadcast chat opened once boot work settled -- drawn in the first pass from the sweep-built index] line 1231: drawn after 1 passes, 6194 ms simulated
+FAIL [DM2 device-cost model: the broadcast chat opened once boot work settled -- drawn in the first pass from the sweep-built index] line 1331: drawn after 1 passes, 6194 ms simulated
    DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 6194 ms simulated, max 98 opens per pass (boot passes before: max 391)
-FAIL [IN1 rotations during loading are held and replayed in order: the same selection as rotating after the load] line 1274: loading shown 0; cursor 85, expected 85
-FAIL [IN5 one Morse sequence (SOS) keyed while the chat loads gives the same draft as keyed live (device-cost model, 63 ms per open)] line 1391: precondition: the chat was not loading while keyed
+FAIL [IN1 rotations during loading are held and replayed in order: the same selection as rotating after the load] line 1374: loading shown 0; cursor 85, expected 85
+FAIL [IN5 one Morse sequence (SOS) keyed while the chat loads gives the same draft as keyed live (device-cost model, 63 ms per open)] line 1491: precondition: the chat was not loading while keyed
    IN6 measured: left after one pass of 1784 ms simulated, 28 opens (20 rotations, then Back)
-FAIL [IN6 a loaded chat: Back queued after 20 rotations leaves in the same pass without reading rows for them (device-cost model)] line 1415: Text: left 1, 28 opens
+FAIL [IN6 a loaded chat: Back queued after 20 rotations leaves in the same pass without reading rows for them (device-cost model)] line 1515: Text: left 1, 28 opens
    IN6c measured: left after one pass of 1658 ms simulated, 26 opens (20 rotations, then Back)
-FAIL [IN6 a loaded chat: Back queued after 20 rotations leaves in the same pass without reading rows for them (device-cost model)] line 1415: Enigma: left 1, 26 opens
-FAIL [OB1 pending records left on flash are found by an incremental pass and published once each; no step reads more than 4 records] line 1481: max 80 opens in a service pass
-FAIL [OB2 a send while offline is queued directly: published on connection with no storage pass] line 1501: pending 0, published 1, 8 directory opens
-FAIL [OB4 a failed publish is retried later; the record stays pending until a publish succeeds; never published twice] line 1535: after the failure: pending 1; then pending 1, published 0
-97 checks passed, 31 failed
+FAIL [IN6 a loaded chat: Back queued after 20 rotations leaves in the same pass without reading rows for them (device-cost model)] line 1515: Enigma: left 1, 26 opens
+FAIL [OB1 pending records left on flash are found by an incremental pass and published once each; no step reads more than 4 records] line 1581: max 80 opens in a service pass
+FAIL [OB2 a send while offline is queued directly: published on connection with no storage pass] line 1601: pending 0, published 1, 8 directory opens
+FAIL [OB4 a failed publish is retried later; the record stays pending until a publish succeeds; never published twice] line 1635: after the failure: pending 1; then pending 1, published 0
+99 checks passed, 38 failed

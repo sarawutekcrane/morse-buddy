@@ -15,7 +15,7 @@
 | Outbox | `scan 5143 ms found=0` | every record loaded in one call, once a group connected |
 | Startup | `[PERF][MQTT] setup/connect/subscribe`, OTA check | network startup, separate from chat entry. The trace does not show a Wi-Fi disconnect. |
 
-## What changed (`production.diff`: 12 files, `held_input.h` new)
+## What changed (`production.diff`: 12 files, including the new `held_input.h`)
 
 1. **Record cache** (`loadMessageForDisplay()`).
    - Holds 10 records, byte-exact; the slot table and the bytes are on the heap.
@@ -58,6 +58,7 @@
 | Everyone, 90 messages, after the boot sweep (CE1) | 98 opens in one pass | 4 opens, drawn in the first pass |
 | Re-entry after arrivals elsewhere (CE2), after visiting a 1:1 chat (CE2b) | 98 opens each | 0 opens |
 | Arrival in the open chat, with its eviction (CE3) | the index is not updated | 4 opens, index equal to a fresh load |
+| Arrival during a cold stepped load (CE11) | 100 opens, one pass | 96 opens, no restart |
 | Everyone opened 1 s after boot (DM1) | one blocking pass: 102 opens, 6446 ms | 4196 ms spread over 46 passes, at most 5 opens in a pass; input is held meanwhile |
 | Everyone opened once boot work settled (DM2) | 6194 ms, one pass | 272 ms, one pass |
 | Everyone opened 14 s after boot, 3 × 99 other messages (DM3) | 6194 ms | 272 ms, one pass |
@@ -76,11 +77,15 @@ Storage bench (`evidence/storage_bench/`; host counts × 63 ms):
 ## Validation
 
 - **`storage_test`** (real store on a temp-dir LittleFS; real Notifications, Text, Enigma and Outbox):
-  - this candidate: **128 passed, 0 failed**
-  - the same tests on 2ed04b6: 97 passed, 31 failed (`evidence/before_runs/`, shim listed there)
+  - this candidate: **137 passed, 0 failed** (`evidence/storage_test_this_candidate.txt`)
+  - the same tests on 2ed04b6: 99 passed, 38 failed (`evidence/before_runs/`, shim listed there)
   - The previous candidate could not be re-run: its source was lost with the container.
-- **Full `run_all.sh`**, all suites: RUN_ALL (`evidence/run_all.txt`).
-- **Targeted mutations** of the store, both chats, Notifications and the Outbox: MUTATIONS (`evidence/mutate_notify.txt`).
+- **Full `run_all.sh` suites** (steps 1–6b; the mutation step run separately below): all steps passed (`evidence/run_all_suites.txt`).
+- **Targeted mutations** of the store, both chats, Notifications and the Outbox (`evidence/mutate_notify.txt`): **124/126 caught**, 0 unexplained survivors. The two survivors were assessed equivalent, with reasons in `mutate_notify.py`:
+  - Without the explicit unreadable-record feed, the feed is dropped anyway (out of step).
+  - Without the open-chat flag on the feed, the chat's per-pass re-sync reloads a stale index anyway, so the flag only saves cost.
+  - The first run's 9 survivors led to new tests (CE11, CE22b, CE24, DM1b, OB5 after the boot pass, a stricter CE16) and to fixing two mutants that changed nothing.
+- **Race mutations** (`mutate_room.py`, unchanged files): ROOMMUT (`evidence/mutate_room.txt`).
 - **ESP32 build** (`evidence/esp32/`):
   - success: RAM 124,476 B, flash 1,206,349 B (83.7%)
   - static DRAM headroom **96 B** (232 B on 2ed04b6)
