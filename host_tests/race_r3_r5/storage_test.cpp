@@ -1503,7 +1503,7 @@ int main(int argc, char** argv) {
     closeChat();
   }
 
-  g_test = "IN2c more input than the device can buffer at all (held buffer and input queue full): the loss is shown, what was kept is in order";
+  g_test = "IN2c more input than the device can buffer at all (held buffer and input queue full): the loss is shown, the oldest input is kept, in order";
   for (int enigma = 0; enigma < 2; enigma++) {
     openCold(enigma);
     std::vector<InputEvent> evs;
@@ -1514,7 +1514,9 @@ int main(int argc, char** argv) {
     std::string vis = T::visibleJoined();
     size_t es = 0;
     for (size_t k = vis.find("EEEE"); k != std::string::npos && k < vis.size() && vis[k] == 'E'; k++) es++;
-    CHECK(T::inputDropped > 0 && noticeShown && es > 0 && es < 50 && r.maxPassOpens <= kLoadingPassOpens,
+    // One input update takes in 32 of the 100 (the queue's capacity) and drops
+    // the newest 68: kept are the oldest 32 events = 16 E, in order.
+    CHECK(T::inputDropped == 68 && noticeShown && es == 16 && r.maxPassOpens <= kLoadingPassOpens,
           "%s: %u dropped by the input queue, notice shown %d, %zu E kept, max %llu opens in a pass", kChat[enigma], T::inputDropped,
           noticeShown, es, (unsigned long long)r.maxPassOpens);
     closeChat();
@@ -1584,6 +1586,24 @@ int main(int argc, char** argv) {
             kChat[enigma], after, (unsigned long long)r.maxPassOpens, want.c_str(), drafted);
       closeChat();
     }
+  }
+
+  g_test = "IN2e held buffer full and the queue full across two passes: the oldest 64 events are kept in order (the newest dropped, counted, warned)";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    std::vector<InputEvent> evs;
+    morseEvents(std::string(50, 'E').c_str(), evs);  // 100 events
+    runLoading(std::vector<InputEvent>(evs.begin(), evs.begin() + 32), 32, 1);  // 32 held
+    LoadRun r = runLoading(std::vector<InputEvent>(evs.begin() + 32, evs.end()), 68);  // 32 queued, 36 dropped
+    loopPass(30);
+    std::string vis = T::visibleJoined();
+    size_t es = 0;
+    for (size_t k = vis.find("EEEE"); k != std::string::npos && k < vis.size() && vis[k] == 'E'; k++) es++;
+    bool warned = vis.find("Input lost while loading") != std::string::npos;
+    CHECK(T::inputDropped == 36 && es == 32 && warned && r.maxPassOpens <= kLoadingPassOpens,
+          "%s: %u dropped (expected 36), %zu E kept (expected 32), warned %d, max %llu opens", kChat[enigma], T::inputDropped, es, warned,
+          (unsigned long long)r.maxPassOpens);
+    closeChat();
   }
 
   g_test = "IN3 no memory for the held buffer while loading: the input waits (bounded passes), nothing lost";

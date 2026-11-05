@@ -111,9 +111,9 @@ HeldInput g_heldInput;
 // Input beyond what the held buffer takes (it is full, or could not be
 // allocated) waits in the input queue (only what can be held is popped):
 // the load goes on at its bounded pace, never completed in one pass.
-// Should the input queue fill up as well, it is drained (all but a Back,
-// which leaves) and the loss is reported ("Input lost while loading"):
-// what was kept stays in order.
+// Should the input queue fill up as well, it drops the newest input (a
+// Back still gets in: core/input_queue.h) and the loss is reported ("Input
+// lost while loading"): what was kept is the oldest input, in order.
 bool g_inputLost = false;        // reported once the chat is drawn
 uint32_t g_inputDropsSeen = 0;   // Input::droppedEventCount() last looked at
 bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
@@ -166,22 +166,12 @@ void drawChatLoading() {
 }
 
 // While the index loads: input taken in order into the held buffer, the
-// rest left in the input queue, which is drained only if it is full. False
-// if a Back was found (the caller leaves).
+// rest left in the input queue. False if a Back is queued (the caller
+// leaves); the queue admits a Back even when full.
 bool takeInputWhileLoading() {
   if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;
   InputEvent q;
   while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);
-  if (Input::queueFull()) {
-    // Nothing more can be kept: the queue is drained so that a Back pressed
-    // now still gets through; what it held is lost, and reported.
-    while (Input::popEvent(q)) {
-      if (q.type == InputEventType::ENCODER_LONG) return false;
-      g_inputLost = true;
-    }
-  }
-  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;  // dropped by the full queue
-  g_inputDropsSeen = Input::droppedEventCount();
   return true;
 }
 

@@ -954,8 +954,8 @@ void refreshIndexIfNeeded() {
 
 // Input beyond what the held buffer takes: as in text_message.cpp's chat
 // (see its takeInputWhileLoading()) -- the rest waits in the input queue,
-// which is drained (all but a Back) only if it is full, and the loss is
-// then reported ("Input lost while loading").
+// whose drops (the newest input, never a Back) are reported ("Input lost
+// while loading").
 bool g_inputLost = false;
 uint32_t g_inputDropsSeen = 0;
 
@@ -963,14 +963,6 @@ bool takeInputWhileLoading() {
   if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;
   InputEvent q;
   while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);
-  if (Input::queueFull()) {
-    while (Input::popEvent(q)) {
-      if (q.type == InputEventType::ENCODER_LONG) return false;
-      g_inputLost = true;
-    }
-  }
-  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;
-  g_inputDropsSeen = Input::droppedEventCount();
   return true;
 }
 

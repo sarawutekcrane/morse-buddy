@@ -143,14 +143,11 @@ muts = [
  (OB, "the pass skips records it found pending", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;\n        enqueue(ref);", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;"),
  # ---- review round: held-input overflow without a synchronous load ----
  (TX, "Text: Back while loading waits for the load", "bool takeInputWhileLoading() {\n  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;", "bool takeInputWhileLoading() {"),
- (TX, "Text: a full input queue is not drained (a Back behind it is lost)", "  if (Input::queueFull()) {\n    // Nothing more", "  if (false) {\n    // Nothing more"),
- (TX, "Text: input dropped by the full queue is not reported", "  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;  // dropped by the full queue\n", ""),
  (TX, "Text: the loss is never shown", "    setSendStatus({\"Input lost while loading\", true});", "    (void)0;"),
  (TX, "Text: a mid-batch reload is completed synchronously", "      refreshIndexIfNeeded();\n      indexRefreshElapsed += millis() - midRefreshStart;", "      while (g_indexDirty) refreshIndexIfNeeded();\n      indexRefreshElapsed += millis() - midRefreshStart;"),
  (TX, "Text: the final reload is completed synchronously", "  refreshIndexIfNeeded();  // one bounded step\n  indexRefreshElapsed += millis() - finalRefreshStart;", "  while (g_indexDirty) refreshIndexIfNeeded();\n  indexRefreshElapsed += millis() - finalRefreshStart;"),
  (TX, "Text: an event met by a mid-batch reload is lost (not retained)", "      if (g_indexDirty) {\n        retain(e, fromHeld);\n        break;", "      if (g_indexDirty) {\n        break;"),
  (EN, "Enigma: Back while loading waits for the load", "bool takeInputWhileLoading() {\n  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;", "bool takeInputWhileLoading() {"),
- (EN, "Enigma: a full input queue is not drained (a Back behind it is lost)", "  if (Input::queueFull()) {\n    while (Input::popEvent(q)) {", "  if (false) {\n    while (Input::popEvent(q)) {"),
  (EN, "Enigma: the loss is never shown", "    setSendStatus({\"Input lost while loading\", true});", "    (void)0;"),
  (EN, "Enigma: the final reload is completed synchronously", "  refreshIndexIfNeeded();  // one bounded step\n  if (g_indexDirty) {\n    Display::drawStatusBar();", "  while (g_indexDirty) refreshIndexIfNeeded();\n  if (g_indexDirty) {\n    Display::drawStatusBar();"),
  (EN, "Enigma: an event met by a mid-batch reload is lost (not retained)", "      if (g_indexDirty) {\n        retain(e);\n        break;", "      if (g_indexDirty) {\n        break;"),
@@ -183,6 +180,8 @@ muts = [
  (EN, "Enigma: drops outside loading raise the loading warning", "  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;", "  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;"),
  (TX, "Text: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
  (EN, "Enigma: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
+ (TX, "Text: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
+ (EN, "Enigma: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
