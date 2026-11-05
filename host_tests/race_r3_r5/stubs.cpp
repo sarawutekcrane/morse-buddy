@@ -38,6 +38,8 @@ std::function<void()> duringUpdate;
 std::vector<std::string> seq;
 int notifications = 0;
 std::vector<std::string> indexLoads;
+size_t inputCap = 0;
+uint32_t inputDropped = 0;
 uint32_t unixTime = 1700000000u;
 bool realGlyphs = false;
 bool scanUnreliable = false;
@@ -45,7 +47,7 @@ bool listUnreliable = false;
 unsigned listings = 0;
 std::function<void(const std::string&)> onDraw;
 void reset() {
-  screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0;
+  screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0;
   connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
   seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; scanUnreliable = false; listUnreliable = false; listings = 0;
@@ -126,7 +128,16 @@ bool wrapLineAt(const char* text, size_t from, int16_t, uint16_t* s, uint16_t* l
 }  // namespace Display
 
 namespace Input {
-void update() { T::updateCount++; while (!T::raw.empty()) { T::inputQ.push_back(T::raw.front()); T::raw.pop_front(); } }
+void update() {
+  T::updateCount++;
+  while (!T::raw.empty()) {
+    if (T::inputCap > 0 && T::inputQ.size() >= T::inputCap) T::inputDropped++;  // input.cpp: dropped when full
+    else T::inputQ.push_back(T::raw.front());
+    T::raw.pop_front();
+  }
+}
+uint32_t droppedEventCount() { return T::inputDropped; }
+bool queueFull() { return T::inputCap > 0 && T::inputQ.size() >= T::inputCap; }
 bool popEvent(InputEvent& e) { if (T::inputQ.empty()) { e = InputEvent{}; return false; } e = T::inputQ.front(); T::inputQ.pop_front(); return true; }
 bool hasQueuedEvent(InputEventType type) { for (auto& e : T::inputQ) if (e.type == type) return true; return false; }
 // Same predicates as src/core/input.cpp:843-849.

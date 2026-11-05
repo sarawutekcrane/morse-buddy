@@ -1375,32 +1375,228 @@ int main(int argc, char** argv) {
     back();
   }
 
-  g_test = "IN2 more input during loading than can be held (40 rotations): nothing lost (the index is completed in that pass)";
-  coldEveryone();
-  {
-    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+  // ---- held input that cannot all be held (review round) ----------------------
+  // Every pass of a loading chat is measured in the device-cost model (63 ms
+  // per open): the bound is what one stepped load pass costs (4 index reads,
+  // plus a little), never a whole conversation.
+  constexpr uint64_t kLoadingPassOpens = 6;
+  struct LoadRun {
+    uint64_t maxPassOpens = 0;
+    int passes = 0;
+    bool left = false;
+  };
+  auto chatLoading = []() { return T::visibleJoined().find("Loading messages") != std::string::npos; };
+  // Runs passes (feeding the given events, `perPass` at a time) until the chat
+  // is drawn or left; records the largest number of opens in one pass.
+  // perPass 0: each event arrives when its time comes (keying in real time).
+  auto runLoading = [&](std::vector<InputEvent> evs, size_t perPass, int limit = 3000) {
+    LoadRun r;
+    size_t next = 0;
+    for (int i = 0; i < limit; i++) {
+      if (perPass == 0) {
+        while (next < evs.size() && static_cast<int32_t>(T::now - evs[next].eventMs) >= 0) T::raw.push_back(evs[next++]);
+      }
+      for (size_t k = 0; k < perPass && next < evs.size(); k++) T::raw.push_back(evs[next++]);
+      FsStats a = g_fs;
+      loopPass();
+      r.maxPassOpens = std::max<uint64_t>(r.maxPassOpens, g_fs.fileOpens - a.fileOpens);
+      r.passes++;
+      if (!TextMessage::isAnyConversationOpen()) { r.left = true; break; }
+      if (next >= evs.size() && T::raw.empty() && !chatLoading() && i > 0) break;
+    }
+    return r;
+  };
+  // Morse key events for `text` (A-Z) at 15 wpm, all in the past: dots 60 ms,
+  // dashes 240 ms, 80 ms between symbols, 400 ms between letters.
+  // (future: keyed from now on, for perPass 0)
+  auto morseEvents = [](const char* text, std::vector<InputEvent>& out, bool future = false) {
+    uint32_t span = 0;
+    for (const char* c = text; *c; c++) {
+      char pat[Morse::kMaxPatternLength + 1];
+      Morse::encodeChar(*c, pat, sizeof(pat));
+      for (char* q = pat; *q; q++) span += (*q == '.' ? 60 : 240) + 80;
+      span += 320;
+    }
+    uint32_t t = future ? T::now + 20 : T::now - span - 600;
+    for (const char* c = text; *c; c++) {
+      char pat[Morse::kMaxPatternLength + 1];
+      Morse::encodeChar(*c, pat, sizeof(pat));
+      for (char* q = pat; *q; q++) {
+        uint32_t dur = *q == '.' ? 60 : 240;
+        out.push_back(InputEvent(InputEventType::DOT_PRESS_START, 0, 0, t));
+        out.push_back(InputEvent(InputEventType::DOT_RELEASE, 0, dur, t + dur));
+        t += dur + 80;
+      }
+      t += 320;
+    }
+  };
+  auto openCold = [&](bool enigma) {
+    coldEveryone();
+    deviceCost();
+    T::inputCap = 32;  // input.cpp's queue
+    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
     loopPass();
-    for (int i = 0; i < 40; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
-    loopPass();
-    bool done = !g_indexDirty;
-    CHECK(done && g_historyCursor == g_indexTotal - 40, "completed in that pass %d; cursor %u, expected %u", done, g_historyCursor,
-          g_indexTotal - 40);
-    back();
+  };
+  auto closeChat = [&]() {
+    LittleFS.onFileOpen = nullptr;
+    g_failNothrowArrayNew = false;
+    T::inputCap = 0;
+    if (TextMessage::isAnyConversationOpen()) back();
+    loopPass(3);
+  };
+  const char* kChat[2] = {"Text", "Enigma"};
+  std::string twentyE(20, 'E');
+
+  g_test = "IN2 more input while loading than the held buffer takes (40 key events over 4 passes): nothing lost, every pass bounded (no synchronous load)";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    std::vector<InputEvent> evs;
+    morseEvents(twentyE.c_str(), evs);  // 40 events
+    bool loadingAtStart = chatLoading();
+    LoadRun r = runLoading(evs, 10);
+    loopPass(30);  // the last letter is finalized after its gap
+    bool drafted = T::visibleJoined().find(twentyE) != std::string::npos;
+    CHECK(loadingAtStart && r.passes > 8 && r.maxPassOpens <= kLoadingPassOpens && drafted && T::inputDropped == 0,
+          "%s: loading %d, %d passes, max %llu opens in a pass, draft of 20 E shown %d, %u dropped", kChat[enigma], loadingAtStart,
+          r.passes, (unsigned long long)r.maxPassOpens, drafted, T::inputDropped);
+    closeChat();
   }
 
-  g_test = "IN3 no memory to hold input during loading: nothing lost (the index is completed in that pass)";
-  coldEveryone();
-  {
-    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
-    loopPass();
-    for (int i = 0; i < 3; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
+  g_test = "IN2b a Back queued after the event that overflowed the held buffer leaves at once (bounded pass)";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    std::vector<InputEvent> evs;
+    morseEvents(twentyE.c_str(), evs);
+    runLoading(std::vector<InputEvent>(evs.begin(), evs.begin() + 34), 34, 1);  // 32 held, the 33rd overflows
+    bool stillLoading = chatLoading();
+    std::vector<InputEvent> rest(evs.begin() + 34, evs.end());
+    rest.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
+    LoadRun r = runLoading(rest, rest.size(), 3);
+    CHECK(stillLoading && r.left && r.passes <= 1 && r.maxPassOpens <= kLoadingPassOpens, "%s: loading %d, left %d after %d passes, %llu opens",
+          kChat[enigma], stillLoading, r.left, r.passes, (unsigned long long)r.maxPassOpens);
+    closeChat();
+  }
+
+  g_test = "IN2c more input than the device can buffer at all (held buffer and input queue full): the loss is shown, what was kept is in order";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    std::vector<InputEvent> evs;
+    morseEvents(std::string(50, 'E').c_str(), evs);  // 100 events in one burst: more than 32 + 32 can hold
+    LoadRun r = runLoading(evs, evs.size());
+    bool noticeShown = T::visibleJoined().find("Input lost while loading") != std::string::npos;
+    loopPass(30);
+    std::string vis = T::visibleJoined();
+    size_t es = 0;
+    for (size_t k = vis.find("EEEE"); k != std::string::npos && k < vis.size() && vis[k] == 'E'; k++) es++;
+    CHECK(T::inputDropped > 0 && noticeShown && es > 0 && es < 50 && r.maxPassOpens <= kLoadingPassOpens,
+          "%s: %u dropped by the input queue, notice shown %d, %zu E kept, max %llu opens in a pass", kChat[enigma], T::inputDropped,
+          noticeShown, es, (unsigned long long)r.maxPassOpens);
+    closeChat();
+  }
+
+  g_test = "IN3 no memory for the held buffer while loading: the input waits (bounded passes), nothing lost";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
     g_failNothrowArrayNew = true;  // the held-input buffer cannot be allocated
-    loopPass();
+    std::vector<InputEvent> evs;
+    morseEvents("SOS", evs);
+    LoadRun r = runLoading(evs, evs.size());
     g_failNothrowArrayNew = false;
-    bool done = !g_indexDirty;
-    CHECK(done && g_historyCursor == g_indexTotal - 3, "completed in that pass %d; cursor %u, expected %u", done, g_historyCursor,
-          g_indexTotal - 3);
-    back();
+    loopPass(30);
+    bool drafted = T::visibleJoined().find("SOS") != std::string::npos;
+    CHECK(r.passes > 8 && r.maxPassOpens <= kLoadingPassOpens && drafted && T::inputDropped == 0,
+          "%s: %d passes, max %llu opens in a pass, draft SOS shown %d", kChat[enigma], r.passes, (unsigned long long)r.maxPassOpens,
+          drafted);
+    closeChat();
+  }
+
+  g_test = "IN3b no memory for the held buffer, then Back: leaves at once";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    g_failNothrowArrayNew = true;
+    std::vector<InputEvent> evs;
+    morseEvents("EE", evs);
+    evs.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
+    LoadRun r = runLoading(evs, evs.size(), 3);
+    g_failNothrowArrayNew = false;
+    CHECK(r.left && r.passes <= 1 && r.maxPassOpens <= kLoadingPassOpens, "%s: left %d after %d passes, %llu opens", kChat[enigma],
+          r.left, r.passes, (unsigned long long)r.maxPassOpens);
+    closeChat();
+  }
+
+  g_test = "IN4d a Send and its replayed Short arriving after the held buffer overflowed: one send attempt";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    T::connected = false;
+    LittleFS.failOpen = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };  // draft kept
+    std::vector<InputEvent> evs;
+    morseEvents(twentyE.c_str(), evs);
+    evs.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, T::now - 10));
+    evs.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, T::now - 10));  // replayed
+    size_t before = std::count(T::seq.begin(), T::seq.end(), std::string("nextId"));
+    LoadRun r = runLoading(evs, 12);
+    loopPass(30);
+    size_t attempts = std::count(T::seq.begin(), T::seq.end(), std::string("nextId")) - before;
+    LittleFS.failOpen = nullptr;
+    T::connected = true;
+    CHECK(attempts == 1 && r.maxPassOpens <= kLoadingPassOpens, "%s: %zu send attempts, max %llu opens in a pass", kChat[enigma], attempts,
+          (unsigned long long)r.maxPassOpens);
+    closeChat();
+  }
+
+  g_test = "IN5b representative Morse keyed while loading (buffer overflowing, or no memory for it) gives the same draft as keyed live";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    for (int mode = 0; mode < 3; mode++) {  // 0 live (loaded), 1 loading with overflow, 2 loading without memory
+      // Without a held buffer the device keeps 1 carried event + its 32-event
+      // input queue: PARIS (28 events) fits, PARISTEST (48) does not (IN5c).
+      const char* word = mode == 2 ? "PARIS" : "PARISTEST";
+      if (mode == 0) {
+        coldEveryone();
+        T::inputCap = 32;
+        if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+        else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+        waitChatDrawn();
+        deviceCost();
+      } else {
+        openCold(enigma);
+        if (mode == 2) g_failNothrowArrayNew = true;
+      }
+      std::vector<InputEvent> evs;
+      morseEvents(word, evs, true);
+      LoadRun r = runLoading(evs, 0);
+      g_failNothrowArrayNew = false;
+      loopPass(30);
+      bool drafted = T::visibleJoined().find(word) != std::string::npos;
+      CHECK(drafted && T::inputDropped == 0 && r.maxPassOpens <= kLoadingPassOpens, "%s mode %d: draft %s shown %d, %u dropped, max %llu opens",
+            kChat[enigma], mode, word, drafted, T::inputDropped, (unsigned long long)r.maxPassOpens);
+      closeChat();
+    }
+  }
+
+  g_test = "IN5c more Morse than the device can keep without a held buffer (48 events): the loss is shown, never a silently different draft";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    g_failNothrowArrayNew = true;
+    std::vector<InputEvent> evs;
+    morseEvents("PARISTEST", evs, true);
+    bool noticeWhileLoading = false;
+    {
+      size_t next = 0;
+      for (int i = 0; i < 3000; i++) {
+        while (next < evs.size() && static_cast<int32_t>(T::now - evs[next].eventMs) >= 0) T::raw.push_back(evs[next++]);
+        loopPass();
+        noticeWhileLoading = noticeWhileLoading || T::visibleJoined().find("Input lost while loading") != std::string::npos;
+        if (next >= evs.size() && !chatLoading()) break;
+      }
+    }
+    g_failNothrowArrayNew = false;
+    loopPass(2);
+    bool noticeAfter = T::visibleJoined().find("Input lost while loading") != std::string::npos;
+    bool full = T::visibleJoined().find("PARISTEST") != std::string::npos;
+    CHECK((noticeWhileLoading || noticeAfter) && !full, "%s: notice while loading %d, after %d; full draft shown %d", kChat[enigma],
+          noticeWhileLoading, noticeAfter, full);
+    closeChat();
   }
 
   // A Send whose draft is kept (offline and the store write failing) and the

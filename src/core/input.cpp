@@ -35,9 +35,13 @@ InputEvent g_queue[kQueueSize];
 uint8_t g_queueHead = 0;
 uint8_t g_queueTail = 0;
 uint8_t g_queueCount = 0;
+uint32_t g_droppedEvents = 0;
 
 void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0, uint32_t eventMs = 0) {
-  if (g_queueCount >= kQueueSize) return;  // drop if the consumer is not draining fast enough
+  if (g_queueCount >= kQueueSize) {  // drop if the consumer is not draining fast enough
+    g_droppedEvents++;
+    return;
+  }
   g_queue[g_queueTail] = InputEvent{type, value, durationMs, eventMs};
   g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueSize);
   g_queueCount++;
@@ -828,6 +832,10 @@ void update() {
   updateEncoderLongHold(now);
   updateCombinedHold(now);
 }
+
+uint32_t droppedEventCount() { return g_droppedEvents; }
+
+bool queueFull() { return g_queueCount >= kQueueSize; }
 
 bool hasQueuedEvent(InputEventType type) {
   for (uint8_t i = 0; i < g_queueCount; i++) {

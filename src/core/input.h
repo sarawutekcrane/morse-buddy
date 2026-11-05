@@ -67,6 +67,13 @@ bool popEvent(InputEvent& outEvent);
 // see a Back waiting behind other input.
 bool hasQueuedEvent(InputEventType type);
 
+// Events dropped because the queue was full (since boot): a screen that
+// stopped draining for a while can tell the user that input was lost.
+uint32_t droppedEventCount();
+
+// True if the queue is full (the next event would be dropped).
+bool queueFull();
+
 // True if `e` is a general-navigation confirm: DOT/DASH released before the
 // 2000ms special-command threshold (Addendum section 9.3).
 bool isMenuConfirm(const InputEvent& e);

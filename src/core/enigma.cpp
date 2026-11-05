@@ -952,13 +952,41 @@ void refreshIndexIfNeeded() {
   }
 }
 
-// The index, complete now (in this pass): for input that cannot wait.
-void completeIndexNow() {
-  if (!g_indexDirty) return;
-  g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
-  g_indexDirty = false;
-  g_chatIndexGeneration = MessageStore::getStorageChangeGeneration();
-  followCursorMessage();
+// Input beyond what the held buffer takes: as in text_message.cpp's chat
+// (see its g_carriedEvent) -- one event carried, the rest waiting in the
+// input queue, the queue drained (all but a Back) only if it is full, and
+// the loss then reported ("Input lost while loading").
+InputEvent g_carriedEvent;
+bool g_haveCarried = false;
+bool g_inputLost = false;
+uint32_t g_inputDropsSeen = 0;
+
+bool takeInputWhileLoading() {
+  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;
+  if (g_haveCarried && g_heldInput.hold(g_carriedEvent)) g_haveCarried = false;
+  InputEvent q;
+  while (!g_haveCarried && Input::popEvent(q)) {
+    if (!g_heldInput.hold(q)) {
+      g_carriedEvent = q;
+      g_haveCarried = true;
+    }
+  }
+  if (Input::queueFull()) {
+    while (Input::popEvent(q)) {
+      if (q.type == InputEventType::ENCODER_LONG) return false;
+      g_inputLost = true;
+    }
+  }
+  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;
+  g_inputDropsSeen = Input::droppedEventCount();
+  return true;
+}
+
+void clearRetainedInput() {
+  g_heldInput.clear();
+  g_haveCarried = false;
+  g_inputLost = false;
+  g_inputDropsSeen = Input::droppedEventCount();
 }
 
 // Storage changed since this chat last looked: the store either kept the
@@ -979,11 +1007,13 @@ bool syncIndexWithStore() {
   return true;
 }
 
-void drawEnigmaChatLoading() {
+void drawEnigmaChatLoading(bool inputLost) {
   Display::setFont(Display::Font::PRIMARY);
   Display::clearContentArea();
-  Display::printLine(static_cast<int16_t>(2 + Display::kCursorCellWidth), Display::kStatusBarHeight + 2,
-                     "Loading messages...");
+  int16_t x = static_cast<int16_t>(2 + Display::kCursorCellWidth);
+  Display::printLine(x, Display::kStatusBarHeight + 2, "Loading messages...");
+  if (inputLost) Display::printLine(x, static_cast<int16_t>(Display::kStatusBarHeight + 2 + Display::lineHeight()),
+                                    "Input lost while loading");
 }
 
 // True while the pattern currently being keyed (g_composePattern) is known
@@ -1859,7 +1889,7 @@ void screenEnigmaChatTick() {
     markIndexDirty();
     g_enigmaChatDirty = true;
     g_enigmaChatNeedsFullRedraw = true;
-    g_heldInput.clear();
+    clearRetainedInput();
     g_chatLoadingShown = false;
     g_chatDrawnThisVisit = false;
   }
@@ -1885,54 +1915,58 @@ void screenEnigmaChatTick() {
     topReloaded = !g_indexDirty;
   }
   Input::update();
-  InputEvent unheld;
-  bool haveUnheld = false;
   if (g_indexDirty) {
-    // Still loading: input is held in order; Back leaves at once.
-    InputEvent q;
-    while (Input::popEvent(q)) {
-      if (q.type == InputEventType::ENCODER_LONG) {
-        g_heldInput.clear();
-        g_enigmaChatLeaving = true;
-        TextMessage::clearOpenConversation();
-        Menu::goBack();
-        return;
+    // Still loading: input is retained in order; Back leaves at once.
+    bool lostBefore = g_inputLost;
+    if (!takeInputWhileLoading()) {
+      clearRetainedInput();
+      InputEvent rest;
+      while (Input::popEvent(rest)) {
       }
-      if (!g_heldInput.hold(q)) {
-        completeIndexNow();  // full, or no memory: completed in this pass instead
-        unheld = q;
-        haveUnheld = true;
-        break;
-      }
-    }
-    if (g_indexDirty) {
-      Display::drawStatusBar();
-      if (!g_chatDrawnThisVisit && !g_chatLoadingShown) {
-        drawEnigmaChatLoading();
-        g_chatLoadingShown = true;
-      }
+      g_enigmaChatLeaving = true;
+      TextMessage::clearOpenConversation();
+      Menu::goBack();
       return;
     }
+    Display::drawStatusBar();
+    if (!g_chatDrawnThisVisit && (!g_chatLoadingShown || g_inputLost != lostBefore)) {
+      drawEnigmaChatLoading(g_inputLost);
+      g_chatLoadingShown = true;
+    }
+    return;
   }
   if (g_chatLoadingShown) {
     g_chatLoadingShown = false;
     g_enigmaChatNeedsFullRedraw = true;
     g_enigmaChatDirty = true;
   }
-  // Held input first, then the one that could not be held, then what arrived
-  // since -- every event through isReplayedSend() at dispatch.
+  // Held input first, then the carried event, then what arrived since --
+  // every event through isReplayedSend() at dispatch.
+  bool fromHeld = false;
   auto nextEvent = [&](InputEvent& out) -> bool {
-    if (g_heldInput.pop(out)) return true;
-    if (haveUnheld) {
-      haveUnheld = false;
-      out = unheld;
+    fromHeld = false;
+    if (g_heldInput.pop(out)) {
+      fromHeld = true;
+      return true;
+    }
+    if (g_haveCarried) {
+      g_haveCarried = false;
+      out = g_carriedEvent;
       return true;
     }
     return Input::popEvent(out);
   };
+  auto retain = [&](const InputEvent& ev) {
+    if (fromHeld) {
+      g_heldInput.unpop();
+    } else if (!g_haveCarried) {
+      g_carriedEvent = ev;
+      g_haveCarried = true;
+    }
+  };
   bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||
                     Input::hasQueuedEvent(InputEventType::ENCODER_LONG) ||
-                    (haveUnheld && unheld.type == InputEventType::ENCODER_LONG);
+                    (g_haveCarried && g_carriedEvent.type == InputEventType::ENCODER_LONG);
   bool droppingBeforeBack = false;
   InputEvent e;
   bool hadEvent = false;
@@ -1943,7 +1977,15 @@ void screenEnigmaChatTick() {
       droppingBeforeBack = true;  // a Back is waiting: history-side work before it is skipped
       continue;
     }
-    if (g_indexDirty) completeIndexNow();  // made stale earlier in this batch
+    if (g_indexDirty && e.type != InputEventType::ENCODER_LONG) {
+      // Made stale earlier in this batch: one bounded step; if that does not
+      // complete it, this event and the rest wait (retained, in order).
+      refreshIndexIfNeeded();
+      if (g_indexDirty) {
+        retain(e);
+        break;
+      }
+    }
     hadEvent = true;
     if (g_sendStatus != nullptr &&
         (e.type == InputEventType::DOT_PRESS_START || e.type == InputEventType::ENCODER_SHORT) &&
@@ -1951,7 +1993,7 @@ void screenEnigmaChatTick() {
       clearSendStatus();
     }
     if (e.type == InputEventType::ENCODER_ROTATE) {
-      completeIndexNow();
+      refreshIndexIfNeeded();  // (complete here: checked above)
       // Hardware Fix #4.3a issue 1: a logical message can span more visual
       // rows than the viewport, so rotating steps through THAT message's
       // own rows (g_historyRowOffset) before moving to the next/previous
@@ -1996,7 +2038,7 @@ void screenEnigmaChatTick() {
   }
   g_heldInput.releaseIfEmpty();
   if (g_enigmaChatLeaving) {
-    g_heldInput.clear();
+    clearRetainedInput();
     InputEvent rest;
     while (Input::popEvent(rest)) {
     }
@@ -2022,9 +2064,17 @@ void screenEnigmaChatTick() {
   }
 
   bool wasIndexDirty = g_indexDirty || topReloaded;
-  completeIndexNow();
+  refreshIndexIfNeeded();  // one bounded step
+  if (g_indexDirty) {
+    Display::drawStatusBar();  // not complete yet: nothing drawn from a partial index
+    return;
+  }
   if (wasIndexDirty) g_enigmaChatDirty = true;
   markSelectedHistoryRead();  // against the complete index
+  if (g_inputLost && !g_sendRanThisTick) {
+    g_inputLost = false;
+    setSendStatus({"Input lost while loading", true});
+  }
 
   Display::drawStatusBar();
   if (!g_enigmaChatDirty) return;
