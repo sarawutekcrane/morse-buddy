@@ -1683,6 +1683,76 @@ int main(int argc, char** argv) {
           during, pendingCount(kBob), pubsFor("msg/" + std::string(kBob)));
   }
 
+  // ---- Outbox, review round: a queued record that cannot be read at publication ----
+  // Counts (and optionally fails) the opens of one record file.
+  static std::string s_watchName;
+  static bool s_watchFail = false;
+  static int s_watchOpens = 0;
+  auto watchRecord = [](const char* contact, uint32_t seq, bool fail) {
+    char name[64];
+    snprintf(name, sizeof(name), "/%s/%08lu.msg", contact, static_cast<unsigned long>(seq));
+    s_watchName = name;
+    s_watchFail = fail;
+    s_watchOpens = 0;
+    LittleFS.failOpen = [](const std::string& p) {
+      if (p.size() < s_watchName.size() || p.compare(p.size() - s_watchName.size(), s_watchName.size(), s_watchName) != 0) return false;
+      s_watchOpens++;
+      return s_watchFail;
+    };
+  };
+
+  g_test = "OB8 a queued record whose read fails at publication (after the boot pass) is retried, not dropped: published once its reads work, flag cleared";
+  freshDevice();
+  powerOn(); runFor(30);  // the boot pass is done; nothing else will look at storage
+  {
+    watchRecord(kCarol, 1, true);  // Carol's first record: unreadable from now on
+    storePending(kCarol, 1700009000u);  // the normal store path: queued directly
+    loopPass(50);
+    int failedReads = s_watchOpens;
+    int pubsDuring = pubsFor("msg/" + std::string(kCarol));
+    s_watchFail = false;  // reads work again: no reboot, no new message, no outside change
+    runFor(120);
+    LittleFS.failOpen = nullptr;
+    CHECK(failedReads >= 1 && pubsDuring == 0, "precondition: %d failed reads at publication, %d published meanwhile", failedReads, pubsDuring);
+    CHECK(pubsFor("msg/" + std::string(kCarol)) == 1 && pendingCount(kCarol) == 0,
+          "after reads recovered: published %d (expected 1), still pending %d", pubsFor("msg/" + std::string(kCarol)), pendingCount(kCarol));
+  }
+
+  g_test = "OB9 a persistently unreadable queued record does not stop another from being published; it stays pending and queued, retried with backoff";
+  freshDevice();
+  powerOn(); runFor(30);
+  {
+    watchRecord(kBob, 1, true);
+    storePending(kBob, 1700009000u);   // never readable
+    storePending(kCarol, 1700009100u); // readable
+    runFor(120);
+    int attempts = s_watchOpens;
+    CHECK(pubsFor("msg/" + std::string(kCarol)) == 1 && pendingCount(kCarol) == 0, "the readable record: published %d, pending %d",
+          pubsFor("msg/" + std::string(kCarol)), pendingCount(kCarol));
+    CHECK(pendingCount(kBob) == 1 && attempts >= 2 && attempts <= 12, "the unreadable one: pending %d, %d read attempts in 120 s",
+          pendingCount(kBob), attempts);
+    s_watchFail = false;
+    runFor(120);
+    LittleFS.failOpen = nullptr;
+    CHECK(pubsFor("msg/" + std::string(kBob)) == 1 && pendingCount(kBob) == 0, "once readable: published %d, pending %d",
+          pubsFor("msg/" + std::string(kBob)), pendingCount(kBob));
+  }
+
+  g_test = "OB10 a queued record confirmed gone (deleted before publication) is dropped after one read: no publish, no retries";
+  freshDevice();
+  powerOn(); runFor(30);
+  {
+    T::connected = false;
+    MessageRef r = storePending(kCarol, 1700009000u);
+    MessageStore::deleteMessage(r);
+    watchRecord(kCarol, r.sequence, false);  // counts reads only
+    T::connected = true;
+    runFor(120);
+    LittleFS.failOpen = nullptr;
+    CHECK(pubsFor("msg/" + std::string(kCarol)) == 0 && s_watchOpens <= 1, "published %d, %d read attempts",
+          pubsFor("msg/" + std::string(kCarol)), s_watchOpens);
+  }
+
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

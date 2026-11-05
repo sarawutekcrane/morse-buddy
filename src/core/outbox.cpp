@@ -33,6 +33,13 @@ namespace {
 //  - queued records are published one per step while their group is
 //    connected (retried after kRetryMs otherwise); the pending flag is
 //    cleared on success, as before.
+//  - a queued record that cannot be read at publication is not dropped
+//    unless its absence is confirmed (a reliable names-only listing of its
+//    conversation without it): an inconclusive failure keeps it queued,
+//    retried after a per-record backoff (kReadRetryMinMs doubling, at most
+//    kReadRetryMaxMs), so it never blocks the other queued records and
+//    never causes a storage pass. A record read and found no longer
+//    pending is dropped (published or cleared elsewhere).
 // The queue and the pass state live on the heap while in use. A record
 // that does not fit the queue stays pending on flash and is found again by
 // the next pass.
@@ -42,9 +49,17 @@ constexpr uint8_t kWalkEntriesPerStep = 16;
 constexpr uint8_t kReadsPerStep = 4;
 constexpr uint8_t kQueueSize = 16;
 constexpr uint32_t kRetryMs = 5000;
+constexpr uint32_t kReadRetryMinMs = 1000;
+constexpr uint32_t kReadRetryMaxMs = 60000;
+constexpr uint32_t kPassRetryMaxMs = 300000;  // an incomplete pass is repeated after a growing pause, at most this
 
+struct Entry {
+  MessageRef ref;
+  uint32_t retryAtMs;   // not tried before this (a read failed)
+  uint8_t readFailures; // inconclusive read failures in a row
+};
 struct Queue {
-  MessageRef refs[kQueueSize];
+  Entry items[kQueueSize];
   uint8_t count;
 };
 Queue* g_queue = nullptr;
@@ -68,6 +83,7 @@ Pass* g_pass = nullptr;
 bool g_passDone = false;          // a complete pass ran since boot (and since the last external change)
 uint32_t g_externalSeen = 0;      // getExternalMutationCount() a complete pass covered
 uint32_t g_passAgainAtMs = 0;     // after an incomplete pass, or an overflowed queue
+uint32_t g_passRetryMs = kRetryMs;  // the pause before repeating an incomplete pass (doubles, reset by a complete one)
 bool g_passAgain = false;
 uint32_t g_nextStepMs = 0;
 
@@ -85,22 +101,47 @@ void enqueue(const MessageRef& ref) {
     g_queue->count = 0;
   }
   for (uint8_t i = 0; i < g_queue->count; i++) {
-    if (sameRef(g_queue->refs[i], ref)) return;
+    if (sameRef(g_queue->items[i].ref, ref)) return;  // queued already (its retry state kept)
   }
   if (g_queue->count >= kQueueSize) {
     g_queueOverflowed = true;
     return;
   }
-  g_queue->refs[g_queue->count++] = ref;
+  Entry& e = g_queue->items[g_queue->count++];
+  e.ref = ref;
+  e.retryAtMs = millis();
+  e.readFailures = 0;
 }
 
-void dropFront() {
-  for (uint8_t i = 1; i < g_queue->count; i++) g_queue->refs[i - 1] = g_queue->refs[i];
+void removeAt(uint8_t k) {
+  for (uint8_t i = k + 1; i < g_queue->count; i++) g_queue->items[i - 1] = g_queue->items[i];
   g_queue->count--;
   if (g_queue->count == 0) {
     delete g_queue;
     g_queue = nullptr;
   }
+}
+
+// The entry goes behind the others (their turn first).
+void moveToBack(uint8_t k) {
+  Entry e = g_queue->items[k];
+  for (uint8_t i = k + 1; i < g_queue->count; i++) g_queue->items[i - 1] = g_queue->items[i];
+  g_queue->items[g_queue->count - 1] = e;
+}
+
+// True only if the record is confirmed gone: its conversation listed
+// reliably (names only, no record opened) without it. A listing that fails,
+// or no memory for it, is inconclusive.
+bool confirmedAbsent(const MessageRef& ref) {
+  uint32_t* seqs = new (std::nothrow) uint32_t[MessageStore::kMaxMessagesPerThread];
+  if (seqs == nullptr) return false;
+  bool reliable = false;
+  uint16_t n = MessageStore::listMessageSequences(ref.group_code, ref.contact_key, seqs, MessageStore::kMaxMessagesPerThread,
+                                                  &reliable);
+  bool listed = false;
+  for (uint16_t i = 0; i < n && !listed; i++) listed = seqs[i] == ref.sequence;
+  delete[] seqs;
+  return reliable && !listed;
 }
 
 void onPendingWritten(const MessageRef& ref) { enqueue(ref); }
@@ -109,20 +150,41 @@ void onPendingWritten(const MessageRef& ref) { enqueue(ref); }
 // this step did storage or network work.
 bool publishStep() {
   if (g_queue == nullptr) return false;
-  if (static_cast<int32_t>(millis() - g_publishRetryAtMs) < 0) return false;
-  MessageRef ref = g_queue->refs[0];
+  uint32_t now = millis();
+  if (static_cast<int32_t>(now - g_publishRetryAtMs) < 0) return false;
+  // The oldest entry whose read retry is due (a record waiting on one does
+  // not hold up the rest).
+  uint8_t k = 0;
+  while (k < g_queue->count && static_cast<int32_t>(now - g_queue->items[k].retryAtMs) < 0) k++;
+  if (k == g_queue->count) return false;
+  MessageRef ref = g_queue->items[k].ref;
   if (!MqttManager::isGroupConnected(ref.group_code)) {
     // Still offline: the rest of the queue first, this one later.
-    if (g_queue->count > 1) {
-      dropFront();
-      enqueue(ref);
-    }
+    if (g_queue->count > 1) moveToBack(k);
     g_publishRetryAtMs = millis() + kRetryMs;
     return false;
   }
   StoredMessageView view;
-  if (!MessageStore::loadMessage(ref, &view) || !(view.header.flags & MessageStore::FLAG_PENDING_OUTBOX)) {
-    dropFront();  // gone, or already published
+  if (!MessageStore::loadMessage(ref, &view)) {
+    if (confirmedAbsent(ref)) {
+      removeAt(k);  // gone (deleted, evicted): nothing to send
+      return true;
+    }
+    // Inconclusive (unreadable now): kept, tried again later.
+    Entry& e = g_queue->items[k];
+    if (e.readFailures < 255) e.readFailures++;
+    uint32_t backoff = kReadRetryMinMs;
+    for (uint8_t i = 1; i < e.readFailures && backoff < kReadRetryMaxMs; i++) backoff *= 2;
+    if (backoff > kReadRetryMaxMs) backoff = kReadRetryMaxMs;
+    e.retryAtMs = millis() + backoff;
+    Serial.printf("[OUTBOX] queued record %s/%s/%lu unreadable (%u); retried in %lu ms\n", ref.group_code, ref.contact_key,
+                  static_cast<unsigned long>(ref.sequence), static_cast<unsigned>(e.readFailures),
+                  static_cast<unsigned long>(backoff));
+    if (g_queue->count > 1) moveToBack(k);
+    return true;
+  }
+  if (!(view.header.flags & MessageStore::FLAG_PENDING_OUTBOX)) {
+    removeAt(k);  // read, and no longer pending: published (or cleared) already
     return true;
   }
   const char* suffix;
@@ -146,7 +208,7 @@ bool publishStep() {
     return true;
   }
   MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);
-  dropFront();
+  removeAt(k);
   return true;
 }
 
@@ -163,9 +225,13 @@ void endPass() {
   if (complete) {
     g_passDone = true;
     g_externalSeen = g_pass->externalAtStart;
+    g_passRetryMs = kRetryMs;
   } else {
+    // Repeated after a growing pause: a record that stays unreadable does not
+    // cause a whole-store pass every few seconds.
     g_passAgain = true;
-    g_passAgainAtMs = millis() + kRetryMs;
+    g_passAgainAtMs = millis() + g_passRetryMs;
+    g_passRetryMs = g_passRetryMs * 2 < kPassRetryMaxMs ? g_passRetryMs * 2 : kPassRetryMaxMs;
   }
   delete g_pass;
   g_pass = nullptr;
