@@ -95,6 +95,8 @@ void onTextMessageEvent(const MessageRef& ref, MessageEventType eventType);
 bool g_indexDirty = true;
 uint16_t g_indexTotal = 0;
 
+void rememberCursorMessage();
+void followCursorMessage();
 void markIndexDirty() { g_indexDirty = true; }
 
 // Chat-entry latency (device A on 2ed04b6: the broadcast chat took about
@@ -108,6 +110,12 @@ constexpr uint8_t kIndexReadsPerPass = 4;
 HeldInput g_heldInput;
 bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
 bool g_chatDrawnThisVisit = false;
+// The storage generation when this chat's index last finished loading. The
+// store keeps the index current across ordinary writes; one it could not
+// keep current (a failed write, a change made outside the store) is
+// reloaded -- once per change, so an index that cannot be cached (a record
+// unreadable) is not reloaded every pass.
+uint32_t g_chatIndexGeneration = 0;
 
 void refreshIndexIfNeeded() {
   if (!g_indexDirty) return;
@@ -116,6 +124,8 @@ void refreshIndexIfNeeded() {
                                           nullptr)) {
     g_indexTotal = count;
     g_indexDirty = false;
+    g_chatIndexGeneration = MessageStore::getStorageChangeGeneration();
+    followCursorMessage();
   }
 }
 
@@ -124,6 +134,26 @@ void completeIndexNow() {
   if (!g_indexDirty) return;
   g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
   g_indexDirty = false;
+  g_chatIndexGeneration = MessageStore::getStorageChangeGeneration();
+  followCursorMessage();
+}
+
+// Storage changed since this chat last looked: the store either kept the
+// index current (patching this conversation's own changes in, which can
+// move rows) -- the count and the selection are re-read -- or could not,
+// and it is reloaded. Either way the selection stays on its message.
+// Returns true if what is shown may have changed.
+bool syncIndexWithStore() {
+  uint32_t now = MessageStore::getStorageChangeGeneration();
+  if (g_indexDirty || g_chatIndexGeneration == now) return false;
+  if (!MessageStore::isIndexCurrent(g_selectedGroupCode, g_selectedContactKey)) {
+    markIndexDirty();
+    return true;
+  }
+  g_chatIndexGeneration = now;
+  g_indexTotal = MessageStore::getIndexCount();
+  followCursorMessage();
+  return true;
 }
 
 void drawChatLoading() {
@@ -294,6 +324,35 @@ uint16_t g_historyCursor = kNoHistoryCursor;
 // viewport be scrolled through row by row while g_historyCursor keeps
 // pointing at the same logical message the whole time.
 uint16_t g_historyRowOffset = 0;
+
+// A reload can insert or remove messages above the selection: the
+// selection follows its message (by sequence), not its row number, so a
+// reload never moves it onto another message (which selecting would read).
+bool g_cursorSeqKnown = false;
+uint32_t g_cursorSeq = 0;
+void rememberCursorMessage() {
+  g_cursorSeqKnown = false;
+  if (g_historyCursor == kNoHistoryCursor) return;
+  const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
+  if (e == nullptr) return;
+  g_cursorSeq = e->sequence;
+  g_cursorSeqKnown = true;
+}
+void followCursorMessage() {
+  if (!g_cursorSeqKnown || g_historyCursor == kNoHistoryCursor) {
+    rememberCursorMessage();
+    return;
+  }
+  for (uint16_t i = 0; i < g_indexTotal; i++) {
+    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
+    if (e != nullptr && e->sequence == g_cursorSeq) {
+      g_historyCursor = i;  // same message: its row offset stays valid
+      break;
+    }
+  }
+  // (gone -- deleted, evicted: the row number is kept, as before)
+  rememberCursorMessage();
+}
 
 char g_composeText[PacketCodec::kMaxDecodedTextLen + 1];
 uint8_t g_composeLen = 0;
@@ -1496,6 +1555,7 @@ void screenChatTick() {
   Display::setFont(Display::Font::PRIMARY);
 
   // One step of the index load (nothing when it is current).
+  if (syncIndexWithStore()) g_chatRenderDirty = true;
   bool topReloaded = false;
   if (g_indexDirty) {
     uint32_t topRefreshStart = millis();
@@ -1649,6 +1709,7 @@ void screenChatTick() {
     // events in one tick), which a single end-of-loop check would miss.
     if (g_historyCursor != kNoHistoryCursor) historyFocusTouchedThisPass = true;
     if (!g_chatIsOpen) break;  // left (Back): the rest is not this chat's
+    if (!g_indexDirty) rememberCursorMessage();
   }
   (void)fromHeld;
   g_heldInput.releaseIfEmpty();

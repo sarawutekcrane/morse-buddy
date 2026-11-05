@@ -902,6 +902,34 @@ const char* g_composeError = nullptr;
 bool g_indexDirty = true;
 uint16_t g_indexTotal = 0;
 
+// A reload can insert or remove messages above the selection: the
+// selection follows its message (by sequence), not its row number, so a
+// reload never moves it onto another message (which selecting would read).
+bool g_cursorSeqKnown = false;
+uint32_t g_cursorSeq = 0;
+void rememberCursorMessage() {
+  g_cursorSeqKnown = false;
+  if (g_historyCursor == kNoHistoryCursor) return;
+  const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
+  if (e == nullptr) return;
+  g_cursorSeq = e->sequence;
+  g_cursorSeqKnown = true;
+}
+void followCursorMessage() {
+  if (!g_cursorSeqKnown || g_historyCursor == kNoHistoryCursor) {
+    rememberCursorMessage();
+    return;
+  }
+  for (uint16_t i = 0; i < g_indexTotal; i++) {
+    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
+    if (e != nullptr && e->sequence == g_cursorSeq) {
+      g_historyCursor = i;  // same message: its row offset stays valid
+      break;
+    }
+  }
+  // (gone -- deleted, evicted: the row number is kept, as before)
+  rememberCursorMessage();
+}
 void markIndexDirty() { g_indexDirty = true; }
 
 // Chat-entry latency: the same stepped index load, held input and prompt
@@ -910,6 +938,7 @@ constexpr uint8_t kIndexReadsPerPass = 4;
 HeldInput g_heldInput;
 bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
 bool g_chatDrawnThisVisit = false;
+uint32_t g_chatIndexGeneration = 0;  // as in text_message.cpp: a stale index is reloaded once per change
 
 void refreshIndexIfNeeded() {
   if (!g_indexDirty) return;
@@ -918,6 +947,8 @@ void refreshIndexIfNeeded() {
                                           nullptr)) {
     g_indexTotal = count;
     g_indexDirty = false;
+    g_chatIndexGeneration = MessageStore::getStorageChangeGeneration();
+    followCursorMessage();
   }
 }
 
@@ -926,6 +957,26 @@ void completeIndexNow() {
   if (!g_indexDirty) return;
   g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
   g_indexDirty = false;
+  g_chatIndexGeneration = MessageStore::getStorageChangeGeneration();
+  followCursorMessage();
+}
+
+// Storage changed since this chat last looked: the store either kept the
+// index current (patching this conversation's own changes in, which can
+// move rows) -- the count and the selection are re-read -- or could not,
+// and it is reloaded. Either way the selection stays on its message.
+// Returns true if what is shown may have changed.
+bool syncIndexWithStore() {
+  uint32_t now = MessageStore::getStorageChangeGeneration();
+  if (g_indexDirty || g_chatIndexGeneration == now) return false;
+  if (!MessageStore::isIndexCurrent(g_selectedGroupCode, g_selectedContactKey)) {
+    markIndexDirty();
+    return true;
+  }
+  g_chatIndexGeneration = now;
+  g_indexTotal = MessageStore::getIndexCount();
+  followCursorMessage();
+  return true;
 }
 
 void drawEnigmaChatLoading() {
@@ -1827,6 +1878,7 @@ void screenEnigmaChatTick() {
   }
 
   // One step of the index load (nothing when it is current).
+  if (syncIndexWithStore()) g_enigmaChatDirty = true;
   bool topReloaded = false;
   if (g_indexDirty) {
     refreshIndexIfNeeded();
@@ -1940,6 +1992,7 @@ void screenEnigmaChatTick() {
       handleComposeEvent(e);
     }
     if (g_enigmaChatLeaving) break;  // left (Back)
+    if (!g_indexDirty) rememberCursorMessage();
   }
   g_heldInput.releaseIfEmpty();
   if (g_enigmaChatLeaving) {

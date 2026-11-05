@@ -180,6 +180,13 @@ const ConversationIndexEntry* getIndexEntry(uint16_t i);
 bool stepConversationIndex(const char* group_code, const char* contact_key, uint8_t maxReads, uint16_t* outCount,
                            uint16_t* outRead, uint16_t* outTotal);
 
+// True if the shared index is complete and current for this conversation.
+// Its entries (getIndexEntry()) may have changed since the last load: the
+// store patches its conversation's writes and removals in place.
+bool isIndexCurrent(const char* group_code, const char* contact_key);
+// The shared index's entry count now.
+uint16_t getIndexCount();
+
 // True while a chat is loading its index (it stepped the load within the
 // last 200 ms): background readers (Notifications, Outbox) wait.
 bool chatIndexLoading();

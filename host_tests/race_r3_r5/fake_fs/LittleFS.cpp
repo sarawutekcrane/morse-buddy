@@ -99,6 +99,7 @@ File HostLittleFS::open(const char* path, const char* mode) {
   impl->path = p;
   impl->f = f;
   g_fs.fileOpens++;
+  if (onFileOpen) onFileOpen(p);
   return File(impl);
 }
 bool HostLittleFS::exists(const char* path) {
@@ -120,6 +121,7 @@ bool HostLittleFS::remove(const char* path) {
 bool HostLittleFS::rmdir(const char* path) { return remove(path); }
 bool HostLittleFS::rename(const char* from, const char* to) {
   g_fs.renames++;
+  if (failRename && failRename(to)) return false;
   std::error_code ec;
   fs::rename(hostPath(from), hostPath(to), ec);
   return !ec;

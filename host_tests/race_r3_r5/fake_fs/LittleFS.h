@@ -50,6 +50,8 @@ struct HostLittleFS {
   std::string root;  // host directory standing for the flash filesystem
   std::function<bool(const std::string&)> failOpen;    // true -> this open() fails
   std::function<bool(const std::string&)> failRemove;  // true -> this remove() fails (nothing removed)
+  std::function<bool(const std::string&)> failRename;  // true (given the target) -> this rename() fails
+  std::function<void(const std::string&)> onFileOpen;  // runs on every successful file open (a device-cost model)
   bool reverseListing = false;  // directories list in reverse name order (LittleFS promises no order)
   bool begin(bool = false, const char* = "/littlefs", int = 10, const char* = "spiffs") { return true; }
   File open(const char* path, const char* mode = "r");

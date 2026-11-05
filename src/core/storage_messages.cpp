@@ -1768,6 +1768,13 @@ uint16_t loadConversationIndex(const char* group_code, const char* contact_key) 
   return g_indexCount;
 }
 
+bool isIndexCurrent(const char* group_code, const char* contact_key) {
+  return g_indexCacheValid && g_indexCacheGeneration == g_storageChangeGeneration &&
+         strcmp(g_indexCacheGroup, group_code) == 0 && strcmp(g_indexCacheContact, contact_key) == 0;
+}
+
+uint16_t getIndexCount() { return g_indexCount; }
+
 bool chatIndexLoading() {
   return g_loader.active && !g_loader.fed && millis() - g_loader.lastStepMs < kChatLoadingMs;
 }

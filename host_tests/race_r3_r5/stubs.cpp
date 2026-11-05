@@ -211,6 +211,8 @@ bool stepConversationIndex(const char* g, const char* c, uint8_t, uint16_t* coun
   return true;
 }
 bool chatIndexLoading() { return false; }
+bool isIndexCurrent(const char*, const char*) { return true; }  // the fake store: reloads only when marked, as before
+uint16_t getIndexCount() { return static_cast<uint16_t>(g_index.size()); }
 bool beginIndexFeed(const char*, const char*, const uint32_t*, uint16_t, bool, bool) { return false; }
 void feedIndexRecord(const char*, const char*, uint32_t, const StoredHeader*, const char*) {}
 bool loadMessageForDisplay(const MessageRef& ref, StoredMessageView* v) { return loadMessage(ref, v); }

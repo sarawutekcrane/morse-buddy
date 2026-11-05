@@ -19,8 +19,18 @@
 #include "core/packet_codec.h"
 #include "core/storage_messages.h"
 
+// The same with a type payload given as bytes (e.g. an encoded TEXT payload).
+inline MessageRef writeLegacyRecordBytes(const char* group, const char* contact, MessageStore::Direction dir, uint16_t flags,
+                                         uint32_t ts, const PacketCodec::MessageEnvelope& env, const uint8_t* payload,
+                                         uint16_t payloadLen);
 inline MessageRef writeLegacyRecord(const char* group, const char* contact, MessageStore::Direction dir, uint16_t flags,
                                     uint32_t ts, const PacketCodec::MessageEnvelope& env, const char* body) {
+  return writeLegacyRecordBytes(group, contact, dir, flags, ts, env, reinterpret_cast<const uint8_t*>(body),
+                                static_cast<uint16_t>(strlen(body)));
+}
+inline MessageRef writeLegacyRecordBytes(const char* group, const char* contact, MessageStore::Direction dir, uint16_t flags,
+                                         uint32_t ts, const PacketCodec::MessageEnvelope& env, const uint8_t* payload,
+                                         uint16_t payloadLen) {
   std::string dirPath = LittleFS.root + "/messages/" + group + "/" + contact;
   std::error_code ec;
   std::filesystem::create_directories(dirPath, ec);
@@ -31,8 +41,7 @@ inline MessageRef writeLegacyRecord(const char* group, const char* contact, Mess
   }
   uint32_t seq = maxOnDisk + 1;  // continues after whatever is on disk
   uint8_t wire[512];
-  size_t wn = PacketCodec::encodeMessagePacket(env, reinterpret_cast<const uint8_t*>(body), static_cast<uint16_t>(strlen(body)),
-                                               wire, sizeof(wire));
+  size_t wn = PacketCodec::encodeMessagePacket(env, payload, payloadLen, wire, sizeof(wire));
   std::string rec;
   auto u16 = [&](uint16_t v) { rec.push_back(static_cast<char>(v & 0xFF)); rec.push_back(static_cast<char>(v >> 8)); };
   auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; i++) rec.push_back(static_cast<char>((v >> (8 * i)) & 0xFF)); };
