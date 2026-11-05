@@ -1,0 +1,19 @@
+history: 40 conversations x 20 messages (4 of 5 received, all received ones flagged unread as legacy firmware left them)
+B0 boot: service init              opens=0 dirEntries=0 writes=0 nvs=0 hostUs=9
+B0b open chat at boot (until drawn) calls=4  per-call max: opens=28 dirEntries=20 writes=0 renames=0 removes=0 nvs=0 hostUs=199  | calls>8opens=1  totals: opens=28 dirEntries=22 writes=0 removes=0 nvs=0
+   B0b simulated: 1804 ms until drawn (63 ms per open)
+   records on flash at boot: 800 (largest conversation 20)
+   every conversation at <=100 records after 1.0 s (simulated); now 800 records
+B1 idle: services per loop pass    calls=6000  per-call max: opens=804 dirEntries=841 writes=0 renames=0 removes=0 nvs=1 hostUs=6220  | calls>8opens=1  totals: opens=1600 dirEntries=2460 writes=0 removes=0 nvs=13
+B1 idle: Main Menu per loop pass   calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=2  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   after 120s idle: Text badge=1
+B2 open chat (until drawn)         calls=4  per-call max: opens=28 dirEntries=20 writes=0 renames=0 removes=0 nvs=0 hostUs=174  | calls>8opens=1  totals: opens=28 dirEntries=20 writes=0 removes=0 nvs=0
+   B2 simulated: 1804 ms until drawn
+B2 rotate x20: UI per pass         calls=20  per-call max: opens=15 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=90  | calls>8opens=20  totals: opens=210 dirEntries=0 writes=0 removes=0 nvs=0
+B2 rotate x20: services per pass   calls=20  per-call max: opens=4 dirEntries=20 writes=1 renames=1 removes=1 nvs=1 hostUs=628  | calls>8opens=0  totals: opens=48 dirEntries=20 writes=15 removes=15 nvs=1
+B2 then idle in chat: services     calls=6000  per-call max: opens=4 dirEntries=20 writes=1 renames=1 removes=1 nvs=1 hostUs=505  | calls>8opens=0  totals: opens=24 dirEntries=20 writes=1 removes=1 nvs=1
+B2 then idle in chat: UI (redraws) calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=4  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   unread on flash in EVERYONE after rotation + 120s: 0 (of 16 received)
+B3 Main Menu rotate x20: UI        calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=1  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+B3 Main Menu rotate x20: services  calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   Text badge now=1

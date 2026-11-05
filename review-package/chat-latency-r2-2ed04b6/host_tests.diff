@@ -1,0 +1,1369 @@
+diff --git a/host_tests/race_r3_r5/README.md b/host_tests/race_r3_r5/README.md
+index 6b20b20..8e986b6 100644
+--- a/host_tests/race_r3_r5/README.md
++++ b/host_tests/race_r3_r5/README.md
+@@ -406,6 +406,59 @@ Measurements (`storage_bench`, step 6b; host op counts, not device time):
+ | 8 x 300: all trimmed to 100 | never | never | never | after 73 s (simulated) |
+ | 400 x 20: background, max per loop pass | none | 40 opens / 421 entries | 4 opens / 401 entries | 4 opens / 20 entries |
+ 
++## Chat entry, round 2 (device A on 2ed04b6; uncommitted candidate)
++
++Device A, flashed 2ed04b6, 70 broadcast messages: `[PERF][CHAT_INDEX]
++list=158 ms read=4446 ms` (one LittleFS open per record, about 63 ms each),
++a cached re-entry still about 864 ms (`historyViewport` 415 + `historyRender`
++447: the visible rows read twice), and `[PERF][OUTBOX] scan 5143 ms found=0`
++after connecting. This round removes the repeated reads (RAM only; no new
++persistent format -- see the review package's `STORAGE_CACHE_DESIGN.md`):
++
++- **Record cache** (`MessageStore::loadMessageForDisplay()`): 10 records,
++  byte-exact, heap; every store write updates a cached record, a removal,
++  a failed write or an external change drops it. The render, re-entry and
++  rotations read what the viewport already read.
++- **The shared index stays current**: mutations of other conversations
++  leave it valid; its own conversation's writes and removals are patched
++  in place. A **parked** second index keeps the last chat.
++- **The boot sweep visits each configured group's Everyone first**; its
++  recount (which reads every record anyway) feeds that chat's index
++  (`beginIndexFeed()`/`feedIndexRecord()`), or the parked index while a
++  chat is open (it never replaces the index an open chat draws from).
++- **Stepped, time-budgeted loads** (`stepConversationIndex()`, 4 reads or
++  about 20 ms per pass); Notifications and the Outbox pause while a chat
++  loads. The chats show "Loading messages..." (or keep what they drew),
++  hold input in order (`held_input.h`, 32 events, heap) and replay it once
++  ready; Back leaves at once; input that cannot be held (full, no memory)
++  completes the index in that pass instead. Every event, held or live, goes
++  through `isReplayedSend()` at dispatch. A Back already queued skips the
++  history-side events before it. The selection follows its message (by
++  sequence) whenever the index changes under it, so a reload or patch
++  never moves it onto another message.
++- **Outbox**: the blocking whole-store scan is replaced by an incremental
++  pass of header-only reads (at most 4 per step within the budget), once
++  per boot after connecting and after an external change; a record written
++  pending is queued directly (`setOnPendingWrittenCallback()`). Pending
++  records stay durable on flash; the flag is cleared only after a publish
++  succeeds.
++
++New `storage_test` cases (host operation counts; the device-cost model
++`LittleFS.onFileOpen` adds 63 ms per file open to the mock clock -- a model,
++not device timing): CE1/CE1b/CE2/CE2b/CE3 entry and re-entry costs;
++CE13 every record served equals its file; CE15 the cache keeps conversations
++apart; CE16 a recount never replaces an open chat's index; CE17 the sweep
++reads each record once; CE18 a deleted cached record is not served;
++CE19/CE20 the parked index follows its conversation, a failed rename loses
++the record from every index; CE21/CE22 the parked feed; CE23 the selection
++stays on its message; DM1-DM3 device-cost model entries; IN1-IN7 held input
++(order, overflow, allocation failure via `operator new[](nothrow)`, Send
++replay in Text and Enigma, one Morse sequence, Back after queued rotations,
++Back while loading); OB1-OB7 the Outbox. ST15 and CE17 run offline (the
++Outbox would publish or read the pending records). `mutate_notify.py`
++targets the store, both chats, Notifications and `outbox.cpp`, three
++mutants at a time (`MUT_JOBS`).
++
+ ## Heap diagnostics (for hardware acceptance)
+ 
+ `race.cpp` writes one serial line per heap reading:
+diff --git a/host_tests/race_r3_r5/fake_fs/LittleFS.cpp b/host_tests/race_r3_r5/fake_fs/LittleFS.cpp
+index be7b50c..b0edb93 100644
+--- a/host_tests/race_r3_r5/fake_fs/LittleFS.cpp
++++ b/host_tests/race_r3_r5/fake_fs/LittleFS.cpp
+@@ -99,6 +99,7 @@ File HostLittleFS::open(const char* path, const char* mode) {
+   impl->path = p;
+   impl->f = f;
+   g_fs.fileOpens++;
++  if (onFileOpen) onFileOpen(p);
+   return File(impl);
+ }
+ bool HostLittleFS::exists(const char* path) {
+@@ -120,6 +121,7 @@ bool HostLittleFS::remove(const char* path) {
+ bool HostLittleFS::rmdir(const char* path) { return remove(path); }
+ bool HostLittleFS::rename(const char* from, const char* to) {
+   g_fs.renames++;
++  if (failRename && failRename(to)) return false;
+   std::error_code ec;
+   fs::rename(hostPath(from), hostPath(to), ec);
+   return !ec;
+diff --git a/host_tests/race_r3_r5/fake_fs/LittleFS.h b/host_tests/race_r3_r5/fake_fs/LittleFS.h
+index afbe5bf..4da0f3d 100644
+--- a/host_tests/race_r3_r5/fake_fs/LittleFS.h
++++ b/host_tests/race_r3_r5/fake_fs/LittleFS.h
+@@ -50,6 +50,8 @@ struct HostLittleFS {
+   std::string root;  // host directory standing for the flash filesystem
+   std::function<bool(const std::string&)> failOpen;    // true -> this open() fails
+   std::function<bool(const std::string&)> failRemove;  // true -> this remove() fails (nothing removed)
++  std::function<bool(const std::string&)> failRename;  // true (given the target) -> this rename() fails
++  std::function<void(const std::string&)> onFileOpen;  // runs on every successful file open (a device-cost model)
+   bool reverseListing = false;  // directories list in reverse name order (LittleFS promises no order)
+   bool begin(bool = false, const char* = "/littlefs", int = 10, const char* = "spiffs") { return true; }
+   File open(const char* path, const char* mode = "r");
+diff --git a/host_tests/race_r3_r5/legacy_store.h b/host_tests/race_r3_r5/legacy_store.h
+index bb03ed2..eeef528 100644
+--- a/host_tests/race_r3_r5/legacy_store.h
++++ b/host_tests/race_r3_r5/legacy_store.h
+@@ -19,8 +19,18 @@
+ #include "core/packet_codec.h"
+ #include "core/storage_messages.h"
+ 
++// The same with a type payload given as bytes (e.g. an encoded TEXT payload).
++inline MessageRef writeLegacyRecordBytes(const char* group, const char* contact, MessageStore::Direction dir, uint16_t flags,
++                                         uint32_t ts, const PacketCodec::MessageEnvelope& env, const uint8_t* payload,
++                                         uint16_t payloadLen);
+ inline MessageRef writeLegacyRecord(const char* group, const char* contact, MessageStore::Direction dir, uint16_t flags,
+                                     uint32_t ts, const PacketCodec::MessageEnvelope& env, const char* body) {
++  return writeLegacyRecordBytes(group, contact, dir, flags, ts, env, reinterpret_cast<const uint8_t*>(body),
++                                static_cast<uint16_t>(strlen(body)));
++}
++inline MessageRef writeLegacyRecordBytes(const char* group, const char* contact, MessageStore::Direction dir, uint16_t flags,
++                                         uint32_t ts, const PacketCodec::MessageEnvelope& env, const uint8_t* payload,
++                                         uint16_t payloadLen) {
+   std::string dirPath = LittleFS.root + "/messages/" + group + "/" + contact;
+   std::error_code ec;
+   std::filesystem::create_directories(dirPath, ec);
+@@ -31,8 +41,7 @@ inline MessageRef writeLegacyRecord(const char* group, const char* contact, Mess
+   }
+   uint32_t seq = maxOnDisk + 1;  // continues after whatever is on disk
+   uint8_t wire[512];
+-  size_t wn = PacketCodec::encodeMessagePacket(env, reinterpret_cast<const uint8_t*>(body), static_cast<uint16_t>(strlen(body)),
+-                                               wire, sizeof(wire));
++  size_t wn = PacketCodec::encodeMessagePacket(env, payload, payloadLen, wire, sizeof(wire));
+   std::string rec;
+   auto u16 = [&](uint16_t v) { rec.push_back(static_cast<char>(v & 0xFF)); rec.push_back(static_cast<char>(v >> 8)); };
+   auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; i++) rec.push_back(static_cast<char>((v >> (8 * i)) & 0xFF)); };
+diff --git a/host_tests/race_r3_r5/mutate_notify.py b/host_tests/race_r3_r5/mutate_notify.py
+index 5847ad5..0a5b668 100644
+--- a/host_tests/race_r3_r5/mutate_notify.py
++++ b/host_tests/race_r3_r5/mutate_notify.py
+@@ -6,11 +6,11 @@
+ # mutation must fail at least one of them.
+ import os, subprocess, sys, shutil, tempfile
+ H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
+-NT, TX, EN, SM = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp"
++NT, TX, EN, SM, OB = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp"
+ muts = [
+  # ---- reading in the chats ----
+- (TX, "Text: selection does not mark read", "  if (hadEvent) g_chatRenderDirty = true;\n  markSelectedHistoryRead();\n", "  if (hadEvent) g_chatRenderDirty = true;\n"),
+- (EN, "Enigma: selection does not mark read", "  if (hadEvent) g_enigmaChatDirty = true;\n  markSelectedHistoryRead();\n", "  if (hadEvent) g_enigmaChatDirty = true;\n"),
++ (TX, "Text: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
++ (EN, "Enigma: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
+  (TX, "Text: every message in the chat marked read on entry", "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n",
+   "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n    for (uint16_t k = 0; k < MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey); k++) Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, k, MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey));\n"),
+  # ---- categories ----
+@@ -70,7 +70,7 @@ muts = [
+  (NT, "the open conversation is trimmed", "  if (TextMessage::isConversationOpen(j.group_code, j.contact_key)) {", "  if (false) {"),
+  (NT, "several deletions per step", "    return;  // at most one deletion per step", "    continue;"),
+  (NT, "the walk reads every directory entry in one step", "constexpr uint8_t kWalkEntriesPerStep = 16;", "constexpr uint8_t kWalkEntriesPerStep = 255;"),
+- (NT, "an unreadable record is skipped (recount applied anyway)", "      j.unreliable = true;\n      continue;", "      continue;"),
++ (NT, "an unreadable record is skipped (recount applied anyway)", "      j.unreliable = true;\n      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord(", "      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord("),
+  (NT, "an arrival does not restart a recount under way", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {\n  conversationChanged(group_code, contact_key);", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {"),
+  (NT, "a whole conversation per step (unbounded)", "constexpr uint8_t kLoadsPerStep = 4;", "constexpr uint8_t kLoadsPerStep = 255;"),
+  (NT, "several rewrites per step", "      j.rewrites++;\n      return;  // at most one rewrite per step", "      j.rewrites++;"),
+@@ -84,7 +84,76 @@ muts = [
+  (SM, "the walk stops at the first group", "      w->group.close();\n      w->inGroup = false;\n      continue;", "      w->group.close();\n      w->inGroup = false;\n      return WalkResult::END;"),
+  (SM, "deleteMessage leaves the record on flash", "bool deleteMessage(const MessageRef& ref) {", "bool deleteMessage(const MessageRef& ref) {\n  (void)ref; return true;"),
+  (SM, "listing counts an interrupted rewrite's .tmp as a second record", "    if (!isDir && len > 4 && strcmp(name + len - 4, \".msg\") == 0) {", "    if (!isDir) {"),
++ # ---- chat entry, round 2: record cache ----
++ (SM, "a store write is not written through to the record cache", "void writeThroughCachedRecord(const MessageRef& ref, bool ok) {\n", "void writeThroughCachedRecord(const MessageRef& ref, bool ok) {\n  return;\n"),
++ (SM, "a removed record stays in the record cache", "  dropCachedRecord(group_code, contact_key, seq);\n  afterRecordRemove(", "  afterRecordRemove("),
++ (SM, "an external change keeps the record cache", "  dropAllCachedRecords();\n  g_externalMutations++;", "  g_externalMutations++;"),
++ (SM, "the record cache ignores the conversation", "    if (c.valid && c.seq == seq && strcmp(c.contact, contact_key) == 0 && strcmp(c.group, group_code) == 0) return &c;", "    if (c.valid && c.seq == seq && strcmp(c.group, group_code) == 0) return &c;"),
++ (SM, "drawn rows are not kept (no record cache)", "  if (!fromCache) keepCachedRecord(ref, g_loadBuffer, len);\n", ""),
++ (SM, "a failed write keeps the cached bytes", "  if (!ok || g_rewriteLen == 0 || !fillCachedRecord(*c, g_rewriteScratch, g_rewriteLen)) c->valid = false;", "  if (ok && g_rewriteLen > 0 && !fillCachedRecord(*c, g_rewriteScratch, g_rewriteLen)) c->valid = false;"),
++ # ---- the shared index kept current ----
++ (SM, "a mutation elsewhere makes the shared index stale", "  if (keepWorking && !target) g_indexCacheGeneration = g_storageChangeGeneration;\n", ""),
++ (SM, "the open conversation's own writes are not patched in (its index goes stale)", "  if (p.working && patchIndexWrite(g_index, &g_indexCount, kMaxMessagesPerThread, e)) g_indexCacheGeneration = p.generation;\n", ""),
++ (SM, "a removal is not patched out of the shared index", "  if (p.working) {\n    patchIndexRemove(g_index, &g_indexCount, seq);\n    g_indexCacheGeneration = p.generation;", "  if (p.working) {\n    g_indexCacheGeneration = p.generation;"),
++ (SM, "a patched entry is appended instead of sorted in", "  uint16_t at = *count;\n  for (uint16_t i = 0; i < *count; i++) {\n    if (indexEntryAfter(arr[i], e)) {", "  uint16_t at = *count;\n  for (uint16_t i = 0; i < 0; i++) {\n    if (indexEntryAfter(arr[i], e)) {"),
++ (SM, "a failed write is patched in as if it succeeded", "  if (!ok || !p.active || p.generation != g_storageChangeGeneration) return;  // stale: reloaded at the next use", "  if (!p.active || p.generation != g_storageChangeGeneration) return;"),
++ (SM, "a write during a stepped load is not followed", "    if (fine) g_loader.generation = p.generation;\n", ""),
++ (SM, "an external change keeps every index current", "  bool known = group_code != nullptr && contact_key != nullptr;", "  bool known = true;\n  if (group_code == nullptr) { group_code = \"\"; contact_key = \"\"; }"),
++ # ---- the parked index ----
++ (SM, "the parked index is never swapped back", "  return g_parked != nullptr && g_parked->valid && parkedHolds(group_code, contact_key);", "  (void)group_code; (void)contact_key; return false;"),
++ (SM, "the outgoing index is not parked", "  if (!isIndexTarget(group_code, contact_key)) parkWorkingIndex();\n", ""),
++ (SM, "a mutation elsewhere drops the parked index", "  if (keepParked) g_parked->generation = g_storageChangeGeneration;\n", ""),
++ (SM, "the parked conversation's own writes are not patched in", "  if (p.parked && patchIndexWrite(g_parked->entries, &g_parked->count, kParkedCapacity, e)) g_parked->generation = p.generation;\n", ""),
++ (SM, "a parked removal is not patched out", "    patchIndexRemove(g_parked->entries, &g_parked->count, seq);\n    g_parked->generation = p.generation;", "    g_parked->generation = p.generation;"),
++ # ---- the recount feeds the index ----
++ (NT, "the recount does not feed the chat index", "      MessageStore::beginIndexFeed(j.group_code, j.contact_key, j.seqs, j.n, true, TextMessage::isAnyConversationOpen());\n", ""),
++ (NT, "the feed ignores the open chat (replaces the index it draws from)", "      MessageStore::beginIndexFeed(j.group_code, j.contact_key, j.seqs, j.n, true, TextMessage::isAnyConversationOpen());\n", "      MessageStore::beginIndexFeed(j.group_code, j.contact_key, j.seqs, j.n, true, false);\n"),
++ (NT, "an unreadable record is fed as read", "      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord(ref.group_code, ref.contact_key, ref.sequence, nullptr, nullptr);\n", ""),
++ (SM, "a feed overwrites a current cached index", "  if (sharedInUse || (g_indexCacheValid && g_indexCacheGeneration == now) ||", "  if (sharedInUse ||"),
++ (SM, "a fed record out of step is accepted", "  if (g_loader.pos >= g_loader.n || g_loaderSeqs[g_loader.pos] != seq ||\n      g_loader.generation != getStorageChangeGeneration()) {", "  if (g_loader.pos >= g_loader.n) {"),
++ (SM, "no parked feed while a chat holds the shared index", "    return beginParkedFeed(group_code, contact_key, seqs, n, listingReliable);", "    return false;"),
++ (SM, "a mutation elsewhere drops the parked feed", "  if (keepParkedFeed) g_parked->feedGeneration = g_storageChangeGeneration;\n", ""),
++ (SM, "a mutation of the fed conversation keeps the parked feed", "  bool keepParkedFeed = known && g_parked != nullptr && g_parked->feeding && g_parked->feedGeneration == before &&\n                        !parkedHolds(group_code, contact_key);", "  bool keepParkedFeed = known && g_parked != nullptr && g_parked->feeding && g_parked->feedGeneration == before;"),
++ (SM, "an unreadable record still completes the parked feed", "    p.valid = p.feedReliable;", "    p.valid = true;"),
++ (SM, "an out-of-step record is fed to the parked index", "  if (p.feedPos >= p.feedN || p.feedSeqs[p.feedPos] != seq || p.feedGeneration != getStorageChangeGeneration()) {", "  if (p.feedPos >= p.feedN) {"),
++ (SM, "the parked feed overwrites a current parked index", "  if (g_parked != nullptr && g_parked->valid && g_parked->generation == now) return false;  // current: kept\n", ""),
++ (SM, "records are not fed to the parked index", "    feedParkedRecord(seq, hdr, message_id);\n    return;", "    return;"),
++ # ---- bounded, time-budgeted steps; Everyone first ----
++ (SM, "an index load reads a whole conversation per step", "    if (k > 0 && millis() - stepStart >= kIndexStepBudgetMs) break;\n    uint32_t seq = g_loaderSeqs[g_loader.pos++];", "    uint32_t seq = g_loaderSeqs[g_loader.pos++];"),
++ (SM, "a stepped load is never cached", "  if (g_loader.reliable && g_loader.generation == g_storageChangeGeneration) {\n    g_indexCacheGeneration", "  if (false) {\n    g_indexCacheGeneration"),
++ (SM, "a load that met an unreadable record is cached", "      g_loader.reliable = false;  // left out, as the one-call load did; not cached\n", ""),
++ (SM, "background work never waits for a loading chat", "  return g_loader.active && !g_loader.fed && millis() - g_loader.lastStepMs < kChatLoadingMs;", "  return false;"),
++ (NT, "Notifications does not pause while a chat loads", "  if (MessageStore::chatIndexLoading()) return;\n  if (g_loadState", "  if (g_loadState"),
++ (NT, "a recount step ignores the time budget", "  for (uint8_t loads = 0; loads < kLoadsPerStep && j.pos < j.n; loads++) {\n    if (loads > 0 && millis() - stepStart >= kStepBudgetMs) return;\n    MessageRef ref;", "  for (uint8_t loads = 0; loads < kLoadsPerStep && j.pos < j.n; loads++) {\n    MessageRef ref;"),
++ (NT, "Everyone is not visited first", "    if (!g_sweep->everyoneDone) {", "    if (false) {"),
++ (NT, "the walk visits Everyone again", "    if (strcmp(contact, MessageStore::kEveryone) == 0 && isConfiguredGroup(group)) return;  // visited first\n", ""),
++ # ---- input while the index loads ----
++ (TX, "Text: input while loading is dropped, not held", "      if (!g_heldInput.hold(q)) {\n        // Full, or no memory", "      if (true) continue;\n      if (!g_heldInput.hold(q)) {\n        // Full, or no memory"),
++ (TX, "Text: Back while loading waits for the load", "      if (q.type == InputEventType::ENCODER_LONG) {\n        g_heldInput.clear();\n        g_chatIsOpen = false;", "      if (false) {\n        g_heldInput.clear();\n        g_chatIsOpen = false;"),
++ (TX, "Text: held events bypass isReplayedSend()", "    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window\n    if (backQueued", "    if (!fromHeld && isReplayedSend(e)) continue;\n    if (backQueued"),
++ (TX, "Text: the event that could not be held is lost", "        unheld = q;\n        haveUnheld = true;\n        break;", "        break;"),
++ (TX, "Text: a full buffer does not complete the index (input waits)", "        uint32_t completeStart = millis();\n        completeIndexNow();", "        uint32_t completeStart = millis();\n        g_heldInput.clear();"),
++ (TX, "Text: a queued Back waits for the rotations before it", "  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||", "  bool backQueued = false && g_heldInput.contains(InputEventType::ENCODER_LONG) ||"),
++ (TX, "Text: the selection does not follow its message", "void followCursorMessage() {\n", "void followCursorMessage() {\n  return;\n"),
++ (TX, "Text: an index the store could not keep current is not reloaded", "  if (!MessageStore::isIndexCurrent(g_selectedGroupCode, g_selectedContactKey)) {\n    markIndexDirty();\n    return true;\n  }", "  if (false) {\n  }"),
++ (EN, "Enigma: input while loading is dropped, not held", "      if (!g_heldInput.hold(q)) {\n        completeIndexNow();", "      if (true) continue;\n      if (!g_heldInput.hold(q)) {\n        completeIndexNow();"),
++ (EN, "Enigma: Back while loading waits for the load", "      if (q.type == InputEventType::ENCODER_LONG) {\n        g_heldInput.clear();\n        g_enigmaChatLeaving = true;", "      if (false) {\n        g_heldInput.clear();\n        g_enigmaChatLeaving = true;"),
++ (EN, "Enigma: replayed Shorts not dropped at dispatch", "    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window\n    if (backQueued", "    if (backQueued"),
++ (EN, "Enigma: a queued Back waits for the rotations before it", "  bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||", "  bool backQueued = false && g_heldInput.contains(InputEventType::ENCODER_LONG) ||"),
++ # ---- Outbox: incremental, header-only, durable ----
++ (OB, "a pending write is not queued directly", "void serviceInit() { MessageStore::setOnPendingWrittenCallback(onPendingWritten); }", "void serviceInit() {}"),
++ (OB, "the pass runs again and again (not once per boot)", "    bool due = !g_passDone || externalChange || g_queueOverflowed ||", "    bool due = true || externalChange || g_queueOverflowed ||"),
++ (OB, "the pass ignores changes made outside the store", "    bool externalChange = MessageStore::getExternalMutationCount() != g_externalSeen;", "    bool externalChange = false;"),
++ (OB, "an unreadable record does not make the pass incomplete", "        p.incomplete = true;  // unreadable (or removed since the listing): the next pass looks again\n", ""),
++ (OB, "a full queue is not remembered (the rest never found)", "  if (g_queue->count >= kQueueSize) {\n    g_queueOverflowed = true;", "  if (g_queue->count >= kQueueSize) {"),
++ (OB, "a failed publish clears the pending flag", "  if (!ok) {\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return true;\n  }", "  if (!ok) {\n    MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);\n    dropFront();\n    return true;\n  }"),
++ (OB, "a record queued while offline is dropped", "    if (g_queue->count > 1) {\n      dropFront();\n      enqueue(ref);\n    }", "    dropFront();\n    return false;"),
++ (OB, "a whole pass in one step (unbounded)", "constexpr uint8_t kReadsPerStep = 4;", "constexpr uint8_t kReadsPerStep = 255;"),
++ (OB, "the pass skips records it found pending", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;\n        enqueue(ref);", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;"),
+ ]
++# Survivors assessed equivalent (no behaviour a test can observe), with the reason.
++equivalent = {
++}
+ out = os.path.join(H, "out", "mutn")
+ _bad = [m[1] for m in muts if open(R + "/" + m[0]).read().count(m[2]) != 1]
+ if _bad:
+@@ -102,7 +171,6 @@ stubsFake = cc(H + "/stubs.cpp", base, "stubs_fake")
+ fsBase = ["-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE", "-I", H + "/fake_fs", "-I", H, "-I", H + "/fake", "-I", REPO + "/src"]
+ stubsReal = cc(H + "/stubs.cpp", fsBase, "stubs_real")
+ lfs = cc(H + "/fake_fs/LittleFS.cpp", ["-I", H + "/fake_fs"], "littlefs")
+-fsroot = tempfile.mkdtemp(prefix="mutn_fs_")
+ 
+ def run(binary, args):
+     try:
+@@ -111,27 +179,45 @@ def run(binary, args):
+     except subprocess.TimeoutExpired:
+         return 124, ["TIMEOUT"]
+ 
+-caught, survivors, build_errors = 0, [], 0
++import concurrent.futures, threading
+ only = sys.argv[1:]
+-for target, name, old, new in muts:
+-    if only and not any(o in name for o in only): continue
++todo = [m for m in muts if not only or any(o in m[1] for o in only)]
++_print_lock = threading.Lock()
++
++def one(k, mut):
++    target, name, old, new = mut
++    out = os.path.join(H, "out", "mutn%d" % k)
+     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
+-    for x in (NT, TX, EN, SM, "notifications.h", "storage_messages.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+-    p = out + "/core/" + target; s = open(p).read()
+-    open(p, "w").write(s.replace(old, new))
++    for x in (NT, TX, EN, SM, OB, "notifications.h", "storage_messages.h", "held_input.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
++    p = out + "/core/" + target; src = open(p).read()
++    open(p, "w").write(src.replace(old, new))
+     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])
+     b1 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS"] + inc + [H + "/notify_test.cpp", out + "/core/" + EN, stubsFake] + common + ["-o", out + "/n"], capture_output=True, text=True)
+     incfs = sum([["-I", i] for i in (H + "/fake_fs", H, H + "/fake", out, REPO + "/src")], [])
+-    b2 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE"] + incfs + [H + "/storage_test.cpp", out + "/core/" + EN, out + "/core/" + SM, stubsReal, lfs] + common + ["-o", out + "/s"], capture_output=True, text=True)
++    b2 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE"] + incfs + [H + "/storage_test.cpp", out + "/core/" + EN, out + "/core/" + SM, out + "/core/" + OB, stubsReal, lfs] + common + ["-o", out + "/s"], capture_output=True, text=True)
+     if b1.returncode or b2.returncode:
+-        print(f"  COMPILE-ERR  {name}: {(b1.stderr or b2.stderr)[:300]}"); build_errors += 1; continue
++        with _print_lock: print(f"  COMPILE-ERR  {name}: {(b1.stderr or b2.stderr)[:300]}", flush=True)
++        shutil.rmtree(out, ignore_errors=True)
++        return name, None
++    fsroot = tempfile.mkdtemp(prefix="mutn_fs_")
+     rc1, f1 = run(out + "/n", [])
+     rc2, f2 = run(out + "/s", [fsroot])
+-    ok = rc1 != 0 or rc2 != 0; caught += ok
+-    if not ok: survivors.append(name)
++    shutil.rmtree(fsroot, ignore_errors=True)
++    shutil.rmtree(out, ignore_errors=True)
++    ok = rc1 != 0 or rc2 != 0
+     first = (f1 or f2 or ["-"])[0][:100]
+-    print(f"  {'CAUGHT ' if ok else 'SURVIVED'} [notify:{len(f1)} storage:{len(f2)}]  {target}: {name}   (first: {first})", flush=True)
+-shutil.rmtree(fsroot, ignore_errors=True)
+-n = len([m for m in muts if not only or any(o in m[1] for o in only)])
+-print(f"{caught}/{n} mutations caught; {len(survivors)} survivor(s); {build_errors} build error(s)")
+-sys.exit(1 if survivors or build_errors else 0)
++    tag = 'CAUGHT ' if ok else (f'SURVIVED (assessed equivalent: {equivalent[name]})' if name in equivalent else 'SURVIVED')
++    with _print_lock: print(f"  {tag} [notify:{len(f1)} storage:{len(f2)}]  {target}: {name}   (first: {first})", flush=True)
++    return name, ok
++
++caught, survivors, build_errors = 0, [], 0
++workers = int(os.environ.get("MUT_JOBS", "3"))
++with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
++    for name, ok in ex.map(lambda km: one(*km), enumerate(todo)):
++        if ok is None: build_errors += 1
++        elif ok: caught += 1
++        else: survivors.append(name)
++n = len(todo)
++eq = len([x for x in survivors if x in equivalent])
++print(f"{caught}/{n} mutations caught; {eq} survivor(s) assessed equivalent; {len(survivors) - eq} unexplained survivor(s); {build_errors} build error(s)")
++sys.exit(1 if (len(survivors) - eq) or build_errors else 0)
+diff --git a/host_tests/race_r3_r5/run_all.sh b/host_tests/race_r3_r5/run_all.sh
+index e9ff35f..ed17edf 100755
+--- a/host_tests/race_r3_r5/run_all.sh
++++ b/host_tests/race_r3_r5/run_all.sh
+@@ -64,7 +64,7 @@ echo "== 4b. Unread marking and badges (hardware finding 3): ACTUAL menu, notifi
+ build nt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -I "$H" -I "$H/fake" -I "$REPO/src" "$H/notify_test.cpp" "$H/stubs.cpp" $FNOTE && run nt
+ echo "== 4c. Unread marking against the REAL message store (findings 1 and 3 on 23293c5): ACTUAL storage_messages.cpp on a host directory (fake_fs/), notifications, text_message, enigma, menu"
+ FSROOT=$(mktemp -d)
+-build stt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_test.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$H/fake_fs/LittleFS.cpp" && {
++build stt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_test.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$R/outbox.cpp" "$H/fake_fs/LittleFS.cpp" && {
+   st=0; "$OUT/stt" "$FSROOT/t" > "$OUT/stt.txt" 2>&1 || st=$?
+   grep -E "FAIL|passed" "$OUT/stt.txt" | sed 's/^/   /' || true
+   [ $st -eq 0 ] || fail "stt exited with status $st"; }
+@@ -94,7 +94,7 @@ echo "== 6. Sizes: encoded by the ACTUAL codec (step 1 E16, step 2 U14) and the
+ build sizes -std=gnu++17 -I "$REPO/src" "$H/sizes.cpp" && { "$OUT/sizes" | sed 's/^/   /' || fail "sizes"; }
+ echo "   (x86-64 host layout: ESP32 is 32-bit, so pointer members are half the size there; not measured on target)"
+ echo "== 6b. Storage work per main-loop pass, ACTUAL store, legacy histories written in the record format (measurement, not pass/fail; host time is not device time)"
+-build bench -std=gnu++17 -O1 -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_bench.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$H/fake_fs/LittleFS.cpp" && {
++build bench -std=gnu++17 -O1 -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_bench.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$R/outbox.cpp" "$H/fake_fs/LittleFS.cpp" && {
+   echo "   -- 8 conversations x 300 messages, 180 s"
+   "$OUT/bench" "$FSROOT/b" 8 300 180 | sed 's/^/   /' || fail "storage bench 8x300"
+   echo "   -- 400 conversations x 20 messages, 120 s"
+diff --git a/host_tests/race_r3_r5/storage_bench.cpp b/host_tests/race_r3_r5/storage_bench.cpp
+index aabb826..250d380 100644
+--- a/host_tests/race_r3_r5/storage_bench.cpp
++++ b/host_tests/race_r3_r5/storage_bench.cpp
+@@ -13,7 +13,12 @@
+ // (legacy_store.h), as older firmware left it. Host time is reported but is NOT device time; the
+ // operation counts are what carries over.
+ //
+-// Usage: storage_bench <fsroot> <conversations> <messagesPerConversation> <seconds>
++// Conversation 0 is the group's broadcast conversation (EVERYONE). With the
++// optional msPerOpen, every file open advances the mock clock by that much
++// (device A on 2ed04b6: about 63 ms), and B0b/B2 report the simulated time
++// until the chat is drawn -- a cost model, not device timing.
++//
++// Usage: storage_bench <fsroot> <conversations> <messagesPerConversation> <seconds> [msPerOpen]
+ #include "stubs.h"
+ #include "core/menu.cpp"
+ #include "core/notifications.cpp"
+@@ -138,20 +143,39 @@ static int unreadOnFlash(const char* contact) {
+ static void menuStub() {}
+ 
+ int main(int argc, char** argv) {
+-  if (argc < 5) { printf("usage: storage_bench <fsroot> <conversations> <msgs> <seconds>\n"); return 2; }
++  if (argc < 5) { printf("usage: storage_bench <fsroot> <conversations> <msgs> <seconds> [msPerOpen]\n"); return 2; }
+   LittleFS.root = argv[1];
+   int convs = atoi(argv[2]), msgs = atoi(argv[3]), seconds = atoi(argv[4]);
++  static uint32_t msPerOpen = argc > 5 ? static_cast<uint32_t>(atoi(argv[5])) : 0;
+   LittleFS.wipe();
+   T::reset();
+   MessageStore::init();
+   char contact[16];
++  auto contactName = [&](int c) {
++    if (c == 0) snprintf(contact, sizeof(contact), "%s", MessageStore::kEveryone);
++    else snprintf(contact, sizeof(contact), "B%011d", c);
++    return contact;
++  };
+   for (int c = 0; c < convs; c++) {
+-    snprintf(contact, sizeof(contact), "B%011d", c);
++    contactName(c);
+     for (int i = 0; i < msgs; i++) storeLegacy(contact, PacketCodec::MSG_TYPE_TEXT, i % 5 != 4, i % 5 != 4, 1700000000u + i * 60);
+   }
+   printf("history: %d conversations x %d messages (4 of 5 received, all received ones flagged unread as legacy firmware left them)\n",
+          convs, msgs);
+ 
++  if (msPerOpen > 0) LittleFS.onFileOpen = [](const std::string&) { T::now += msPerOpen; };
++  // Opens the chat and runs passes until it is drawn (no "Loading messages..."):
++  // returns the simulated time it took.
++  auto openUntilDrawn = [&](const char* c, Worst* ui, Worst* svc) {
++    TextMessage::navigateToChatDirect(kG, c);
++    uint32_t start = T::now;
++    for (int i = 0; i < 5000; i++) {
++      loopPass(svc, ui);
++      std::string v = T::visibleJoined();
++      if (i > 0 && v.find("Loading messages") == std::string::npos && v.find("Bob") != std::string::npos) break;
++    }
++    return T::now - start;
++  };
+   // Boot: services' init, then the Main Menu.
+   g_fs.clear();
+   Menu::init(); g_stackSize = 1; Menu::consumeJustEntered();
+@@ -163,11 +187,11 @@ int main(int argc, char** argv) {
+          (unsigned long long)afterInit.fs.dirEntries, (unsigned long long)afterInit.fs.writes, afterInit.nvs, tInit);
+ 
+   // B0b: the last conversation's chat, opened at once (legacy-size history).
+-  snprintf(contact, sizeof(contact), "B%011d", convs - 1);
+-  TextMessage::navigateToChatDirect(kG, contact);
++  contactName(convs - 1);
+   Worst openLegacy;
+-  loopPass(nullptr, &openLegacy); loopPass(nullptr, &openLegacy);
+-  openLegacy.print("B0b open chat at boot (2 passes)");
++  uint32_t b0bMs = openUntilDrawn(contact, &openLegacy, &openLegacy);
++  openLegacy.print("B0b open chat at boot (until drawn)");
++  if (msPerOpen > 0) printf("   B0b simulated: %u ms until drawn (%u ms per open)\n", b0bMs, msPerOpen);
+   T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
+   loopPass(nullptr, nullptr); loopPass(nullptr, nullptr);
+ 
+@@ -192,11 +216,11 @@ int main(int argc, char** argv) {
+   idleUi.print("B1 idle: Main Menu per loop pass");
+   printf("   after %ds idle: Text badge=%d\n", seconds, Notifications::hasAnyUnreadText() ? 1 : 0);
+ 
+-  // B2: open the first conversation's Text chat and rotate up 20 messages.
+-  TextMessage::navigateToChatDirect(kG, "B00000000000");
++  // B2: open the broadcast chat (conversation 0) and rotate up 20 messages.
+   Worst openUi;
+-  loopPass(nullptr, &openUi); loopPass(nullptr, &openUi);
+-  openUi.print("B2 open chat (2 loop passes)");
++  uint32_t b2Ms = openUntilDrawn(contactName(0), &openUi, &openUi);
++  openUi.print("B2 open chat (until drawn)");
++  if (msPerOpen > 0) printf("   B2 simulated: %u ms until drawn\n", b2Ms);
+   Worst rotUi, rotSvc;
+   for (int i = 0; i < 20; i++) {
+     T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
+@@ -208,8 +232,8 @@ int main(int argc, char** argv) {
+   for (int i = 0; i < passes; i++) loopPass(&afterSvc, &afterUi);
+   afterSvc.print("B2 then idle in chat: services");
+   afterUi.print("B2 then idle in chat: UI (redraws)");
+-  printf("   unread on flash in B00000000000 after rotation + %ds: %d (of %d received)\n", seconds, unreadOnFlash("B00000000000"),
+-         msgs - msgs / 5);
++  printf("   unread on flash in %s after rotation + %ds: %d (of %d received)\n", MessageStore::kEveryone, seconds,
++         unreadOnFlash(MessageStore::kEveryone), msgs - msgs / 5);
+ 
+   // B3: back to the Main Menu, rotate it 20 times.
+   T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
+diff --git a/host_tests/race_r3_r5/storage_test.cpp b/host_tests/race_r3_r5/storage_test.cpp
+index daad912..9b43e82 100644
+--- a/host_tests/race_r3_r5/storage_test.cpp
++++ b/host_tests/race_r3_r5/storage_test.cpp
+@@ -20,6 +20,21 @@
+ #include <map>
+ #include "legacy_store.h"
+ #include <filesystem>
++#include <algorithm>
++#include <deque>
++#include <tuple>
++
++// Allocation-failure injection: while set, every nothrow array new fails
++// (the held-input buffer, the record cache), as on a device out of heap.
++static bool g_failNothrowArrayNew = false;
++void* operator new[](size_t n, const std::nothrow_t&) noexcept {
++  if (g_failNothrowArrayNew) return nullptr;
++  try {
++    return ::operator new[](n);  // paired with the ordinary delete[]
++  } catch (...) {
++    return nullptr;
++  }
++}
+ 
+ namespace Sleep { void notifyActivity() {} }
+ void playTone(uint16_t, uint16_t, SoundClass) {}
+@@ -135,6 +150,14 @@ static bool isUnread(const MessageRef& ref) {
+   StoredMessageView v;
+   return MessageStore::loadMessage(ref, &v) && (v.header.flags & MessageStore::FLAG_UNREAD);
+ }
++// A TEXT record as an older firmware left it, with its text (shown in the chat).
++static MessageRef storeText(const char* contact, const char* sender, bool received, bool unread, uint32_t ts, const char* text) {
++  PacketCodec::MessageEnvelope env = envOf(sender, PacketCodec::MSG_TYPE_TEXT, ts);
++  uint8_t payload[96];
++  size_t pn = PacketCodec::encodeTextPayload(text, payload, sizeof(payload));
++  return writeLegacyRecordBytes(kG, contact, received ? MessageStore::Direction::RECEIVED : MessageStore::Direction::SENT,
++                                unread ? MessageStore::FLAG_UNREAD : 0, ts, env, payload, static_cast<uint16_t>(pn));
++}
+ // A pending-outbox record (sent, not yet published): never evicted.
+ static MessageRef storePending(const char* contact, uint32_t ts) {
+   PacketCodec::MessageEnvelope env = envOf("DEADBEEFAAAA", PacketCodec::MSG_TYPE_TEXT, ts);
+@@ -192,6 +215,34 @@ static void loopPass(int n = 1) {
+   }
+ }
+ static void runFor(int seconds) { loopPass(seconds * 1000 / 20); }
++// Chat entry, pass by pass: the largest number of file opens one main-loop
++// pass made (services and UI together), the opens in total, and the passes
++// until `expect` was on screen (-1: never, within `limit` passes).
++struct EntryProfile {
++  uint64_t maxPassOpens = 0, totalOpens = 0;
++  int passesToContent = -1;
++};
++// The chat's index as the boot sweep has not reached the conversation yet:
++// nothing cached (an external mutation drops every cache).
++static void coldIndex() { MessageStore::notifyExternalStorageMutationAttempted(); }
++static EntryProfile enterChat(bool enigma, const char* contact, const char* expect, int limit = 600) {
++  EntryProfile p;
++  FsStats start = g_fs;
++  if (enigma) Enigma::navigateToChatDirect(kG, contact);
++  else TextMessage::navigateToChatDirect(kG, contact);
++  for (int i = 1; i <= limit; i++) {
++    FsStats a = g_fs;
++    loopPass();
++    p.maxPassOpens = std::max<uint64_t>(p.maxPassOpens, g_fs.fileOpens - a.fileOpens);
++    std::string vis = T::visibleJoined();
++    if (vis.find("Loading messages") == std::string::npos && vis.find(expect) != std::string::npos) {
++      p.passesToContent = i;
++      break;
++    }
++  }
++  p.totalOpens = g_fs.fileOpens - start.fileOpens;
++  return p;
++}
+ static void rot(int8_t v) {
+   T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, v, 0, 0));
+   loopPass();
+@@ -201,8 +252,15 @@ static void back() {
+   T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
+   loopPass(3);
+ }
+-static void openText(const char* contact) { TextMessage::navigateToChatDirect(kG, contact); loopPass(3); }
+-static void openEnigma(const char* contact) { Enigma::navigateToChatDirect(kG, contact); loopPass(3); }
++// Opens a chat and waits until it is drawn (its index may load over several
++// passes; input given while "Loading messages..." shows is held).
++static void waitChatDrawn() {
++  loopPass(3);
++  for (int i = 0; i < 3000 && T::visibleJoined().find("Loading messages") != std::string::npos; i++) loopPass();
++  loopPass();
++}
++static void openText(const char* contact) { TextMessage::navigateToChatDirect(kG, contact); waitChatDrawn(); }
++static void openEnigma(const char* contact) { Enigma::navigateToChatDirect(kG, contact); waitChatDrawn(); }
+ 
+ static void menuStub() {}
+ static void powerOn() {  // first boot of a test: empty NVS unless the test wrote some
+@@ -217,6 +275,8 @@ static void reboot() { powerOn(); }
+ static void freshDevice() {
+   LittleFS.failOpen = nullptr;
+   LittleFS.failRemove = nullptr;
++  LittleFS.failRename = nullptr;
++  LittleFS.onFileOpen = nullptr;
+   LittleFS.reverseListing = false;
+   LittleFS.wipe();
+   T::reset();
+@@ -483,6 +543,7 @@ int main(int argc, char** argv) {
+   // ---- retention: the latest 100 per conversation (approved reduction from 300) ----
+   g_test = "ST15 legacy 300-record conversation trimmed in the background to the latest 100; pending outbox kept; contents kept";
+   freshDevice();
++  T::connected = false;  // offline: the Outbox would publish the pending records (and rewrite their flags)
+   {
+     std::vector<MessageRef> pending;
+     for (int i = 0; i < 300; i++) {
+@@ -509,6 +570,7 @@ int main(int argc, char** argv) {
+     CHECK(g_svcMax.opens <= 8 && g_svcMax.removes <= 1, "per pass: opens %llu removes %llu", (unsigned long long)g_svcMax.opens,
+           (unsigned long long)g_svcMax.removes);
+   }
++  T::connected = true;
+ 
+   g_test = "ST16 trimming interrupted by a reboot resumes and ends with exactly the latest 100";
+   freshDevice();
+@@ -758,6 +820,769 @@ int main(int argc, char** argv) {
+           k.count(3), k.count(4));
+   }
+ 
++  // =========================================================================
++  // Chat entry, round 2 (device A on 2ed04b6). Host operation counts; the
++  // device-cost model (LittleFS.onFileOpen: 63 ms per file open, device A's
++  // measured cost) turns them into simulated time. Not device timing.
++  // =========================================================================
++  // The chat shows Morse by default: "msg 089" is drawn as "-- ... --. / ----- ---.. ----.".
++  const char* kNewest = "----- ---.. ----.";  // 089
++  auto everyoneHistory = [](int n) {
++    char text[40];
++    for (int i = 0; i < n; i++) {
++      snprintf(text, sizeof(text), "msg %03d", i);
++      bool received = i % 3 != 0;
++      storeText(MessageStore::kEveryone, received ? kBob : "DEADBEEFAAAA", received, received && i >= n - 5,
++                1700000000u + i * 60, text);
++    }
++  };
++  auto snapshotIndex = [](uint16_t n) {
++    std::vector<std::tuple<uint32_t, uint32_t, std::string, uint16_t>> v;
++    for (uint16_t i = 0; i < n; i++) {
++      const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
++      if (e != nullptr) v.emplace_back(e->sequence, e->effective_sort_timestamp, e->message_id, e->flags);
++    }
++    return v;
++  };
++  auto freshIndex = [&](const char* contact) {
++    coldIndex();
++    uint16_t n = MessageStore::loadConversationIndex(kG, contact);
++    return snapshotIndex(n);
++  };
++
++  g_test = "CE1 Text Everyone chat, 90 messages, after the boot sweep: the index came from the sweep's reads; entry reads only the rows drawn";
++  freshDevice();
++  everyoneHistory(90);
++  for (int i = 0; i < 100; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, false, 1700000000u + i * 60);
++  powerOn(); runFor(120);  // boot sweep done
++  {
++    EntryProfile p = enterChat(false, MessageStore::kEveryone, kNewest);
++    printf("   CE1 measured: max %llu opens/pass, %llu opens total, content after %d passes\n",
++           (unsigned long long)p.maxPassOpens, (unsigned long long)p.totalOpens, p.passesToContent);
++    CHECK(p.passesToContent > 0 && p.passesToContent <= 2, "the newest message appeared after %d passes", p.passesToContent);
++    CHECK(p.totalOpens <= 8, "entry opened %llu files (the drawn rows are at most 8)", (unsigned long long)p.totalOpens);
++  }
++
++  g_test = "CE1b the same chat entered before the sweep reached it (cold): spread over passes, bounded opens per pass";
++  {
++    back();
++    coldIndex();
++    EntryProfile p = enterChat(false, MessageStore::kEveryone, kNewest);
++    printf("   CE1b measured: max %llu opens/pass, %llu opens total, content after %d passes\n",
++           (unsigned long long)p.maxPassOpens, (unsigned long long)p.totalOpens, p.passesToContent);
++    CHECK(p.passesToContent > 1 && p.maxPassOpens <= 12, "max %llu opens in a pass, content after %d passes",
++          (unsigned long long)p.maxPassOpens, p.passesToContent);
++    CHECK(snapshotIndex(g_indexTotal) == freshIndex(MessageStore::kEveryone) && g_indexTotal == 90,
++          "the stepped load differs from a one-call load (%u entries)", g_indexTotal);
++  }
++
++  g_test = "CE2 re-entry after work in OTHER conversations (arrivals with eviction, a flag rewrite) reuses the index: no reload";
++  {
++    back();
++    openText(MessageStore::kEveryone);
++    back();
++    for (int k = 0; k < 3; k++) arrive(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000000u + k);  // Carol holds 100: each evicts one
++    MessageRef c = arrive(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000010u);
++    Notifications::clearUnread(kG, kCarol, c);  // a flag rewrite there
++    EntryProfile p = enterChat(false, MessageStore::kEveryone, kNewest);
++    printf("   CE2 measured: max %llu opens/pass, %llu opens total, content after %d passes\n",
++           (unsigned long long)p.maxPassOpens, (unsigned long long)p.totalOpens, p.passesToContent);
++    CHECK(p.passesToContent == 1 && p.totalOpens == 0, "re-entry: %llu opens, content after %d passes",
++          (unsigned long long)p.totalOpens, p.passesToContent);
++  }
++
++  g_test = "CE2b after visiting another chat: the index was parked and is swapped back without reading";
++  {
++    back();
++    openText(kCarol);
++    back();
++    EntryProfile p = enterChat(false, MessageStore::kEveryone, kNewest);
++    printf("   CE2b measured: max %llu opens/pass, %llu opens total, content after %d passes\n",
++           (unsigned long long)p.maxPassOpens, (unsigned long long)p.totalOpens, p.passesToContent);
++    CHECK(p.passesToContent == 1 && p.totalOpens == 0, "return: %llu opens, content after %d passes",
++          (unsigned long long)p.totalOpens, p.passesToContent);
++    back();
++  }
++
++  g_test = "CE3 the open chat's own changes (an arrival, a read-up rewriting flags, an eviction) are patched in: the index equals a fresh load";
++  freshDevice();
++  everyoneHistory(100);
++  powerOn(); runFor(120);
++  {
++    openText(MessageStore::kEveryone);
++    FsStats a = g_fs;
++    MessageRef r = arrive(MessageStore::kEveryone, PacketCodec::MSG_TYPE_TEXT, 1700003000u);  // at 100: evicts the oldest
++    runFor(2);
++    uint64_t opens = g_fs.fileOpens - a.fileOpens;
++    printf("   CE3 measured: %llu opens to store an arrival (with its eviction) and show it in the open chat\n", (unsigned long long)opens);
++    CHECK(opens <= 12, "%llu opens: the open chat reloaded its index", (unsigned long long)opens);
++    rot(-1); rot(-1);  // selects; the read-up rewrites flags
++    runFor(10);
++    auto kept = snapshotIndex(g_indexTotal);
++    uint16_t total = g_indexTotal;
++    back();
++    auto fresh = freshIndex(MessageStore::kEveryone);
++    (void)opens;
++    CHECK(kept == fresh && total == 100 && onFlash(kG, MessageStore::kEveryone).count(r.sequence) == 1,
++          "patched index equal to a fresh load %d (%u entries)", kept == fresh, total);
++  }
++
++  g_test = "CE13 caches follow flash exactly: after display loads, read-ups, arrivals with eviction, a payload rewrite, a failed write and a deletion, every record served equals its file";
++  freshDevice();
++  everyoneHistory(100);
++  powerOn(); runFor(120);
++  {
++    openText(MessageStore::kEveryone);
++    for (int i = 0; i < 6; i++) rot(-1);
++    runFor(5);
++    arrive(MessageStore::kEveryone, PacketCodec::MSG_TYPE_TEXT, 1700009000u);
++    MessageRef any{};
++    strcpy(any.group_code, kG);
++    strcpy(any.contact_key, MessageStore::kEveryone);
++    any.sequence = 99;
++    const uint8_t local[3] = {1, 2, 3};
++    MessageStore::updateTypeLocalPayload(any, local, sizeof(local));
++    LittleFS.failRename = [](const std::string& p) { return p.find("/00000098.msg") != std::string::npos; };
++    any.sequence = 98;
++    MessageStore::updateLocalFlags(any, MessageStore::FLAG_UNREAD, 0);  // fails: the record is lost (removed before the rename)
++    LittleFS.failRename = nullptr;
++    any.sequence = 97;
++    MessageStore::deleteMessage(any);
++    runFor(5);
++    // Every record: what the store serves equals the file on flash.
++    auto files = onFlash(kG, MessageStore::kEveryone);
++    int differ = 0, served = 0;
++    for (uint32_t seq = 1; seq <= 110; seq++) {
++      MessageRef ref = any;
++      ref.sequence = seq;
++      StoredMessageView v;
++      bool ok = MessageStore::loadMessage(ref, &v);
++      bool onDisk = files.count(seq) == 1;
++      if (ok != onDisk) differ++;
++      if (ok && onDisk) {
++        served++;
++        const std::string& f = files[seq];
++        uint16_t wl = static_cast<uint8_t>(f[11]) | (static_cast<uint8_t>(f[12]) << 8);
++        bool same = v.header.flags == (static_cast<uint8_t>(f[1]) | (static_cast<uint8_t>(f[2]) << 8)) && v.wirePacketLen == wl &&
++                    memcmp(v.wirePacket, f.data() + 13, wl) == 0 && v.localPayloadLen == f.size() - 15 - wl;
++        if (!same) differ++;
++      }
++    }
++    auto kept = snapshotIndex(g_indexTotal);
++    back();
++    auto fresh = freshIndex(MessageStore::kEveryone);
++    CHECK(differ == 0 && served == static_cast<int>(files.size()), "%d records differ from flash (%d served, %zu on flash)", differ,
++          served, files.size());
++    CHECK(kept == fresh, "the chat's index differs from a fresh load (%zu vs %zu entries)", kept.size(), fresh.size());
++  }
++
++  g_test = "CE15 the record cache keeps conversations apart: two chats with the same sequence numbers each show their own messages";
++  freshDevice();
++  storeText(kBob, kBob, true, false, 1700000000u, "BBB");
++  storeText(kCarol, kCarol, true, false, 1700000000u, "CCC");
++  powerOn(); runFor(30);
++  {
++    openText(kBob);
++    bool bobOk = T::visibleJoined().find("-... -... -...") != std::string::npos;
++    back();
++    openText(kCarol);
++    bool carolOk = T::visibleJoined().find("-.-. -.-. -.-.") != std::string::npos && T::visibleJoined().find("-... -... -...") == std::string::npos;
++    back();
++    CHECK(bobOk && carolOk, "Bob's chat showed his message %d, Carol's showed hers only %d", bobOk, carolOk);
++  }
++
++  g_test = "CE16 a recount of Everyone while another chat is open does not replace that chat's index";
++  freshDevice();
++  everyoneHistory(40);
++  for (int i = 0; i < 20; i++) storeText(kBob, kBob, true, false, 1700000000u + i * 60, "BOB");
++  powerOn();
++  {
++    openText(kBob);
++    for (int i = 0; i < 2000; i++) loopPass();  // the sweep recounts (and feeds) Everyone meanwhile
++    bool ok = g_indexTotal == 20;
++    for (uint16_t i = 0; i < g_indexTotal && ok; i++) {
++      const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
++      ok = e != nullptr && onFlash(kG, kBob).count(e->sequence) == 1;
++    }
++    rot(-1);
++    bool shown = T::visibleJoined().find("-... --- -...") != std::string::npos;
++    back();
++    CHECK(ok && shown, "Bob's open chat: index still Bob's %d (%u entries), his messages shown %d", ok, g_indexTotal, shown);
++  }
++
++  g_test = "CE17 the boot sweep reads each record once (Everyone, visited first, is not visited again by the walk)";
++  freshDevice();
++  T::connected = false;  // offline: the Outbox's own header pass (once per boot, after connecting) is OB1's
++  everyoneHistory(50);
++  for (int i = 0; i < 30; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++  {
++    FsStats a = g_fs;
++    powerOn(); runFor(120);
++    uint64_t opens = g_fs.fileOpens - a.fileOpens;
++    printf("   CE17 measured: %llu file opens for the boot sweep of 80 records\n", (unsigned long long)opens);
++    CHECK(opens <= 80 + 4, "%llu opens for 80 records", (unsigned long long)opens);
++  }
++  T::connected = true;
++
++  g_test = "CE18 a displayed (cached) record that is deleted is no longer served";
++  {
++    openText(MessageStore::kEveryone);
++    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_indexTotal - 1);
++    MessageRef r{};
++    strcpy(r.group_code, kG);
++    strcpy(r.contact_key, MessageStore::kEveryone);
++    r.sequence = e->sequence;
++    StoredMessageView v;
++    bool before = MessageStore::loadMessage(r, &v);
++    MessageStore::deleteMessage(r);
++    FsStats a = g_fs;
++    bool after = MessageStore::loadMessage(r, &v);
++    CHECK(before && !after && g_fs.openFails > a.openFails, "served before %d, after deletion %d", before, after);
++    back();
++  }
++
++  g_test = "CE19 a parked index follows its conversation (arrivals with eviction, a flag rewrite) and is swapped back equal to a fresh load";
++  freshDevice();
++  everyoneHistory(100);
++  for (int i = 0; i < 30; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++  powerOn(); runFor(120);
++  {
++    openText(MessageStore::kEveryone);
++    back();
++    openText(kBob);  // Everyone parked
++    MessageRef last{};
++    for (int k = 0; k < 3; k++) {
++      PacketCodec::MessageEnvelope env = envOf(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000000u + k);
++      uint8_t payload[64], wire[256];
++      size_t pn = PacketCodec::encodeTextPayload("parked", payload, sizeof(payload));
++      size_t wn = PacketCodec::encodeMessagePacket(env, payload, static_cast<uint16_t>(pn), wire, sizeof(wire));
++      MessageStore::appendStoredMessage(kG, MessageStore::kEveryone, MessageStore::Direction::RECEIVED, MessageStore::FLAG_UNREAD,
++                                        env.timestamp, wire, static_cast<uint16_t>(wn), nullptr, 0, &last);  // evicts the oldest
++      loopPass(2);
++    }
++    Notifications::clearUnread(kG, MessageStore::kEveryone, last);  // a flag rewrite of a parked record
++    arrive(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000500u);  // a mutation elsewhere
++    runFor(5);
++    back();
++    FsStats a = g_fs;
++    uint16_t c = 0;
++    bool swapped = MessageStore::stepConversationIndex(kG, MessageStore::kEveryone, 0, &c, nullptr, nullptr);
++    uint64_t reads = g_fs.fileOpens - a.fileOpens;
++    auto kept = snapshotIndex(c);
++    auto fresh = freshIndex(MessageStore::kEveryone);
++    CHECK(swapped && reads == 0 && kept == fresh && c == 100, "swapped back %d with %llu reads; equal to a fresh load %d (%u entries)",
++          swapped, (unsigned long long)reads, kept == fresh, c);
++  }
++
++  g_test = "CE20 a rewrite whose rename fails loses the record (the old file was removed first): neither the shared nor the parked index keeps listing it";
++  for (int parked = 0; parked < 2; parked++) {
++    freshDevice();
++    everyoneHistory(40);
++    for (int i = 0; i < 10; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++    powerOn(); runFor(60);
++    openText(MessageStore::kEveryone);
++    if (parked) { back(); openText(kBob); }
++    MessageRef r{};
++    strcpy(r.group_code, kG);
++    strcpy(r.contact_key, MessageStore::kEveryone);
++    r.sequence = 40;
++    LittleFS.failRename = [](const std::string&) { return true; };
++    MessageStore::updateLocalFlags(r, 0, MessageStore::FLAG_UNREAD);
++    LittleFS.failRename = nullptr;
++    bool gone = onFlash(kG, MessageStore::kEveryone).count(40) == 0;
++    back();
++    if (!parked) TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone), waitChatDrawn();
++    uint16_t c = 0;
++    if (parked) {
++      while (!MessageStore::stepConversationIndex(kG, MessageStore::kEveryone, 8, &c, nullptr, nullptr)) {}
++    } else {
++      for (int i = 0; i < 2000 && g_indexDirty; i++) loopPass();
++      c = g_indexTotal;
++    }
++    bool listed = false;
++    for (uint16_t i = 0; i < c; i++) listed = listed || MessageStore::getIndexEntry(i)->sequence == 40;
++    CHECK(gone && !listed && c == 39, "%s: record gone %d, still listed %d (%u entries)", parked ? "parked" : "shared", gone, listed, c);
++    if (!parked) back();
++  }
++
++  g_test = "CE21 a 1:1 chat opened right after boot holds the shared index: the sweep's recount builds Everyone's parked index, entered without reloading and equal to a fresh load";
++  for (int variant = 0; variant < 3; variant++) {  // 0: quiet, 1: an arrival elsewhere meanwhile, 2: an arrival in Everyone meanwhile
++    freshDevice();
++    everyoneHistory(90);
++    for (int i = 0; i < 30; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++    for (int i = 0; i < 20; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++    powerOn();
++    openText(kBob);  // before the sweep reached anything
++    for (int i = 0; i < 2000; i++) {
++      loopPass();
++      if (variant > 0 && i == 40) arrive(variant == 1 ? kCarol : MessageStore::kEveryone, PacketCodec::MSG_TYPE_TEXT, 1800000000u);
++    }
++    back();
++    FsStats a = g_fs;
++    EntryProfile p = enterChat(false, MessageStore::kEveryone, variant == 2 ? "" : kNewest);
++    for (int i = 0; i < 2000 && g_indexDirty; i++) loopPass();
++    uint64_t opens = g_fs.fileOpens - a.fileOpens;
++    auto kept = snapshotIndex(g_indexTotal);
++    back();
++    auto fresh = freshIndex(MessageStore::kEveryone);
++    printf("   CE21 variant %d measured: %llu opens on entry, content after %d passes\n", variant, (unsigned long long)opens,
++           p.passesToContent);
++    CHECK(kept == fresh && fresh.size() == (variant == 2 ? 91u : 90u), "variant %d: index equal to a fresh load %d (%zu entries)",
++          variant, kept == fresh, fresh.size());
++    CHECK(p.passesToContent > 0 && p.passesToContent <= 2 && opens <= 8, "variant %d: content after %d passes, %llu opens (no reload)",
++          variant, p.passesToContent, (unsigned long long)opens);
++  }
++
++  g_test = "CE22 the parked feed, step by step: a mutation of its conversation, an unreadable record or an out-of-step record drops it; a mutation elsewhere does not";
++  for (int variant = 0; variant < 5; variant++) {  // 0 clean, 1 arrival elsewhere, 2 arrival in Everyone, 3 unreadable, 4 out of step
++    freshDevice();
++    everyoneHistory(30);
++    for (int i = 0; i < 10; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++    MessageStore::loadConversationIndex(kG, kBob);  // the shared index is current for Bob
++    uint32_t seqs[MessageStore::kMaxMessagesPerThread];
++    bool reliable = false;
++    uint16_t n = MessageStore::listMessageSequences(kG, MessageStore::kEveryone, seqs, MessageStore::kMaxMessagesPerThread, &reliable);
++    bool began = MessageStore::beginIndexFeed(kG, MessageStore::kEveryone, seqs, n, reliable, true);
++    for (uint16_t i = 0; i < n; i++) {
++      if (i == 15 && variant == 1) arrive(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000000u);
++      if (i == 15 && variant == 2) arrive(MessageStore::kEveryone, PacketCodec::MSG_TYPE_TEXT, 1800000000u);
++      MessageRef ref{};
++      strcpy(ref.group_code, kG);
++      strcpy(ref.contact_key, MessageStore::kEveryone);
++      ref.sequence = seqs[variant == 4 && i == 15 ? 16 : i];
++      StoredMessageView view;
++      bool ok = MessageStore::loadMessage(ref, &view) && !(variant == 3 && i == 15);
++      MessageStore::feedIndexRecord(kG, MessageStore::kEveryone, ref.sequence, ok ? &view.header : nullptr,
++                                    ok ? view.envelope.message_id : nullptr);
++    }
++    uint16_t c = 0;
++    FsStats a = g_fs;
++    bool swapped = MessageStore::stepConversationIndex(kG, MessageStore::kEveryone, 0, &c, nullptr, nullptr);
++    uint64_t reads = g_fs.fileOpens - a.fileOpens;
++    bool expectUsable = variant <= 1;
++    auto kept = swapped ? snapshotIndex(c) : decltype(snapshotIndex(0))();
++    auto fresh = freshIndex(MessageStore::kEveryone);
++    CHECK(began && swapped == expectUsable && reads == 0 && (!swapped || kept == fresh),
++          "variant %d: feed began %d, used %d (expected %d) with %llu reads, equal to a fresh load %d", variant, began, swapped,
++          expectUsable, (unsigned long long)reads, kept == fresh);
++  }
++
++  g_test = "CE23 the selection stays on its message when the index changes under it (an arrival patched in above it; a reload after an outside change): nothing else is read";
++  for (int variant = 0; variant < 2; variant++) {
++    freshDevice();
++    for (int i = 0; i < 10; i++) storeText(kBob, "DEADBEEFAAAA", false, false, 1700000000u + i * 600, "OUT");
++    powerOn(); runFor(30);
++    openText(kBob);
++    rot(-1); rot(-1); rot(-1);
++    uint32_t selected = MessageStore::getIndexEntry(g_historyCursor)->sequence;
++    MessageRef older = variant == 0 ? arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000100u)                   // shown near the top
++                                    : storeText(kBob, kBob, true, true, 1700000100u, "LATE");                  // written outside the store
++    runFor(5);
++    bool same = g_historyCursor != kNoHistoryCursor && MessageStore::getIndexEntry(g_historyCursor) != nullptr &&
++                MessageStore::getIndexEntry(g_historyCursor)->sequence == selected;
++    bool listed = false;
++    for (uint16_t i = 0; i < g_indexTotal; i++) listed = listed || MessageStore::getIndexEntry(i)->sequence == older.sequence;
++    CHECK(same && listed && g_indexTotal == 11 && isUnread(older), "variant %d: still on its message %d, the new one listed %d (%u), still unread %d",
++          variant, same, listed, g_indexTotal, isUnread(older));
++    auto kept = snapshotIndex(g_indexTotal);
++    back();
++    CHECK(kept == freshIndex(kBob), "variant %d: the chat's index differs from a fresh load", variant);
++  }
++
++  // ---- device-cost model: 63 ms per file open (device A's measured cost) ----
++  auto deviceCost = []() { LittleFS.onFileOpen = [](const std::string&) { T::now += 63; }; };
++  auto modelEntry = [&](const char* label, int afterBootMs, int maxPasses) {
++    T::now += 0;
++    loopPass(afterBootMs / 20);
++    PassMax bootMax = g_svcMax;
++    uint32_t start = T::now;
++    EntryProfile p = enterChat(false, MessageStore::kEveryone, kNewest, maxPasses);
++    uint32_t simulated = T::now - start;
++    printf("   %s: chat drawn after %d passes, %u ms simulated, max %llu opens per pass (boot passes before: max %llu)\n", label,
++           p.passesToContent, simulated, (unsigned long long)p.maxPassOpens, (unsigned long long)bootMax.opens);
++    return std::make_tuple(p, simulated, bootMax);
++  };
++
++  g_test = "DM1 device-cost model: the broadcast chat opened 1 s after boot (sweep and outbox pass still running) -- bounded opens per pass until drawn";
++  freshDevice();
++  everyoneHistory(90);
++  for (int i = 0; i < 100; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, false, 1700000000u + i * 60);
++  deviceCost();
++  powerOn();
++  {
++    auto r = modelEntry("DM1 1 s after boot", 1000, 3000);
++    EntryProfile p = std::get<0>(r);
++    CHECK(p.passesToContent > 0 && p.maxPassOpens <= 6, "drawn after %d passes, max %llu opens in a pass", p.passesToContent,
++          (unsigned long long)p.maxPassOpens);
++    CHECK(std::get<2>(r).opens <= 2, "boot passes before the chat: max %llu opens", (unsigned long long)std::get<2>(r).opens);
++  }
++  back();
++  LittleFS.onFileOpen = nullptr;
++
++  g_test = "DM2 device-cost model: the broadcast chat opened once boot work settled -- drawn in the first pass from the sweep-built index";
++  freshDevice();
++  everyoneHistory(90);
++  for (int i = 0; i < 100; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, false, 1700000000u + i * 60);
++  deviceCost();
++  powerOn();
++  {
++    auto r = modelEntry("DM2 after boot work settled", 60000, 100);
++    EntryProfile p = std::get<0>(r);
++    CHECK(p.passesToContent == 1 && std::get<1>(r) < 1000, "drawn after %d passes, %u ms simulated", p.passesToContent, std::get<1>(r));
++  }
++  back();
++  LittleFS.onFileOpen = nullptr;
++
++  g_test = "DM3 device-cost model: 3 large conversations met before Everyone; the chat opened 14 s after boot is drawn in one pass (Everyone visited first)";
++  freshDevice();
++  char c3[16];
++  for (int c = 0; c < 3; c++) {
++    snprintf(c3, sizeof(c3), "A%011d", c);  // listed before EVERYONE
++    for (int i = 0; i < 99; i++) storeOnly(c3, PacketCodec::MSG_TYPE_TEXT, false, 1700000000u + i * 60);
++  }
++  everyoneHistory(90);
++  deviceCost();
++  powerOn();
++  {
++    auto r = modelEntry("DM3 14 s after boot, 3 x 99 others", 14000, 100);
++    EntryProfile p = std::get<0>(r);
++    CHECK(p.passesToContent == 1, "drawn after %d passes", p.passesToContent);
++  }
++  back();
++  LittleFS.onFileOpen = nullptr;
++
++  // ---- input while the index loads -------------------------------------------
++  // A cold Everyone chat of 90 messages takes about 24 passes to load (4 reads a pass).
++  auto coldEveryone = [&]() {
++    freshDevice();
++    everyoneHistory(90);
++    powerOn(); runFor(120);
++    coldIndex();
++  };
++
++  g_test = "IN1 rotations during loading are held and replayed in order: the same selection as rotating after the load";
++  coldEveryone();
++  {
++    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++    loopPass();
++    bool loading = T::visibleJoined().find("Loading messages") != std::string::npos;
++    for (int i = 0; i < 5; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    loopPass();
++    for (int i = 0; i < 3000 && g_indexDirty; i++) loopPass();
++    loopPass();
++    uint16_t cursor = g_historyCursor;
++    CHECK(loading && cursor == g_indexTotal - 5, "loading shown %d; cursor %u, expected %u", loading, cursor, g_indexTotal - 5);
++    back();
++  }
++
++  g_test = "IN2 more input during loading than can be held (40 rotations): nothing lost (the index is completed in that pass)";
++  coldEveryone();
++  {
++    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++    loopPass();
++    for (int i = 0; i < 40; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    loopPass();
++    bool done = !g_indexDirty;
++    CHECK(done && g_historyCursor == g_indexTotal - 40, "completed in that pass %d; cursor %u, expected %u", done, g_historyCursor,
++          g_indexTotal - 40);
++    back();
++  }
++
++  g_test = "IN3 no memory to hold input during loading: nothing lost (the index is completed in that pass)";
++  coldEveryone();
++  {
++    TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++    loopPass();
++    for (int i = 0; i < 3; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    g_failNothrowArrayNew = true;  // the held-input buffer cannot be allocated
++    loopPass();
++    g_failNothrowArrayNew = false;
++    bool done = !g_indexDirty;
++    CHECK(done && g_historyCursor == g_indexTotal - 3, "completed in that pass %d; cursor %u, expected %u", done, g_historyCursor,
++          g_indexTotal - 3);
++    back();
++  }
++
++  // A Send whose draft is kept (offline and the store write failing) and the
++  // same Short replayed by the encoder (same release time): one attempt.
++  auto sendWithReplay = [&](bool enigma, bool reloadFirst) {
++    coldEveryone();
++    T::connected = false;
++    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
++    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++    if (reloadFirst) {
++      waitChatDrawn();
++      coldIndex();
++      if (enigma) Enigma::markConversationChanged(kG, MessageStore::kEveryone);
++      else TextMessage::markConversationChanged(kG, MessageStore::kEveryone);
++    }
++    loopPass();
++    LittleFS.failOpen = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };
++    uint32_t t = T::now;
++    T::raw.push_back(InputEvent(InputEventType::DOT_PRESS_START, 0, 0, t - 300));
++    T::raw.push_back(InputEvent(InputEventType::DOT_RELEASE, 0, 60, t - 240));
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 10));
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 10));  // replayed
++    size_t before = std::count(T::seq.begin(), T::seq.end(), std::string("nextId"));
++    for (int i = 0; i < 3000 && (g_indexDirty || !T::raw.empty() || T::visibleJoined().find("Loading messages") != std::string::npos); i++)
++      loopPass();
++    loopPass(20);
++    size_t attempts = std::count(T::seq.begin(), T::seq.end(), std::string("nextId")) - before;
++    LittleFS.failOpen = nullptr;
++    T::connected = true;
++    back();
++    return attempts;
++  };
++
++  g_test = "IN4 a Send and its replayed Short, both received while loading: one send attempt";
++  {
++    size_t n = sendWithReplay(false, false);
++    CHECK(n == 1, "%zu send attempts", n);
++  }
++  g_test = "IN4b the same while a reload during the visit holds the input: one send attempt";
++  {
++    size_t n = sendWithReplay(false, true);
++    CHECK(n == 1, "%zu send attempts", n);
++  }
++  g_test = "IN4c Enigma: a Send and its replayed Short, both received while loading: one send attempt";
++  {
++    size_t n = sendWithReplay(true, false);
++    CHECK(n == 1, "%zu send attempts", n);
++  }
++
++  g_test = "IN5 one Morse sequence (SOS) keyed while the chat loads gives the same draft as keyed live (device-cost model, 63 ms per open)";
++  {
++    auto keySos = [](uint32_t t0) {
++      // S O S at 15 wpm (dit 80 ms): dots 60 ms, dashes 240 ms, 80 ms symbol gaps, 400 ms letter gaps
++      uint32_t t = t0;
++      const char* pattern[3] = {"...", "---", "..."};
++      for (int l = 0; l < 3; l++) {
++        for (const char* c = pattern[l]; *c; c++) {
++          uint32_t dur = *c == '.' ? 60 : 240;
++          T::raw.push_back(InputEvent(InputEventType::DOT_PRESS_START, 0, 0, t));
++          T::raw.push_back(InputEvent(InputEventType::DOT_RELEASE, 0, dur, t + dur));
++          t += dur + 80;
++        }
++        t += 320;
++      }
++      return t;
++    };
++    std::string live, held;
++    for (int mode = 0; mode < 2; mode++) {
++      coldEveryone();
++      deviceCost();
++      TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++      if (mode == 0) waitChatDrawn();
++      else loopPass();
++      bool loading = mode == 1 && T::visibleJoined().find("Loading messages") != std::string::npos;
++      // Keyed over the next ~3 s; each event becomes visible to the chat once its time has passed.
++      uint32_t t0 = T::now + 20;
++      std::deque<InputEvent> evs;
++      std::swap(evs, T::raw);
++      keySos(t0);
++      std::swap(evs, T::raw);
++      while (!evs.empty() || T::now < t0 + 4000) {
++        while (!evs.empty() && evs.front().eventMs <= T::now) { T::raw.push_back(evs.front()); evs.pop_front(); }
++        loopPass();
++      }
++      for (int i = 0; i < 3000 && g_indexDirty; i++) loopPass();
++      loopPass(40);
++      (mode == 0 ? live : held) = std::string(g_composeText, g_composeLen);
++      if (mode == 1) CHECK(loading, "precondition: the chat was not loading while keyed");
++      LittleFS.onFileOpen = nullptr;
++      back();
++    }
++    CHECK(live == "SOS" && held == live, "live draft '%s', keyed while loading '%s'", live.c_str(), held.c_str());
++  }
++
++  g_test = "IN6 a loaded chat: Back queued after 20 rotations leaves in the same pass without reading rows for them (device-cost model)";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    everyoneHistory(90);
++    powerOn(); runFor(120);
++    if (enigma) openEnigma(MessageStore::kEveryone);
++    else openText(MessageStore::kEveryone);
++    deviceCost();
++    for (int i = 0; i < 20; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
++    FsStats a = g_fs;
++    uint32_t start = T::now;
++    loopPass();
++    uint32_t ms = T::now - start;
++    bool left = !TextMessage::isAnyConversationOpen();
++    printf("   IN6%s measured: left after one pass of %u ms simulated, %llu opens (20 rotations, then Back)\n", enigma ? "c" : "", ms,
++           (unsigned long long)(g_fs.fileOpens - a.fileOpens));
++    CHECK(left && g_fs.fileOpens - a.fileOpens <= 1, "%s: left %d, %llu opens", enigma ? "Enigma" : "Text", left,
++          (unsigned long long)(g_fs.fileOpens - a.fileOpens));
++    LittleFS.onFileOpen = nullptr;
++    loopPass(3);
++  }
++
++  g_test = "IN6b a Send queued before a rotation and a Back is still sent; nothing after the rotation is handled";
++  freshDevice();
++  everyoneHistory(20);
++  powerOn(); runFor(60);
++  {
++    openText(MessageStore::kEveryone);
++    uint32_t t = T::now;
++    T::raw.push_back(InputEvent(InputEventType::DOT_PRESS_START, 0, 0, t - 300));
++    T::raw.push_back(InputEvent(InputEventType::DOT_RELEASE, 0, 60, t - 240));
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 100));
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 5));  // would select/act in history
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, t));
++    size_t before = onFlash(kG, MessageStore::kEveryone).size();
++    loopPass(3);
++    CHECK(!TextMessage::isConversationOpen(kG, MessageStore::kEveryone) && onFlash(kG, MessageStore::kEveryone).size() == before + 1,
++          "left %d, %zu messages stored by the Send (expected 1)", !TextMessage::isConversationOpen(kG, MessageStore::kEveryone),
++          onFlash(kG, MessageStore::kEveryone).size() - before);
++  }
++
++  g_test = "IN7 Back while the chat loads leaves at once (held input dropped with it)";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    coldEveryone();
++    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
++    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++    loopPass();
++    for (int i = 0; i < 10; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    loopPass();
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
++    FsStats a = g_fs;
++    loopPass();
++    CHECK(!TextMessage::isAnyConversationOpen() && g_heldInput.empty() && g_fs.fileOpens - a.fileOpens <= 4,
++          "%s: left %d, held left %d, %llu opens", enigma ? "Enigma" : "Text", !TextMessage::isAnyConversationOpen(),
++          !g_heldInput.empty(), (unsigned long long)(g_fs.fileOpens - a.fileOpens));
++    loopPass(3);
++  }
++
++  // ---- Outbox: incremental, header-only, durable pending records ----------------
++  auto pendingCount = [](const char* contact) {
++    int n = 0;
++    for (auto& kv : onFlash(kG, contact)) n += (static_cast<uint8_t>(kv.second[1]) & MessageStore::FLAG_PENDING_OUTBOX) ? 1 : 0;
++    return n;
++  };
++  auto pubsFor = [](const std::string& topicPart) {
++    int n = 0;
++    for (auto& p : T::pubs) n += (p.result && p.topic.find(topicPart) != std::string::npos) ? 1 : 0;
++    return n;
++  };
++
++  g_test = "OB1 pending records left on flash are found by an incremental pass and published once each; no step reads more than 4 records";
++  freshDevice();
++  for (int i = 0; i < 60; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++  for (int i = 0; i < 5; i++) storePending(kBob, 1700005000u + i);
++  MessageStore::notifyExternalStorageMutationAttempted();
++  {
++    powerOn();
++    g_svcMax = PassMax();
++    runFor(120);
++    CHECK(pendingCount(kBob) == 0 && pubsFor("msg/" + std::string(kBob)) == 5, "pending left %d, published %d", pendingCount(kBob),
++          pubsFor("msg/" + std::string(kBob)));
++    CHECK(g_svcMax.opens <= 8, "max %llu opens in a service pass", (unsigned long long)g_svcMax.opens);
++    FsStats a = g_fs;
++    runFor(60);
++    CHECK(g_fs.fileOpens == a.fileOpens, "%llu opens while idle after the pass (the pass ran again)",
++          (unsigned long long)(g_fs.fileOpens - a.fileOpens));
++  }
++
++  g_test = "OB2 a send while offline is queued directly: published on connection with no storage pass";
++  freshDevice();
++  everyoneHistory(30);
++  powerOn(); runFor(60);
++  {
++    T::connected = false;
++    MessageRef r = storePending(kBob, 1700009000u);
++    runFor(10);
++    unsigned listingsBefore = 0;
++    FsStats a = g_fs;
++    T::connected = true;
++    runFor(10);
++    (void)listingsBefore;
++    CHECK(pendingCount(kBob) == 0 && pubsFor("msg/" + std::string(kBob)) == 1 && g_fs.dirOpens - a.dirOpens <= 1,
++          "pending %d, published %d, %llu directory opens", pendingCount(kBob), pubsFor("msg/" + std::string(kBob)),
++          (unsigned long long)(g_fs.dirOpens - a.dirOpens));
++    (void)r;
++  }
++
++  g_test = "OB3 a pending record survives reboots while offline and is published once after connecting";
++  freshDevice();
++  {
++    T::connected = false;
++    powerOn(); runFor(10);
++    storePending(kBob, 1700009000u);
++    runFor(10);
++    reboot(); runFor(30);
++    reboot(); runFor(30);
++    int offlinePubs = static_cast<int>(T::pubs.size());
++    CHECK(pendingCount(kBob) == 1, "pending %d after reboots offline", pendingCount(kBob));
++    T::connected = true;
++    runFor(30);
++    CHECK(pendingCount(kBob) == 0 && pubsFor("msg/" + std::string(kBob)) == 1, "after connecting: pending %d, published %d (offline attempts %d)",
++          pendingCount(kBob), pubsFor("msg/" + std::string(kBob)), offlinePubs);
++  }
++
++  g_test = "OB4 a failed publish is retried later; the record stays pending until a publish succeeds; never published twice";
++  freshDevice();
++  powerOn(); runFor(10);
++  {
++    T::publishScript = {false};
++    T::onPublished = nullptr;
++    storePending(kBob, 1700009000u);
++    loopPass(5);
++    int pendingAfterFail = pendingCount(kBob);
++    T::connected = true;  // the failed publish closed the connection; reconnected
++    runFor(30);
++    CHECK(pendingAfterFail == 1 && pendingCount(kBob) == 0 && pubsFor("msg/" + std::string(kBob)) == 1,
++          "after the failure: pending %d; then pending %d, published %d", pendingAfterFail, pendingCount(kBob),
++          pubsFor("msg/" + std::string(kBob)));
++  }
++
++  g_test = "OB5 more pending records than the queue holds (40): every one published (a further pass finds the rest), each once";
++  freshDevice();
++  {
++    T::connected = false;
++    powerOn(); runFor(5);
++    for (int i = 0; i < 40; i++) storePending(kBob, 1700009000u + i);
++    T::connected = true;
++    runFor(180);
++    std::map<std::string, int> seen;
++    for (auto& p : T::pubs) if (p.result) seen[std::string(p.data.begin(), p.data.end())]++;
++    bool once = true;
++    for (auto& kv : seen) once = once && kv.second == 1;
++    CHECK(pendingCount(kBob) == 0 && seen.size() == 40 && once, "pending %d, %zu distinct published, each once %d", pendingCount(kBob),
++          seen.size(), once);
++  }
++
++  g_test = "OB6 a change made outside the store starts a new pass; a pending record it left is found";
++  freshDevice();
++  powerOn(); runFor(30);
++  {
++    T::connected = false;
++    storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u);
++    PacketCodec::MessageEnvelope env = envOf("DEADBEEFAAAA", PacketCodec::MSG_TYPE_TEXT, 1700009100u);
++    writeLegacyRecord(kG, kBob, MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX, 1700009100u, env, "OUT");  // notifies
++    T::connected = true;
++    runFor(30);
++    CHECK(pendingCount(kBob) == 0 && pubsFor("msg/" + std::string(kBob)) == 1, "pending %d, published %d", pendingCount(kBob),
++          pubsFor("msg/" + std::string(kBob)));
++  }
++
++  g_test = "OB7 a pending record that cannot be read during the pass is not skipped: a later pass publishes it";
++  freshDevice();
++  {
++    PacketCodec::MessageEnvelope env = envOf("DEADBEEFAAAA", PacketCodec::MSG_TYPE_TEXT, 1700009100u);
++    MessageRef r = writeLegacyRecord(kG, kBob, MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX, 1700009100u, env, "OUT");
++    static char name[32];
++    snprintf(name, sizeof(name), "/%08lu.msg", static_cast<unsigned long>(r.sequence));
++    LittleFS.failOpen = [](const std::string& p) { return p.find(kBob) != std::string::npos && p.find(name) != std::string::npos; };
++    powerOn(); runFor(20);
++    int during = pubsFor("msg/" + std::string(kBob));
++    LittleFS.failOpen = nullptr;
++    runFor(30);
++    CHECK(during == 0 && pendingCount(kBob) == 0 && pubsFor("msg/" + std::string(kBob)) == 1, "during %d; then pending %d, published %d",
++          during, pendingCount(kBob), pubsFor("msg/" + std::string(kBob)));
++  }
++
+   printf("%d checks passed, %d failed\n", g_pass, g_fail);
+   return g_fail == 0 ? 0 : 1;
+ }
+diff --git a/host_tests/race_r3_r5/stubs.cpp b/host_tests/race_r3_r5/stubs.cpp
+index 26a1db8..54130b0 100644
+--- a/host_tests/race_r3_r5/stubs.cpp
++++ b/host_tests/race_r3_r5/stubs.cpp
+@@ -128,6 +128,7 @@ bool wrapLineAt(const char* text, size_t from, int16_t, uint16_t* s, uint16_t* l
+ namespace Input {
+ void update() { T::updateCount++; while (!T::raw.empty()) { T::inputQ.push_back(T::raw.front()); T::raw.pop_front(); } }
+ bool popEvent(InputEvent& e) { if (T::inputQ.empty()) { e = InputEvent{}; return false; } e = T::inputQ.front(); T::inputQ.pop_front(); return true; }
++bool hasQueuedEvent(InputEventType type) { for (auto& e : T::inputQ) if (e.type == type) return true; return false; }
+ // Same predicates as src/core/input.cpp:843-849.
+ bool isMenuConfirm(const InputEvent& e) { return e.type == InputEventType::DOT_RELEASE && e.durationMs < Morse::kSpecialCommandMs; }
+ bool isBack(const InputEvent& e) { return e.type == InputEventType::ENCODER_LONG; }
+@@ -135,6 +136,7 @@ bool isBack(const InputEvent& e) { return e.type == InputEventType::ENCODER_LONG
+ 
+ namespace MqttManager {
+ bool isGroupConnected(const char*) { return T::connected; }
++bool isAnyGroupConnected() { return T::connected; }
+ bool isGroupReady(const char*) { return T::connected; }
+ bool publishRaw(const char*, const char* topic, const char* payload, bool retained, int qos) {
+   T::seq.push_back(std::string("publishRaw ") + topic + " " + payload + (retained ? " R" : " -") + std::to_string(qos));
+@@ -200,6 +202,30 @@ uint16_t loadConversationIndex(const char* g, const char* c) {
+   return static_cast<uint16_t>(g_index.size());
+ }
+ const ConversationIndexEntry* getIndexEntry(uint16_t i) { return i < g_index.size() ? &g_index[i] : nullptr; }
++// The fake store loads in one step (no cost model): ready at once.
++bool stepConversationIndex(const char* g, const char* c, uint8_t, uint16_t* count, uint16_t* read, uint16_t* total) {
++  uint16_t n = loadConversationIndex(g, c);
++  if (count) *count = n;
++  if (read) *read = n;
++  if (total) *total = n;
++  return true;
++}
++bool chatIndexLoading() { return false; }
++bool isIndexCurrent(const char*, const char*) { return true; }  // the fake store: reloads only when marked, as before
++uint16_t getIndexCount() { return static_cast<uint16_t>(g_index.size()); }
++bool beginIndexFeed(const char*, const char*, const uint32_t*, uint16_t, bool, bool) { return false; }
++void feedIndexRecord(const char*, const char*, uint32_t, const StoredHeader*, const char*) {}
++bool loadMessageForDisplay(const MessageRef& ref, StoredMessageView* v) { return loadMessage(ref, v); }
++bool readMessageHeader(const MessageRef& ref, StoredHeader* h) {
++  StoredMessageView v;
++  if (!loadMessage(ref, &v)) return false;
++  *h = v.header;
++  return true;
++}
++bool conversationExists(const char* g, const char* c) {
++  for (auto& r : T::store) if (!strcmp(r.ref.group_code, g) && !strcmp(r.ref.contact_key, c)) return true;
++  return false;
++}
+ bool findMessageById(const char* g, const char* c, const char* id, MessageRef* out) {
+   for (auto& r : T::store) if (!strcmp(r.ref.group_code, g) && !strcmp(r.ref.contact_key, c) && !strcmp(r.env.message_id, id)) { *out = r.ref; return true; }
+   return false;

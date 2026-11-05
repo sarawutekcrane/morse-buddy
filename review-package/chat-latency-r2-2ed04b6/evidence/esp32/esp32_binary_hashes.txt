@@ -1,0 +1,16 @@
+# ESP32 builds (pio run, espressif32@6.13.0, framework-arduinoespressif32 3.20017.241212). Not flashed.
+# Static DRAM: dram0_0_seg is 124580 B; used = .dram0.heap_start - segment origin (0x3ffbdb5c).
+
+## 2ed04b6
+RAM:   [====      ]  37.9% (used 124340 bytes from 327680 bytes)
+Flash: [========  ]  83.1% (used 1198433 bytes from 1441792 bytes)
+static DRAM used 124348 of 124580 B, headroom 232 B
+2e4da9d161ce672c43ad5a5fc32eaa4ef728376465bd256775e56f6a0daefb23  firmware.bin
+38321d73487b2e3e00cd3ce1baaadeaa5fde619d0ee40e7cce3ed4d83761a1fe  firmware.elf
+
+## this candidate
+RAM:   [====      ]  38.0% (used 124476 bytes from 327680 bytes)
+Flash: [========  ]  83.7% (used 1206349 bytes from 1441792 bytes)
+static DRAM used 124484 of 124580 B, headroom 96 B
+bd635c6f1f56ca39abc4fb145031d7e1b6cfc97cc3e25dc5a9b87836512f9644  firmware.bin
+1d6953874e9597b1eae3e5bd1bb7ebde88d52a15a688af7543c8b5966f563c2e  firmware.elf
