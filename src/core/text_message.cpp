@@ -1584,6 +1584,7 @@ void screenChatTick() {
 
   // One step of the index load (nothing when it is current).
   if (syncIndexWithStore()) g_chatRenderDirty = true;
+  bool loadingAtStart = g_indexDirty;
   bool topReloaded = false;
   if (g_indexDirty) {
     uint32_t topRefreshStart = millis();
@@ -1593,6 +1594,11 @@ void screenChatTick() {
     topReloaded = !g_indexDirty;
   }
   Input::update();
+  // Input dropped by this update while the index was loading is reported,
+  // also when the load completed earlier in this same pass. (Drops at any
+  // other time are only taken note of.)
+  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;
+  g_inputDropsSeen = Input::droppedEventCount();
   if (g_indexDirty) {
     // Still loading: input is retained in order; Back leaves at once (what
     // was retained is dropped with it, as leaving would have dropped it).

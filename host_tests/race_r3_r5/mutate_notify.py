@@ -6,7 +6,7 @@
 # mutation must fail at least one of them.
 import os, subprocess, sys, shutil, tempfile
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
-NT, TX, EN, SM, OB = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp"
+NT, TX, EN, SM, OB, IQ = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h"
 muts = [
  # ---- reading in the chats ----
  (TX, "Text: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
@@ -173,6 +173,16 @@ muts = [
  (EN, "Enigma: an event put back is lost", "    else Input::unpopEvent(ev);", "    else (void)ev;"),
  (NT, "Notifications ignores the shared background step (adds to the Outbox's in one pass)", "  if (!claimBackgroundStorageStep(BG_NOTIFICATIONS)) {", "  if (false) {"),
  (OB, "the Outbox pass ignores the shared background step", "  if (!claimBackgroundStorageStep(BG_OUTBOX)) {", "  if (false) {"),
+ # ---- review round 4: Back into a full queue; loss on the completing pass ----
+ (IQ, "a Back reaching a full queue is dropped (as before)", "      if (e.type != InputEventType::ENCODER_LONG) return;", "      return;"),
+ (IQ, "the event a Back displaces is not counted", "      tail_ = static_cast<uint8_t>((tail_ + kCapacity - 1) % kCapacity);\n      count_--;", "      tail_ = static_cast<uint8_t>((tail_ + kCapacity - 1) % kCapacity);\n      count_--;\n      dropped_--;"),
+ (IQ, "a Back displaces the oldest event instead of the newest", "      uint8_t k = count_;\n      while (k > 0 && q_[(head_ + k - 1) % kCapacity].type == InputEventType::ENCODER_LONG) k--;", "      uint8_t k = 1;"),
+ (TX, "Text: loss on the pass that completes the load is not reported", "  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;", "  if (g_indexDirty && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;"),
+ (EN, "Enigma: loss on the pass that completes the load is not reported", "  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;", "  if (g_indexDirty && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;"),
+ (TX, "Text: drops outside loading raise the loading warning", "  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;", "  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;"),
+ (EN, "Enigma: drops outside loading raise the loading warning", "  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;", "  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;"),
+ (TX, "Text: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
+ (EN, "Enigma: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
@@ -213,7 +223,7 @@ def one(k, mut):
     target, name, old, new = mut
     out = os.path.join(H, "out", "mutn%d" % k)
     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
-    for x in (NT, TX, EN, SM, OB, "notifications.h", "storage_messages.h", "held_input.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+    for x in (NT, TX, EN, SM, OB, IQ, "notifications.h", "storage_messages.h", "held_input.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
     p = out + "/core/" + target; src = open(p).read()
     open(p, "w").write(src.replace(old, new))
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])

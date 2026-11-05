@@ -11,6 +11,7 @@
 #include "core/menu.cpp"
 #include "core/notifications.cpp"
 #include "core/text_message.cpp"
+#include "core/input_queue.h"
 #include "core/outbox.cpp"  // in this translation unit, so a reboot also resets its RAM state
 #include "core/enigma.h"
 #include "core/storage_messages.h"
@@ -1686,6 +1687,134 @@ int main(int argc, char** argv) {
     bool full = T::visibleJoined().find("PARISTEST") != std::string::npos;
     CHECK((noticeWhileLoading || noticeAfter) && !full, "%s: notice while loading %d, after %d; full draft shown %d", kChat[enigma],
           noticeWhileLoading, noticeAfter, full);
+    closeChat();
+  }
+
+  // ---- review round 4: Back into a full queue; loss on the completing pass ----
+  g_test = "IN9u the production input queue (core/input_queue.h): FIFO order, drops counted; a Back reaching a full queue is kept, displacing the newest other event (counted)";
+  {
+    InputQueue q;
+    for (int i = 0; i < 33; i++) q.push(InputEvent(InputEventType::ENCODER_ROTATE, 1, 0, static_cast<uint32_t>(100 + i)));
+    bool fullAfter32 = q.full() && q.size() == 32 && q.dropped() == 1;  // the 33rd ordinary event: dropped, as before
+    q.push(InputEvent(InputEventType::ENCODER_LONG, 0, 800, 999));
+    std::vector<uint32_t> order;
+    bool backLast = false;
+    InputEvent e;
+    while (q.pop(e)) { order.push_back(e.eventMs); backLast = e.type == InputEventType::ENCODER_LONG; }
+    bool ordered = order.size() == 32 && order.back() == 999;
+    for (size_t i = 0; i + 1 < order.size() && ordered; i++) ordered = order[i] == 100 + i;  // 100..130, then the Back
+    CHECK(fullAfter32 && ordered && backLast && q.dropped() == 2, "full after 32 %d; order kept with the Back last %d (%zu events); dropped %u",
+          fullAfter32, ordered && backLast, order.size(), q.dropped());
+    InputQueue b;
+    for (int i = 0; i < 32; i++) b.push(InputEvent(InputEventType::ENCODER_LONG, 0, 800, static_cast<uint32_t>(i)));
+    b.push(InputEvent(InputEventType::ENCODER_LONG, 0, 800, 77));
+    CHECK(b.size() == 32 && b.dropped() == 1, "a queue of Backs: a further Back dropped (%u kept, %u dropped)", b.size(), b.dropped());
+  }
+
+  g_test = "IN9 a Back generated while the input queue is already full (held buffer full, chat still loading) is recognized: the chat leaves in that pass, no synchronous load";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    std::vector<InputEvent> evs;
+    morseEvents(std::string(32, 'E').c_str(), evs);  // 64 events
+    runLoading(std::vector<InputEvent>(evs.begin(), evs.begin() + 32), 32, 1);  // pass 1: 32 held
+    bool loading = chatLoading();
+    // Pass 2: one input update brings 32 more (the queue is then full) and,
+    // behind them, the Back -- before the chat can look at the queue.
+    std::vector<InputEvent> burst(evs.begin() + 32, evs.end());
+    burst.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
+    LoadRun r = runLoading(burst, burst.size(), 6);
+    CHECK(loading && r.left && r.passes <= 1 && r.maxPassOpens <= kLoadingPassOpens && T::inputDropped >= 1,
+          "%s: loading %d; left %d after %d passes, max %llu opens; %u displaced/dropped", kChat[enigma], loading, r.left, r.passes,
+          (unsigned long long)r.maxPassOpens, T::inputDropped);
+    closeChat();
+  }
+
+  g_test = "IN10 input lost by the very input update of the pass in which loading completes is still reported (\"Input lost while loading\")";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    std::vector<InputEvent> evs;
+    morseEvents(std::string(34, 'E').c_str(), evs);  // 68 events
+    runLoading(std::vector<InputEvent>(evs.begin(), evs.begin() + 32), 32, 1);       // 32 held
+    runLoading(std::vector<InputEvent>(evs.begin() + 32, evs.begin() + 63), 31, 1);  // 31 queued: not full, nothing lost yet
+    // Until one record is left: the next pass's load step completes the index.
+    uint16_t c = 0, rd = 0, tot = 0;
+    for (int i = 0; i < 3000; i++) {
+      MessageStore::stepConversationIndex(kG, MessageStore::kEveryone, 0, &c, &rd, &tot);  // (reads nothing)
+      if (tot > 0 && rd + 1 >= tot) break;
+      loopPass();
+    }
+    bool oneLeft = tot > 0 && rd + 1 == tot && chatLoading();
+    uint32_t droppedBefore = T::inputDropped;
+    // That pass: the load completes, then its input update overflows the queue.
+    runLoading(std::vector<InputEvent>(evs.begin() + 63, evs.end()), 5, 1);
+    bool completed = !chatLoading();
+    bool dropped = T::inputDropped > droppedBefore;
+    loopPass(2);
+    bool warned = T::visibleJoined().find("Input lost while loading") != std::string::npos;
+    CHECK(oneLeft && completed && dropped && warned, "%s: one record left %d, completed in that pass %d, input dropped %d, warning shown %d",
+          kChat[enigma], oneLeft, completed, dropped, warned);
+    closeChat();
+  }
+
+  g_test = "IN11 no false warning: input dropped before the visit (another screen), or lost in a previous visit, is not reported in a new one";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    coldEveryone();
+    deviceCost();
+    T::inputCap = 32;
+    // On another screen: a burst the queue cannot take (8 dropped), then drained there.
+    std::vector<InputEvent> junk;
+    morseEvents(std::string(20, 'E').c_str(), junk);
+    for (auto& j : junk) T::raw.push_back(j);
+    Input::update();
+    InputEvent x;
+    while (Input::popEvent(x)) {}
+    bool droppedElsewhere = T::inputDropped > 0;
+    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+    std::vector<InputEvent> evs;
+    morseEvents("SOS", evs, true);
+    runLoading(evs, 0);
+    loopPass(30);
+    bool warned1 = T::visibleJoined().find("Input lost while loading") != std::string::npos;
+    bool drafted = T::visibleJoined().find("SOS") != std::string::npos;
+    // A visit that did lose input, then a new visit.
+    back();
+    coldIndex();
+    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+    loopPass();
+    std::vector<InputEvent> lots;
+    morseEvents(std::string(50, 'E').c_str(), lots);
+    runLoading(lots, lots.size());
+    loopPass(5);
+    bool warnedLossVisit = T::visibleJoined().find("Input lost while loading") != std::string::npos;
+    back();
+    coldIndex();
+    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+    runLoading({}, 0);
+    loopPass(5);
+    bool warned3 = T::visibleJoined().find("Input lost while loading") != std::string::npos;
+    CHECK(droppedElsewhere && !warned1 && drafted && warnedLossVisit && !warned3,
+          "%s: dropped elsewhere %d, warned on the next visit %d (draft SOS %d); lossy visit warned %d; the visit after it warned %d",
+          kChat[enigma], droppedElsewhere, warned1, drafted, warnedLossVisit, warned3);
+    closeChat();
+  }
+
+  g_test = "IN11b input dropped while a chat is already loaded (not loading) does not raise the \"while loading\" warning";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    coldEveryone();
+    T::inputCap = 32;
+    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+    waitChatDrawn();
+    std::vector<InputEvent> evs;
+    morseEvents(std::string(20, 'E').c_str(), evs);  // 40 in one update: 8 dropped by the queue
+    for (auto& e2 : evs) T::raw.push_back(e2);
+    loopPass(5);
+    bool dropped = T::inputDropped > 0;
+    bool warned = T::visibleJoined().find("Input lost while loading") != std::string::npos;
+    CHECK(dropped && !warned, "%s: dropped %d, warned %d", kChat[enigma], dropped, warned);
     closeChat();
   }
 

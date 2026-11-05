@@ -20,11 +20,21 @@ class InputQueue {
  public:
   static constexpr uint8_t kCapacity = 32;
 
-  // Appends an event; when full the event is dropped (and counted).
+  // Appends an event; when full the event is dropped (and counted) -- except
+  // a Back (ENCODER_LONG): a screen that stopped draining (a chat loading
+  // its index) must still see it, so it displaces the newest queued event
+  // that is not a Back, which is counted as dropped instead. The order of
+  // everything kept is unchanged. (A queue of nothing but Backs drops it.)
   void push(const InputEvent& e) {
     if (count_ >= kCapacity) {  // drop if the consumer is not draining fast enough
       dropped_++;
-      return;
+      if (e.type != InputEventType::ENCODER_LONG) return;
+      uint8_t k = count_;
+      while (k > 0 && q_[(head_ + k - 1) % kCapacity].type == InputEventType::ENCODER_LONG) k--;
+      if (k == 0) return;
+      for (uint8_t i = k; i < count_; i++) q_[(head_ + i - 1) % kCapacity] = q_[(head_ + i) % kCapacity];  // close the gap
+      tail_ = static_cast<uint8_t>((tail_ + kCapacity - 1) % kCapacity);
+      count_--;
     }
     q_[tail_] = e;
     tail_ = static_cast<uint8_t>((tail_ + 1) % kCapacity);
