@@ -1,5 +1,5 @@
 diff --git a/host_tests/race_r3_r5/mutate_notify.py b/host_tests/race_r3_r5/mutate_notify.py
-index 4632680..a357062 100644
+index 4632680..a37f0e6 100644
 --- a/host_tests/race_r3_r5/mutate_notify.py
 +++ b/host_tests/race_r3_r5/mutate_notify.py
 @@ -6,7 +6,7 @@
@@ -11,7 +11,22 @@ index 4632680..a357062 100644
  muts = [
   # ---- reading in the chats ----
   (TX, "Text: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
-@@ -173,6 +173,16 @@ muts = [
+@@ -143,14 +143,11 @@ muts = [
+  (OB, "the pass skips records it found pending", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;\n        enqueue(ref);", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;"),
+  # ---- review round: held-input overflow without a synchronous load ----
+  (TX, "Text: Back while loading waits for the load", "bool takeInputWhileLoading() {\n  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;", "bool takeInputWhileLoading() {"),
+- (TX, "Text: a full input queue is not drained (a Back behind it is lost)", "  if (Input::queueFull()) {\n    // Nothing more", "  if (false) {\n    // Nothing more"),
+- (TX, "Text: input dropped by the full queue is not reported", "  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;  // dropped by the full queue\n", ""),
+  (TX, "Text: the loss is never shown", "    setSendStatus({\"Input lost while loading\", true});", "    (void)0;"),
+  (TX, "Text: a mid-batch reload is completed synchronously", "      refreshIndexIfNeeded();\n      indexRefreshElapsed += millis() - midRefreshStart;", "      while (g_indexDirty) refreshIndexIfNeeded();\n      indexRefreshElapsed += millis() - midRefreshStart;"),
+  (TX, "Text: the final reload is completed synchronously", "  refreshIndexIfNeeded();  // one bounded step\n  indexRefreshElapsed += millis() - finalRefreshStart;", "  while (g_indexDirty) refreshIndexIfNeeded();\n  indexRefreshElapsed += millis() - finalRefreshStart;"),
+  (TX, "Text: an event met by a mid-batch reload is lost (not retained)", "      if (g_indexDirty) {\n        retain(e, fromHeld);\n        break;", "      if (g_indexDirty) {\n        break;"),
+  (EN, "Enigma: Back while loading waits for the load", "bool takeInputWhileLoading() {\n  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;", "bool takeInputWhileLoading() {"),
+- (EN, "Enigma: a full input queue is not drained (a Back behind it is lost)", "  if (Input::queueFull()) {\n    while (Input::popEvent(q)) {", "  if (false) {\n    while (Input::popEvent(q)) {"),
+  (EN, "Enigma: the loss is never shown", "    setSendStatus({\"Input lost while loading\", true});", "    (void)0;"),
+  (EN, "Enigma: the final reload is completed synchronously", "  refreshIndexIfNeeded();  // one bounded step\n  if (g_indexDirty) {\n    Display::drawStatusBar();", "  while (g_indexDirty) refreshIndexIfNeeded();\n  if (g_indexDirty) {\n    Display::drawStatusBar();"),
+  (EN, "Enigma: an event met by a mid-batch reload is lost (not retained)", "      if (g_indexDirty) {\n        retain(e);\n        break;", "      if (g_indexDirty) {\n        break;"),
+@@ -173,6 +170,18 @@ muts = [
   (EN, "Enigma: an event put back is lost", "    else Input::unpopEvent(ev);", "    else (void)ev;"),
   (NT, "Notifications ignores the shared background step (adds to the Outbox's in one pass)", "  if (!claimBackgroundStorageStep(BG_NOTIFICATIONS)) {", "  if (false) {"),
   (OB, "the Outbox pass ignores the shared background step", "  if (!claimBackgroundStorageStep(BG_OUTBOX)) {", "  if (false) {"),
@@ -25,10 +40,12 @@ index 4632680..a357062 100644
 + (EN, "Enigma: drops outside loading raise the loading warning", "  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;", "  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;"),
 + (TX, "Text: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
 + (EN, "Enigma: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
++ (TX, "Text: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
++ (EN, "Enigma: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
  ]
  # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
  equivalent = {
-@@ -213,7 +223,7 @@ def one(k, mut):
+@@ -213,7 +222,7 @@ def one(k, mut):
      target, name, old, new = mut
      out = os.path.join(H, "out", "mutn%d" % k)
      shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
@@ -38,7 +55,7 @@ index 4632680..a357062 100644
      open(p, "w").write(src.replace(old, new))
      inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])
 diff --git a/host_tests/race_r3_r5/storage_test.cpp b/host_tests/race_r3_r5/storage_test.cpp
-index 728ee59..9d37e93 100644
+index 728ee59..236f023 100644
 --- a/host_tests/race_r3_r5/storage_test.cpp
 +++ b/host_tests/race_r3_r5/storage_test.cpp
 @@ -11,6 +11,7 @@
@@ -49,7 +66,52 @@ index 728ee59..9d37e93 100644
  #include "core/outbox.cpp"  // in this translation unit, so a reboot also resets its RAM state
  #include "core/enigma.h"
  #include "core/storage_messages.h"
-@@ -1689,6 +1690,134 @@ int main(int argc, char** argv) {
+@@ -1502,7 +1503,7 @@ int main(int argc, char** argv) {
+     closeChat();
+   }
+ 
+-  g_test = "IN2c more input than the device can buffer at all (held buffer and input queue full): the loss is shown, what was kept is in order";
++  g_test = "IN2c more input than the device can buffer at all (held buffer and input queue full): the loss is shown, the oldest input is kept, in order";
+   for (int enigma = 0; enigma < 2; enigma++) {
+     openCold(enigma);
+     std::vector<InputEvent> evs;
+@@ -1513,7 +1514,9 @@ int main(int argc, char** argv) {
+     std::string vis = T::visibleJoined();
+     size_t es = 0;
+     for (size_t k = vis.find("EEEE"); k != std::string::npos && k < vis.size() && vis[k] == 'E'; k++) es++;
+-    CHECK(T::inputDropped > 0 && noticeShown && es > 0 && es < 50 && r.maxPassOpens <= kLoadingPassOpens,
++    // One input update takes in 32 of the 100 (the queue's capacity) and drops
++    // the newest 68: kept are the oldest 32 events = 16 E, in order.
++    CHECK(T::inputDropped == 68 && noticeShown && es == 16 && r.maxPassOpens <= kLoadingPassOpens,
+           "%s: %u dropped by the input queue, notice shown %d, %zu E kept, max %llu opens in a pass", kChat[enigma], T::inputDropped,
+           noticeShown, es, (unsigned long long)r.maxPassOpens);
+     closeChat();
+@@ -1585,6 +1588,24 @@ int main(int argc, char** argv) {
+     }
+   }
+ 
++  g_test = "IN2e held buffer full and the queue full across two passes: the oldest 64 events are kept in order (the newest dropped, counted, warned)";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    openCold(enigma);
++    std::vector<InputEvent> evs;
++    morseEvents(std::string(50, 'E').c_str(), evs);  // 100 events
++    runLoading(std::vector<InputEvent>(evs.begin(), evs.begin() + 32), 32, 1);  // 32 held
++    LoadRun r = runLoading(std::vector<InputEvent>(evs.begin() + 32, evs.end()), 68);  // 32 queued, 36 dropped
++    loopPass(30);
++    std::string vis = T::visibleJoined();
++    size_t es = 0;
++    for (size_t k = vis.find("EEEE"); k != std::string::npos && k < vis.size() && vis[k] == 'E'; k++) es++;
++    bool warned = vis.find("Input lost while loading") != std::string::npos;
++    CHECK(T::inputDropped == 36 && es == 32 && warned && r.maxPassOpens <= kLoadingPassOpens,
++          "%s: %u dropped (expected 36), %zu E kept (expected 32), warned %d, max %llu opens", kChat[enigma], T::inputDropped, es, warned,
++          (unsigned long long)r.maxPassOpens);
++    closeChat();
++  }
++
+   g_test = "IN3 no memory for the held buffer while loading: the input waits (bounded passes), nothing lost";
+   for (int enigma = 0; enigma < 2; enigma++) {
+     openCold(enigma);
+@@ -1689,6 +1710,134 @@ int main(int argc, char** argv) {
      closeChat();
    }
  
