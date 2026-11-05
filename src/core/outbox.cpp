@@ -81,7 +81,7 @@ struct Pass {
 };
 Pass* g_pass = nullptr;
 bool g_passDone = false;          // a complete pass ran since boot (and since the last external change)
-uint32_t g_externalSeen = 0;      // getExternalMutationCount() a complete pass covered
+uint32_t g_externalAtPassStart = 0;  // getExternalMutationCount() when the last pass began
 uint32_t g_passAgainAtMs = 0;     // after an incomplete pass, or an overflowed queue
 uint32_t g_passRetryMs = kRetryMs;  // the pause before repeating an incomplete pass (doubles, reset by a complete one)
 bool g_passAgain = false;
@@ -224,7 +224,7 @@ void endPass() {
   MessageStore::endConversationWalk(g_pass->walk);
   if (complete) {
     g_passDone = true;
-    g_externalSeen = g_pass->externalAtStart;
+    g_passAgain = false;
     g_passRetryMs = kRetryMs;
   } else {
     // Repeated after a growing pause: a record that stays unreadable does not
@@ -242,6 +242,7 @@ void startPass() {
   if (g_pass == nullptr) return;  // tried again at the next step
   memset(g_pass, 0, sizeof(Pass));
   g_pass->externalAtStart = MessageStore::getExternalMutationCount();
+  g_externalAtPassStart = g_pass->externalAtStart;
   g_pass->startMs = millis();
   g_pass->walk = MessageStore::beginConversationWalk();
   if (g_pass->walk == nullptr) g_pass->incomplete = true;
@@ -309,8 +310,12 @@ void serviceTick() {
   if (publishStep()) return;
   if (MessageStore::chatIndexLoading()) return;  // a chat loading its index goes first (as in Notifications)
   if (g_pass == nullptr) {
-    bool externalChange = MessageStore::getExternalMutationCount() != g_externalSeen;
-    bool due = !g_passDone || externalChange || g_queueOverflowed ||
+    // A change outside the store since the last pass began, or a full queue,
+    // starts one at once; the first pass after boot too. A pass that could
+    // not read everything (also the first) is repeated only after its
+    // growing pause.
+    bool externalChange = MessageStore::getExternalMutationCount() != g_externalAtPassStart;
+    bool due = externalChange || g_queueOverflowed || (!g_passDone && !g_passAgain) ||
                (g_passAgain && static_cast<int32_t>(now - g_passAgainAtMs) >= 0);
     // As before: storage is looked through only once a group is connected
     // (nothing could be published before).

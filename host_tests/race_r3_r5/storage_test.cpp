@@ -1495,6 +1495,59 @@ int main(int argc, char** argv) {
     closeChat();
   }
 
+  g_test = "IN2d with the held buffer and the input queue full, a Back pressed afterwards still leaves at once";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    openCold(enigma);
+    std::vector<InputEvent> evs;
+    morseEvents(std::string(50, 'E').c_str(), evs);
+    runLoading(evs, evs.size(), 1);  // 32 held, 32 queued, the rest dropped
+    bool stillLoading = chatLoading();
+    LoadRun r = runLoading({InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now)}, 1, 3);
+    CHECK(stillLoading && r.left && r.passes <= 1, "%s: loading %d, left %d after %d passes", kChat[enigma], stillLoading, r.left,
+          r.passes);
+    closeChat();
+  }
+
+  g_test = "IN8 a Send whose store write fails makes the open chat's index stale mid-batch: the reload is stepped (bounded passes), the keys after it kept in order";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    for (int after = 0; after < 2; after++) {  // keys after the Send in the same batch, or none
+      coldEveryone();
+      if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
+      else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
+      waitChatDrawn();
+      deviceCost();
+      T::inputCap = 32;
+      T::connected = false;
+      // The Send's store write fails before touching the record (its temp
+      // file cannot be written): the draft is kept, the index goes stale.
+      LittleFS.failOpen = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };
+      std::vector<InputEvent> evs;
+      morseEvents(after ? "ET" : "E", evs);  // E: events 0-1; T (if any) 400 ms after E's release
+      evs.insert(evs.begin() + 2, InputEvent(InputEventType::ENCODER_SHORT, 0, 120, evs[1].eventMs + 200));
+      for (auto& ev : evs) T::raw.push_back(ev);
+      FsStats a0 = g_fs;
+      loopPass();  // the batch: E, the failing Send, (T)
+      uint64_t firstPass = g_fs.fileOpens - a0.fileOpens;
+      LittleFS.failOpen = nullptr;
+      // A reload during a visit keeps the history on screen (no placeholder):
+      // a fixed 300 passes, each measured.
+      LoadRun r;
+      r.maxPassOpens = firstPass;
+      for (int q = 0; q < 300; q++) {
+        FsStats a = g_fs;
+        loopPass();
+        r.maxPassOpens = std::max<uint64_t>(r.maxPassOpens, g_fs.fileOpens - a.fileOpens);
+      }
+      loopPass(30);
+      T::connected = true;
+      std::string want = after ? "ET" : "E";
+      bool drafted = T::visibleJoined().find("#CURSOR|" + want + "|") != std::string::npos;
+      CHECK(r.maxPassOpens <= kLoadingPassOpens + 2 && drafted, "%s, keys after %d: max %llu opens in a pass, draft %s shown %d",
+            kChat[enigma], after, (unsigned long long)r.maxPassOpens, want.c_str(), drafted);
+      closeChat();
+    }
+  }
+
   g_test = "IN3 no memory for the held buffer while loading: the input waits (bounded passes), nothing lost";
   for (int enigma = 0; enigma < 2; enigma++) {
     openCold(enigma);
@@ -1898,10 +1951,21 @@ int main(int argc, char** argv) {
   };
 
   g_test = "OB8 a queued record whose read fails at publication (after the boot pass) is retried, not dropped: published once its reads work, flag cleared";
+  for (int dirToo = 0; dirToo < 2; dirToo++) {  // 1: its conversation cannot be listed either (absence unconfirmed)
   freshDevice();
   powerOn(); runFor(30);  // the boot pass is done; nothing else will look at storage
   {
     watchRecord(kCarol, 1, true);  // Carol's first record: unreadable from now on
+    static bool s_dirFail = false;
+    s_dirFail = dirToo;
+    if (dirToo) {
+      LittleFS.failOpen = [](const std::string& p) {
+        bool rec = p.size() >= s_watchName.size() && p.compare(p.size() - s_watchName.size(), s_watchName.size(), s_watchName) == 0;
+        bool dir = s_dirFail && p.size() >= 15 && p.compare(p.size() - 15, 15, "/CA201000000001") == 0;
+        if (rec) s_watchOpens++;
+        return (rec && s_watchFail) || (dir && s_watchFail);
+      };
+    }
     storePending(kCarol, 1700009000u);  // the normal store path: queued directly
     loopPass(50);
     int failedReads = s_watchOpens;
@@ -1911,7 +1975,35 @@ int main(int argc, char** argv) {
     LittleFS.failOpen = nullptr;
     CHECK(failedReads >= 1 && pubsDuring == 0, "precondition: %d failed reads at publication, %d published meanwhile", failedReads, pubsDuring);
     CHECK(pubsFor("msg/" + std::string(kCarol)) == 1 && pendingCount(kCarol) == 0,
-          "after reads recovered: published %d (expected 1), still pending %d", pubsFor("msg/" + std::string(kCarol)), pendingCount(kCarol));
+          "listing fails too %d: after reads recovered: published %d (expected 1), still pending %d", dirToo,
+          pubsFor("msg/" + std::string(kCarol)), pendingCount(kCarol));
+  }
+  }
+
+  g_test = "OB7b a record that stays unreadable during discovery: the repeated passes back off (no whole-store pass every few seconds)";
+  freshDevice();
+  for (int i = 0; i < 20; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+  {
+    PacketCodec::MessageEnvelope env = envOf("DEADBEEFAAAA", PacketCodec::MSG_TYPE_TEXT, 1700009100u);
+    MessageRef r = writeLegacyRecord(kG, kBob, MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX, 1700009100u, env, "OUT");
+    watchRecord(kBob, r.sequence, true);
+    // The Notifications sweep retries the same record too (its own bounded
+    // backoff): measured offline first, where no Outbox pass runs.
+    T::connected = false;
+    powerOn(); runFor(300);  // both backoffs at their steady pace
+    int a = s_watchOpens;
+    runFor(300);
+    int sweepOnly = s_watchOpens - a;
+    T::connected = true;
+    runFor(300);
+    int b = s_watchOpens;
+    runFor(300);
+    int both = s_watchOpens - b;
+    LittleFS.failOpen = nullptr;
+    int passes = both - sweepOnly;  // each Outbox pass tries the unreadable record once
+    printf("   OB7b measured: in 300 s, %d reads of the unreadable record offline (sweep), %d online: %d Outbox passes\n", sweepOnly,
+           both, passes);
+    CHECK(passes >= 1 && passes <= 4, "%d Outbox passes in 300 s (sweep %d, both %d)", passes, sweepOnly, both);
   }
 
   g_test = "OB9 a persistently unreadable queued record does not stop another from being published; it stays pending and queued, retried with backoff";
