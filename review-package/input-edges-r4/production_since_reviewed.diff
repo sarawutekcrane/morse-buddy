@@ -1,0 +1,237 @@
+diff --git a/src/core/enigma.cpp b/src/core/enigma.cpp
+index adfcb4a..ba8314f 100644
+--- a/src/core/enigma.cpp
++++ b/src/core/enigma.cpp
+@@ -1900,12 +1900,18 @@ void screenEnigmaChatTick() {
+ 
+   // One step of the index load (nothing when it is current).
+   if (syncIndexWithStore()) g_enigmaChatDirty = true;
++  bool loadingAtStart = g_indexDirty;
+   bool topReloaded = false;
+   if (g_indexDirty) {
+     refreshIndexIfNeeded();
+     topReloaded = !g_indexDirty;
+   }
+   Input::update();
++  // Input dropped by this update while the index was loading is reported,
++  // also when the load completed earlier in this same pass. (Drops at any
++  // other time are only taken note of.)
++  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;
++  g_inputDropsSeen = Input::droppedEventCount();
+   if (g_indexDirty) {
+     // Still loading: input is retained in order; Back leaves at once.
+     bool lostBefore = g_inputLost;
+diff --git a/src/core/input.cpp b/src/core/input.cpp
+index d89e33f..f0346fc 100644
+--- a/src/core/input.cpp
++++ b/src/core/input.cpp
+@@ -1,4 +1,5 @@
+ #include "core/input.h"
++#include "core/input_queue.h"
+ 
+ #include <Arduino.h>
+ #include "esp_timer.h"
+@@ -19,32 +20,11 @@ constexpr uint32_t kCombinedRevealMs = Morse::kSpecialCommandMs;  // 2000ms
+ // ---------------------------------------------------------------------------
+ // Event queue.
+ // ---------------------------------------------------------------------------
+-// Hardware Fix #4.7d Part H: raised from 8 to 32. Fix #4.7b's independent
+-// DOT/DASH timer can now accumulate up to kButtonEdgeQueueCap (16) accepted
+-// edges before drainButtonEdges() converts them into semantic InputEvents
+-// in a single Input::update() call, plus whatever ENCODER_ROTATE/encoder-
+-// switch activity also occurred during the same busy interval -- an 8-slot
+-// semantic queue could silently drop the tail of that backlog right here,
+-// even though every physical edge had already been captured reliably.
+-// 32 comfortably covers the full 16-edge DOT backlog plus normal
+-// concurrent encoder activity, at a small, acceptable RAM cost, without
+-// touching kButtonEdgeQueueCap or the DOT capture/debounce algorithm
+-// itself.
+-constexpr uint8_t kQueueSize = 32;
+-InputEvent g_queue[kQueueSize];
+-uint8_t g_queueHead = 0;
+-uint8_t g_queueTail = 0;
+-uint8_t g_queueCount = 0;
+-uint32_t g_droppedEvents = 0;
++// The queue itself (and why it holds 32): core/input_queue.h.
++InputQueue g_events;
+ 
+ void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0, uint32_t eventMs = 0) {
+-  if (g_queueCount >= kQueueSize) {  // drop if the consumer is not draining fast enough
+-    g_droppedEvents++;
+-    return;
+-  }
+-  g_queue[g_queueTail] = InputEvent{type, value, durationMs, eventMs};
+-  g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueSize);
+-  g_queueCount++;
++  g_events.push(InputEvent{type, value, durationMs, eventMs});
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -833,43 +813,17 @@ void update() {
+   updateCombinedHold(now);
+ }
+ 
+-uint32_t droppedEventCount() { return g_droppedEvents; }
++uint32_t droppedEventCount() { return g_events.dropped(); }
+ 
+-bool queueFull() { return g_queueCount >= kQueueSize; }
++bool queueFull() { return g_events.full(); }
+ 
+-bool peekEvent(InputEvent& outEvent) {
+-  if (g_queueCount == 0) return false;
+-  outEvent = g_queue[g_queueHead];
+-  return true;
+-}
++bool peekEvent(InputEvent& outEvent) { return g_events.peek(outEvent); }
+ 
+-void unpopEvent(const InputEvent& event) {
+-  if (g_queueCount >= kQueueSize) {  // cannot happen right after a pop
+-    g_droppedEvents++;
+-    return;
+-  }
+-  g_queueHead = static_cast<uint8_t>((g_queueHead + kQueueSize - 1) % kQueueSize);
+-  g_queue[g_queueHead] = event;
+-  g_queueCount++;
+-}
++void unpopEvent(const InputEvent& event) { g_events.unpop(event); }
+ 
+-bool hasQueuedEvent(InputEventType type) {
+-  for (uint8_t i = 0; i < g_queueCount; i++) {
+-    if (g_queue[(g_queueHead + i) % kQueueSize].type == type) return true;
+-  }
+-  return false;
+-}
++bool hasQueuedEvent(InputEventType type) { return g_events.contains(type); }
+ 
+-bool popEvent(InputEvent& outEvent) {
+-  if (g_queueCount == 0) {
+-    outEvent = InputEvent{};
+-    return false;
+-  }
+-  outEvent = g_queue[g_queueHead];
+-  g_queueHead = static_cast<uint8_t>((g_queueHead + 1) % kQueueSize);
+-  g_queueCount--;
+-  return true;
+-}
++bool popEvent(InputEvent& outEvent) { return g_events.pop(outEvent); }
+ 
+ bool isMenuConfirm(const InputEvent& e) {
+   return e.type == InputEventType::DOT_RELEASE && e.durationMs < Morse::kSpecialCommandMs;
+diff --git a/src/core/input_queue.h b/src/core/input_queue.h
+new file mode 100644
+index 0000000..5692457
+--- /dev/null
++++ b/src/core/input_queue.h
+@@ -0,0 +1,88 @@
++#pragma once
++// The semantic input event queue (FIFO, fixed capacity) behind
++// Input::popEvent() and friends, kept separate from input.cpp's GPIO and
++// timing code so host tests run this exact code.
++//
++// Hardware Fix #4.7d Part H: raised from 8 to 32. Fix #4.7b's independent
++// DOT/DASH timer can now accumulate up to kButtonEdgeQueueCap (16) accepted
++// edges before drainButtonEdges() converts them into semantic InputEvents
++// in a single Input::update() call, plus whatever ENCODER_ROTATE/encoder-
++// switch activity also occurred during the same busy interval -- an 8-slot
++// semantic queue could silently drop the tail of that backlog right here,
++// even though every physical edge had already been captured reliably.
++// 32 comfortably covers the full 16-edge DOT backlog plus normal
++// concurrent encoder activity, at a small, acceptable RAM cost.
++#include <stdint.h>
++
++#include "core/input.h"
++
++class InputQueue {
++ public:
++  static constexpr uint8_t kCapacity = 32;
++
++  // Appends an event; when full the event is dropped (and counted) -- except
++  // a Back (ENCODER_LONG): a screen that stopped draining (a chat loading
++  // its index) must still see it, so it displaces the newest queued event
++  // that is not a Back, which is counted as dropped instead. The order of
++  // everything kept is unchanged. (A queue of nothing but Backs drops it.)
++  void push(const InputEvent& e) {
++    if (count_ >= kCapacity) {  // drop if the consumer is not draining fast enough
++      dropped_++;
++      if (e.type != InputEventType::ENCODER_LONG) return;
++      uint8_t k = count_;
++      while (k > 0 && q_[(head_ + k - 1) % kCapacity].type == InputEventType::ENCODER_LONG) k--;
++      if (k == 0) return;
++      for (uint8_t i = k; i < count_; i++) q_[(head_ + i - 1) % kCapacity] = q_[(head_ + i) % kCapacity];  // close the gap
++      tail_ = static_cast<uint8_t>((tail_ + kCapacity - 1) % kCapacity);
++      count_--;
++    }
++    q_[tail_] = e;
++    tail_ = static_cast<uint8_t>((tail_ + 1) % kCapacity);
++    count_++;
++  }
++  bool pop(InputEvent& out) {
++    if (count_ == 0) {
++      out = InputEvent{};
++      return false;
++    }
++    out = q_[head_];
++    head_ = static_cast<uint8_t>((head_ + 1) % kCapacity);
++    count_--;
++    return true;
++  }
++  bool peek(InputEvent& out) const {
++    if (count_ == 0) return false;
++    out = q_[head_];
++    return true;
++  }
++  // Puts an event just popped back at the front.
++  void unpop(const InputEvent& e) {
++    if (count_ >= kCapacity) {  // cannot happen right after a pop
++      dropped_++;
++      return;
++    }
++    head_ = static_cast<uint8_t>((head_ + kCapacity - 1) % kCapacity);
++    q_[head_] = e;
++    count_++;
++  }
++  bool contains(InputEventType type) const {
++    for (uint8_t i = 0; i < count_; i++) {
++      if (q_[(head_ + i) % kCapacity].type == type) return true;
++    }
++    return false;
++  }
++  bool full() const { return count_ >= kCapacity; }
++  uint8_t size() const { return count_; }
++  uint32_t dropped() const { return dropped_; }
++  void clear() {
++    head_ = tail_ = count_ = 0;
++    dropped_ = 0;
++  }
++
++ private:
++  InputEvent q_[kCapacity];
++  uint8_t head_ = 0;
++  uint8_t tail_ = 0;
++  uint8_t count_ = 0;
++  uint32_t dropped_ = 0;
++};
+diff --git a/src/core/text_message.cpp b/src/core/text_message.cpp
+index ecb06c0..8eee78b 100644
+--- a/src/core/text_message.cpp
++++ b/src/core/text_message.cpp
+@@ -1584,6 +1584,7 @@ void screenChatTick() {
+ 
+   // One step of the index load (nothing when it is current).
+   if (syncIndexWithStore()) g_chatRenderDirty = true;
++  bool loadingAtStart = g_indexDirty;
+   bool topReloaded = false;
+   if (g_indexDirty) {
+     uint32_t topRefreshStart = millis();
+@@ -1593,6 +1594,11 @@ void screenChatTick() {
+     topReloaded = !g_indexDirty;
+   }
+   Input::update();
++  // Input dropped by this update while the index was loading is reported,
++  // also when the load completed earlier in this same pass. (Drops at any
++  // other time are only taken note of.)
++  if ((loadingAtStart || g_indexDirty) && Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;
++  g_inputDropsSeen = Input::droppedEventCount();
+   if (g_indexDirty) {
+     // Still loading: input is retained in order; Back leaves at once (what
+     // was retained is dropped with it, as leaving would have dropped it).
