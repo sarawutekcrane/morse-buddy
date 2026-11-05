@@ -1,0 +1,725 @@
+diff --git a/src/core/enigma.cpp b/src/core/enigma.cpp
+index 4ba577d..adfcb4a 100644
+--- a/src/core/enigma.cpp
++++ b/src/core/enigma.cpp
+@@ -952,13 +952,32 @@ void refreshIndexIfNeeded() {
+   }
+ }
+ 
+-// The index, complete now (in this pass): for input that cannot wait.
+-void completeIndexNow() {
+-  if (!g_indexDirty) return;
+-  g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
+-  g_indexDirty = false;
+-  g_chatIndexGeneration = MessageStore::getStorageChangeGeneration();
+-  followCursorMessage();
++// Input beyond what the held buffer takes: as in text_message.cpp's chat
++// (see its takeInputWhileLoading()) -- the rest waits in the input queue,
++// which is drained (all but a Back) only if it is full, and the loss is
++// then reported ("Input lost while loading").
++bool g_inputLost = false;
++uint32_t g_inputDropsSeen = 0;
++
++bool takeInputWhileLoading() {
++  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;
++  InputEvent q;
++  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);
++  if (Input::queueFull()) {
++    while (Input::popEvent(q)) {
++      if (q.type == InputEventType::ENCODER_LONG) return false;
++      g_inputLost = true;
++    }
++  }
++  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;
++  g_inputDropsSeen = Input::droppedEventCount();
++  return true;
++}
++
++void clearRetainedInput() {
++  g_heldInput.clear();
++  g_inputLost = false;
++  g_inputDropsSeen = Input::droppedEventCount();
+ }
+ 
+ // Storage changed since this chat last looked: the store either kept the
+@@ -979,11 +998,13 @@ bool syncIndexWithStore() {
+   return true;
+ }
+ 
+-void drawEnigmaChatLoading() {
++void drawEnigmaChatLoading(bool inputLost) {
+   Display::setFont(Display::Font::PRIMARY);
+   Display::clearContentArea();
+-  Display::printLine(static_cast<int16_t>(2 + Display::kCursorCellWidth), Display::kStatusBarHeight + 2,
+-                     "Loading messages...");
++  int16_t x = static_cast<int16_t>(2 + Display::kCursorCellWidth);
++  Display::printLine(x, Display::kStatusBarHeight + 2, "Loading messages...");
++  if (inputLost) Display::printLine(x, static_cast<int16_t>(Display::kStatusBarHeight + 2 + Display::lineHeight()),
++                                    "Input lost while loading");
+ }
+ 
+ // True while the pattern currently being keyed (g_composePattern) is known
+@@ -1859,7 +1880,7 @@ void screenEnigmaChatTick() {
+     markIndexDirty();
+     g_enigmaChatDirty = true;
+     g_enigmaChatNeedsFullRedraw = true;
+-    g_heldInput.clear();
++    clearRetainedInput();
+     g_chatLoadingShown = false;
+     g_chatDrawnThisVisit = false;
+   }
+@@ -1885,54 +1906,48 @@ void screenEnigmaChatTick() {
+     topReloaded = !g_indexDirty;
+   }
+   Input::update();
+-  InputEvent unheld;
+-  bool haveUnheld = false;
+   if (g_indexDirty) {
+-    // Still loading: input is held in order; Back leaves at once.
+-    InputEvent q;
+-    while (Input::popEvent(q)) {
+-      if (q.type == InputEventType::ENCODER_LONG) {
+-        g_heldInput.clear();
+-        g_enigmaChatLeaving = true;
+-        TextMessage::clearOpenConversation();
+-        Menu::goBack();
+-        return;
+-      }
+-      if (!g_heldInput.hold(q)) {
+-        completeIndexNow();  // full, or no memory: completed in this pass instead
+-        unheld = q;
+-        haveUnheld = true;
+-        break;
+-      }
+-    }
+-    if (g_indexDirty) {
+-      Display::drawStatusBar();
+-      if (!g_chatDrawnThisVisit && !g_chatLoadingShown) {
+-        drawEnigmaChatLoading();
+-        g_chatLoadingShown = true;
++    // Still loading: input is retained in order; Back leaves at once.
++    bool lostBefore = g_inputLost;
++    if (!takeInputWhileLoading()) {
++      clearRetainedInput();
++      InputEvent rest;
++      while (Input::popEvent(rest)) {
+       }
++      g_enigmaChatLeaving = true;
++      TextMessage::clearOpenConversation();
++      Menu::goBack();
+       return;
+     }
++    Display::drawStatusBar();
++    if (!g_chatDrawnThisVisit && (!g_chatLoadingShown || g_inputLost != lostBefore)) {
++      drawEnigmaChatLoading(g_inputLost);
++      g_chatLoadingShown = true;
++    }
++    return;
+   }
+   if (g_chatLoadingShown) {
+     g_chatLoadingShown = false;
+     g_enigmaChatNeedsFullRedraw = true;
+     g_enigmaChatDirty = true;
+   }
+-  // Held input first, then the one that could not be held, then what arrived
+-  // since -- every event through isReplayedSend() at dispatch.
++  // Held input first, then the input queue -- every event through
++  // isReplayedSend() at dispatch.
++  bool fromHeld = false;
+   auto nextEvent = [&](InputEvent& out) -> bool {
+-    if (g_heldInput.pop(out)) return true;
+-    if (haveUnheld) {
+-      haveUnheld = false;
+-      out = unheld;
++    fromHeld = false;
++    if (g_heldInput.pop(out)) {
++      fromHeld = true;
+       return true;
+     }
+     return Input::popEvent(out);
+   };
++  auto retain = [&](const InputEvent& ev) {
++    if (fromHeld) g_heldInput.unpop();
++    else Input::unpopEvent(ev);
++  };
+   bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||
+-                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG) ||
+-                    (haveUnheld && unheld.type == InputEventType::ENCODER_LONG);
++                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG);
+   bool droppingBeforeBack = false;
+   InputEvent e;
+   bool hadEvent = false;
+@@ -1943,7 +1958,15 @@ void screenEnigmaChatTick() {
+       droppingBeforeBack = true;  // a Back is waiting: history-side work before it is skipped
+       continue;
+     }
+-    if (g_indexDirty) completeIndexNow();  // made stale earlier in this batch
++    if (g_indexDirty && e.type != InputEventType::ENCODER_LONG) {
++      // Made stale earlier in this batch: one bounded step; if that does not
++      // complete it, this event and the rest wait (retained, in order).
++      refreshIndexIfNeeded();
++      if (g_indexDirty) {
++        retain(e);
++        break;
++      }
++    }
+     hadEvent = true;
+     if (g_sendStatus != nullptr &&
+         (e.type == InputEventType::DOT_PRESS_START || e.type == InputEventType::ENCODER_SHORT) &&
+@@ -1951,7 +1974,7 @@ void screenEnigmaChatTick() {
+       clearSendStatus();
+     }
+     if (e.type == InputEventType::ENCODER_ROTATE) {
+-      completeIndexNow();
++      refreshIndexIfNeeded();  // (complete here: checked above)
+       // Hardware Fix #4.3a issue 1: a logical message can span more visual
+       // rows than the viewport, so rotating steps through THAT message's
+       // own rows (g_historyRowOffset) before moving to the next/previous
+@@ -1996,7 +2019,7 @@ void screenEnigmaChatTick() {
+   }
+   g_heldInput.releaseIfEmpty();
+   if (g_enigmaChatLeaving) {
+-    g_heldInput.clear();
++    clearRetainedInput();
+     InputEvent rest;
+     while (Input::popEvent(rest)) {
+     }
+@@ -2022,9 +2045,17 @@ void screenEnigmaChatTick() {
+   }
+ 
+   bool wasIndexDirty = g_indexDirty || topReloaded;
+-  completeIndexNow();
++  refreshIndexIfNeeded();  // one bounded step
++  if (g_indexDirty) {
++    Display::drawStatusBar();  // not complete yet: nothing drawn from a partial index
++    return;
++  }
+   if (wasIndexDirty) g_enigmaChatDirty = true;
+   markSelectedHistoryRead();  // against the complete index
++  if (g_inputLost && !g_sendRanThisTick) {
++    g_inputLost = false;
++    setSendStatus({"Input lost while loading", true});
++  }
+ 
+   Display::drawStatusBar();
+   if (!g_enigmaChatDirty) return;
+diff --git a/src/core/input.cpp b/src/core/input.cpp
+index 66a1a87..d89e33f 100644
+--- a/src/core/input.cpp
++++ b/src/core/input.cpp
+@@ -35,9 +35,13 @@ InputEvent g_queue[kQueueSize];
+ uint8_t g_queueHead = 0;
+ uint8_t g_queueTail = 0;
+ uint8_t g_queueCount = 0;
++uint32_t g_droppedEvents = 0;
+ 
+ void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0, uint32_t eventMs = 0) {
+-  if (g_queueCount >= kQueueSize) return;  // drop if the consumer is not draining fast enough
++  if (g_queueCount >= kQueueSize) {  // drop if the consumer is not draining fast enough
++    g_droppedEvents++;
++    return;
++  }
+   g_queue[g_queueTail] = InputEvent{type, value, durationMs, eventMs};
+   g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueSize);
+   g_queueCount++;
+@@ -829,6 +833,26 @@ void update() {
+   updateCombinedHold(now);
+ }
+ 
++uint32_t droppedEventCount() { return g_droppedEvents; }
++
++bool queueFull() { return g_queueCount >= kQueueSize; }
++
++bool peekEvent(InputEvent& outEvent) {
++  if (g_queueCount == 0) return false;
++  outEvent = g_queue[g_queueHead];
++  return true;
++}
++
++void unpopEvent(const InputEvent& event) {
++  if (g_queueCount >= kQueueSize) {  // cannot happen right after a pop
++    g_droppedEvents++;
++    return;
++  }
++  g_queueHead = static_cast<uint8_t>((g_queueHead + kQueueSize - 1) % kQueueSize);
++  g_queue[g_queueHead] = event;
++  g_queueCount++;
++}
++
+ bool hasQueuedEvent(InputEventType type) {
+   for (uint8_t i = 0; i < g_queueCount; i++) {
+     if (g_queue[(g_queueHead + i) % kQueueSize].type == type) return true;
+diff --git a/src/core/input.h b/src/core/input.h
+index be351ee..bbc06cf 100644
+--- a/src/core/input.h
++++ b/src/core/input.h
+@@ -67,6 +67,19 @@ bool popEvent(InputEvent& outEvent);
+ // see a Back waiting behind other input.
+ bool hasQueuedEvent(InputEventType type);
+ 
++// Events dropped because the queue was full (since boot): a screen that
++// stopped draining for a while can tell the user that input was lost.
++uint32_t droppedEventCount();
++
++// True if the queue is full (the next event would be dropped).
++bool queueFull();
++
++// The next event without popping it (false if none).
++bool peekEvent(InputEvent& outEvent);
++// Puts an event just popped back at the front of the queue (it is popped
++// first next time). A screen that cannot handle it yet leaves it there.
++void unpopEvent(const InputEvent& event);
++
+ // True if `e` is a general-navigation confirm: DOT/DASH released before the
+ // 2000ms special-command threshold (Addendum section 9.3).
+ bool isMenuConfirm(const InputEvent& e);
+diff --git a/src/core/outbox.cpp b/src/core/outbox.cpp
+index 0b8586b..83a540e 100644
+--- a/src/core/outbox.cpp
++++ b/src/core/outbox.cpp
+@@ -33,6 +33,13 @@ namespace {
+ //  - queued records are published one per step while their group is
+ //    connected (retried after kRetryMs otherwise); the pending flag is
+ //    cleared on success, as before.
++//  - a queued record that cannot be read at publication is not dropped
++//    unless its absence is confirmed (a reliable names-only listing of its
++//    conversation without it): an inconclusive failure keeps it queued,
++//    retried after a per-record backoff (kReadRetryMinMs doubling, at most
++//    kReadRetryMaxMs), so it never blocks the other queued records and
++//    never causes a storage pass. A record read and found no longer
++//    pending is dropped (published or cleared elsewhere).
+ // The queue and the pass state live on the heap while in use. A record
+ // that does not fit the queue stays pending on flash and is found again by
+ // the next pass.
+@@ -42,9 +49,17 @@ constexpr uint8_t kWalkEntriesPerStep = 16;
+ constexpr uint8_t kReadsPerStep = 4;
+ constexpr uint8_t kQueueSize = 16;
+ constexpr uint32_t kRetryMs = 5000;
++constexpr uint32_t kReadRetryMinMs = 1000;
++constexpr uint32_t kReadRetryMaxMs = 60000;
++constexpr uint32_t kPassRetryMaxMs = 300000;  // an incomplete pass is repeated after a growing pause, at most this
+ 
++struct Entry {
++  MessageRef ref;
++  uint32_t retryAtMs;   // not tried before this (a read failed)
++  uint8_t readFailures; // inconclusive read failures in a row
++};
+ struct Queue {
+-  MessageRef refs[kQueueSize];
++  Entry items[kQueueSize];
+   uint8_t count;
+ };
+ Queue* g_queue = nullptr;
+@@ -66,8 +81,9 @@ struct Pass {
+ };
+ Pass* g_pass = nullptr;
+ bool g_passDone = false;          // a complete pass ran since boot (and since the last external change)
+-uint32_t g_externalSeen = 0;      // getExternalMutationCount() a complete pass covered
++uint32_t g_externalAtPassStart = 0;  // getExternalMutationCount() when the last pass began
+ uint32_t g_passAgainAtMs = 0;     // after an incomplete pass, or an overflowed queue
++uint32_t g_passRetryMs = kRetryMs;  // the pause before repeating an incomplete pass (doubles, reset by a complete one)
+ bool g_passAgain = false;
+ uint32_t g_nextStepMs = 0;
+ 
+@@ -85,17 +101,20 @@ void enqueue(const MessageRef& ref) {
+     g_queue->count = 0;
+   }
+   for (uint8_t i = 0; i < g_queue->count; i++) {
+-    if (sameRef(g_queue->refs[i], ref)) return;
++    if (sameRef(g_queue->items[i].ref, ref)) return;  // queued already (its retry state kept)
+   }
+   if (g_queue->count >= kQueueSize) {
+     g_queueOverflowed = true;
+     return;
+   }
+-  g_queue->refs[g_queue->count++] = ref;
++  Entry& e = g_queue->items[g_queue->count++];
++  e.ref = ref;
++  e.retryAtMs = millis();
++  e.readFailures = 0;
+ }
+ 
+-void dropFront() {
+-  for (uint8_t i = 1; i < g_queue->count; i++) g_queue->refs[i - 1] = g_queue->refs[i];
++void removeAt(uint8_t k) {
++  for (uint8_t i = k + 1; i < g_queue->count; i++) g_queue->items[i - 1] = g_queue->items[i];
+   g_queue->count--;
+   if (g_queue->count == 0) {
+     delete g_queue;
+@@ -103,26 +122,69 @@ void dropFront() {
+   }
+ }
+ 
++// The entry goes behind the others (their turn first).
++void moveToBack(uint8_t k) {
++  Entry e = g_queue->items[k];
++  for (uint8_t i = k + 1; i < g_queue->count; i++) g_queue->items[i - 1] = g_queue->items[i];
++  g_queue->items[g_queue->count - 1] = e;
++}
++
++// True only if the record is confirmed gone: its conversation listed
++// reliably (names only, no record opened) without it. A listing that fails,
++// or no memory for it, is inconclusive.
++bool confirmedAbsent(const MessageRef& ref) {
++  uint32_t* seqs = new (std::nothrow) uint32_t[MessageStore::kMaxMessagesPerThread];
++  if (seqs == nullptr) return false;
++  bool reliable = false;
++  uint16_t n = MessageStore::listMessageSequences(ref.group_code, ref.contact_key, seqs, MessageStore::kMaxMessagesPerThread,
++                                                  &reliable);
++  bool listed = false;
++  for (uint16_t i = 0; i < n && !listed; i++) listed = seqs[i] == ref.sequence;
++  delete[] seqs;
++  return reliable && !listed;
++}
++
+ void onPendingWritten(const MessageRef& ref) { enqueue(ref); }
+ 
+ // Publishes the oldest queued record if its group is connected. True if
+ // this step did storage or network work.
+ bool publishStep() {
+   if (g_queue == nullptr) return false;
+-  if (static_cast<int32_t>(millis() - g_publishRetryAtMs) < 0) return false;
+-  MessageRef ref = g_queue->refs[0];
++  uint32_t now = millis();
++  if (static_cast<int32_t>(now - g_publishRetryAtMs) < 0) return false;
++  // The oldest entry whose read retry is due (a record waiting on one does
++  // not hold up the rest).
++  uint8_t k = 0;
++  while (k < g_queue->count && static_cast<int32_t>(now - g_queue->items[k].retryAtMs) < 0) k++;
++  if (k == g_queue->count) return false;
++  MessageRef ref = g_queue->items[k].ref;
+   if (!MqttManager::isGroupConnected(ref.group_code)) {
+     // Still offline: the rest of the queue first, this one later.
+-    if (g_queue->count > 1) {
+-      dropFront();
+-      enqueue(ref);
+-    }
++    if (g_queue->count > 1) moveToBack(k);
+     g_publishRetryAtMs = millis() + kRetryMs;
+     return false;
+   }
+   StoredMessageView view;
+-  if (!MessageStore::loadMessage(ref, &view) || !(view.header.flags & MessageStore::FLAG_PENDING_OUTBOX)) {
+-    dropFront();  // gone, or already published
++  if (!MessageStore::loadMessage(ref, &view)) {
++    if (confirmedAbsent(ref)) {
++      removeAt(k);  // gone (deleted, evicted): nothing to send
++      return true;
++    }
++    // Inconclusive (unreadable now): kept, tried again later.
++    Entry& e = g_queue->items[k];
++    if (e.readFailures < 255) e.readFailures++;
++    uint32_t backoff = kReadRetryMinMs;
++    for (uint8_t i = 1; i < e.readFailures && backoff < kReadRetryMaxMs; i++) backoff *= 2;
++    if (backoff > kReadRetryMaxMs) backoff = kReadRetryMaxMs;
++    e.retryAtMs = millis() + backoff;
++    Serial.printf("[OUTBOX] queued record %s/%s/%lu unreadable (%u); retried in %lu ms\n", ref.group_code, ref.contact_key,
++                  static_cast<unsigned long>(ref.sequence), static_cast<unsigned>(e.readFailures),
++                  static_cast<unsigned long>(backoff));
++    if (g_queue->count > 1) moveToBack(k);
++    return true;
++  }
++  if (!(view.header.flags & MessageStore::FLAG_PENDING_OUTBOX)) {
++    removeAt(k);  // read, and no longer pending: published (or cleared) already
+     return true;
+   }
+   const char* suffix;
+@@ -146,7 +208,7 @@ bool publishStep() {
+     return true;
+   }
+   MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);
+-  dropFront();
++  removeAt(k);
+   return true;
+ }
+ 
+@@ -162,10 +224,14 @@ void endPass() {
+   MessageStore::endConversationWalk(g_pass->walk);
+   if (complete) {
+     g_passDone = true;
+-    g_externalSeen = g_pass->externalAtStart;
++    g_passAgain = false;
++    g_passRetryMs = kRetryMs;
+   } else {
++    // Repeated after a growing pause: a record that stays unreadable does not
++    // cause a whole-store pass every few seconds.
+     g_passAgain = true;
+-    g_passAgainAtMs = millis() + kRetryMs;
++    g_passAgainAtMs = millis() + g_passRetryMs;
++    g_passRetryMs = g_passRetryMs * 2 < kPassRetryMaxMs ? g_passRetryMs * 2 : kPassRetryMaxMs;
+   }
+   delete g_pass;
+   g_pass = nullptr;
+@@ -176,6 +242,7 @@ void startPass() {
+   if (g_pass == nullptr) return;  // tried again at the next step
+   memset(g_pass, 0, sizeof(Pass));
+   g_pass->externalAtStart = MessageStore::getExternalMutationCount();
++  g_externalAtPassStart = g_pass->externalAtStart;
+   g_pass->startMs = millis();
+   g_pass->walk = MessageStore::beginConversationWalk();
+   if (g_pass->walk == nullptr) g_pass->incomplete = true;
+@@ -243,8 +310,12 @@ void serviceTick() {
+   if (publishStep()) return;
+   if (MessageStore::chatIndexLoading()) return;  // a chat loading its index goes first (as in Notifications)
+   if (g_pass == nullptr) {
+-    bool externalChange = MessageStore::getExternalMutationCount() != g_externalSeen;
+-    bool due = !g_passDone || externalChange || g_queueOverflowed ||
++    // A change outside the store since the last pass began, or a full queue,
++    // starts one at once; the first pass after boot too. A pass that could
++    // not read everything (also the first) is repeated only after its
++    // growing pause.
++    bool externalChange = MessageStore::getExternalMutationCount() != g_externalAtPassStart;
++    bool due = externalChange || g_queueOverflowed || (!g_passDone && !g_passAgain) ||
+                (g_passAgain && static_cast<int32_t>(now - g_passAgainAtMs) >= 0);
+     // As before: storage is looked through only once a group is connected
+     // (nothing could be published before).
+diff --git a/src/core/text_message.cpp b/src/core/text_message.cpp
+index 03c4a13..ecb06c0 100644
+--- a/src/core/text_message.cpp
++++ b/src/core/text_message.cpp
+@@ -108,6 +108,14 @@ void markIndexDirty() { g_indexDirty = true; }
+ // replays it once the index is ready. Back leaves at once.
+ constexpr uint8_t kIndexReadsPerPass = 4;
+ HeldInput g_heldInput;
++// Input beyond what the held buffer takes (it is full, or could not be
++// allocated) waits in the input queue (only what can be held is popped):
++// the load goes on at its bounded pace, never completed in one pass.
++// Should the input queue fill up as well, it is drained (all but a Back,
++// which leaves) and the loss is reported ("Input lost while loading"):
++// what was kept stays in order.
++bool g_inputLost = false;        // reported once the chat is drawn
++uint32_t g_inputDropsSeen = 0;   // Input::droppedEventCount() last looked at
+ bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
+ bool g_chatDrawnThisVisit = false;
+ // The storage generation when this chat's index last finished loading. The
+@@ -129,14 +137,6 @@ void refreshIndexIfNeeded() {
+   }
+ }
+ 
+-// The index, complete now (in this pass): for input that cannot wait.
+-void completeIndexNow() {
+-  if (!g_indexDirty) return;
+-  g_indexTotal = MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);
+-  g_indexDirty = false;
+-  g_chatIndexGeneration = MessageStore::getStorageChangeGeneration();
+-  followCursorMessage();
+-}
+ 
+ // Storage changed since this chat last looked: the store either kept the
+ // index current (patching this conversation's own changes in, which can
+@@ -159,8 +159,36 @@ bool syncIndexWithStore() {
+ void drawChatLoading() {
+   Display::setFont(Display::Font::PRIMARY);
+   Display::clearContentArea();
+-  Display::printLine(static_cast<int16_t>(2 + Display::kCursorCellWidth), Display::kStatusBarHeight + 2,
+-                     "Loading messages...");
++  int16_t x = static_cast<int16_t>(2 + Display::kCursorCellWidth);
++  Display::printLine(x, Display::kStatusBarHeight + 2, "Loading messages...");
++  if (g_inputLost) Display::printLine(x, static_cast<int16_t>(Display::kStatusBarHeight + 2 + Display::lineHeight()),
++                                      "Input lost while loading");
++}
++
++// While the index loads: input taken in order into the held buffer, the
++// rest left in the input queue, which is drained only if it is full. False
++// if a Back was found (the caller leaves).
++bool takeInputWhileLoading() {
++  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;
++  InputEvent q;
++  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);
++  if (Input::queueFull()) {
++    // Nothing more can be kept: the queue is drained so that a Back pressed
++    // now still gets through; what it held is lost, and reported.
++    while (Input::popEvent(q)) {
++      if (q.type == InputEventType::ENCODER_LONG) return false;
++      g_inputLost = true;
++    }
++  }
++  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;  // dropped by the full queue
++  g_inputDropsSeen = Input::droppedEventCount();
++  return true;
++}
++
++void clearRetainedInput() {
++  g_heldInput.clear();
++  g_inputLost = false;
++  g_inputDropsSeen = Input::droppedEventCount();
+ }
+ 
+ // =============================================================================
+@@ -1538,7 +1566,7 @@ void screenChatTick() {
+     g_chatViewportCacheValid = false;
+     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
+     g_readCheckDone = false;  // a selection after (re)entry is checked afresh
+-    g_heldInput.clear();
++    clearRetainedInput();
+     g_chatLoadingShown = false;
+     g_chatDrawnThisVisit = false;
+   }
+@@ -1565,71 +1593,55 @@ void screenChatTick() {
+     topReloaded = !g_indexDirty;
+   }
+   Input::update();
+-  // An event that could not be held while loading: processed first, live.
+-  InputEvent unheld;
+-  bool haveUnheld = false;
+   if (g_indexDirty) {
+-    // Still loading: input is held in order; Back leaves at once (what was
+-    // held is dropped with it, as leaving would have dropped it).
+-    InputEvent q;
+-    while (Input::popEvent(q)) {
+-      if (q.type == InputEventType::ENCODER_LONG) {
+-        g_heldInput.clear();
+-        g_chatIsOpen = false;
+-        Menu::goBack();
+-        emitChatScreenPerf("loading-back");
+-        return;
+-      }
+-      if (!g_heldInput.hold(q)) {
+-        // Full, or no memory: the index is completed in this pass instead
+-        // (one blocking load), and this event and the rest go live.
+-        uint32_t completeStart = millis();
+-        completeIndexNow();
+-        indexRefreshElapsed += millis() - completeStart;
+-        unheld = q;
+-        haveUnheld = true;
+-        break;
++    // Still loading: input is retained in order; Back leaves at once (what
++    // was retained is dropped with it, as leaving would have dropped it).
++    bool lostBefore = g_inputLost;
++    if (!takeInputWhileLoading()) {
++      clearRetainedInput();
++      InputEvent rest;
++      while (Input::popEvent(rest)) {
+       }
+-    }
+-    if (g_indexDirty) {
+-      Display::drawStatusBar();
+-      if (!g_chatDrawnThisVisit && !g_chatLoadingShown) {
+-        drawChatLoading();
+-        g_chatLoadingShown = true;
+-      }
+-      emitChatScreenPerf("loading");
++      g_chatIsOpen = false;
++      Menu::goBack();
++      emitChatScreenPerf("loading-back");
+       return;
+     }
++    Display::drawStatusBar();
++    if (!g_chatDrawnThisVisit && (!g_chatLoadingShown || g_inputLost != lostBefore)) {
++      drawChatLoading();
++      g_chatLoadingShown = true;
++    }
++    emitChatScreenPerf("loading");
++    return;
+   }
+   if (g_chatLoadingShown) {
+     g_chatLoadingShown = false;
+     g_chatNeedsFullRedraw = true;
+     g_chatRenderDirty = true;
+   }
+-  // Held input first (in order), then the one that could not be held, then
+-  // what arrived since. Every event goes through isReplayedSend() at
+-  // dispatch, held or not, so a Short replayed from a Send window is
+-  // dropped either way.
++  // Held input first (in order), then the input queue. Every event goes
++  // through isReplayedSend() at dispatch, retained or not, so a Short
++  // replayed from a Send window is dropped either way.
+   auto nextEvent = [&](InputEvent& out, bool* fromHeld) -> bool {
+     *fromHeld = false;
+     if (g_heldInput.pop(out)) {
+       *fromHeld = true;
+       return true;
+     }
+-    if (haveUnheld) {
+-      haveUnheld = false;
+-      out = unheld;
+-      return true;
+-    }
+     return Input::popEvent(out);
+   };
++  // Puts an event back where it came from (it is handled first next time).
++  auto retain = [&](const InputEvent& ev, bool wasHeld) {
++    if (wasHeld) g_heldInput.unpop();
++    else Input::unpopEvent(ev);
++  };
+   // A Back already queued: the history-side events before it are not worth
+   // the reads they would cost (rotations would load and measure rows the
+   // user is leaving); from the first such event on, nothing before the Back
+   // is handled. Compose-side input before it (keys, a Send) still is.
+   bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||
+-                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG) ||
+-                    (haveUnheld && unheld.type == InputEventType::ENCODER_LONG);
++                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG);
+   bool droppingBeforeBack = false;
+   InputEvent e;
+   bool hadEvent = false;
+@@ -1642,12 +1654,17 @@ void screenChatTick() {
+       continue;
+     }
+     // Something in this batch made the index stale (a Send, a deletion):
+-    // it is completed before the next event uses it.
+-    if (g_indexDirty) {
++    // one bounded step; if that does not complete it, this event and the
++    // rest wait (retained, in order) for the next passes.
++    if (g_indexDirty && e.type != InputEventType::ENCODER_LONG) {
+       uint32_t midRefreshStart = millis();
+-      completeIndexNow();
++      refreshIndexIfNeeded();
+       indexRefreshElapsed += millis() - midRefreshStart;
+       indexReloadOccurred = true;
++      if (g_indexDirty) {
++        retain(e, fromHeld);
++        break;
++      }
+     }
+     hadEvent = true;
+     if (g_sendStatus != nullptr &&
+@@ -1661,9 +1678,9 @@ void screenChatTick() {
+     // straight from history focus back to compose.
+     if (g_historyCursor != kNoHistoryCursor) historyFocusTouchedThisPass = true;
+     if (e.type == InputEventType::ENCODER_ROTATE) {
+-      bool rotateRefreshWasDirty = g_indexDirty;
++      bool rotateRefreshWasDirty = g_indexDirty;  // (complete here: checked above)
+       uint32_t rotateRefreshStart = millis();
+-      completeIndexNow();
++      refreshIndexIfNeeded();
+       indexRefreshElapsed += millis() - rotateRefreshStart;
+       if (rotateRefreshWasDirty) indexReloadOccurred = true;
+       // Hardware Fix #4.4 issue C: a logical message can span more visual
+@@ -1716,7 +1733,7 @@ void screenChatTick() {
+   if (!g_chatIsOpen) {
+     // Left: what was still queued behind the Back is dropped, as the chat
+     // that would have handled it is gone.
+-    g_heldInput.clear();
++    clearRetainedInput();
+     InputEvent rest;
+     while (Input::popEvent(rest)) {
+     }
+@@ -1749,13 +1766,26 @@ void screenChatTick() {
+ 
+   bool wasIndexDirty = g_indexDirty || topReloaded;
+   uint32_t finalRefreshStart = millis();
+-  completeIndexNow();
++  refreshIndexIfNeeded();  // one bounded step
+   indexRefreshElapsed += millis() - finalRefreshStart;
++  if (g_indexDirty) {
++    // Not complete yet: nothing is drawn from a partial index (the screen
++    // keeps what it shows); the next passes continue the load.
++    Display::drawStatusBar();
++    emitChatScreenPerf("reloading");
++    return;
++  }
+   if (wasIndexDirty) {
+     g_chatRenderDirty = true;  // index actually reloaded: content may have changed
+     indexReloadOccurred = true;
+   }
+   markSelectedHistoryRead();  // against the complete index
++  if (g_inputLost && !g_sendRanThisTick) {
++    // Shown once the retained input was replayed (a key pressed after it
++    // clears it, like a Send outcome).
++    g_inputLost = false;
++    setSendStatus({"Input lost while loading", true});
++  }
+ 
+   Display::drawStatusBar();
+   if (!g_chatRenderDirty) {

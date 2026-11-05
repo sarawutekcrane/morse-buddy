@@ -1,0 +1,17 @@
+   CE1 measured: max 4 opens/pass, 4 opens total, content after 1 passes
+   CE1b measured: max 6 opens/pass, 94 opens total, content after 23 passes
+   CE2 measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE2b measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE3 measured: 4 opens to store an arrival (with its eviction) and show it in the open chat
+   CE17 measured: 80 file opens for the boot sweep of 80 records
+   CE21 variant 0 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 1 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 2 measured: 4 opens on entry, content after 1 passes
+   CE11 measured: 96 opens to load 90 records with an arrival during the load
+   DM1 1 s after boot: chat drawn after 46 passes, 4196 ms simulated, max 5 opens per pass (boot passes before: max 2)
+   DM2 after boot work settled: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 2)
+   DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 2)
+   IN6 measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   IN6c measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   OB7b measured: in 300 s, 25 reads of the unreadable record offline (sweep), 26 online: 1 Outbox passes
+170 checks passed, 0 failed

@@ -1,0 +1,57 @@
+Processing morse_buddy (platform: espressif32@6.13.0; board: esp32dev; framework: arduino)
+--------------------------------------------------------------------------------
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32dev.html
+PLATFORM: Espressif 32 (6.13.0) > Espressif ESP32 Dev Module
+HARDWARE: ESP32 240MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20017.241212+sha.dcc1105b 
+ - tool-esptoolpy @ 2.41100.260830 (4.11.0) 
+ - toolchain-xtensa-esp32 @ 8.4.0+2021r2-patch5
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 38 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- MQTT @ 2.5.2
+|-- Adafruit GFX Library @ 1.13.0
+|-- Adafruit ST7735 and ST7789 Library @ 1.12.0
+|-- Adafruit BusIO @ 1.17.4
+|-- SPI @ 2.0.0
+|-- WiFi @ 2.0.0
+|-- LittleFS @ 2.0.0
+|-- HTTPClient @ 2.0.0
+|-- Update @ 2.0.0
+|-- WiFiClientSecure @ 2.0.0
+|-- Preferences @ 2.0.0
+Building in release mode
+Compiling .pio/build/morse_buddy/src/core/enigma.cpp.o
+Compiling .pio/build/morse_buddy/src/core/input.cpp.o
+Compiling .pio/build/morse_buddy/src/core/menu.cpp.o
+Compiling .pio/build/morse_buddy/src/core/mixed_text_entry.cpp.o
+Compiling .pio/build/morse_buddy/src/core/morse_practice.cpp.o
+Compiling .pio/build/morse_buddy/src/core/number_guessing.cpp.o
+Compiling .pio/build/morse_buddy/src/core/number_guessing_friend.cpp.o
+Compiling .pio/build/morse_buddy/src/core/race.cpp.o
+Compiling .pio/build/morse_buddy/src/core/radio.cpp.o
+Compiling .pio/build/morse_buddy/src/core/settings.cpp.o
+Compiling .pio/build/morse_buddy/src/core/storage_init.cpp.o
+Compiling .pio/build/morse_buddy/src/core/text_message.cpp.o
+Compiling .pio/build/morse_buddy/src/main.cpp.o
+Compiling .pio/build/morse_buddy/src/ota/ota_manager.cpp.o
+Linking .pio/build/morse_buddy/firmware.elf
+Retrieving maximum program size .pio/build/morse_buddy/firmware.elf
+Checking size .pio/build/morse_buddy/firmware.elf
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [====      ]  38.0% (used 124516 bytes from 327680 bytes)
+Flash: [========  ]  83.7% (used 1207385 bytes from 1441792 bytes)
+Building .pio/build/morse_buddy/firmware.bin with action:
+  "$PYTHONEXE" "$OBJCOPY" --chip esp32 elf2image --flash_mode ${__get_board_flash_mode(__env__)} --flash_freq ${__get_board_f_image(__env__)} --flash_size 4MB --elf-sha256-offset 0xb0 -o $TARGET $SOURCES
+Building .pio/build/morse_buddy/firmware.bin
+esptool.py v4.11.0
+Creating esp32 image...
+Merged 27 ELF sections
+Successfully created esp32 image.
+========================= [SUCCESS] Took 11.64 seconds =========================
+RC=0

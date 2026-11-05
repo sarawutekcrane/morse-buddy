@@ -1,0 +1,44 @@
+   CE1 measured: max 4 opens/pass, 4 opens total, content after 1 passes
+   CE1b measured: max 6 opens/pass, 94 opens total, content after 23 passes
+   CE2 measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE2b measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE3 measured: 4 opens to store an arrival (with its eviction) and show it in the open chat
+   CE17 measured: 80 file opens for the boot sweep of 80 records
+   CE21 variant 0 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 1 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 2 measured: 4 opens on entry, content after 1 passes
+   CE11 measured: 96 opens to load 90 records with an arrival during the load
+   DM1 1 s after boot: chat drawn after 46 passes, 4196 ms simulated, max 5 opens per pass (boot passes before: max 2)
+   DM2 after boot work settled: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 2)
+   DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 2)
+FAIL [IN2 more input while loading than the held buffer takes (40 key events over 4 passes): nothing lost, every pass bounded (no synchronous load)] line 1460: Text: loading 1, 4 passes, max 90 opens in a pass, draft of 20 E shown 1, 0 dropped
+FAIL [IN2 more input while loading than the held buffer takes (40 key events over 4 passes): nothing lost, every pass bounded (no synchronous load)] line 1460: Enigma: loading 1, 4 passes, max 89 opens in a pass, draft of 20 E shown 1, 0 dropped
+FAIL [IN2b a Back queued after the event that overflowed the held buffer leaves at once (bounded pass)] line 1476: Text: loading 1, left 1 after 1 passes, 88 opens
+FAIL [IN2b a Back queued after the event that overflowed the held buffer leaves at once (bounded pass)] line 1476: Enigma: loading 1, left 1 after 1 passes, 88 opens
+FAIL [IN2c more input than the device can buffer at all (held buffer and input queue full): the loss is shown, what was kept is in order] line 1492: Text: 68 dropped by the input queue, notice shown 0, 16 E kept, max 5 opens in a pass
+FAIL [IN2c more input than the device can buffer at all (held buffer and input queue full): the loss is shown, what was kept is in order] line 1492: Enigma: 68 dropped by the input queue, notice shown 0, 16 E kept, max 4 opens in a pass
+FAIL [IN8 a Send whose store write fails makes the open chat's index stale mid-batch: the reload is stepped (bounded passes), the keys after it kept in order] line 1545: Text, keys after 0: max 86 opens in a pass, draft E shown 1
+FAIL [IN8 a Send whose store write fails makes the open chat's index stale mid-batch: the reload is stepped (bounded passes), the keys after it kept in order] line 1545: Text, keys after 1: max 86 opens in a pass, draft ET shown 1
+FAIL [IN8 a Send whose store write fails makes the open chat's index stale mid-batch: the reload is stepped (bounded passes), the keys after it kept in order] line 1545: Enigma, keys after 0: max 87 opens in a pass, draft E shown 1
+FAIL [IN8 a Send whose store write fails makes the open chat's index stale mid-batch: the reload is stepped (bounded passes), the keys after it kept in order] line 1545: Enigma, keys after 1: max 87 opens in a pass, draft ET shown 1
+FAIL [IN3 no memory for the held buffer while loading: the input waits (bounded passes), nothing lost] line 1561: Text: 2 passes, max 93 opens in a pass, draft SOS shown 1
+FAIL [IN3 no memory for the held buffer while loading: the input waits (bounded passes), nothing lost] line 1561: Enigma: 2 passes, max 92 opens in a pass, draft SOS shown 1
+FAIL [IN3b no memory for the held buffer, then Back: leaves at once] line 1576: Text: left 1 after 1 passes, 89 opens
+FAIL [IN3b no memory for the held buffer, then Back: leaves at once] line 1576: Enigma: left 1 after 1 passes, 89 opens
+FAIL [IN4d a Send and its replayed Short arriving after the held buffer overflowed: one send attempt] line 1596: Text: 1 send attempts, max 91 opens in a pass
+FAIL [IN4d a Send and its replayed Short arriving after the held buffer overflowed: one send attempt] line 1596: Enigma: 1 send attempts, max 90 opens in a pass
+FAIL [IN5b representative Morse keyed while loading (buffer overflowing, or no memory for it) gives the same draft as keyed live] line 1624: Text mode 1: draft PARISTEST shown 0, 0 dropped, max 27 opens
+FAIL [IN5b representative Morse keyed while loading (buffer overflowing, or no memory for it) gives the same draft as keyed live] line 1624: Text mode 2: draft PARIS shown 0, 0 dropped, max 92 opens
+FAIL [IN5b representative Morse keyed while loading (buffer overflowing, or no memory for it) gives the same draft as keyed live] line 1624: Enigma mode 1: draft PARISTEST shown 0, 0 dropped, max 26 opens
+FAIL [IN5b representative Morse keyed while loading (buffer overflowing, or no memory for it) gives the same draft as keyed live] line 1624: Enigma mode 2: draft PARIS shown 0, 0 dropped, max 91 opens
+FAIL [IN5c more Morse than the device can keep without a held buffer (48 events): the loss is shown, never a silently different draft] line 1650: Text: notice while loading 0, after 0; full draft shown 0
+FAIL [IN5c more Morse than the device can keep without a held buffer (48 events): the loss is shown, never a silently different draft] line 1650: Enigma: notice while loading 0, after 0; full draft shown 0
+   IN6 measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   IN6c measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+FAIL [OB8 a queued record whose read fails at publication (after the boot pass) is retried, not dropped: published once its reads work, flag cleared] line 1977: listing fails too 0: after reads recovered: published 0 (expected 1), still pending 1
+FAIL [OB8 a queued record whose read fails at publication (after the boot pass) is retried, not dropped: published once its reads work, flag cleared] line 1977: listing fails too 1: after reads recovered: published 0 (expected 1), still pending 1
+   OB7b measured: in 300 s, 25 reads of the unreadable record offline (sweep), 707 online: 682 Outbox passes
+FAIL [OB7b a record that stays unreadable during discovery: the repeated passes back off (no whole-store pass every few seconds)] line 2006: 682 Outbox passes in 300 s (sweep 25, both 707)
+FAIL [OB9 a persistently unreadable queued record does not stop another from being published; it stays pending and queued, retried with backoff] line 2020: the unreadable one: pending 1, 1 read attempts in 120 s
+FAIL [OB9 a persistently unreadable queued record does not stop another from being published; it stays pending and queued, retried with backoff] line 2025: once readable: published 0, pending 1
+143 checks passed, 27 failed
