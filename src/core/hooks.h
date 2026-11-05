@@ -200,3 +200,11 @@ static const uint8_t kMaxAppServices = 16;
 bool registerAppService(const AppService& service);
 void initRegisteredServices();
 void tickRegisteredServices();
+
+// Background storage readers (the Notifications sweep and jobs, the
+// Outbox's pass) take turns: at most one of them does a storage step per
+// round of tickRegisteredServices(), so their bounded steps never add up in
+// one main-loop pass. A reader that got the last turn yields if another was
+// waiting. False: skip this step (try again next round).
+enum BackgroundReader : uint8_t { BG_NOTIFICATIONS = 1, BG_OUTBOX = 2 };
+bool claimBackgroundStorageStep(BackgroundReader who);

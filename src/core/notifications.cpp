@@ -934,6 +934,11 @@ void serviceTick() {
     writeReadUps();
     return;
   }
+  // One background storage step per main-loop pass, shared with the Outbox.
+  if (!claimBackgroundStorageStep(BG_NOTIFICATIONS)) {
+    g_nextStepMs = now;  // not this pass: the next one
+    return;
+  }
   if (g_job != nullptr) {
     stepJob();
     return;

@@ -138,7 +138,7 @@ muts = [
  (OB, "a pending write is not queued directly", "void serviceInit() { MessageStore::setOnPendingWrittenCallback(onPendingWritten); }", "void serviceInit() {}"),
  (OB, "an unreadable record does not make the pass incomplete", "        p.incomplete = true;  // unreadable (or removed since the listing): the next pass looks again\n", ""),
  (OB, "a full queue is not remembered (the rest never found)", "  if (g_queue->count >= kQueueSize) {\n    g_queueOverflowed = true;", "  if (g_queue->count >= kQueueSize) {"),
- (OB, "a failed publish clears the pending flag", "  if (!ok) {\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return true;\n  }", "  if (!ok) {\n    MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);\n    dropFront();\n    return true;\n  }"),
+ (OB, "a failed publish clears the pending flag", "  if (!ok) {\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return true;\n  }", "  if (!ok) {\n    MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);\n    removeAt(k);\n    return true;\n  }"),
  (OB, "a whole pass in one step (unbounded)", "constexpr uint8_t kReadsPerStep = 4;", "constexpr uint8_t kReadsPerStep = 255;"),
  (OB, "the pass skips records it found pending", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;\n        enqueue(ref);", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;"),
  # ---- review round: held-input overflow without a synchronous load ----
@@ -171,6 +171,8 @@ muts = [
  (EN, "Enigma: input while loading is dropped, not held", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);", "  while (Input::popEvent(q)) {}"),
  (EN, "Enigma: input beyond the held buffer is dropped (not left in the queue)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);", "  while (Input::popEvent(q)) g_heldInput.hold(q);"),
  (EN, "Enigma: an event put back is lost", "    else Input::unpopEvent(ev);", "    else (void)ev;"),
+ (NT, "Notifications ignores the shared background step (adds to the Outbox's in one pass)", "  if (!claimBackgroundStorageStep(BG_NOTIFICATIONS)) {", "  if (false) {"),
+ (OB, "the Outbox pass ignores the shared background step", "  if (!claimBackgroundStorageStep(BG_OUTBOX)) {", "  if (false) {"),
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
@@ -217,7 +219,7 @@ def one(k, mut):
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])
     b1 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS"] + inc + [H + "/notify_test.cpp", out + "/core/" + EN, stubsFake] + common + ["-o", out + "/n"], capture_output=True, text=True)
     incfs = sum([["-I", i] for i in (H + "/fake_fs", H, H + "/fake", out, REPO + "/src")], [])
-    b2 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE"] + incfs + [H + "/storage_test.cpp", out + "/core/" + EN, out + "/core/" + SM, out + "/core/" + OB, stubsReal, lfs] + common + ["-o", out + "/s"], capture_output=True, text=True)
+    b2 = subprocess.run(["g++", "-std=gnu++17", "-O1", "-DREAL_NOTIFICATIONS", "-DREAL_MESSAGE_STORE"] + incfs + [H + "/storage_test.cpp", out + "/core/" + EN, out + "/core/" + SM, stubsReal, lfs] + common + ["-o", out + "/s"], capture_output=True, text=True)
     if b1.returncode or b2.returncode:
         with _print_lock: print(f"  COMPILE-ERR  {name}: {(b1.stderr or b2.stderr)[:300]}", flush=True)
         shutil.rmtree(out, ignore_errors=True)

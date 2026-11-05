@@ -320,6 +320,13 @@ void serviceTick() {
     // As before: storage is looked through only once a group is connected
     // (nothing could be published before).
     if (!due || !MqttManager::isAnyGroupConnected()) return;
+  }
+  // One background storage step per main-loop pass, shared with Notifications.
+  if (!claimBackgroundStorageStep(BG_OUTBOX)) {
+    g_nextStepMs = now;  // not this pass: the next one
+    return;
+  }
+  if (g_pass == nullptr) {
     startPass();
     if (g_pass == nullptr) return;
   }

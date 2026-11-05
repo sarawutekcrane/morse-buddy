@@ -11,6 +11,7 @@
 #include "core/menu.cpp"
 #include "core/notifications.cpp"
 #include "core/text_message.cpp"
+#include "core/outbox.cpp"  // in this translation unit, so a reboot also resets its RAM state
 #include "core/enigma.h"
 #include "core/storage_messages.h"
 #include "LittleFS.h"
@@ -263,8 +264,29 @@ static void openText(const char* contact) { TextMessage::navigateToChatDirect(kG
 static void openEnigma(const char* contact) { Enigma::navigateToChatDirect(kG, contact); waitChatDrawn(); }
 
 static void menuStub() {}
+// The Outbox's RAM state (a reboot loses it).
+static void resetOutboxVolatile() {
+  delete Outbox::g_queue;
+  Outbox::g_queue = nullptr;
+  Outbox::g_queueOverflowed = false;
+  Outbox::g_publishRetryAtMs = 0;
+  if (Outbox::g_pass != nullptr) MessageStore::endConversationWalk(Outbox::g_pass->walk);
+  delete Outbox::g_pass;
+  Outbox::g_pass = nullptr;
+  Outbox::g_passDone = false;
+  Outbox::g_passAgain = false;
+  Outbox::g_passAgainAtMs = 0;
+  Outbox::g_nextStepMs = 0;
+#ifndef OUTBOX_2FDE185  // the reviewed candidate's outbox.cpp lacks these
+  Outbox::g_passRetryMs = Outbox::kRetryMs;
+  Outbox::g_externalAtPassStart = 0;
+#else
+  Outbox::g_externalSeen = 0;
+#endif
+}
 static void powerOn() {  // first boot of a test: empty NVS unless the test wrote some
   resetNotifyVolatile();
+  resetOutboxVolatile();
   MessageStore::notifyExternalStorageMutationAttempted();
   Menu::init(); g_stackSize = 1; Menu::consumeJustEntered();
   Notifications::serviceInit();
@@ -884,6 +906,7 @@ int main(int argc, char** argv) {
     for (int k = 0; k < 3; k++) arrive(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000000u + k);  // Carol holds 100: each evicts one
     MessageRef c = arrive(kCarol, PacketCodec::MSG_TYPE_TEXT, 1800000010u);
     Notifications::clearUnread(kG, kCarol, c);  // a flag rewrite there
+    runFor(30);  // background work settled (CE1b's outside change started an Outbox pass): only the chat is measured
     EntryProfile p = enterChat(false, MessageStore::kEveryone, kNewest);
     printf("   CE2 measured: max %llu opens/pass, %llu opens total, content after %d passes\n",
            (unsigned long long)p.maxPassOpens, (unsigned long long)p.totalOpens, p.passesToContent);
@@ -896,6 +919,7 @@ int main(int argc, char** argv) {
     back();
     openText(kCarol);
     back();
+    runFor(30);
     EntryProfile p = enterChat(false, MessageStore::kEveryone, kNewest);
     printf("   CE2b measured: max %llu opens/pass, %llu opens total, content after %d passes\n",
            (unsigned long long)p.maxPassOpens, (unsigned long long)p.totalOpens, p.passesToContent);
@@ -1500,7 +1524,8 @@ int main(int argc, char** argv) {
     openCold(enigma);
     std::vector<InputEvent> evs;
     morseEvents(std::string(50, 'E').c_str(), evs);
-    runLoading(evs, evs.size(), 1);  // 32 held, 32 queued, the rest dropped
+    runLoading(std::vector<InputEvent>(evs.begin(), evs.begin() + 32), 32, 1);  // 32 held
+    runLoading(std::vector<InputEvent>(evs.begin() + 32, evs.end()), 68, 1);    // 32 queued (full), the rest dropped
     bool stillLoading = chatLoading();
     LoadRun r = runLoading({InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now)}, 1, 3);
     CHECK(stillLoading && r.left && r.passes <= 1, "%s: loading %d, left %d after %d passes", kChat[enigma], stillLoading, r.left,
@@ -1510,7 +1535,7 @@ int main(int argc, char** argv) {
 
   g_test = "IN8 a Send whose store write fails makes the open chat's index stale mid-batch: the reload is stepped (bounded passes), the keys after it kept in order";
   for (int enigma = 0; enigma < 2; enigma++) {
-    for (int after = 0; after < 2; after++) {  // keys after the Send in the same batch, or none
+    for (int after = 0; after < 3; after++) {  // keys after the Send in the same batch (1), none (0), a rotation (2)
       coldEveryone();
       if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
       else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
@@ -1522,8 +1547,11 @@ int main(int argc, char** argv) {
       // file cannot be written): the draft is kept, the index goes stale.
       LittleFS.failOpen = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };
       std::vector<InputEvent> evs;
-      morseEvents(after ? "ET" : "E", evs);  // E: events 0-1; T (if any) 400 ms after E's release
+      morseEvents(after == 1 ? "ET" : "E", evs);  // E: events 0-1; T (if any) 400 ms after E's release
       evs.insert(evs.begin() + 2, InputEvent(InputEventType::ENCODER_SHORT, 0, 120, evs[1].eventMs + 200));
+      if (after == 2) evs.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));  // selects the newest message
+      int composeCursorY0 = -1;
+      for (auto& d : T::screen) if (d.text == "#CURSOR") composeCursorY0 = std::max(composeCursorY0, d.y);
       for (auto& ev : evs) T::raw.push_back(ev);
       FsStats a0 = g_fs;
       loopPass();  // the batch: E, the failing Send, (T)
@@ -1540,8 +1568,17 @@ int main(int argc, char** argv) {
       }
       loopPass(30);
       T::connected = true;
-      std::string want = after ? "ET" : "E";
-      bool drafted = T::visibleJoined().find("#CURSOR|" + want + "|") != std::string::npos;
+      std::string want = after == 1 ? "ET" : "E";
+      bool drafted;
+      if (after == 2) {
+        // The rotation was kept: the selection cursor is in the history, above the compose row.
+        int cursorY = -1;
+        for (auto& d : T::screen) if (d.text == "#CURSOR") cursorY = d.y;
+        drafted = cursorY >= 0 && cursorY < composeCursorY0 && T::visibleJoined().find("#CURSOR|E|") == std::string::npos;
+        want = "(the rotation)";
+      } else {
+        drafted = T::visibleJoined().find("#CURSOR|" + want + "|") != std::string::npos;
+      }
       CHECK(r.maxPassOpens <= kLoadingPassOpens + 2 && drafted, "%s, keys after %d: max %llu opens in a pass, draft %s shown %d",
             kChat[enigma], after, (unsigned long long)r.maxPassOpens, want.c_str(), drafted);
       closeChat();
@@ -1673,9 +1710,14 @@ int main(int argc, char** argv) {
     T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 10));
     T::raw.push_back(InputEvent(InputEventType::ENCODER_SHORT, 0, 120, t - 10));  // replayed
     size_t before = std::count(T::seq.begin(), T::seq.end(), std::string("nextId"));
-    for (int i = 0; i < 3000 && (g_indexDirty || !T::raw.empty() || T::visibleJoined().find("Loading messages") != std::string::npos); i++)
+    // Until everything held was replayed: the failed store write makes the
+    // index stale, so a reload (with "Loading messages...") can follow the Send.
+    for (int settled = 0, i = 0; i < 6000 && settled < 40; i++) {
       loopPass();
-    loopPass(20);
+      bool busy = g_indexDirty || !T::raw.empty() || T::visibleJoined().find("Loading messages") != std::string::npos ||
+                  T::visibleJoined().find("Sending...") != std::string::npos;
+      settled = busy ? 0 : settled + 1;
+    }
     size_t attempts = std::count(T::seq.begin(), T::seq.end(), std::string("nextId")) - before;
     LittleFS.failOpen = nullptr;
     T::connected = true;

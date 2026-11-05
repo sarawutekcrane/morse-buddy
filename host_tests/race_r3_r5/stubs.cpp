@@ -367,7 +367,21 @@ ScreenHandlerFn getModeHandler(uint8_t m) { return m < 8 ? g_modeHandlers[m] : n
 static AppService g_services[16]; static int g_serviceCount = 0;
 bool registerAppService(const AppService& s) { if (g_serviceCount < 16) g_services[g_serviceCount++] = s; return true; }
 void T_initServices() { for (int i = 0; i < g_serviceCount; i++) if (g_services[i].init) g_services[i].init(); }
-void T_tickServices() { for (int i = 0; i < g_serviceCount; i++) if (g_services[i].tick) g_services[i].tick(); }
+// As hooks.cpp: one background storage step per round, taking turns.
+static bool g_stepClaimed = false;
+static uint8_t g_stepWaiting = 0, g_stepWaitingLast = 0, g_stepLastWinner = 0;
+bool claimBackgroundStorageStep(BackgroundReader who) {
+  uint8_t bit = static_cast<uint8_t>(who);
+  bool othersWaited = (g_stepWaitingLast & static_cast<uint8_t>(~bit)) != 0;
+  if (g_stepClaimed || (g_stepLastWinner == bit && othersWaited)) { g_stepWaiting |= bit; return false; }
+  g_stepClaimed = true; g_stepLastWinner = bit; return true;
+}
+// A new round of service ticks (as tickRegisteredServices() begins one).
+void T_beginServiceRound() { g_stepWaitingLast = g_stepWaiting; g_stepWaiting = 0; g_stepClaimed = false; }
+void T_tickServices() {
+  T_beginServiceRound();
+  for (int i = 0; i < g_serviceCount; i++) if (g_services[i].tick) g_services[i].tick();
+}
 static SettingsChangeHook g_settingsHooks[8]; static int g_settingsHookCount = 0;
 bool registerSettingsChangeHook(SettingsChangeHook fn) { if (g_settingsHookCount < 8) g_settingsHooks[g_settingsHookCount++] = fn; return true; }
 void T_fireSettingsChange(const SettingsChangeInfo& info) { for (int i = 0; i < g_settingsHookCount; i++) g_settingsHooks[i](info); }

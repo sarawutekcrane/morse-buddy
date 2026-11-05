@@ -306,7 +306,29 @@ void initRegisteredServices() {
   }
 }
 
+namespace {
+bool g_storageStepClaimed = false;
+uint8_t g_storageStepWaiting = 0;          // readers turned away this round
+uint8_t g_storageStepWaitingLastRound = 0;
+uint8_t g_storageStepLastWinner = 0;
+}  // namespace
+
+bool claimBackgroundStorageStep(BackgroundReader who) {
+  uint8_t bit = static_cast<uint8_t>(who);
+  bool othersWaited = (g_storageStepWaitingLastRound & static_cast<uint8_t>(~bit)) != 0;
+  if (g_storageStepClaimed || (g_storageStepLastWinner == bit && othersWaited)) {
+    g_storageStepWaiting |= bit;
+    return false;
+  }
+  g_storageStepClaimed = true;
+  g_storageStepLastWinner = bit;
+  return true;
+}
+
 void tickRegisteredServices() {
+  g_storageStepWaitingLastRound = g_storageStepWaiting;
+  g_storageStepWaiting = 0;
+  g_storageStepClaimed = false;
   for (uint8_t i = 0; i < g_appServiceCount; i++) {
     if (g_appServices[i].tick != nullptr) g_appServices[i].tick();
   }

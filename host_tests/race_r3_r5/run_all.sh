@@ -64,7 +64,7 @@ echo "== 4b. Unread marking and badges (hardware finding 3): ACTUAL menu, notifi
 build nt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -I "$H" -I "$H/fake" -I "$REPO/src" "$H/notify_test.cpp" "$H/stubs.cpp" $FNOTE && run nt
 echo "== 4c. Unread marking against the REAL message store (findings 1 and 3 on 23293c5): ACTUAL storage_messages.cpp on a host directory (fake_fs/), notifications, text_message, enigma, menu"
 FSROOT=$(mktemp -d)
-build stt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_test.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$R/outbox.cpp" "$H/fake_fs/LittleFS.cpp" && {
+build stt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -DREAL_MESSAGE_STORE -I "$H/fake_fs" -I "$H" -I "$H/fake" -I "$REPO/src" "$H/storage_test.cpp" "$H/stubs.cpp" $FNOTE "$R/storage_messages.cpp" "$H/fake_fs/LittleFS.cpp" && {
   st=0; "$OUT/stt" "$FSROOT/t" > "$OUT/stt.txt" 2>&1 || st=$?
   grep -E "FAIL|passed" "$OUT/stt.txt" | sed 's/^/   /' || true
   [ $st -eq 0 ] || fail "stt exited with status $st"; }

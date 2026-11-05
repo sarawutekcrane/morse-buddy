@@ -101,6 +101,7 @@ static void tick(int n = 1) { for (int i = 0; i < n; i++) { Menu::tick(); T::now
 static void press(InputEventType t, uint32_t dur = 80) { T::raw.push_back(InputEvent(t, 0, dur, T::now)); }
 static void rot(int8_t v) { T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, v, 0, 0)); }
 void T_initServices();
+void T_beginServiceRound();
 
 static const char* kG = "GROUP1";
 static const char* kBob = "B0B000000001";
@@ -196,14 +197,14 @@ static void reboot() {
 static void notifyTick(int n = 1) {
   for (int i = 0; i < n; i++) {
     uint32_t end = T::now + NV::kRetryMs + 1;
-    while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; NV::serviceTick(); }
+    while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; T_beginServiceRound(); NV::serviceTick(); }
   }
 }
 // The device stays on for 3 s: deferred writes (summary after 2 s, read-up
 // record after 1 s) are made, and background work advances.
 static void stayOn() {
   uint32_t end = T::now + 3000;
-  while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; NV::serviceTick(); }
+  while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; T_beginServiceRound(); NV::serviceTick(); }
 }
 static int stateOf(const char* contact) {
   Notifications::Summary* x = Notifications::findSummary(kG, contact);
