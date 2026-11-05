@@ -74,6 +74,12 @@ uint32_t droppedEventCount();
 // True if the queue is full (the next event would be dropped).
 bool queueFull();
 
+// The next event without popping it (false if none).
+bool peekEvent(InputEvent& outEvent);
+// Puts an event just popped back at the front of the queue (it is popped
+// first next time). A screen that cannot handle it yet leaves it there.
+void unpopEvent(const InputEvent& event);
+
 // True if `e` is a general-navigation confirm: DOT/DASH released before the
 // 2000ms special-command threshold (Addendum section 9.3).
 bool isMenuConfirm(const InputEvent& e);

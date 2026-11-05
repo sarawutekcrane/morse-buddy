@@ -837,6 +837,22 @@ uint32_t droppedEventCount() { return g_droppedEvents; }
 
 bool queueFull() { return g_queueCount >= kQueueSize; }
 
+bool peekEvent(InputEvent& outEvent) {
+  if (g_queueCount == 0) return false;
+  outEvent = g_queue[g_queueHead];
+  return true;
+}
+
+void unpopEvent(const InputEvent& event) {
+  if (g_queueCount >= kQueueSize) {  // cannot happen right after a pop
+    g_droppedEvents++;
+    return;
+  }
+  g_queueHead = static_cast<uint8_t>((g_queueHead + kQueueSize - 1) % kQueueSize);
+  g_queue[g_queueHead] = event;
+  g_queueCount++;
+}
+
 bool hasQueuedEvent(InputEventType type) {
   for (uint8_t i = 0; i < g_queueCount; i++) {
     if (g_queue[(g_queueHead + i) % kQueueSize].type == type) return true;

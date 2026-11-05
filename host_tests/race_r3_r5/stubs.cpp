@@ -138,6 +138,8 @@ void update() {
 }
 uint32_t droppedEventCount() { return T::inputDropped; }
 bool queueFull() { return T::inputCap > 0 && T::inputQ.size() >= T::inputCap; }
+bool peekEvent(InputEvent& e) { if (T::inputQ.empty()) return false; e = T::inputQ.front(); return true; }
+void unpopEvent(const InputEvent& e) { T::inputQ.push_front(e); }
 bool popEvent(InputEvent& e) { if (T::inputQ.empty()) { e = InputEvent{}; return false; } e = T::inputQ.front(); T::inputQ.pop_front(); return true; }
 bool hasQueuedEvent(InputEventType type) { for (auto& e : T::inputQ) if (e.type == type) return true; return false; }
 // Same predicates as src/core/input.cpp:843-849.

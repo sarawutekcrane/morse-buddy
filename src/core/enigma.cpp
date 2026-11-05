@@ -953,24 +953,16 @@ void refreshIndexIfNeeded() {
 }
 
 // Input beyond what the held buffer takes: as in text_message.cpp's chat
-// (see its g_carriedEvent) -- one event carried, the rest waiting in the
-// input queue, the queue drained (all but a Back) only if it is full, and
-// the loss then reported ("Input lost while loading").
-InputEvent g_carriedEvent;
-bool g_haveCarried = false;
+// (see its takeInputWhileLoading()) -- the rest waits in the input queue,
+// which is drained (all but a Back) only if it is full, and the loss is
+// then reported ("Input lost while loading").
 bool g_inputLost = false;
 uint32_t g_inputDropsSeen = 0;
 
 bool takeInputWhileLoading() {
   if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;
-  if (g_haveCarried && g_heldInput.hold(g_carriedEvent)) g_haveCarried = false;
   InputEvent q;
-  while (!g_haveCarried && Input::popEvent(q)) {
-    if (!g_heldInput.hold(q)) {
-      g_carriedEvent = q;
-      g_haveCarried = true;
-    }
-  }
+  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);
   if (Input::queueFull()) {
     while (Input::popEvent(q)) {
       if (q.type == InputEventType::ENCODER_LONG) return false;
@@ -984,7 +976,6 @@ bool takeInputWhileLoading() {
 
 void clearRetainedInput() {
   g_heldInput.clear();
-  g_haveCarried = false;
   g_inputLost = false;
   g_inputDropsSeen = Input::droppedEventCount();
 }
@@ -1940,8 +1931,8 @@ void screenEnigmaChatTick() {
     g_enigmaChatNeedsFullRedraw = true;
     g_enigmaChatDirty = true;
   }
-  // Held input first, then the carried event, then what arrived since --
-  // every event through isReplayedSend() at dispatch.
+  // Held input first, then the input queue -- every event through
+  // isReplayedSend() at dispatch.
   bool fromHeld = false;
   auto nextEvent = [&](InputEvent& out) -> bool {
     fromHeld = false;
@@ -1949,24 +1940,14 @@ void screenEnigmaChatTick() {
       fromHeld = true;
       return true;
     }
-    if (g_haveCarried) {
-      g_haveCarried = false;
-      out = g_carriedEvent;
-      return true;
-    }
     return Input::popEvent(out);
   };
   auto retain = [&](const InputEvent& ev) {
-    if (fromHeld) {
-      g_heldInput.unpop();
-    } else if (!g_haveCarried) {
-      g_carriedEvent = ev;
-      g_haveCarried = true;
-    }
+    if (fromHeld) g_heldInput.unpop();
+    else Input::unpopEvent(ev);
   };
   bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||
-                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG) ||
-                    (g_haveCarried && g_carriedEvent.type == InputEventType::ENCODER_LONG);
+                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG);
   bool droppingBeforeBack = false;
   InputEvent e;
   bool hadEvent = false;

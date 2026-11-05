@@ -109,13 +109,11 @@ void markIndexDirty() { g_indexDirty = true; }
 constexpr uint8_t kIndexReadsPerPass = 4;
 HeldInput g_heldInput;
 // Input beyond what the held buffer takes (it is full, or could not be
-// allocated): the next event is kept here and the rest waits in the input
-// queue -- the load goes on at its bounded pace, never completed in one
-// pass. Should the input queue fill up as well, it is drained (all but a
-// Back, which leaves) and the loss is reported ("Input lost while
-// loading"): what was kept stays in order.
-InputEvent g_carriedEvent;
-bool g_haveCarried = false;
+// allocated) waits in the input queue (only what can be held is popped):
+// the load goes on at its bounded pace, never completed in one pass.
+// Should the input queue fill up as well, it is drained (all but a Back,
+// which leaves) and the loss is reported ("Input lost while loading"):
+// what was kept stays in order.
 bool g_inputLost = false;        // reported once the chat is drawn
 uint32_t g_inputDropsSeen = 0;   // Input::droppedEventCount() last looked at
 bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
@@ -167,19 +165,13 @@ void drawChatLoading() {
                                       "Input lost while loading");
 }
 
-// While the index loads: input taken in order into the held buffer (or the
-// carried slot), the input queue drained only if it is full. False if a
-// Back was found (the caller leaves).
+// While the index loads: input taken in order into the held buffer, the
+// rest left in the input queue, which is drained only if it is full. False
+// if a Back was found (the caller leaves).
 bool takeInputWhileLoading() {
   if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;
-  if (g_haveCarried && g_heldInput.hold(g_carriedEvent)) g_haveCarried = false;
   InputEvent q;
-  while (!g_haveCarried && Input::popEvent(q)) {
-    if (!g_heldInput.hold(q)) {
-      g_carriedEvent = q;
-      g_haveCarried = true;
-    }
-  }
+  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);
   if (Input::queueFull()) {
     // Nothing more can be kept: the queue is drained so that a Back pressed
     // now still gets through; what it held is lost, and reported.
@@ -195,7 +187,6 @@ bool takeInputWhileLoading() {
 
 void clearRetainedInput() {
   g_heldInput.clear();
-  g_haveCarried = false;
   g_inputLost = false;
   g_inputDropsSeen = Input::droppedEventCount();
 }
@@ -1629,38 +1620,28 @@ void screenChatTick() {
     g_chatNeedsFullRedraw = true;
     g_chatRenderDirty = true;
   }
-  // Held input first (in order), then the carried event, then what arrived
-  // since. Every event goes through isReplayedSend() at dispatch, retained or
-  // not, so a Short replayed from a Send window is dropped either way.
+  // Held input first (in order), then the input queue. Every event goes
+  // through isReplayedSend() at dispatch, retained or not, so a Short
+  // replayed from a Send window is dropped either way.
   auto nextEvent = [&](InputEvent& out, bool* fromHeld) -> bool {
     *fromHeld = false;
     if (g_heldInput.pop(out)) {
       *fromHeld = true;
       return true;
     }
-    if (g_haveCarried) {
-      g_haveCarried = false;
-      out = g_carriedEvent;
-      return true;
-    }
     return Input::popEvent(out);
   };
-  // Puts an event back (it is handled first next time).
+  // Puts an event back where it came from (it is handled first next time).
   auto retain = [&](const InputEvent& ev, bool wasHeld) {
-    if (wasHeld) {
-      g_heldInput.unpop();
-    } else if (!g_haveCarried) {
-      g_carriedEvent = ev;
-      g_haveCarried = true;
-    }
+    if (wasHeld) g_heldInput.unpop();
+    else Input::unpopEvent(ev);
   };
   // A Back already queued: the history-side events before it are not worth
   // the reads they would cost (rotations would load and measure rows the
   // user is leaving); from the first such event on, nothing before the Back
   // is handled. Compose-side input before it (keys, a Send) still is.
   bool backQueued = g_heldInput.contains(InputEventType::ENCODER_LONG) ||
-                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG) ||
-                    (g_haveCarried && g_carriedEvent.type == InputEventType::ENCODER_LONG);
+                    Input::hasQueuedEvent(InputEventType::ENCODER_LONG);
   bool droppingBeforeBack = false;
   InputEvent e;
   bool hadEvent = false;

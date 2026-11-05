@@ -142,19 +142,14 @@ muts = [
  (OB, "a whole pass in one step (unbounded)", "constexpr uint8_t kReadsPerStep = 4;", "constexpr uint8_t kReadsPerStep = 255;"),
  (OB, "the pass skips records it found pending", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;\n        enqueue(ref);", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;"),
  # ---- review round: held-input overflow without a synchronous load ----
- (TX, "Text: input while loading is dropped, not held", "  while (!g_haveCarried && Input::popEvent(q)) {\n    if (!g_heldInput.hold(q)) {", "  while (!g_haveCarried && Input::popEvent(q)) {\n    if (true) continue;\n    if (!g_heldInput.hold(q)) {"),
  (TX, "Text: Back while loading waits for the load", "bool takeInputWhileLoading() {\n  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;", "bool takeInputWhileLoading() {"),
- (TX, "Text: input beyond the held buffer is dropped (not carried)", "    if (!g_heldInput.hold(q)) {\n      g_carriedEvent = q;\n      g_haveCarried = true;\n    }", "    if (!g_heldInput.hold(q)) {\n    }"),
  (TX, "Text: a full input queue is not drained (a Back behind it is lost)", "  if (Input::queueFull()) {\n    // Nothing more", "  if (false) {\n    // Nothing more"),
  (TX, "Text: input dropped by the full queue is not reported", "  if (Input::droppedEventCount() != g_inputDropsSeen) g_inputLost = true;  // dropped by the full queue\n", ""),
  (TX, "Text: the loss is never shown", "    setSendStatus({\"Input lost while loading\", true});", "    (void)0;"),
- (TX, "Text: overflow completes the index synchronously (as before)", "      g_carriedEvent = q;\n      g_haveCarried = true;\n    }\n  }\n  if (Input::queueFull()) {\n    // Nothing more", "      g_carriedEvent = q;\n      g_haveCarried = true;\n      MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);\n    }\n  }\n  if (Input::queueFull()) {\n    // Nothing more"),
  (TX, "Text: a mid-batch reload is completed synchronously", "      refreshIndexIfNeeded();\n      indexRefreshElapsed += millis() - midRefreshStart;", "      while (g_indexDirty) refreshIndexIfNeeded();\n      indexRefreshElapsed += millis() - midRefreshStart;"),
  (TX, "Text: the final reload is completed synchronously", "  refreshIndexIfNeeded();  // one bounded step\n  indexRefreshElapsed += millis() - finalRefreshStart;", "  while (g_indexDirty) refreshIndexIfNeeded();\n  indexRefreshElapsed += millis() - finalRefreshStart;"),
  (TX, "Text: an event met by a mid-batch reload is lost (not retained)", "      if (g_indexDirty) {\n        retain(e, fromHeld);\n        break;", "      if (g_indexDirty) {\n        break;"),
- (EN, "Enigma: input while loading is dropped, not held", "  while (!g_haveCarried && Input::popEvent(q)) {\n    if (!g_heldInput.hold(q)) {", "  while (!g_haveCarried && Input::popEvent(q)) {\n    if (true) continue;\n    if (!g_heldInput.hold(q)) {"),
  (EN, "Enigma: Back while loading waits for the load", "bool takeInputWhileLoading() {\n  if (Input::hasQueuedEvent(InputEventType::ENCODER_LONG)) return false;", "bool takeInputWhileLoading() {"),
- (EN, "Enigma: input beyond the held buffer is dropped (not carried)", "    if (!g_heldInput.hold(q)) {\n      g_carriedEvent = q;\n      g_haveCarried = true;\n    }", "    if (!g_heldInput.hold(q)) {\n    }"),
  (EN, "Enigma: a full input queue is not drained (a Back behind it is lost)", "  if (Input::queueFull()) {\n    while (Input::popEvent(q)) {", "  if (false) {\n    while (Input::popEvent(q)) {"),
  (EN, "Enigma: the loss is never shown", "    setSendStatus({\"Input lost while loading\", true});", "    (void)0;"),
  (EN, "Enigma: the final reload is completed synchronously", "  refreshIndexIfNeeded();  // one bounded step\n  if (g_indexDirty) {\n    Display::drawStatusBar();", "  while (g_indexDirty) refreshIndexIfNeeded();\n  if (g_indexDirty) {\n    Display::drawStatusBar();"),
@@ -169,6 +164,13 @@ muts = [
  (OB, "an incomplete first pass is repeated at once (no pause)", "    bool due = externalChange || g_queueOverflowed || (!g_passDone && !g_passAgain) ||", "    bool due = externalChange || g_queueOverflowed || !g_passDone ||"),
  (OB, "an incomplete pass is repeated without a growing pause", "    g_passRetryMs = g_passRetryMs * 2 < kPassRetryMaxMs ? g_passRetryMs * 2 : kPassRetryMaxMs;\n", ""),
  (OB, "a record queued while offline is dropped", "    if (g_queue->count > 1) moveToBack(k);\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return false;", "    removeAt(k);\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return false;"),
+ (TX, "Text: input while loading is dropped, not held", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);", "  while (Input::popEvent(q)) {}"),
+ (TX, "Text: input beyond the held buffer is dropped (not left in the queue)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);", "  while (Input::popEvent(q)) g_heldInput.hold(q);"),
+ (TX, "Text: overflow completes the index synchronously (as before)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::peekEvent(q)) MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey);"),
+ (TX, "Text: an event put back is lost", "    else Input::unpopEvent(ev);", "    else (void)ev;"),
+ (EN, "Enigma: input while loading is dropped, not held", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);", "  while (Input::popEvent(q)) {}"),
+ (EN, "Enigma: input beyond the held buffer is dropped (not left in the queue)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);", "  while (Input::popEvent(q)) g_heldInput.hold(q);"),
+ (EN, "Enigma: an event put back is lost", "    else Input::unpopEvent(ev);", "    else (void)ev;"),
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
