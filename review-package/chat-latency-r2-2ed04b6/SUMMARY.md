@@ -85,7 +85,7 @@ Storage bench (`evidence/storage_bench/`; host counts × 63 ms):
   - Without the explicit unreadable-record feed, the feed is dropped anyway (out of step).
   - Without the open-chat flag on the feed, the chat's per-pass re-sync reloads a stale index anyway, so the flag only saves cost.
   - The first run's 9 survivors led to new tests (CE11, CE22b, CE24, DM1b, OB5 after the boot pass, a stricter CE16) and to fixing two mutants that changed nothing.
-- **Race mutations** (`mutate_room.py`, unchanged files): ROOMMUT (`evidence/mutate_room.txt`).
+- **Race mutations** (`mutate_room.py`, unchanged files): 104/107 caught, 0 unexplained; the 3 survivors are the script's existing "redundant guard" equivalents (`evidence/mutate_room.txt`).
 - **ESP32 build** (`evidence/esp32/`):
   - success: RAM 124,476 B, flash 1,206,349 B (83.7%)
   - static DRAM headroom **96 B** (232 B on 2ed04b6)
