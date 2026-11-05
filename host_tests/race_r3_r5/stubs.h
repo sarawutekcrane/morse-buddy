@@ -16,10 +16,15 @@ extern std::vector<Draw> drawLog;       // every draw call, timestamped with the
 extern std::deque<InputEvent> inputQ;  // converted events (popEvent reads these)
 extern std::deque<InputEvent> raw;     // captured edges; only Input::update() converts them
 extern int updateCount;
-// The input queue's capacity, as input.cpp's (0: unlimited, the default);
-// events converted beyond it are dropped and counted, as on the device.
+// The input queue: 0 (the default) an unlimited host queue (inputQ); any
+// other value the PRODUCTION queue (core/input_queue.h, the code input.cpp
+// runs: 32 events, its drop policy), with inputDropped its drop count.
 extern size_t inputCap;
 extern uint32_t inputDropped;
+}
+class InputQueue;
+namespace T {
+InputQueue& deviceQueue();
 // MQTT
 extern bool connected;
 extern std::deque<bool> publishScript;  // next publishBinary() results while connected (default true)

@@ -1,5 +1,6 @@
 // HOST TEST STUBS (not production).
 #include "stubs.h"
+#include "core/input_queue.h"
 #include <Arduino.h>
 #include <algorithm>
 #include "core/display.h"
@@ -38,6 +39,7 @@ std::function<void()> duringUpdate;
 std::vector<std::string> seq;
 int notifications = 0;
 std::vector<std::string> indexLoads;
+InputQueue& deviceQueue() { static InputQueue q; return q; }
 size_t inputCap = 0;
 uint32_t inputDropped = 0;
 uint32_t unixTime = 1700000000u;
@@ -47,7 +49,7 @@ bool listUnreliable = false;
 unsigned listings = 0;
 std::function<void(const std::string&)> onDraw;
 void reset() {
-  screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0;
+  screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0; deviceQueue().clear();
   connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
   seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; scanUnreliable = false; listUnreliable = false; listings = 0;
@@ -128,20 +130,37 @@ bool wrapLineAt(const char* text, size_t from, int16_t, uint16_t* s, uint16_t* l
 }  // namespace Display
 
 namespace Input {
+static bool device() { return T::inputCap > 0; }
 void update() {
   T::updateCount++;
   while (!T::raw.empty()) {
-    if (T::inputCap > 0 && T::inputQ.size() >= T::inputCap) T::inputDropped++;  // input.cpp: dropped when full
+    if (device()) T::deviceQueue().push(T::raw.front());  // input.cpp's pushEvent()
     else T::inputQ.push_back(T::raw.front());
     T::raw.pop_front();
   }
+  if (device()) T::inputDropped = T::deviceQueue().dropped();
 }
-uint32_t droppedEventCount() { return T::inputDropped; }
-bool queueFull() { return T::inputCap > 0 && T::inputQ.size() >= T::inputCap; }
-bool peekEvent(InputEvent& e) { if (T::inputQ.empty()) return false; e = T::inputQ.front(); return true; }
-void unpopEvent(const InputEvent& e) { T::inputQ.push_front(e); }
-bool popEvent(InputEvent& e) { if (T::inputQ.empty()) { e = InputEvent{}; return false; } e = T::inputQ.front(); T::inputQ.pop_front(); return true; }
-bool hasQueuedEvent(InputEventType type) { for (auto& e : T::inputQ) if (e.type == type) return true; return false; }
+uint32_t droppedEventCount() { return device() ? T::deviceQueue().dropped() : T::inputDropped; }
+bool queueFull() { return device() && T::deviceQueue().full(); }
+bool peekEvent(InputEvent& e) {
+  if (device()) return T::deviceQueue().peek(e);
+  if (T::inputQ.empty()) return false;
+  e = T::inputQ.front(); return true;
+}
+void unpopEvent(const InputEvent& e) {
+  if (device()) T::deviceQueue().unpop(e);
+  else T::inputQ.push_front(e);
+}
+bool popEvent(InputEvent& e) {
+  if (device()) return T::deviceQueue().pop(e);
+  if (T::inputQ.empty()) { e = InputEvent{}; return false; }
+  e = T::inputQ.front(); T::inputQ.pop_front(); return true;
+}
+bool hasQueuedEvent(InputEventType type) {
+  if (device()) return T::deviceQueue().contains(type);
+  for (auto& e : T::inputQ) if (e.type == type) return true;
+  return false;
+}
 // Same predicates as src/core/input.cpp:843-849.
 bool isMenuConfirm(const InputEvent& e) { return e.type == InputEventType::DOT_RELEASE && e.durationMs < Morse::kSpecialCommandMs; }
 bool isBack(const InputEvent& e) { return e.type == InputEventType::ENCODER_LONG; }

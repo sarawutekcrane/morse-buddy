@@ -1,4 +1,5 @@
 #include "core/input.h"
+#include "core/input_queue.h"
 
 #include <Arduino.h>
 #include "esp_timer.h"
@@ -19,32 +20,11 @@ constexpr uint32_t kCombinedRevealMs = Morse::kSpecialCommandMs;  // 2000ms
 // ---------------------------------------------------------------------------
 // Event queue.
 // ---------------------------------------------------------------------------
-// Hardware Fix #4.7d Part H: raised from 8 to 32. Fix #4.7b's independent
-// DOT/DASH timer can now accumulate up to kButtonEdgeQueueCap (16) accepted
-// edges before drainButtonEdges() converts them into semantic InputEvents
-// in a single Input::update() call, plus whatever ENCODER_ROTATE/encoder-
-// switch activity also occurred during the same busy interval -- an 8-slot
-// semantic queue could silently drop the tail of that backlog right here,
-// even though every physical edge had already been captured reliably.
-// 32 comfortably covers the full 16-edge DOT backlog plus normal
-// concurrent encoder activity, at a small, acceptable RAM cost, without
-// touching kButtonEdgeQueueCap or the DOT capture/debounce algorithm
-// itself.
-constexpr uint8_t kQueueSize = 32;
-InputEvent g_queue[kQueueSize];
-uint8_t g_queueHead = 0;
-uint8_t g_queueTail = 0;
-uint8_t g_queueCount = 0;
-uint32_t g_droppedEvents = 0;
+// The queue itself (and why it holds 32): core/input_queue.h.
+InputQueue g_events;
 
 void pushEvent(InputEventType type, int8_t value = 0, uint32_t durationMs = 0, uint32_t eventMs = 0) {
-  if (g_queueCount >= kQueueSize) {  // drop if the consumer is not draining fast enough
-    g_droppedEvents++;
-    return;
-  }
-  g_queue[g_queueTail] = InputEvent{type, value, durationMs, eventMs};
-  g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueSize);
-  g_queueCount++;
+  g_events.push(InputEvent{type, value, durationMs, eventMs});
 }
 
 // ---------------------------------------------------------------------------
@@ -833,43 +813,17 @@ void update() {
   updateCombinedHold(now);
 }
 
-uint32_t droppedEventCount() { return g_droppedEvents; }
+uint32_t droppedEventCount() { return g_events.dropped(); }
 
-bool queueFull() { return g_queueCount >= kQueueSize; }
+bool queueFull() { return g_events.full(); }
 
-bool peekEvent(InputEvent& outEvent) {
-  if (g_queueCount == 0) return false;
-  outEvent = g_queue[g_queueHead];
-  return true;
-}
+bool peekEvent(InputEvent& outEvent) { return g_events.peek(outEvent); }
 
-void unpopEvent(const InputEvent& event) {
-  if (g_queueCount >= kQueueSize) {  // cannot happen right after a pop
-    g_droppedEvents++;
-    return;
-  }
-  g_queueHead = static_cast<uint8_t>((g_queueHead + kQueueSize - 1) % kQueueSize);
-  g_queue[g_queueHead] = event;
-  g_queueCount++;
-}
+void unpopEvent(const InputEvent& event) { g_events.unpop(event); }
 
-bool hasQueuedEvent(InputEventType type) {
-  for (uint8_t i = 0; i < g_queueCount; i++) {
-    if (g_queue[(g_queueHead + i) % kQueueSize].type == type) return true;
-  }
-  return false;
-}
+bool hasQueuedEvent(InputEventType type) { return g_events.contains(type); }
 
-bool popEvent(InputEvent& outEvent) {
-  if (g_queueCount == 0) {
-    outEvent = InputEvent{};
-    return false;
-  }
-  outEvent = g_queue[g_queueHead];
-  g_queueHead = static_cast<uint8_t>((g_queueHead + 1) % kQueueSize);
-  g_queueCount--;
-  return true;
-}
+bool popEvent(InputEvent& outEvent) { return g_events.pop(outEvent); }
 
 bool isMenuConfirm(const InputEvent& e) {
   return e.type == InputEventType::DOT_RELEASE && e.durationMs < Morse::kSpecialCommandMs;
