@@ -87,6 +87,16 @@ struct ConversationIndexEntry {
 using EvictedCallback = void (*)(const MessageRef& ref, uint16_t flags);
 void setOnEvictedCallback(EvictedCallback cb);
 
+// Called after every successful write of a record whose header has
+// FLAG_PENDING_OUTBOX (an offline send): Outbox queues it directly instead
+// of scanning storage for pending records. Optional.
+using PendingWrittenCallback = void (*)(const MessageRef& ref);
+void setOnPendingWrittenCallback(PendingWrittenCallback cb);
+
+// How many times notifyExternalStorageMutationAttempted() was called since
+// boot: a change made outside the store (RAM only).
+uint32_t getExternalMutationCount();
+
 void init();
 
 // Hardware Diagnostic #4.9h: a RAM-only, monotonically increasing counter
@@ -140,12 +150,52 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
                          const uint8_t* localPayload, uint16_t localPayloadLen, MessageRef* outRef);
 
 // Loads one record into the shared internal buffer. False if missing/corrupt.
+// Served from the record cache (below) when it holds the record.
 bool loadMessage(const MessageRef& ref, StoredMessageView* outView);
+
+// The same, for a record a chat is drawing: it is also kept in the record
+// cache (10 records, byte-exact, heap), so drawing it again, measuring it, or
+// indexing it reads no file. Every store write updates a cached record;
+// a removal, a failed write or an external mutation drops it.
+bool loadMessageForDisplay(const MessageRef& ref, StoredMessageView* outView);
+
+// The record's header only (one small read, or none if cached).
+bool readMessageHeader(const MessageRef& ref, StoredHeader* outHeader);
 
 // Refreshes the internal index for one conversation, sorted ascending by
 // (effective_sort_timestamp, message_id) per Addendum 7.11. Returns count.
 uint16_t loadConversationIndex(const char* group_code, const char* contact_key);
 const ConversationIndexEntry* getIndexEntry(uint16_t i);
+
+// The same index, built a bounded amount per call so a chat stays responsive
+// while it loads: the directory listing, then at most maxReads records,
+// ending early once about 20 ms are spent. True once the index is complete
+// for this conversation (getIndexEntry() then serves it); outCount (optional)
+// is the entries so far, outRead/outTotal (optional) the records read and
+// listed. Free when the index is cached and current, or when the conversation
+// is the parked index (the last chat's, or one the boot sweep built while
+// another chat was open). The cached index stays current across mutations of
+// other conversations; its own conversation's writes and removals are patched
+// in. loadConversationIndex() runs this to completion.
+bool stepConversationIndex(const char* group_code, const char* contact_key, uint8_t maxReads, uint16_t* outCount,
+                           uint16_t* outRead, uint16_t* outTotal);
+
+// True while a chat is loading its index (it stepped the load within the
+// last 200 ms): background readers (Notifications, Outbox) wait.
+bool chatIndexLoading();
+
+// The Notifications recount reads every record of a conversation anyway: it
+// hands them to the index instead of the chat reading them again. Begins a
+// feed of the listed sequences (in this order); false if none was begun
+// (unreliable listing, or that conversation's index is already current).
+// When a chat holds the shared index, the feed builds the parked index.
+// A record that could not be read is fed with hdr == nullptr (the index is
+// then not cached). A record fed out of order, or a mutation of that
+// conversation meanwhile, drops the feed.
+bool beginIndexFeed(const char* group_code, const char* contact_key, const uint32_t* seqs, uint16_t n,
+                    bool listingReliable);
+void feedIndexRecord(const char* group_code, const char* contact_key, uint32_t seq, const StoredHeader* hdr,
+                     const char* message_id);
 
 void updateLocalStatus(const MessageRef& ref, uint16_t newFlags);
 void updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask);

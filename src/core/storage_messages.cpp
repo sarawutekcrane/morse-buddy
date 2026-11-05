@@ -40,6 +40,18 @@ constexpr size_t kMaxRecordFileSize = 1024;
 constexpr size_t kMessageIdOffsetInFile = kStoredHeaderDiskSize + 2 + PacketCodec::kHeaderSize;  // = 19
 
 EvictedCallback g_onEvicted = nullptr;
+PendingWrittenCallback g_onPendingWritten = nullptr;
+uint32_t g_externalMutations = 0;
+
+// Chat-entry latency (device A on 2ed04b6: one LittleFS open per record,
+// about 63 ms each). Defined further down; the low-level primitives below
+// call them around every record write and removal.
+void bumpGenerationFor(const char* group_code, const char* contact_key);
+void afterRecordWrite(const MessageRef& ref, const StoredHeader& header, bool ok);
+void afterRecordRemove(const char* group_code, const char* contact_key, uint32_t seq, bool removed);
+void dropCachedRecord(const char* group_code, const char* contact_key, uint32_t seq);
+void dropAllCachedRecords();
+bool cachedRecordBytes(const char* group_code, const char* contact_key, uint32_t seq, const uint8_t** bytes, uint16_t* len);
 
 // Hardware Diagnostic #4.9h: see getStorageChangeGeneration()'s header
 // comment in storage_messages.h. Bumped at the two low-level primitives
@@ -194,7 +206,20 @@ uint16_t countMessages(const char* group_code, const char* contact_key, uint32_t
   return n;
 }
 
+void decodeStoredHeader(const uint8_t* buf, StoredHeader* outHdr) {
+  outHdr->direction = static_cast<Direction>(buf[0]);
+  outHdr->flags = readU16LE(&buf[1]);
+  outHdr->local_write_sequence = readU32LE(&buf[3]);
+  outHdr->effective_sort_timestamp = readU32LE(&buf[7]);
+}
+
 bool readHeaderOnly(const char* group_code, const char* contact_key, uint32_t seq, StoredHeader* outHdr) {
+  const uint8_t* cached = nullptr;
+  uint16_t cachedLen = 0;
+  if (cachedRecordBytes(group_code, contact_key, seq, &cached, &cachedLen) && cachedLen >= kStoredHeaderDiskSize) {
+    decodeStoredHeader(cached, outHdr);
+    return true;
+  }
   char path[96];
   buildRecordPath(group_code, contact_key, seq, path, sizeof(path));
   File f = LittleFS.open(path, "r");
@@ -256,7 +281,7 @@ bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t 
   // ensureFreeSpaceForWrite()) funnel through here, so this one call site
   // covers deletion for both. See g_storageChangeGeneration's own comment
   // above for why unconditional-before-the-attempt is the safe rule.
-  g_storageChangeGeneration++;
+  bumpGenerationFor(group_code, contact_key);
   // Hardware Diagnostic #4.9u: conservative -- a deletion could remove a
   // pending OR non-pending record, and determining which would require
   // reading the header first (readHeaderOnly() below can itself fail), so
@@ -269,6 +294,8 @@ bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t 
   char path[96];
   buildRecordPath(group_code, contact_key, seq, path, sizeof(path));
   bool removed = LittleFS.remove(path);
+  dropCachedRecord(group_code, contact_key, seq);
+  afterRecordRemove(group_code, contact_key, seq, removed);
   if (removed && notifyIfUnread && haveHdr && (hdr.flags & FLAG_UNREAD) && g_onEvicted != nullptr) {
     MessageRef ref;
     strncpy(ref.group_code, group_code, sizeof(ref.group_code) - 1);
@@ -497,9 +524,15 @@ uint32_t getOutboxChangeGeneration() { return g_outboxChangeGeneration; }
 // remove pending records, and this file has no way to know from here
 // whether it did.
 void notifyExternalStorageMutationAttempted() {
-  g_storageChangeGeneration++;
+  bumpGenerationFor(nullptr, nullptr);  // which conversations: unknown -- every cached index goes stale
   g_outboxChangeGeneration++;
+  dropAllCachedRecords();
+  g_externalMutations++;
 }
+
+void setOnPendingWrittenCallback(PendingWrittenCallback cb) { g_onPendingWritten = cb; }
+
+uint32_t getExternalMutationCount() { return g_externalMutations; }
 
 void init() {
   ensureDirExists("/messages");
@@ -557,16 +590,23 @@ uint32_t g_pendingCandidateSequence = 0;
 uint32_t g_pendingCandidatePostWriteGeneration = 0;
 }  // namespace
 
-bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
-                   uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen) {
-  // Hardware Diagnostic #4.9h: bumped unconditionally, before any of this
-  // function's own filesystem work -- see g_storageChangeGeneration's own
-  // comment above for why this must happen even on a path that goes on to
-  // fail/return false (the remove(finalPath)-then-rename(tempPath,
-  // finalPath) sequence below can leave finalPath gone if the rename
-  // fails, which is itself a real change to what a later scan would find,
-  // even though this function reports failure).
-  g_storageChangeGeneration++;
+namespace {
+// The record bytes atomicRewriteFile() last built (written through to the
+// record cache by atomicRewrite()).
+uint8_t g_rewriteScratch[kMaxRecordFileSize];
+size_t g_rewriteLen = 0;
+
+bool atomicRewriteFile(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
+                       uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen) {
+  // Hardware Diagnostic #4.9h: the generation is bumped by atomicRewrite(),
+  // unconditionally, before any of this function's own filesystem work --
+  // see g_storageChangeGeneration's own comment above for why this must
+  // happen even on a path that goes on to fail/return false (the
+  // remove(finalPath)-then-rename(tempPath, finalPath) sequence below can
+  // leave finalPath gone if the rename fails, which is itself a real change
+  // to what a later scan would find, even though this function reports
+  // failure).
+  g_rewriteLen = 0;
 
   // Hardware Diagnostic #4.9u: if the header being written IS pending,
   // this attempt could be creating (or re-affirming) a pending record, so
@@ -581,9 +621,9 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
   bool intendsPending = (header.flags & FLAG_PENDING_OUTBOX) != 0;
   if (intendsPending) g_outboxChangeGeneration++;
 
-  static uint8_t scratch[kMaxRecordFileSize];
+  uint8_t* scratch = g_rewriteScratch;
   size_t needed = kStoredHeaderDiskSize + 2 + wirePacketLen + 2 + localPayloadLen;
-  if (needed > sizeof(scratch)) {
+  if (needed > sizeof(g_rewriteScratch)) {
     if (!intendsPending) g_outboxChangeGeneration++;
     return false;
   }
@@ -608,6 +648,7 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
     memcpy(&scratch[pos], localPayload, localPayloadLen);
     pos += localPayloadLen;
   }
+  g_rewriteLen = pos;
 
   char finalPath[96];
   buildRecordPath(ref.group_code, ref.contact_key, ref.sequence, finalPath, sizeof(finalPath));
@@ -637,6 +678,18 @@ bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint
   bool renamed = LittleFS.rename(tempPath, finalPath);
   if (!intendsPending && !renamed) g_outboxChangeGeneration++;
   return renamed;
+}
+}  // namespace
+
+bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
+                   uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen) {
+  bumpGenerationFor(ref.group_code, ref.contact_key);
+  bool ok = atomicRewriteFile(ref, header, wirePacket, wirePacketLen, localPayload, localPayloadLen);
+  afterRecordWrite(ref, header, ok);
+  // A record written pending (an offline send, a retried one): Outbox
+  // queues it directly instead of scanning storage for it.
+  if (ok && (header.flags & FLAG_PENDING_OUTBOX) && g_onPendingWritten != nullptr) g_onPendingWritten(ref);
+  return ok;
 }
 
 namespace {
@@ -967,21 +1020,10 @@ namespace {
 uint8_t g_loadBuffer[kMaxRecordFileSize];
 }  // namespace
 
-bool loadMessage(const MessageRef& ref, StoredMessageView* outView) {
-  if (outView == nullptr) return false;
-  char path[96];
-  buildRecordPath(ref.group_code, ref.contact_key, ref.sequence, path, sizeof(path));
-  File f = LittleFS.open(path, "r");
-  if (!f) return false;
-  size_t len = f.size();
-  if (len > sizeof(g_loadBuffer) || len < kStoredHeaderDiskSize + 2 + 2) {
-    f.close();
-    return false;
-  }
-  size_t readLen = f.read(g_loadBuffer, len);
-  f.close();
-  if (readLen != len) return false;
-
+namespace {
+// Decodes the record held in g_loadBuffer[0, len) into outView.
+bool parseRecord(const MessageRef& ref, size_t len, StoredMessageView* outView) {
+  if (len < kStoredHeaderDiskSize + 2 + 2) return false;
   size_t pos = 0;
   StoredHeader hdr;
   hdr.direction = static_cast<Direction>(g_loadBuffer[pos]);
@@ -1027,6 +1069,60 @@ bool loadMessage(const MessageRef& ref, StoredMessageView* outView) {
   return true;
 }
 
+// Reads the record into g_loadBuffer: from the record cache, else one open.
+bool readRecord(const MessageRef& ref, size_t* outLen, bool* outFromCache) {
+  *outFromCache = false;
+  const uint8_t* cached = nullptr;
+  uint16_t cachedLen = 0;
+  if (cachedRecordBytes(ref.group_code, ref.contact_key, ref.sequence, &cached, &cachedLen) &&
+      cachedLen <= sizeof(g_loadBuffer)) {
+    memcpy(g_loadBuffer, cached, cachedLen);  // a copy: the view never points into a cache slot
+    *outLen = cachedLen;
+    *outFromCache = true;
+    return true;
+  }
+  char path[96];
+  buildRecordPath(ref.group_code, ref.contact_key, ref.sequence, path, sizeof(path));
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t len = f.size();
+  if (len > sizeof(g_loadBuffer) || len < kStoredHeaderDiskSize + 2 + 2) {
+    f.close();
+    return false;
+  }
+  size_t readLen = f.read(g_loadBuffer, len);
+  f.close();
+  if (readLen != len) return false;
+  *outLen = len;
+  return true;
+}
+
+void keepCachedRecord(const MessageRef& ref, const uint8_t* bytes, size_t len);
+}  // namespace
+
+bool loadMessage(const MessageRef& ref, StoredMessageView* outView) {
+  if (outView == nullptr) return false;
+  size_t len = 0;
+  bool fromCache = false;
+  if (!readRecord(ref, &len, &fromCache)) return false;
+  return parseRecord(ref, len, outView);
+}
+
+bool loadMessageForDisplay(const MessageRef& ref, StoredMessageView* outView) {
+  if (outView == nullptr) return false;
+  size_t len = 0;
+  bool fromCache = false;
+  if (!readRecord(ref, &len, &fromCache)) return false;
+  if (!parseRecord(ref, len, outView)) return false;
+  if (!fromCache) keepCachedRecord(ref, g_loadBuffer, len);
+  return true;
+}
+
+bool readMessageHeader(const MessageRef& ref, StoredHeader* outHeader) {
+  if (outHeader == nullptr) return false;
+  return readHeaderOnly(ref.group_code, ref.contact_key, ref.sequence, outHeader);
+}
+
 namespace {
 // Hardware Diagnostic #4.9q: g_index/g_indexCount and the g_indexCache*/
 // g_pendingCandidate* globals these functions use now live earlier in
@@ -1056,6 +1152,15 @@ bool indexEntryAfter(const ConversationIndexEntry& a, const ConversationIndexEnt
 // as before by every other caller (eviction, dedup, findMessageById()).
 bool readIndexMetadata(const char* group_code, const char* contact_key, uint32_t seq, StoredHeader* outHdr,
                        char outId[PacketCodec::kMessageIdLen]) {
+  const uint8_t* cached = nullptr;
+  uint16_t cachedLen = 0;
+  if (cachedRecordBytes(group_code, contact_key, seq, &cached, &cachedLen) &&
+      cachedLen >= kMessageIdOffsetInFile + PacketCodec::kMessageIdLen) {
+    decodeStoredHeader(cached, outHdr);
+    memcpy(outId, cached + kMessageIdOffsetInFile, PacketCodec::kMessageIdLen);
+    outId[PacketCodec::kMessageIdLen - 1] = '\0';
+    return true;
+  }
   char path[96];
   buildRecordPath(group_code, contact_key, seq, path, sizeof(path));
   File f = LittleFS.open(path, "r");
@@ -1180,198 +1285,591 @@ bool tryApplyIndexAppendCandidate(const char* group_code, const char* contact_ke
 }
 }  // namespace
 
-// Hardware Diagnostic #4.9i: instrumentation only -- every existing return
-// value, record limit, ordering rule, filtering condition, and error path
-// (a record whose metadata can't be fully read is still silently excluded
-// from the index exactly as before -- see readIndexMetadata(), added by
-// the #4.9j follow-up to read it through one file handle instead of the
-// original two-helper pair this comment used to name) is unchanged. Four
-// uint32_t durations are accumulated with plain millis()-delta subtraction
-// (the same rollover-safe convention already used elsewhere in this
-// codebase, e.g. outbox.cpp's scan/publish/flush timing -- unsigned
-// wraparound arithmetic gives the correct elapsed value even across a
-// millis() rollover) and only printed, as one line, after everything is
-// done, so the diagnostic Serial.printf() call itself is never included in
-// any of the four measured windows.
-//
-// Hardware Diagnostic #4.9k: a cache-hit check now runs first (see the
-// early return below) -- when it hits, none of the above real-load timing
-// runs at all, so the existing [PERF][CHAT_INDEX] total/list/read/sort
-// line only ever describes an actual load, exactly as before. A hit
-// instead prints its own compact line. No boot preload: g_indexCacheValid
-// starts false, so the very first call for any conversation always falls
-// through to a real load.
-//
-// Hardware Diagnostic #4.9q: between the cache-hit check and the full
-// load, a third possibility now exists -- applying a pending single-entry
-// append candidate (see tryApplyIndexAppendCandidate()) that reads and
-// inserts just the ONE newly appended record instead of re-enumerating
-// and re-reading the whole conversation. It prints its own
-// "[PERF][CHAT_INDEX] incremental=1 ..." line and returns exactly like a
-// full load would (same g_indexCount, same g_index ordering) -- a caller
-// cannot tell from the return value alone which of the three paths ran.
-// Scope for this first implementation is exactly one successful append to
-// a valid, unchanged, below-capacity index (see maybeRecordIndexAppendCandidate()'s
-// own eligibility list); eviction, multiple appends before a reload, flag/
-// payload changes, group deletion, an unreliable prior load, and an
-// identity switch all still fall back to the full load below unchanged.
-// Every caller that reloads only when its own dirty flag is set (e.g.
-// text_message.cpp/enigma.cpp/number_guessing_friend.cpp's
-// refreshIndexIfNeeded(), and text_message.cpp's own [PERF][CHAT_SCREEN]
-// indexReload=1 diagnostic) still calls this same function on a reload,
-// unaware of and unaffected by which of the three paths above actually
-// ran -- so "a reload happened" (indexReload=1) no longer implies a full
-// re-enumeration; it may now mean this incremental path ran instead. This
-// file cannot itself change how those out-of-file diagnostics label that
-// distinction (only storage_messages.cpp is in scope for this commit);
-// this comment documents the fact for whoever next touches that file.
-uint16_t loadConversationIndex(const char* group_code, const char* contact_key) {
-  // Hardware Diagnostic #4.9k: reuse the shared index untouched when
-  // nothing that could invalidate it has happened since the last
-  // successful, reliable load of this EXACT conversation -- same group,
-  // same contact, same storage generation. Zero filesystem access on a
-  // hit. There is only one cache slot (matching the one shared g_index),
-  // so switching A -> B -> A always misses on the return to A; only
-  // re-entering the SAME conversation with nothing having bumped the
-  // generation in between can hit.
-  if (g_indexCacheValid && strcmp(g_indexCacheGroup, group_code) == 0 &&
-      strcmp(g_indexCacheContact, contact_key) == 0 &&
-      getStorageChangeGeneration() == g_indexCacheGeneration) {
-    Serial.printf("[PERF][CHAT_INDEX] cacheHit=1 indexed=%u\n", static_cast<unsigned>(g_indexCount));
-    return g_indexCount;
-  }
+// ---------------------------------------------------------------------------
+// Chat-entry latency (device A on 2ed04b6, 70 broadcast messages:
+// "[PERF][CHAT_INDEX] list=158 ms read=4446 ms", one LittleFS open per
+// record at about 63 ms each; a cached re-entry still spent about 864 ms
+// reading the visible rows twice). The work is removed, not only spread:
+//  - a record cache: the rows a chat displayed, kept byte-exact and written
+//    through on every store write, so the render and later passes read them
+//    without opening a file;
+//  - the shared index is kept current across mutations: its own
+//    conversation's writes and removals are patched in place, and those of
+//    other conversations leave it valid (bumpGenerationFor());
+//  - a parked second index keeps the last chat, so going back to it reads
+//    nothing;
+//  - the Notifications boot sweep's recount, which reads every record
+//    anyway, feeds the index (beginIndexFeed()/feedIndexRecord());
+//  - what is still loaded is loaded in bounded, time-budgeted steps
+//    (stepConversationIndex()), so the chat stays responsive meanwhile.
+// All of it is RAM only and rebuilt from the records: nothing new on flash.
+// ---------------------------------------------------------------------------
+namespace {
 
-  // Hardware Diagnostic #4.9q: a pending append candidate for a DIFFERENT
-  // identity is now definitely stale -- either this call is about to
-  // overwrite the cache slot with a full load for that different
-  // identity, or (if this requested identity matches the cache slot's
-  // current contents) that slot never was the candidate's own baseline in
-  // the first place. Switching conversations discards it outright rather
-  // than letting it linger for a return to the candidate's identity
-  // later, by which point the cache slot's contents would have already
-  // changed out from under it.
+// ---- the record cache ------------------------------------------------------
+constexpr uint8_t kRecordCacheSlots = 10;
+struct CachedRecord {
+  bool valid;
+  char group[PacketCodec::kGroupCodeLen];
+  char contact[kContactKeyLen];
+  uint32_t seq;
+  uint16_t len, cap;
+  uint32_t lastUse;
+  uint8_t* bytes;  // heap, exactly the record file's bytes
+};
+CachedRecord g_recordCache[kRecordCacheSlots];
+uint32_t g_recordCacheClock = 0;
+
+CachedRecord* findCachedRecord(const char* group_code, const char* contact_key, uint32_t seq) {
+  for (auto& c : g_recordCache) {
+    if (c.valid && c.seq == seq && strcmp(c.contact, contact_key) == 0 && strcmp(c.group, group_code) == 0) return &c;
+  }
+  return nullptr;
+}
+
+// Stores len bytes in slot c (reallocating if needed). False if no memory
+// (the slot is then dropped).
+bool fillCachedRecord(CachedRecord& c, const uint8_t* bytes, size_t len) {
+  if (len > c.cap || c.bytes == nullptr) {
+    delete[] c.bytes;
+    c.bytes = new (std::nothrow) uint8_t[len];
+    c.cap = c.bytes != nullptr ? static_cast<uint16_t>(len) : 0;
+    if (c.bytes == nullptr) {
+      c.valid = false;
+      return false;
+    }
+  }
+  memcpy(c.bytes, bytes, len);
+  c.len = static_cast<uint16_t>(len);
+  c.lastUse = ++g_recordCacheClock;
+  return true;
+}
+
+void keepCachedRecord(const MessageRef& ref, const uint8_t* bytes, size_t len) {
+  if (len == 0 || len > kMaxRecordFileSize) return;
+  if (strlen(ref.group_code) >= PacketCodec::kGroupCodeLen || strlen(ref.contact_key) >= kContactKeyLen) return;
+  CachedRecord* slot = findCachedRecord(ref.group_code, ref.contact_key, ref.sequence);
+  if (slot == nullptr) {
+    for (auto& c : g_recordCache) {
+      if (!c.valid) {
+        slot = &c;
+        break;
+      }
+      if (slot == nullptr || c.lastUse < slot->lastUse) slot = &c;
+    }
+    slot->valid = false;
+    strncpy(slot->group, ref.group_code, sizeof(slot->group) - 1);
+    slot->group[sizeof(slot->group) - 1] = '\0';
+    strncpy(slot->contact, ref.contact_key, sizeof(slot->contact) - 1);
+    slot->contact[sizeof(slot->contact) - 1] = '\0';
+    slot->seq = ref.sequence;
+  }
+  if (fillCachedRecord(*slot, bytes, len)) slot->valid = true;
+}
+
+// A store write: what the cache holds for this record becomes the bytes just
+// written (or is dropped if the write failed -- the file may be gone).
+void writeThroughCachedRecord(const MessageRef& ref, bool ok) {
+  CachedRecord* c = findCachedRecord(ref.group_code, ref.contact_key, ref.sequence);
+  if (c == nullptr) return;
+  if (!ok || g_rewriteLen == 0 || !fillCachedRecord(*c, g_rewriteScratch, g_rewriteLen)) c->valid = false;
+}
+
+}  // namespace
+
+namespace {
+void dropCachedRecord(const char* group_code, const char* contact_key, uint32_t seq) {
+  CachedRecord* c = findCachedRecord(group_code, contact_key, seq);
+  if (c != nullptr) c->valid = false;
+}
+
+void dropAllCachedRecords() {
+  for (auto& c : g_recordCache) c.valid = false;
+}
+
+bool cachedRecordBytes(const char* group_code, const char* contact_key, uint32_t seq, const uint8_t** bytes,
+                       uint16_t* len) {
+  CachedRecord* c = findCachedRecord(group_code, contact_key, seq);
+  if (c == nullptr) return false;
+  c->lastUse = ++g_recordCacheClock;
+  *bytes = c->bytes;
+  *len = c->len;
+  return true;
+}
+
+// ---- sorted index arrays -----------------------------------------------------
+// Inserts e in sorted position, after every entry it does not sort before
+// (the stable order the full load's insertion sort gives). Removes an entry
+// of the same sequence first. False if the array is full.
+bool patchIndexWrite(ConversationIndexEntry* arr, uint16_t* count, uint16_t cap, const ConversationIndexEntry& e) {
+  for (uint16_t i = 0; i < *count; i++) {
+    if (arr[i].sequence == e.sequence) {
+      memmove(&arr[i], &arr[i + 1], sizeof(ConversationIndexEntry) * (*count - i - 1));
+      (*count)--;
+      break;
+    }
+  }
+  if (*count >= cap) return false;
+  uint16_t at = *count;
+  for (uint16_t i = 0; i < *count; i++) {
+    if (indexEntryAfter(arr[i], e)) {
+      at = i;
+      break;
+    }
+  }
+  memmove(&arr[at + 1], &arr[at], sizeof(ConversationIndexEntry) * (*count - at));
+  arr[at] = e;
+  (*count)++;
+  return true;
+}
+
+void patchIndexRemove(ConversationIndexEntry* arr, uint16_t* count, uint32_t seq) {
+  for (uint16_t i = 0; i < *count; i++) {
+    if (arr[i].sequence == seq) {
+      memmove(&arr[i], &arr[i + 1], sizeof(ConversationIndexEntry) * (*count - i - 1));
+      (*count)--;
+      return;
+    }
+  }
+}
+
+// ---- the stepped load into the shared index ----------------------------------
+// g_indexCacheGroup/g_indexCacheContact name the conversation g_index holds:
+// complete and current when g_indexCacheValid, or being loaded (g_loader).
+constexpr uint32_t kIndexStepBudgetMs = 20;  // about one open per pass on device A
+constexpr uint32_t kChatLoadingMs = 200;     // a chat steps its load every pass; older steps mean nobody is waiting
+struct IndexLoader {
+  bool active;
+  bool listed;
+  bool reliable;
+  bool fed;  // the records arrive from the Notifications recount (feedIndexRecord()), not this loader's reads
+  uint16_t n, pos, steps;
+  uint32_t generation;  // the storage generation the entries so far are current for
+  uint32_t startMs, listMs, readMs, lastStepMs;
+};
+IndexLoader g_loader = {};
+uint32_t g_loaderSeqs[kMaxMessagesPerThread];
+
+bool isIndexTarget(const char* group_code, const char* contact_key) {
+  return (g_indexCacheValid || g_loader.active) && strcmp(g_indexCacheGroup, group_code) == 0 &&
+         strcmp(g_indexCacheContact, contact_key) == 0;
+}
+
+// ---- the parked index: the last chat's index, kept while another is open ----
+constexpr uint16_t kParkedCapacity = kRetainedMessagesPerThread;
+// While the shared index is held by a chat, the boot sweep's recount feeds
+// the parked one instead (feeding: not usable until complete).
+struct ParkedIndex {
+  bool valid;
+  char group[PacketCodec::kGroupCodeLen];
+  char contact[kContactKeyLen];
+  uint32_t generation;
+  uint16_t count;
+  ConversationIndexEntry entries[kParkedCapacity];
+  bool feeding, feedReliable;
+  uint16_t feedN, feedPos;
+  uint32_t feedGeneration;
+  uint32_t feedSeqs[kParkedCapacity];
+};
+ParkedIndex* g_parked = nullptr;
+
+bool parkedHolds(const char* group_code, const char* contact_key) {
+  return g_parked != nullptr && strcmp(g_parked->group, group_code) == 0 && strcmp(g_parked->contact, contact_key) == 0;
+}
+
+bool isParked(const char* group_code, const char* contact_key) {
+  return g_parked != nullptr && g_parked->valid && parkedHolds(group_code, contact_key);
+}
+
+// The same-conversation mutation under way (set by bumpGenerationFor(),
+// applied by afterRecordWrite()/afterRecordRemove() once its outcome is
+// known): which indexes hold that conversation and were current before it.
+struct PendingPatch {
+  bool active;
+  bool working, loader, parked;
+  uint32_t generation;  // the generation the mutation bumped to
+};
+PendingPatch g_patch = {};
+
+ConversationIndexEntry entryFromRecord(uint32_t seq, const StoredHeader& header, const uint8_t* bytes, size_t len,
+                                       bool* ok) {
+  ConversationIndexEntry e;
+  memset(&e, 0, sizeof(e));
+  e.sequence = seq;
+  e.effective_sort_timestamp = header.effective_sort_timestamp;
+  e.flags = header.flags;
+  *ok = len >= kMessageIdOffsetInFile + PacketCodec::kMessageIdLen;
+  if (*ok) {
+    memcpy(e.message_id, bytes + kMessageIdOffsetInFile, PacketCodec::kMessageIdLen);
+    e.message_id[PacketCodec::kMessageIdLen - 1] = '\0';
+  }
+  return e;
+}
+
+bool seqInLoaderRemainder(uint32_t seq) {
+  for (uint16_t i = g_loader.pos; i < g_loader.n; i++) {
+    if (g_loaderSeqs[i] == seq) return true;
+  }
+  return false;
+}
+
+void removeFromLoaderRemainder(uint32_t seq) {
+  for (uint16_t i = g_loader.pos; i < g_loader.n; i++) {
+    if (g_loaderSeqs[i] == seq) {
+      memmove(&g_loaderSeqs[i], &g_loaderSeqs[i + 1], sizeof(uint32_t) * (g_loader.n - i - 1));
+      g_loader.n--;
+      return;
+    }
+  }
+}
+}  // namespace
+
+namespace {
+// Bumps the storage generation for a mutation of one conversation (nullptr:
+// unknown, e.g. a whole group removed outside the store). Indexes of OTHER
+// conversations that were current stay current; those of this conversation
+// are patched once the mutation's outcome is known (afterRecordWrite()/
+// afterRecordRemove()), or go stale.
+void bumpGenerationFor(const char* group_code, const char* contact_key) {
+  uint32_t before = g_storageChangeGeneration;
+  bool known = group_code != nullptr && contact_key != nullptr;
+  bool target = known && isIndexTarget(group_code, contact_key);
+  bool keepWorking = known && g_indexCacheValid && g_indexCacheGeneration == before;
+  bool keepLoader = known && g_loader.active && g_loader.generation == before;
+  bool keepParked = known && g_parked != nullptr && g_parked->valid && g_parked->generation == before &&
+                    !isParked(group_code, contact_key);
+  bool keepParkedFeed = known && g_parked != nullptr && g_parked->feeding && g_parked->feedGeneration == before &&
+                        !parkedHolds(group_code, contact_key);
+  g_patch.active = known;
+  g_patch.working = keepWorking && target;
+  g_patch.loader = keepLoader && target && !g_loader.fed;  // a fed load is dropped instead (the recount relists)
+  g_patch.parked = known && isParked(group_code, contact_key) && g_parked->generation == before;
+  g_storageChangeGeneration++;
+  g_patch.generation = g_storageChangeGeneration;
+  if (keepWorking && !target) g_indexCacheGeneration = g_storageChangeGeneration;
+  if (keepLoader && !target) g_loader.generation = g_storageChangeGeneration;
+  if (keepParked) g_parked->generation = g_storageChangeGeneration;
+  if (keepParkedFeed) g_parked->feedGeneration = g_storageChangeGeneration;
+}
+
+void afterRecordWrite(const MessageRef& ref, const StoredHeader& header, bool ok) {
+  writeThroughCachedRecord(ref, ok);
+  PendingPatch p = g_patch;
+  g_patch.active = false;
+  if (!ok || !p.active || p.generation != g_storageChangeGeneration) return;  // stale: reloaded at the next use
+  bool idOk = false;
+  ConversationIndexEntry e = entryFromRecord(ref.sequence, header, g_rewriteScratch, g_rewriteLen, &idOk);
+  if (!idOk) return;
+  if (p.working && patchIndexWrite(g_index, &g_indexCount, kMaxMessagesPerThread, e)) g_indexCacheGeneration = p.generation;
+  if (p.loader) {
+    // Loaded already: patched. Still to be read: read later, as written now.
+    bool fine = seqInLoaderRemainder(ref.sequence) || patchIndexWrite(g_index, &g_indexCount, kMaxMessagesPerThread, e);
+    if (fine) g_loader.generation = p.generation;
+  }
+  if (p.parked && patchIndexWrite(g_parked->entries, &g_parked->count, kParkedCapacity, e)) g_parked->generation = p.generation;
+}
+
+void afterRecordRemove(const char* group_code, const char* contact_key, uint32_t seq, bool removed) {
+  (void)group_code;
+  (void)contact_key;
+  PendingPatch p = g_patch;
+  g_patch.active = false;
+  if (!removed || !p.active || p.generation != g_storageChangeGeneration) return;
+  if (p.working) {
+    patchIndexRemove(g_index, &g_indexCount, seq);
+    g_indexCacheGeneration = p.generation;
+  }
+  if (p.loader) {
+    removeFromLoaderRemainder(seq);
+    patchIndexRemove(g_index, &g_indexCount, seq);
+    g_loader.generation = p.generation;
+  }
+  if (p.parked) {
+    patchIndexRemove(g_parked->entries, &g_parked->count, seq);
+    g_parked->generation = p.generation;
+  }
+}
+
+// The shared index (complete and current) is kept in the parked slot before
+// the shared one is reused for another conversation.
+void parkWorkingIndex() {
+  if (!g_indexCacheValid || g_indexCacheGeneration != g_storageChangeGeneration) return;
+  if (g_indexCount > kParkedCapacity) return;  // an older firmware's longer history: not parked
+  if (g_parked == nullptr) {
+    g_parked = new (std::nothrow) ParkedIndex;
+    if (g_parked == nullptr) return;
+    g_parked->valid = false;
+    g_parked->feeding = false;
+  }
+  strncpy(g_parked->group, g_indexCacheGroup, sizeof(g_parked->group) - 1);
+  g_parked->group[sizeof(g_parked->group) - 1] = '\0';
+  strncpy(g_parked->contact, g_indexCacheContact, sizeof(g_parked->contact) - 1);
+  g_parked->contact[sizeof(g_parked->contact) - 1] = '\0';
+  memcpy(g_parked->entries, g_index, sizeof(ConversationIndexEntry) * g_indexCount);
+  g_parked->feeding = false;
+  g_parked->count = g_indexCount;
+  g_parked->generation = g_indexCacheGeneration;
+  g_parked->valid = true;
+}
+
+void setIndexIdentity(const char* group_code, const char* contact_key) {
+  strncpy(g_indexCacheGroup, group_code, sizeof(g_indexCacheGroup) - 1);
+  g_indexCacheGroup[sizeof(g_indexCacheGroup) - 1] = '\0';
+  strncpy(g_indexCacheContact, contact_key, sizeof(g_indexCacheContact) - 1);
+  g_indexCacheContact[sizeof(g_indexCacheContact) - 1] = '\0';
+}
+
+bool identityFits(const char* group_code, const char* contact_key) {
+  return strlen(group_code) < sizeof(g_indexCacheGroup) && strlen(contact_key) < sizeof(g_indexCacheContact);
+}
+
+void finishLoad() {
+  g_loader.active = false;
+  if (g_loader.reliable && g_loader.generation == g_storageChangeGeneration) {
+    g_indexCacheGeneration = g_storageChangeGeneration;
+    g_indexCacheValid = true;
+  }
+  uint32_t wallMs = millis() - g_loader.startMs;
+  uint32_t busyMs = g_loader.listMs + g_loader.readMs;
+  if (busyMs >= 20 || wallMs >= 20) {
+    Serial.printf("[PERF][CHAT_INDEX] total=%lu ms list=%lu ms read=%lu ms sort=0 ms enumerated=%u indexed=%u steps=%u wall=%lu ms%s\n",
+                  static_cast<unsigned long>(busyMs), static_cast<unsigned long>(g_loader.listMs),
+                  static_cast<unsigned long>(g_loader.readMs), static_cast<unsigned>(g_loader.n),
+                  static_cast<unsigned>(g_indexCount), static_cast<unsigned>(g_loader.steps),
+                  static_cast<unsigned long>(wallMs), g_loader.fed ? " fed=1" : "");
+  }
+}
+
+void insertLoadedEntry(uint32_t seq, const StoredHeader& hdr, const char* mid) {
+  ConversationIndexEntry e;
+  e.sequence = seq;
+  e.effective_sort_timestamp = hdr.effective_sort_timestamp;
+  strncpy(e.message_id, mid, PacketCodec::kMessageIdLen - 1);
+  e.message_id[PacketCodec::kMessageIdLen - 1] = '\0';
+  e.flags = hdr.flags;
+  if (!patchIndexWrite(g_index, &g_indexCount, kMaxMessagesPerThread, e)) g_loader.reliable = false;
+}
+
+void startLoad(const char* group_code, const char* contact_key, bool fed) {
+  if (!isIndexTarget(group_code, contact_key)) parkWorkingIndex();
   if (g_pendingCandidateValid &&
       (strcmp(g_pendingCandidateGroup, group_code) != 0 || strcmp(g_pendingCandidateContact, contact_key) != 0)) {
     g_pendingCandidateValid = false;
   }
+  g_indexCacheValid = false;
+  setIndexIdentity(group_code, contact_key);
+  g_indexCount = 0;
+  memset(&g_loader, 0, sizeof(g_loader));
+  g_loader.active = true;
+  g_loader.reliable = identityFits(group_code, contact_key);
+  g_loader.fed = fed;
+  g_loader.generation = g_storageChangeGeneration;
+  g_loader.startMs = millis();
+}
+}  // namespace
 
-  // Hardware Diagnostic #4.9q: identity necessarily matches here (any
-  // mismatch was just discarded above). Ordinary cache-hit above already
-  // failed, which -- given appendStoredMessage() never updates
-  // g_indexCacheGeneration itself -- can only mean a candidate for this
-  // exact identity is outstanding, or no candidate exists at all and a
-  // real load is needed. tryApplyIndexAppendCandidate() re-verifies every
-  // prerequisite itself and always clears g_pendingCandidateValid before
-  // returning false, so a false return here safely falls through to the
-  // existing full-load path below with nothing left to discard.
-  if (g_pendingCandidateValid) {
+bool stepConversationIndex(const char* group_code, const char* contact_key, uint8_t maxReads, uint16_t* outCount,
+                           uint16_t* outRead, uint16_t* outTotal) {
+  uint32_t now = g_storageChangeGeneration;
+  auto report = [&](bool done) {
+    if (outCount != nullptr) *outCount = g_indexCount;
+    if (outRead != nullptr) *outRead = g_loader.active ? g_loader.pos : g_indexCount;
+    if (outTotal != nullptr) *outTotal = g_loader.active ? g_loader.n : g_indexCount;
+    return done;
+  };
+  // Hardware Diagnostic #4.9k: reuse the shared index untouched when it is
+  // complete and current for this conversation. Zero filesystem access.
+  if (g_indexCacheValid && strcmp(g_indexCacheGroup, group_code) == 0 &&
+      strcmp(g_indexCacheContact, contact_key) == 0 && g_indexCacheGeneration == now) {
+    Serial.printf("[PERF][CHAT_INDEX] cacheHit=1 indexed=%u\n", static_cast<unsigned>(g_indexCount));
+    return report(true);
+  }
+  // The parked index: swapped in, the shared one parked in its place.
+  if (isParked(group_code, contact_key) && g_parked->generation == now && identityFits(group_code, contact_key)) {
+    bool parkOut = g_indexCacheValid && g_indexCacheGeneration == now && g_indexCount <= kParkedCapacity;
+    uint16_t inCount = g_parked->count;
+    uint16_t outCountWorking = g_indexCount;
+    char outGroup[PacketCodec::kGroupCodeLen], outContact[kContactKeyLen];
+    strncpy(outGroup, g_indexCacheGroup, sizeof(outGroup));
+    strncpy(outContact, g_indexCacheContact, sizeof(outContact));
+    uint16_t m = inCount > outCountWorking ? inCount : outCountWorking;
+    for (uint16_t i = 0; i < m; i++) {
+      ConversationIndexEntry t = g_index[i];
+      g_index[i] = g_parked->entries[i];
+      if (parkOut) g_parked->entries[i] = t;
+    }
+    g_loader.active = false;
+    setIndexIdentity(group_code, contact_key);
+    g_indexCount = inCount;
+    g_indexCacheGeneration = now;
+    g_indexCacheValid = true;
+    if (parkOut) {
+      strncpy(g_parked->group, outGroup, sizeof(g_parked->group));
+      strncpy(g_parked->contact, outContact, sizeof(g_parked->contact));
+      g_parked->count = outCountWorking;
+      g_parked->generation = now;
+    } else {
+      g_parked->valid = false;
+    }
+    g_parked->feeding = false;
+    if (g_pendingCandidateValid) g_pendingCandidateValid = false;
+    Serial.printf("[PERF][CHAT_INDEX] parkedHit=1 indexed=%u\n", static_cast<unsigned>(g_indexCount));
+    return report(true);
+  }
+  // Hardware Diagnostic #4.9q: a single appended record patched in.
+  if (g_pendingCandidateValid && strcmp(g_pendingCandidateGroup, group_code) == 0 &&
+      strcmp(g_pendingCandidateContact, contact_key) == 0) {
     uint32_t incTotalStart = millis();
     if (tryApplyIndexAppendCandidate(group_code, contact_key)) {
       uint32_t incTotalElapsed = millis() - incTotalStart;
       Serial.printf("[PERF][CHAT_INDEX] incremental=1 total=%lu ms indexed=%u\n",
                     static_cast<unsigned long>(incTotalElapsed), static_cast<unsigned>(g_indexCount));
-      return g_indexCount;
+      return report(true);
     }
   }
-
-  // Falling through to a real load: whatever was cached no longer applies
-  // once g_index below starts being overwritten, so invalidate it BEFORE
-  // that happens -- if this load itself turns out unreliable, no stale
-  // "valid" cache survives it either.
-  g_indexCacheValid = false;
-
-  uint32_t totalStart = millis();
-
-  // Hardware Diagnostic #4.9k: generation snapshot taken before directory
-  // enumeration starts; compared again after the metadata-read loop
-  // finishes (sorting never touches storage, so it can't move this) to
-  // confirm nothing mutated this conversation's storage while this load
-  // was in progress.
-  uint32_t generationBeforeLoad = getStorageChangeGeneration();
-
-  static uint32_t seqs[kMaxMessagesPerThread];
-  uint32_t listStart = millis();
-  // Hardware Diagnostic #4.9k: same outOpenFailed output #4.9h-follow-up
-  // added to listSequences() -- any failed/non-directory open, INCLUDING a
-  // conversation directory that has simply never been created, makes this
-  // load ineligible for caching below. Unlike forEachConversation()'s
-  // multi-directory walk (where a never-created group/root is normal),
-  // here group_code/contact_key name one specific, already-selected
-  // conversation, so treating any open failure as uncacheable is the
-  // simple, correct rule the task calls for -- it does not change what is
-  // returned or enumerated, only whether the result may be trusted later.
-  bool dirOpenFailed = false;
-  uint16_t n = listSequences(group_code, contact_key, seqs, kMaxMessagesPerThread, &dirOpenFailed);
-  uint32_t listElapsed = millis() - listStart;
-
-  g_indexCount = 0;
-  // Hardware Diagnostic #4.9k: sticky-false across the whole read loop --
-  // any single readIndexMetadata() failure poisons cacheability for this
-  // load, but (matching the existing behavior this comment already
-  // documented) never stops or skips processing of the OTHER records:
-  // every one that DOES load successfully is still indexed exactly as
-  // before.
-  bool metadataReliable = true;
+  if (!(g_loader.active && isIndexTarget(group_code, contact_key) && g_loader.generation == now)) {
+    startLoad(group_code, contact_key, false);
+  } else if (g_loader.fed) {
+    g_loader.fed = false;  // a load fed by the recount is continued by this chat's own reads (chatIndexLoading())
+  }
+  g_loader.steps++;
+  g_loader.lastStepMs = millis();
+  uint32_t stepStart = millis();
+  if (!g_loader.listed) {
+    bool openFailed = false, truncated = false;
+    uint32_t listStart = millis();
+    g_loader.n = listSequences(group_code, contact_key, g_loaderSeqs, kMaxMessagesPerThread, &openFailed, &truncated);
+    g_loader.listMs += millis() - listStart;
+    if (openFailed || truncated) g_loader.reliable = false;
+    g_loader.pos = 0;
+    g_loader.listed = true;
+  }
   uint32_t readStart = millis();
-  for (uint16_t i = 0; i < n && g_indexCount < kMaxMessagesPerThread; i++) {
+  for (uint8_t k = 0; k < maxReads && g_loader.pos < g_loader.n; k++) {
+    if (k > 0 && millis() - stepStart >= kIndexStepBudgetMs) break;
+    uint32_t seq = g_loaderSeqs[g_loader.pos++];
     StoredHeader hdr;
     char mid[PacketCodec::kMessageIdLen];
-    if (readIndexMetadata(group_code, contact_key, seqs[i], &hdr, mid)) {
-      ConversationIndexEntry& e = g_index[g_indexCount++];
-      e.sequence = seqs[i];
-      e.effective_sort_timestamp = hdr.effective_sort_timestamp;
-      strncpy(e.message_id, mid, PacketCodec::kMessageIdLen - 1);
-      e.message_id[PacketCodec::kMessageIdLen - 1] = '\0';
-      e.flags = hdr.flags;
+    if (readIndexMetadata(group_code, contact_key, seq, &hdr, mid)) {
+      insertLoadedEntry(seq, hdr, mid);
     } else {
-      metadataReliable = false;
+      g_loader.reliable = false;  // left out, as the one-call load did; not cached
     }
   }
-  uint32_t readElapsed = millis() - readStart;
+  g_loader.readMs += millis() - readStart;
+  if (g_loader.pos < g_loader.n) return report(false);
+  finishLoad();
+  return report(true);
+}
 
-  uint32_t sortStart = millis();
-  for (uint16_t i = 1; i < g_indexCount; i++) {
-    ConversationIndexEntry key = g_index[i];
-    int32_t j = static_cast<int32_t>(i) - 1;
-    while (j >= 0 && indexEntryAfter(g_index[j], key)) {
-      g_index[j + 1] = g_index[j];
-      j--;
-    }
-    g_index[j + 1] = key;
-  }
-  uint32_t sortElapsed = millis() - sortStart;
-
-  // Hardware Diagnostic #4.9k: establish cache validity only when this
-  // load can be trusted to still be correct until something bumps the
-  // generation again -- reliable directory enumeration AND reliable
-  // per-record metadata reads AND the generation unchanged across the
-  // whole load (a successfully opened, genuinely empty directory still
-  // qualifies: dirOpenFailed is false and the read loop trivially stays
-  // reliable with n == 0). A partial failure still returns every
-  // successfully indexed entry above exactly as before; it simply isn't
-  // cached for reuse. Overlong group_code/contact_key that the cache
-  // buffers can't hold without truncation are also refused -- caching a
-  // truncated identity could later false-hit against a different,
-  // longer key sharing the same truncated prefix.
-  bool loadReliable = !dirOpenFailed && metadataReliable && (getStorageChangeGeneration() == generationBeforeLoad);
-  if (loadReliable && strlen(group_code) < sizeof(g_indexCacheGroup) &&
-      strlen(contact_key) < sizeof(g_indexCacheContact)) {
-    strncpy(g_indexCacheGroup, group_code, sizeof(g_indexCacheGroup) - 1);
-    g_indexCacheGroup[sizeof(g_indexCacheGroup) - 1] = '\0';
-    strncpy(g_indexCacheContact, contact_key, sizeof(g_indexCacheContact) - 1);
-    g_indexCacheContact[sizeof(g_indexCacheContact) - 1] = '\0';
-    g_indexCacheGeneration = getStorageChangeGeneration();
-    g_indexCacheValid = true;
-  }
-
-  uint32_t totalElapsed = millis() - totalStart;
-  if (totalElapsed >= 20) {
-    Serial.printf("[PERF][CHAT_INDEX] total=%lu ms list=%lu ms read=%lu ms sort=%lu ms enumerated=%u indexed=%u\n",
-                  static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(listElapsed),
-                  static_cast<unsigned long>(readElapsed), static_cast<unsigned long>(sortElapsed),
-                  static_cast<unsigned>(n), static_cast<unsigned>(g_indexCount));
+uint16_t loadConversationIndex(const char* group_code, const char* contact_key) {
+  while (!stepConversationIndex(group_code, contact_key, 255, nullptr, nullptr, nullptr)) {
   }
   return g_indexCount;
+}
+
+bool chatIndexLoading() {
+  return g_loader.active && !g_loader.fed && millis() - g_loader.lastStepMs < kChatLoadingMs;
+}
+
+namespace {
+// The shared index is in use: the feed builds the parked one instead -- not
+// over a current parked index of another conversation (the last chat).
+bool beginParkedFeed(const char* group_code, const char* contact_key, const uint32_t* seqs, uint16_t n,
+                     bool listingReliable) {
+  uint32_t now = getStorageChangeGeneration();
+  if (!listingReliable || n > kParkedCapacity) return false;
+  if (strlen(group_code) >= PacketCodec::kGroupCodeLen || strlen(contact_key) >= kContactKeyLen) return false;
+  if (g_parked != nullptr && g_parked->valid && g_parked->generation == now) return false;  // current: kept
+  if (g_parked == nullptr) {
+    g_parked = new (std::nothrow) ParkedIndex;
+    if (g_parked == nullptr) return false;
+  }
+  g_parked->valid = false;
+  strncpy(g_parked->group, group_code, sizeof(g_parked->group) - 1);
+  g_parked->group[sizeof(g_parked->group) - 1] = '\0';
+  strncpy(g_parked->contact, contact_key, sizeof(g_parked->contact) - 1);
+  g_parked->contact[sizeof(g_parked->contact) - 1] = '\0';
+  g_parked->count = 0;
+  g_parked->feeding = true;
+  g_parked->feedReliable = true;
+  g_parked->feedN = n;
+  g_parked->feedPos = 0;
+  g_parked->feedGeneration = now;
+  memcpy(g_parked->feedSeqs, seqs, sizeof(uint32_t) * n);
+  if (n == 0) {
+    g_parked->feeding = false;
+    g_parked->valid = true;
+    g_parked->generation = now;
+  }
+  return true;
+}
+
+void feedParkedRecord(uint32_t seq, const StoredHeader* hdr, const char* message_id) {
+  ParkedIndex& p = *g_parked;
+  if (p.feedPos >= p.feedN || p.feedSeqs[p.feedPos] != seq || p.feedGeneration != getStorageChangeGeneration()) {
+    p.feeding = false;  // out of step, or the conversation changed: dropped
+    return;
+  }
+  p.feedPos++;
+  if (hdr == nullptr) {
+    p.feedReliable = false;
+  } else {
+    ConversationIndexEntry e;
+    e.sequence = seq;
+    e.effective_sort_timestamp = hdr->effective_sort_timestamp;
+    strncpy(e.message_id, message_id, PacketCodec::kMessageIdLen - 1);
+    e.message_id[PacketCodec::kMessageIdLen - 1] = '\0';
+    e.flags = hdr->flags;
+    if (!patchIndexWrite(p.entries, &p.count, kParkedCapacity, e)) p.feedReliable = false;
+  }
+  if (p.feedPos == p.feedN) {
+    p.feeding = false;
+    p.valid = p.feedReliable;
+    p.generation = p.feedGeneration;
+  }
+}
+}  // namespace
+
+bool beginIndexFeed(const char* group_code, const char* contact_key, const uint32_t* seqs, uint16_t n,
+                    bool listingReliable) {
+  // Into the shared index only when it holds nothing current and no chat is
+  // loading it; otherwise into the parked one.
+  uint32_t now = getStorageChangeGeneration();
+  if ((g_indexCacheValid && g_indexCacheGeneration == now) || (g_loader.active && !g_loader.fed && g_loader.generation == now)) {
+    if (isIndexTarget(group_code, contact_key)) return false;  // that conversation is already the shared index
+    return beginParkedFeed(group_code, contact_key, seqs, n, listingReliable);
+  }
+  if (!listingReliable || n > kMaxMessagesPerThread || !identityFits(group_code, contact_key)) return false;
+  startLoad(group_code, contact_key, true);
+  g_loader.listed = true;
+  g_loader.n = n;
+  memcpy(g_loaderSeqs, seqs, sizeof(uint32_t) * n);
+  if (n == 0) finishLoad();
+  return true;
+}
+
+void feedIndexRecord(const char* group_code, const char* contact_key, uint32_t seq, const StoredHeader* hdr,
+                     const char* message_id) {
+  if (g_parked != nullptr && g_parked->feeding && parkedHolds(group_code, contact_key)) {
+    feedParkedRecord(seq, hdr, message_id);
+    return;
+  }
+  if (!g_loader.active || !g_loader.fed || !isIndexTarget(group_code, contact_key)) return;
+  if (g_loader.pos >= g_loader.n || g_loaderSeqs[g_loader.pos] != seq ||
+      g_loader.generation != getStorageChangeGeneration()) {
+    g_loader.active = false;  // out of step, or the conversation changed: a chat loads it itself
+    g_indexCount = 0;
+    return;
+  }
+  g_loader.pos++;
+  g_loader.steps++;
+  if (hdr == nullptr) {
+    g_loader.reliable = false;
+  } else {
+    insertLoadedEntry(seq, *hdr, message_id);
+  }
+  if (g_loader.pos == g_loader.n) finishLoad();
 }
 
 const ConversationIndexEntry* getIndexEntry(uint16_t i) {
