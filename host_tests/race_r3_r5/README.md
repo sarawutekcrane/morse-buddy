@@ -406,6 +406,59 @@ Measurements (`storage_bench`, step 6b; host op counts, not device time):
 | 8 x 300: all trimmed to 100 | never | never | never | after 73 s (simulated) |
 | 400 x 20: background, max per loop pass | none | 40 opens / 421 entries | 4 opens / 401 entries | 4 opens / 20 entries |
 
+## Chat entry, round 2 (device A on 2ed04b6; uncommitted candidate)
+
+Device A, flashed 2ed04b6, 70 broadcast messages: `[PERF][CHAT_INDEX]
+list=158 ms read=4446 ms` (one LittleFS open per record, about 63 ms each),
+a cached re-entry still about 864 ms (`historyViewport` 415 + `historyRender`
+447: the visible rows read twice), and `[PERF][OUTBOX] scan 5143 ms found=0`
+after connecting. This round removes the repeated reads (RAM only; no new
+persistent format -- see the review package's `STORAGE_CACHE_DESIGN.md`):
+
+- **Record cache** (`MessageStore::loadMessageForDisplay()`): 10 records,
+  byte-exact, heap; every store write updates a cached record, a removal,
+  a failed write or an external change drops it. The render, re-entry and
+  rotations read what the viewport already read.
+- **The shared index stays current**: mutations of other conversations
+  leave it valid; its own conversation's writes and removals are patched
+  in place. A **parked** second index keeps the last chat.
+- **The boot sweep visits each configured group's Everyone first**; its
+  recount (which reads every record anyway) feeds that chat's index
+  (`beginIndexFeed()`/`feedIndexRecord()`), or the parked index while a
+  chat is open (it never replaces the index an open chat draws from).
+- **Stepped, time-budgeted loads** (`stepConversationIndex()`, 4 reads or
+  about 20 ms per pass); Notifications and the Outbox pause while a chat
+  loads. The chats show "Loading messages..." (or keep what they drew),
+  hold input in order (`held_input.h`, 32 events, heap) and replay it once
+  ready; Back leaves at once; input that cannot be held (full, no memory)
+  completes the index in that pass instead. Every event, held or live, goes
+  through `isReplayedSend()` at dispatch. A Back already queued skips the
+  history-side events before it. The selection follows its message (by
+  sequence) whenever the index changes under it, so a reload or patch
+  never moves it onto another message.
+- **Outbox**: the blocking whole-store scan is replaced by an incremental
+  pass of header-only reads (at most 4 per step within the budget), once
+  per boot after connecting and after an external change; a record written
+  pending is queued directly (`setOnPendingWrittenCallback()`). Pending
+  records stay durable on flash; the flag is cleared only after a publish
+  succeeds.
+
+New `storage_test` cases (host operation counts; the device-cost model
+`LittleFS.onFileOpen` adds 63 ms per file open to the mock clock -- a model,
+not device timing): CE1/CE1b/CE2/CE2b/CE3 entry and re-entry costs;
+CE13 every record served equals its file; CE15 the cache keeps conversations
+apart; CE16 a recount never replaces an open chat's index; CE17 the sweep
+reads each record once; CE18 a deleted cached record is not served;
+CE19/CE20 the parked index follows its conversation, a failed rename loses
+the record from every index; CE21/CE22 the parked feed; CE23 the selection
+stays on its message; DM1-DM3 device-cost model entries; IN1-IN7 held input
+(order, overflow, allocation failure via `operator new[](nothrow)`, Send
+replay in Text and Enigma, one Morse sequence, Back after queued rotations,
+Back while loading); OB1-OB7 the Outbox. ST15 and CE17 run offline (the
+Outbox would publish or read the pending records). `mutate_notify.py`
+targets the store, both chats, Notifications and `outbox.cpp`, three
+mutants at a time (`MUT_JOBS`).
+
 ## Heap diagnostics (for hardware acceptance)
 
 `race.cpp` writes one serial line per heap reading:

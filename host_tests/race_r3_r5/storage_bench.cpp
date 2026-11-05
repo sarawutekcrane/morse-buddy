@@ -13,7 +13,12 @@
 // (legacy_store.h), as older firmware left it. Host time is reported but is NOT device time; the
 // operation counts are what carries over.
 //
-// Usage: storage_bench <fsroot> <conversations> <messagesPerConversation> <seconds>
+// Conversation 0 is the group's broadcast conversation (EVERYONE). With the
+// optional msPerOpen, every file open advances the mock clock by that much
+// (device A on 2ed04b6: about 63 ms), and B0b/B2 report the simulated time
+// until the chat is drawn -- a cost model, not device timing.
+//
+// Usage: storage_bench <fsroot> <conversations> <messagesPerConversation> <seconds> [msPerOpen]
 #include "stubs.h"
 #include "core/menu.cpp"
 #include "core/notifications.cpp"
@@ -138,20 +143,39 @@ static int unreadOnFlash(const char* contact) {
 static void menuStub() {}
 
 int main(int argc, char** argv) {
-  if (argc < 5) { printf("usage: storage_bench <fsroot> <conversations> <msgs> <seconds>\n"); return 2; }
+  if (argc < 5) { printf("usage: storage_bench <fsroot> <conversations> <msgs> <seconds> [msPerOpen]\n"); return 2; }
   LittleFS.root = argv[1];
   int convs = atoi(argv[2]), msgs = atoi(argv[3]), seconds = atoi(argv[4]);
+  static uint32_t msPerOpen = argc > 5 ? static_cast<uint32_t>(atoi(argv[5])) : 0;
   LittleFS.wipe();
   T::reset();
   MessageStore::init();
   char contact[16];
+  auto contactName = [&](int c) {
+    if (c == 0) snprintf(contact, sizeof(contact), "%s", MessageStore::kEveryone);
+    else snprintf(contact, sizeof(contact), "B%011d", c);
+    return contact;
+  };
   for (int c = 0; c < convs; c++) {
-    snprintf(contact, sizeof(contact), "B%011d", c);
+    contactName(c);
     for (int i = 0; i < msgs; i++) storeLegacy(contact, PacketCodec::MSG_TYPE_TEXT, i % 5 != 4, i % 5 != 4, 1700000000u + i * 60);
   }
   printf("history: %d conversations x %d messages (4 of 5 received, all received ones flagged unread as legacy firmware left them)\n",
          convs, msgs);
 
+  if (msPerOpen > 0) LittleFS.onFileOpen = [](const std::string&) { T::now += msPerOpen; };
+  // Opens the chat and runs passes until it is drawn (no "Loading messages..."):
+  // returns the simulated time it took.
+  auto openUntilDrawn = [&](const char* c, Worst* ui, Worst* svc) {
+    TextMessage::navigateToChatDirect(kG, c);
+    uint32_t start = T::now;
+    for (int i = 0; i < 5000; i++) {
+      loopPass(svc, ui);
+      std::string v = T::visibleJoined();
+      if (i > 0 && v.find("Loading messages") == std::string::npos && v.find("Bob") != std::string::npos) break;
+    }
+    return T::now - start;
+  };
   // Boot: services' init, then the Main Menu.
   g_fs.clear();
   Menu::init(); g_stackSize = 1; Menu::consumeJustEntered();
@@ -163,11 +187,11 @@ int main(int argc, char** argv) {
          (unsigned long long)afterInit.fs.dirEntries, (unsigned long long)afterInit.fs.writes, afterInit.nvs, tInit);
 
   // B0b: the last conversation's chat, opened at once (legacy-size history).
-  snprintf(contact, sizeof(contact), "B%011d", convs - 1);
-  TextMessage::navigateToChatDirect(kG, contact);
+  contactName(convs - 1);
   Worst openLegacy;
-  loopPass(nullptr, &openLegacy); loopPass(nullptr, &openLegacy);
-  openLegacy.print("B0b open chat at boot (2 passes)");
+  uint32_t b0bMs = openUntilDrawn(contact, &openLegacy, &openLegacy);
+  openLegacy.print("B0b open chat at boot (until drawn)");
+  if (msPerOpen > 0) printf("   B0b simulated: %u ms until drawn (%u ms per open)\n", b0bMs, msPerOpen);
   T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
   loopPass(nullptr, nullptr); loopPass(nullptr, nullptr);
 
@@ -192,11 +216,11 @@ int main(int argc, char** argv) {
   idleUi.print("B1 idle: Main Menu per loop pass");
   printf("   after %ds idle: Text badge=%d\n", seconds, Notifications::hasAnyUnreadText() ? 1 : 0);
 
-  // B2: open the first conversation's Text chat and rotate up 20 messages.
-  TextMessage::navigateToChatDirect(kG, "B00000000000");
+  // B2: open the broadcast chat (conversation 0) and rotate up 20 messages.
   Worst openUi;
-  loopPass(nullptr, &openUi); loopPass(nullptr, &openUi);
-  openUi.print("B2 open chat (2 loop passes)");
+  uint32_t b2Ms = openUntilDrawn(contactName(0), &openUi, &openUi);
+  openUi.print("B2 open chat (until drawn)");
+  if (msPerOpen > 0) printf("   B2 simulated: %u ms until drawn\n", b2Ms);
   Worst rotUi, rotSvc;
   for (int i = 0; i < 20; i++) {
     T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
@@ -208,8 +232,8 @@ int main(int argc, char** argv) {
   for (int i = 0; i < passes; i++) loopPass(&afterSvc, &afterUi);
   afterSvc.print("B2 then idle in chat: services");
   afterUi.print("B2 then idle in chat: UI (redraws)");
-  printf("   unread on flash in B00000000000 after rotation + %ds: %d (of %d received)\n", seconds, unreadOnFlash("B00000000000"),
-         msgs - msgs / 5);
+  printf("   unread on flash in %s after rotation + %ds: %d (of %d received)\n", MessageStore::kEveryone, seconds,
+         unreadOnFlash(MessageStore::kEveryone), msgs - msgs / 5);
 
   // B3: back to the Main Menu, rotate it 20 times.
   T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));

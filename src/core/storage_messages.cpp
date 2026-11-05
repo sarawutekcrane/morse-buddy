@@ -1317,11 +1317,15 @@ struct CachedRecord {
   uint32_t lastUse;
   uint8_t* bytes;  // heap, exactly the record file's bytes
 };
-CachedRecord g_recordCache[kRecordCacheSlots];
+// The slot table is on the heap too (static DRAM has no room for it),
+// allocated by the first record kept.
+CachedRecord* g_recordCache = nullptr;
 uint32_t g_recordCacheClock = 0;
 
 CachedRecord* findCachedRecord(const char* group_code, const char* contact_key, uint32_t seq) {
-  for (auto& c : g_recordCache) {
+  if (g_recordCache == nullptr) return nullptr;
+  for (uint8_t i = 0; i < kRecordCacheSlots; i++) {
+    CachedRecord& c = g_recordCache[i];
     if (c.valid && c.seq == seq && strcmp(c.contact, contact_key) == 0 && strcmp(c.group, group_code) == 0) return &c;
   }
   return nullptr;
@@ -1348,9 +1352,14 @@ bool fillCachedRecord(CachedRecord& c, const uint8_t* bytes, size_t len) {
 void keepCachedRecord(const MessageRef& ref, const uint8_t* bytes, size_t len) {
   if (len == 0 || len > kMaxRecordFileSize) return;
   if (strlen(ref.group_code) >= PacketCodec::kGroupCodeLen || strlen(ref.contact_key) >= kContactKeyLen) return;
+  if (g_recordCache == nullptr) {
+    g_recordCache = new (std::nothrow) CachedRecord[kRecordCacheSlots]();
+    if (g_recordCache == nullptr) return;  // no memory: not cached (read from flash again)
+  }
   CachedRecord* slot = findCachedRecord(ref.group_code, ref.contact_key, ref.sequence);
   if (slot == nullptr) {
-    for (auto& c : g_recordCache) {
+    for (uint8_t i = 0; i < kRecordCacheSlots; i++) {
+      CachedRecord& c = g_recordCache[i];
       if (!c.valid) {
         slot = &c;
         break;
@@ -1384,7 +1393,8 @@ void dropCachedRecord(const char* group_code, const char* contact_key, uint32_t 
 }
 
 void dropAllCachedRecords() {
-  for (auto& c : g_recordCache) c.valid = false;
+  if (g_recordCache == nullptr) return;
+  for (uint8_t i = 0; i < kRecordCacheSlots; i++) g_recordCache[i].valid = false;
 }
 
 bool cachedRecordBytes(const char* group_code, const char* contact_key, uint32_t seq, const uint8_t** bytes,
