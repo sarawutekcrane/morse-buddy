@@ -296,14 +296,17 @@ bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t 
   bool removed = LittleFS.remove(path);
   dropCachedRecord(group_code, contact_key, seq);
   afterRecordRemove(group_code, contact_key, seq, removed);
-  if (removed && notifyIfUnread && haveHdr && (hdr.flags & FLAG_UNREAD) && g_onEvicted != nullptr) {
+  // A removed record whose header could not be read is reported too, as
+  // unread (conservatively): its count is then recounted, and a pending read
+  // of it ends -- its removal is known to have succeeded.
+  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {
     MessageRef ref;
     strncpy(ref.group_code, group_code, sizeof(ref.group_code) - 1);
     ref.group_code[sizeof(ref.group_code) - 1] = '\0';
     strncpy(ref.contact_key, contact_key, sizeof(ref.contact_key) - 1);
     ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
     ref.sequence = seq;
-    g_onEvicted(ref, hdr.flags);
+    g_onEvicted(ref, haveHdr ? hdr.flags : static_cast<uint16_t>(FLAG_UNREAD));
   }
   return removed;
 }

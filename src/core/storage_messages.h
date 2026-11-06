@@ -82,8 +82,10 @@ struct ConversationIndexEntry {
   uint16_t flags;
 };
 
-// Called whenever an UNREAD record is evicted (FIFO or global low-space),
-// so Notifications can decrement its per-conversation summary. Optional.
+// Called whenever an UNREAD record (or one whose header could not be read,
+// reported with FLAG_UNREAD) is evicted (FIFO or global low-space) -- only
+// once its removal succeeded -- so Notifications can correct its
+// per-conversation summary and end a pending read of it. Optional.
 using EvictedCallback = void (*)(const MessageRef& ref, uint16_t flags);
 void setOnEvictedCallback(EvictedCallback cb);
 

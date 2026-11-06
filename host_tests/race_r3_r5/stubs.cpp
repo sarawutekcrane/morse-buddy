@@ -45,6 +45,7 @@ uint32_t inputDropped = 0;
 uint32_t unixTime = 1700000000u;
 bool realGlyphs = false;
 bool realWrap = false;
+bool groupConfigured = true;
 bool scanUnreliable = false;
 bool listUnreliable = false;
 unsigned listings = 0;
@@ -53,7 +54,7 @@ void reset() {
   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0; deviceQueue().clear();
   connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
-  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; realWrap = false; scanUnreliable = false; listUnreliable = false; listings = 0;
+  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; realWrap = false; groupConfigured = true; scanUnreliable = false; listUnreliable = false; listings = 0;
 }
 std::string visibleJoined() { std::string s; for (auto& d : screen) { s += d.text; s += '|'; } return s; }
 std::string rowAt(int y) {
@@ -368,7 +369,7 @@ bool readMovedOnto(const char*, const char*, uint32_t, const char*) { return tru
 }
 #endif
 namespace Settings {
-FamilyGroup getGroup(uint8_t) { FamilyGroup g{}; g.configured = true; strcpy(g.name, "Fam"); strcpy(g.code, "GROUP1"); return g; }
+FamilyGroup getGroup(uint8_t) { FamilyGroup g{}; g.configured = T::groupConfigured; strcpy(g.name, "Fam"); strcpy(g.code, "GROUP1"); return g; }
 uint8_t getGroupCount() { return 1; }
 const char* getMyName() { return ""; }
 uint8_t getMyColorIndex() { return IdentityColor::kInvalidColor; }

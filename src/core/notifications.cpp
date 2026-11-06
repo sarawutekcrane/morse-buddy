@@ -73,11 +73,24 @@ constexpr const char* kOldReadUpKey = "readup";
 // one record rewrite per step (serviceTick()), before any other job. Nothing
 // is written or listed on the cursor-movement path. The count is decremented
 // only once the rewrite clearing FLAG_UNREAD succeeded, so counts and badges
-// always describe what is on flash. A rewrite (or read) that fails is
-// retried (kBackoffMinMs doubling, at most kBackoffMaxMs) and moved behind
-// the others, until it succeeds or the request is dropped: its record gone
-// (seen absent by two complete listings, on two attempts), now holding
-// another message, or no longer unread.
+// describe what is on flash, except after a rewrite whose outcome is unknown
+// (see applyRead(): the conversation is then recounted). A rewrite (or
+// read) that fails is retried (kBackoffMinMs doubling, at most
+// kBackoffMaxMs) and moved behind the others.
+//
+// Trustworthy completion only. A request ends when its rewrite succeeded;
+// when its record, loaded, is already read or holds another message (its
+// sequence reused); when the store reports that record's removal as done
+// (eviction, trimming: forgetPendingReads()); when the same message was
+// read by its explicit DOT action; or when its group is no longer
+// configured (deleted). A record that cannot be loaded is never taken as
+// gone: through the Arduino API a failed open, or a directory listing cut
+// short by a read error, looks exactly like absence. Such a request keeps
+// its slot and is retried with backoff -- until the record loads again, or
+// until reboot if it really disappeared without a removal the store could
+// report (a rewrite whose rename failed, a file removed outside the store).
+// One retry is one failed open, about once a minute at most; it never
+// blocks the other requests or the other background work.
 //
 // Finite capacity: at most kMaxPendingReads accepted requests. A request
 // that finds the list full (a burst of moves, or earlier requests waiting
@@ -97,7 +110,6 @@ struct PendingRead {
   uint32_t sequence;
   uint32_t retryAtMs;  // 0: due now
   uint8_t failures;    // rewrites (or reads) that failed so far
-  uint8_t absentSeen;  // the last attempt found the record absent from a complete listing
 };
 struct PendingReads {
   uint8_t count;
@@ -581,37 +593,25 @@ void finishRecount() {
 
 // ---- per-message read (see PendingRead above) -----------------------------
 
-void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence);
+void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence,
+                        const char* messageId = nullptr);
 
-// Whether a complete, reliable listing of the conversation shows the record
-// gone. A failed or incomplete (truncated: more records than a listing holds)
-// listing, or no memory for it, is not a confirmation. (A directory read
-// error that ends the listing early cannot be told from its end through the
-// Arduino API: hence the second listing applyRead() requires.)
-bool recordConfirmedGone(const MessageRef& ref) {
-  uint32_t* seqs = new (std::nothrow) uint32_t[MessageStore::kMaxMessagesPerThread];
-  if (seqs == nullptr) return false;
-  bool reliable = false, truncated = false;
-  uint16_t n = MessageStore::listMessageSequences(ref.group_code, ref.contact_key, seqs, MessageStore::kMaxMessagesPerThread,
-                                                  &reliable, &truncated);
-  bool listed = false;
-  for (uint16_t i = 0; i < n && !listed; i++) listed = seqs[i] == ref.sequence;
-  delete[] seqs;
-  return reliable && !truncated && !listed;
+// The conversation's count may no longer describe flash (a rewrite whose
+// outcome is unknown): recounted from the flags.
+void invalidateCount(const char* group_code, const char* contact_key) {
+  Summary* s = findSummary(group_code, contact_key);
+  if (s == nullptr || s->state != SUMMARY_COUNTED) return;
+  markUnresolved(s, 0);
+  saveSummaries();
 }
 
 enum class ReadOutcome : uint8_t { DONE, RETRY };
 
 // After a failed attempt, the record may have changed without its count
-// following: a rewrite reported failed after its rename (flag cleared), or
-// one whose rename failed after the old file was removed (record gone, see
-// atomicRewrite()). Recount rather than guess.
+// following. Recount rather than guess.
 void recountAfterFailedAttempt(const PendingRead& p) {
   if (p.failures == 0) return;
-  Summary* s = findSummary(p.group_code, p.contact_key);
-  if (s == nullptr || s->state != SUMMARY_COUNTED) return;
-  markUnresolved(s, 0);
-  saveSummaries();
+  invalidateCount(p.group_code, p.contact_key);
 }
 
 // Clears this one message's FLAG_UNREAD on flash and, only once that
@@ -622,20 +622,11 @@ ReadOutcome applyRead(PendingRead& p) {
   strncpy(ref.group_code, p.group_code, sizeof(ref.group_code) - 1);
   strncpy(ref.contact_key, p.contact_key, sizeof(ref.contact_key) - 1);
   ref.sequence = p.sequence;
+  if (!isConfiguredGroup(p.group_code)) return ReadOutcome::DONE;  // the group was deleted: nothing of it is shown
   StoredMessageView view;
-  if (!MessageStore::loadMessage(ref, &view)) {
-    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone
-      p.absentSeen = 0;
-      return ReadOutcome::RETRY;
-    }
-    if (!p.absentSeen) {  // absent once: confirmed only by a later, second listing
-      p.absentSeen = 1;
-      return ReadOutcome::RETRY;
-    }
-    recountAfterFailedAttempt(p);  // deleted or evicted: nothing to read
-    return ReadOutcome::DONE;
-  }
-  p.absentSeen = 0;
+  // Not loadable: unreadable for now, or gone -- which cannot be told apart
+  // (see above). Kept, retried.
+  if (!MessageStore::loadMessage(ref, &view)) return ReadOutcome::RETRY;
   if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {
     recountAfterFailedAttempt(p);  // another message holds the sequence now: it is not read
     return ReadOutcome::DONE;
@@ -645,9 +636,19 @@ ReadOutcome applyRead(PendingRead& p) {
     return ReadOutcome::DONE;
   }
   Summary* s = findSummary(p.group_code, p.contact_key);
-  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return ReadOutcome::RETRY;
-  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread
   int slot = slotForType(view.envelope.message_type);
+  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) {
+    // Retried. The record, read back: still there (a plain failure; should
+    // the flag be cleared after all, the next attempt finds it read and
+    // recounts), or not loadable -- the rewrite's outcome unknown (a failed
+    // rename may have lost it, see atomicRewrite()): its count is recounted.
+    StoredMessageView after;
+    bool same = MessageStore::loadMessage(ref, &after) &&
+                strncmp(after.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) == 0;
+    if (!same) invalidateCount(p.group_code, p.contact_key);
+    return ReadOutcome::RETRY;
+  }
+  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread
   if (s != nullptr && s->state == SUMMARY_COUNTED && slot >= 0 && s->unread[slot] > 0) {
     s->unread[slot]--;
     saveSummaries();
@@ -690,15 +691,16 @@ bool stepPendingRead() {
   return false;
 }
 
-// Pending reads of a record that is gone (sequence given), of a whole
-// conversation (contact given, no sequence) or of a whole group.
-void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence) {
-  if (g_reads == nullptr) return;
+// Ends the pending reads of one record whose removal the store reported
+// done (group, contact and sequence), or -- message id given too -- of that
+// exact message once read another way. Nothing of any other record,
+// conversation or group.
+void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence, const char* messageId) {
+  if (g_reads == nullptr || contact_key == nullptr || sequence == nullptr) return;
   for (uint8_t i = g_reads->count; i-- > 0;) {
     const PendingRead& p = g_reads->items[i];
-    if (strcmp(p.group_code, group_code) != 0) continue;
-    if (contact_key != nullptr && strcmp(p.contact_key, contact_key) != 0) continue;
-    if (sequence != nullptr && p.sequence != *sequence) continue;
+    if (strcmp(p.group_code, group_code) != 0 || strcmp(p.contact_key, contact_key) != 0 || p.sequence != *sequence) continue;
+    if (messageId != nullptr && strncmp(p.messageId, messageId, PacketCodec::kMessageIdLen) != 0) continue;
     removePendingRead(i);
     if (g_reads == nullptr) return;
   }
@@ -898,9 +900,10 @@ bool hasBadge(uint8_t mask) {
   return false;  // no stored message type maps to BADGE_TRAINING_GAME (Race ORs in its own flag)
 }
 
-// An UNREAD record was evicted (the append path's retention cap or low-space
-// cleanup; background trimming deletes through deleteMessage(), uncounting as
-// it goes, and never comes here).
+// An UNREAD record (or one whose header could not be read) was evicted --
+// its removal succeeded (the append path's retention cap or low-space
+// cleanup; background trimming deletes through deleteMessage(), uncounting
+// and forgetting as it goes, and never comes here).
 // Its type can no longer be read, so the conversation becomes UNRESOLVED (its
 // badges stay lit) and is recounted in the background -- never here: this
 // runs inside an append, on the arrival path.
@@ -926,7 +929,8 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
     }
   }
   if (changed) saveSummaries();
-  forgetPendingReads(info.group_code, nullptr, nullptr);
+  // (Its pending reads end at their next attempt, once the group is no
+  // longer configured: applyRead().)
 }
 
 void serviceInit() {
@@ -992,6 +996,7 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
 
   if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return;  // still unread: still counted
   conversationChanged(group_code, contact_key);
+  forgetPendingReads(group_code, contact_key, &ref.sequence, view.envelope.message_id);  // read: nothing left to do
   Summary* s = findSummary(group_code, contact_key);
   if (s == nullptr || s->state == SUMMARY_UNRESOLVED) return;  // an UNRESOLVED one is recounted in the background
   int slot = slotForType(view.envelope.message_type);

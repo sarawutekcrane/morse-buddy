@@ -26,14 +26,14 @@ muts = [
  (EN, "Enigma: a marker on every message (sent and read too)", "    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);", "    out->unread = e != nullptr;"),
  (TX, "Text: a change kept current in the index is not redrawn (stale marker)", "  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;\n", ""),
  (EN, "Enigma: a change kept current in the index is not redrawn (stale marker)", "  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;\n", ""),
- (NT, "a read is counted before (or without) its rewrite succeeding", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return ReadOutcome::RETRY;", "  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);"),
+ (NT, "a read is counted before (or without) its rewrite succeeding", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) {\n    // Retried.", "  if (MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD) && false) {\n    // Retried."),
  (NT, "a read whose rewrite failed is dropped (not retried)", "    if (applyRead(p) == ReadOutcome::DONE) {", "    if (applyRead(p) == ReadOutcome::DONE || true) {"),
  (NT, "a failing read is retried every step (no backoff; starves the other work)", "    if (p.retryAtMs != 0 && static_cast<int32_t>(now - p.retryAtMs) < 0) continue;\n", ""),
  (NT, "a read is applied without checking the message id (another message under the same sequence is read)", "  if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {", "  if (false) {"),
  (NT, "a pending read waits behind the other background work", "  if (stepPendingRead()) return;  // the user is looking at it: before any job\n", "  if (g_job == nullptr && g_sweep == nullptr && stepPendingRead()) return;\n"),
  (NT, "a read does not restart a recount under way", "  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread\n", ""),
  (NT, "a read decrements an UNRESOLVED summary's category flag", "  if (s != nullptr && s->state == SUMMARY_COUNTED && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;", "  if (s != nullptr && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;"),
- (NT, "after a failed attempt, a changed or vanished record is not recounted", "  if (p.failures == 0) return;\n  Summary* s = findSummary(p.group_code, p.contact_key);", "  return;\n  Summary* s = findSummary(p.group_code, p.contact_key);"),
+ (NT, "after a failed attempt, a changed or vanished record is not recounted", "  if (p.failures == 0) return;\n  invalidateCount(p.group_code, p.contact_key);", "  return;\n  invalidateCount(p.group_code, p.contact_key);"),
  (NT, "the explicit DOT read is counted although its rewrite failed", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return;  // still unread: still counted", "  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);"),
  (NT, "the earlier read-up record is never erased", "  if (p.remove(kOldReadUpKey)) Serial.println", "  if (false) Serial.println"),
  (NT, "an arrival in an open Text/Enigma chat is read (readIfOpen ignored)", "  if (conversationCurrentlyOpen && readIfOpen) {", "  if (conversationCurrentlyOpen) {"),
@@ -42,12 +42,17 @@ muts = [
  (NT, "a full list applies the read at once (round 5: a synchronous rewrite on the movement path)", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return false;", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return applyRead(r) == ReadOutcome::DONE;"),
  (NT, "no memory for the list: the read applied at once (round 5)", "                    static_cast<unsigned long>(sequence));\n      return false;\n    }\n    g_reads->count = 0;", "                    static_cast<unsigned long>(sequence));\n      return applyRead(r) == ReadOutcome::DONE;\n    }\n    g_reads->count = 0;"),
  (NT, "the full list overwrites the newest pending read", "  if (g_reads->count >= kMaxPendingReads) {", "  if (g_reads->count >= kMaxPendingReads) {\n    g_reads->items[g_reads->count - 1] = r;\n    return true;\n  }\n  if (false) {"),
- (NT, "absence taken from a single listing", "    if (!p.absentSeen) {  // absent once: confirmed only by a later, second listing", "    if (false) {"),
- (NT, "absence is remembered across a listing that shows the record (not reset)", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone\n      p.absentSeen = 0;", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone"),
- (NT, "a failed listing taken as confirmation of absence", "  return reliable && !truncated && !listed;", "  return !truncated && !listed;"),
- (NT, "an incomplete (truncated) listing taken as complete", "  return reliable && !truncated && !listed;", "  return reliable && !listed;"),
  (TX, "Text: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
  (EN, "Enigma: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
+ # ---- round 7: trustworthy completion only; uncertain failures keep the request ----
+ (NT, "a record that cannot be loaded ends its request (taken as gone)", "  if (!MessageStore::loadMessage(ref, &view)) return ReadOutcome::RETRY;", "  if (!MessageStore::loadMessage(ref, &view)) return ReadOutcome::DONE;"),
+ (NT, "a deleted group's reads are still applied", "  if (!isConfiguredGroup(p.group_code)) return ReadOutcome::DONE;  // the group was deleted: nothing of it is shown\n", ""),
+ (NT, "an unknown rewrite outcome leaves the count as it was", "    if (!same) invalidateCount(p.group_code, p.contact_key);\n", ""),
+ (NT, "an eviction does not end its pending read", "  conversationChanged(ref.group_code, ref.contact_key);\n  forgetPendingReads(ref.group_code, ref.contact_key, &ref.sequence);\n  if (!(flags", "  conversationChanged(ref.group_code, ref.contact_key);\n  if (!(flags"),
+ (NT, "the explicit DOT read leaves its pending request", "  forgetPendingReads(group_code, contact_key, &ref.sequence, view.envelope.message_id);  // read: nothing left to do\n", ""),
+ (NT, "ending a request ignores its sequence (another message's request ends too)", "strcmp(p.contact_key, contact_key) != 0 || p.sequence != *sequence) continue;", "strcmp(p.contact_key, contact_key) != 0) continue;"),
+ (SM, "an evicted record whose header could not be read is not reported", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (removed && notifyIfUnread && haveHdr && (hdr.flags & FLAG_UNREAD) && g_onEvicted != nullptr) {"),
+ (SM, "a failed removal is reported as an eviction", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {"),
  # ---- date headings (round 5) ----
  (HD, "headings in UTC, not Thailand time", "  return (ts + kThaiOffsetSeconds) / 86400u;", "  return ts / 86400u;"),
  (HD, "untrusted timestamps shown with an invented date (only 0 is unknown)", "  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;", "  if (ts == 0) return kUnknownDay;"),
@@ -216,7 +221,6 @@ muts = [
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
- "an incomplete (truncated) listing taken as complete": "listMessageSequences() itself reports a truncated listing as unreliable (storage_messages.cpp: *outReliable = !openFailed && !truncated), so the explicit !truncated guard cannot change an outcome; PO6(e) shows a record outside a truncated listing kept pending either way",
  "the feed ignores the open chat (replaces the index it draws from)": "a current open-chat index is still protected by the cache check, and a stale one is reloaded by the chat's per-pass re-sync (CE23) anyway: the flag only saves that reload (cost, not correctness)",
  "an unreadable record is fed as read": "without the explicit nullptr feed the next fed record is out of step, which drops the feed; either way the fed index is never used and the chat loads itself",
 }

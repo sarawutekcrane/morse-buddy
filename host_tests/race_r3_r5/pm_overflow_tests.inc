@@ -224,7 +224,7 @@
           unreadOf(bob).size(), unreadOf(carol).size());
   }
 
-  g_test = "PO6 absence must be confirmed: a deleted record is dropped only after two complete listings without it; an unreadable record, a listing cut short once, or no memory for the listing keep the read pending";
+  g_test = "PO6 a record that cannot be loaded keeps its read pending: deleted unreported, unreadable, a listing cut short, no memory, no directory, a truncated listing (round 7; was: dropped after two absent listings)";
   {
     // (a) deleted
     freshDevice();
@@ -241,19 +241,15 @@
     loopPass(2);  // first rewrite failed: retried later
     back();
     failWrites(false);
-    MessageStore::deleteMessage(bob[2]);  // gone, Notifications not told
+    MessageStore::deleteMessage(bob[2]);  // gone, Notifications not told (deleteMessage() reports nothing)
     attempts = 0;
     LittleFS.failOpen = [](const std::string& q) { attempts += q == target; return false; };  // counts open attempts only
-    int pendingAfterFirst = -1;
-    for (int i = 0; i < 6000 && pendingReads() > 0; i++) {
-      loopPass();
-      if (attempts == 1 && pendingAfterFirst < 0) pendingAfterFirst = pendingReads();
-    }
+    runFor(120);
     LittleFS.failOpen = nullptr;
-    runFor(60);
-    CHECK(pendingAfterFirst == 1 && attempts == 2 && pendingReads() == 0 && countsMatch(kBob) && Notifications::getUnreadCount(kG, kBob) == 2,
-          "deleted: pending after the first absent listing %d (expected 1), read attempts %d (expected 2), pending now %d, count %u", pendingAfterFirst,
-          attempts, pendingReads(), Notifications::getUnreadCount(kG, kBob));
+    // Round 7: a disappearance nothing reported is not confirmed absence: the
+    // request keeps its slot and is retried with backoff (known deletions: PO8).
+    CHECK(pendingReads() == 1 && attempts >= 3 && attempts <= 8, "deleted unreported: %d pending (expected 1, kept), %d attempts in 120 s",
+          pendingReads(), attempts);
 
     // (b) unreadable for a minute, then readable: read without another visit
     freshDevice();

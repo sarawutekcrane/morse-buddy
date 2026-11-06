@@ -665,6 +665,7 @@
   }
 
 #include "pm_overflow_tests.inc"
+#include "pm_uncertain_tests.inc"
 
   // ---- measurements (printed, not checked): device-cost model, 63 ms per open ----
   {

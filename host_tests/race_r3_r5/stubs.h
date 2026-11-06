@@ -51,6 +51,9 @@ extern bool realGlyphs;
 // Display fake wrapping: false (default) = wrapLineAt() returns the rest of
 // the text as one row; true = a greedy word wrap at the row width. Reset by reset().
 extern bool realWrap;
+// Settings stub: whether its one group (GROUP1) is configured (false: as
+// after deleting it). Reset by reset().
+extern bool groupConfigured;
 // REAL_NOTIFICATIONS builds only: MessageStore::findMessagesByPredicate()
 // scans the fake store; true makes it report the scan as unreliable.
 extern bool scanUnreliable;
