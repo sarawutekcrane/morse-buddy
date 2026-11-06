@@ -1,0 +1,48 @@
+   CE1 measured: max 4 opens/pass, 4 opens total, content after 1 passes
+   CE1b measured: max 6 opens/pass, 94 opens total, content after 23 passes
+   CE2 measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE2b measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE3 measured: 4 opens to store an arrival (with its eviction) and show it in the open chat
+   CE17 measured: 80 file opens for the boot sweep of 80 records
+   CE21 variant 0 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 1 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 2 measured: 3 opens on entry, content after 1 passes
+   CE11 measured: 95 opens to load 90 records with an arrival during the load
+   DM1 1 s after boot: chat drawn after 68 passes, 5959 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   DM2 after boot work settled: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 1)
+   DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 335 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   IN6 measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   IN6c measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   OB7b measured: in 300 s, 25 reads of the unreadable record offline (sweep), 26 online: 1 Outbox passes
+   PO1 Text measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+   PO1 Enigma measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+   PO2 Text measured: UI passes while writes fail: max opens 16, dirEntries 45 (the chat's own reload), writes 0
+   PO2 Text measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+   PO2 Enigma measured: UI passes while writes fail: max opens 15, dirEntries 45 (the chat's own reload), writes 0
+   PO2 Enigma measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+FAIL [PO6 a record that cannot be loaded keeps its read pending: deleted unreported, unreadable, a listing cut short, no memory, no directory, a truncated listing (round 7; was: dropped after two absent listings)] line 251: deleted unreported: 0 pending (expected 1, kept), 2 attempts in 120 s
+FAIL [PO7 two (and many) consecutive premature listings while the record's opens fail: the record stays on flash, unread; the read stays pending throughout and is applied on recovery without another visit] line 73: Text: 6 failed attempts; pending after two consecutive empty listings 0; pending throughout 0; on flash and unread throughout 1
+FAIL [PO7 two (and many) consecutive premature listings while the record's opens fail: the record stays on flash, unread; the read stays pending throughout and is applied on recovery without another visit] line 81: Text: after recovery: bob[12] read on flash 0; 13 unread (expected 12)
+FAIL [PO7 two (and many) consecutive premature listings while the record's opens fail: the record stays on flash, unread; the read stays pending throughout and is applied on recovery without another visit] line 73: Enigma: 6 failed attempts; pending after two consecutive empty listings 0; pending throughout 0; on flash and unread throughout 1
+FAIL [PO7 two (and many) consecutive premature listings while the record's opens fail: the record stays on flash, unread; the read stays pending throughout and is applied on recovery without another visit] line 81: Enigma: after recovery: bob[12] read on flash 0; 13 unread (expected 12)
+FAIL [PO8 a known successful eviction cancels exactly its request (another stays); a failed deletion does not cancel] line 125: variant 2 evicted: 2 pending before, record still on flash 0, 2 pending after (expected 1)
+FAIL [PO9 a record gone without any notification: its request stays pending (one slot), retried with backoff; other reads and other work go on] line 183: the request: 0 pending (expected 1, kept), 2 attempts in 300 s (backoff)
+FAIL [PO9 a record gone without any notification: its request stays pending (one slot), retried with backoff; other reads and other work go on] line 185: the same conversation: bob[1] read 1; 0 pending (the uncertain one only)
+   PO9 measured (300 s, one uncertain request): 2 attempts; background max per pass opens 4 writes 0 dirEntries 13
+FAIL [PO10 a rewrite whose rename fails after the old file was removed loses the record: the request stays pending (uncertain), the count is recounted to match flash] line 211: Text: record gone 1; 0 pending (expected 1); flash 2 unread, count 2
+FAIL [PO10 a rewrite whose rename fails after the old file was removed loses the record: the request stays pending (uncertain), the count is recounted to match flash] line 211: Enigma: record gone 1; 0 pending (expected 1); flash 2 unread, count 2
+FAIL [PO11 the same message read by its explicit DOT action ends its pending request at once (exact identity); the others stay] line 234: pending 2 -> 2 (expected 2 -> 1); bob[1] read 1, bob[2] unread 1
+FAIL [PO12 a pending read of a group no longer configured (deleted) ends at its next attempt; its record is not rewritten] line 261: pending 1 -> 0; 1 rewrites; record unread 0
+MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   36 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3068 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   30 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12290 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+MEASURE -- Enigma chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   93 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 4 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7679 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   31 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12353 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+322 checks passed, 12 failed

@@ -1,0 +1,75 @@
+== toolchain: g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+== repo HEAD: 0f2e76ba34b6f259a756811f438a76ea4415c275  (working tree: )
+== 1. Room protocol E1-E27 + review findings F1-F3: ACTUAL race_protocol.cpp + crc32.cpp, several engines, broker + NVS + identity-counter fault models, ASan+UBSan
+   audited 112 publish logs; 422 receive-queue overflow drops injected
+   1028 checks passed, 0 failed
+== 1b. Race sequence numbers: ACTUAL identity.cpp near UINT32_MAX, interleaved with nextId(), exhaustion, reboots, write/read failures
+      Race numbers handed out: 10 (incl. 4 pre-existing); message-id counter now 6
+   85 checks passed, 0 failed
+== 2. Room UI (R1, R2, R3-R5, review U15-U17): ACTUAL menu.cpp + race.cpp + race_protocol.cpp + identity.cpp; peers are ACTUAL engines
+      wire: RS topic 59, payload 544, RX 610; request RX 126; reply payload 49, RX 115; TX part 66
+   418 checks passed, 0 failed
+== 3. Race Guess history browsing (RB1-RB12, ported to the room protocol): same sources
+   100 checks passed, 0 failed
+== 4. Solo and Friend regressions (unchanged tests): ACTUAL menu, number_guessing(_friend), presence, text_message, enigma
+   52 checks passed, 0 failed
+   330 checks passed, 0 failed
+== 4b. Unread marking and badges (hardware finding 3): ACTUAL menu, notifications, text_message, enigma
+   119 checks passed, 0 failed
+== 4c. Unread marking against the REAL message store (findings 1 and 3 on 23293c5): ACTUAL storage_messages.cpp on a host directory (fake_fs/), notifications, text_message, enigma, menu
+   334 checks passed, 0 failed
+   warnings in changed/related files (all builds): number_guessing.cpp:174:49: warning: 'snprintf' output may be truncated before the last format character [-Wformat-truncation=] 
+== 5. C++11 / C++17 compile (-fsyntax-only -Wall -Wextra; host fakes incl. fake_sys/) of every changed production file, baseline vs candidate
+   (a compiler error fails the script; warnings are counted and listed)
+   /home/user/morse-buddy/host_tests/race_r3_r5/out/base/core/enigma.cpp:69:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++11 base: compiled, 1 warnings
+   /home/user/morse-buddy/src/core/enigma.cpp:71:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++11 cand: compiled, 1 warnings
+   /home/user/morse-buddy/host_tests/race_r3_r5/out/base/core/enigma.cpp:69:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++17 base: compiled, 1 warnings
+   /home/user/morse-buddy/src/core/enigma.cpp:71:19: warning: comparison of integer expressions of different signedness: 'int' and 'size_t' {aka 'long unsigned int'} [-Wsign-compare]
+   gnu++17 cand: compiled, 1 warnings
+== 6. Sizes: encoded by the ACTUAL codec (step 1 E16, step 2 U14) and the RAM of the engine on this host
+   sizeof(RoomState)=652 sizeof(Entry)=28 sizeof(Engine)=2152
+     room_=652 buf_=599 rec_(MemberRecord)=84 commit_=64 disc_=288 replyRate_=160 reconcile_=80 p_=80
+   (x86-64 host layout: ESP32 is 32-bit, so pointer members are half the size there; not measured on target)
+== 6b. Storage work per main-loop pass, ACTUAL store, legacy histories written in the record format (measurement, not pass/fail; host time is not device time)
+   -- 8 conversations x 300 messages, 180 s
+   history: 8 conversations x 300 messages (4 of 5 received, all received ones flagged unread as legacy firmware left them)
+   B0 boot: service init              opens=0 dirEntries=0 writes=0 nvs=0 hostUs=13
+   B0b open chat at boot (until drawn) calls=150  per-call max: opens=8 dirEntries=300 writes=0 renames=0 removes=0 nvs=0 hostUs=591  | calls>8opens=0  totals: opens=304 dirEntries=300 writes=0 removes=0 nvs=0
+      records on flash at boot: 2400 (largest conversation 300)
+      every conversation at <=100 records after 73.0 s (simulated); now 800 records
+   B1 idle: services per loop pass    calls=9000  per-call max: opens=4 dirEntries=300 writes=0 renames=0 removes=1 nvs=1 hostUs=613  | calls>8opens=0  totals: opens=6192 dirEntries=5116 writes=0 removes=1600 nvs=8
+   B1 idle: Main Menu per loop pass   calls=9000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=13  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+      after 180s idle: Text badge=1
+   B2 open chat (until drawn)         calls=4  per-call max: opens=4 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=37  | calls>8opens=0  totals: opens=4 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 rotate x20: UI per pass         calls=20  per-call max: opens=1 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=15  | calls>8opens=0  totals: opens=16 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 rotate x20: services per pass   calls=20  per-call max: opens=3 dirEntries=0 writes=1 renames=1 removes=1 nvs=0 hostUs=321  | calls>8opens=0  totals: opens=17 dirEntries=0 writes=9 removes=9 nvs=0
+   B2 then idle in chat: services     calls=9000  per-call max: opens=3 dirEntries=0 writes=1 renames=1 removes=1 nvs=1 hostUs=508  | calls>8opens=0  totals: opens=11 dirEntries=0 writes=7 removes=7 nvs=1
+   B2 then idle in chat: UI (redraws) calls=9000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=28  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+      unread on flash in EVERYONE after rotation + 180s: 64 (of 240 received)
+   B3 Main Menu rotate x20: UI        calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=1  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   B3 Main Menu rotate x20: services  calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+      Text badge now=1
+   -- 400 conversations x 20 messages, 120 s
+   history: 400 conversations x 20 messages (4 of 5 received, all received ones flagged unread as legacy firmware left them)
+   B0 boot: service init              opens=0 dirEntries=0 writes=0 nvs=0 hostUs=10
+   B0b open chat at boot (until drawn) calls=10  per-call max: opens=8 dirEntries=20 writes=0 renames=0 removes=0 nvs=0 hostUs=63  | calls>8opens=0  totals: opens=24 dirEntries=20 writes=0 removes=0 nvs=0
+      records on flash at boot: 8000 (largest conversation 20)
+      every conversation at <=100 records after 1.0 s (simulated); now 8000 records
+   B1 idle: services per loop pass    calls=6000  per-call max: opens=4 dirEntries=20 writes=0 renames=0 removes=0 nvs=1 hostUs=306  | calls>8opens=0  totals: opens=14656 dirEntries=22032 writes=0 removes=0 nvs=4
+   B1 idle: Main Menu per loop pass   calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=19  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+      after 120s idle: Text badge=1
+   B2 open chat (until drawn)         calls=4  per-call max: opens=4 dirEntries=1 writes=0 renames=0 removes=0 nvs=0 hostUs=43  | calls>8opens=0  totals: opens=4 dirEntries=1 writes=0 removes=0 nvs=0
+   B2 rotate x20: UI per pass         calls=20  per-call max: opens=1 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=21  | calls>8opens=0  totals: opens=16 dirEntries=0 writes=0 removes=0 nvs=0
+   B2 rotate x20: services per pass   calls=20  per-call max: opens=3 dirEntries=20 writes=1 renames=1 removes=1 nvs=0 hostUs=382  | calls>8opens=0  totals: opens=17 dirEntries=20 writes=9 removes=9 nvs=0
+   B2 then idle in chat: services     calls=6000  per-call max: opens=4 dirEntries=20 writes=1 renames=1 removes=1 nvs=1 hostUs=357  | calls>8opens=0  totals: opens=1351 dirEntries=2727 writes=7 removes=7 nvs=1
+   B2 then idle in chat: UI (redraws) calls=6000  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=6  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+      unread on flash in EVERYONE after rotation + 120s: 0 (of 16 received)
+   B3 Main Menu rotate x20: UI        calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+   B3 Main Menu rotate x20: services  calls=20  per-call max: opens=0 dirEntries=0 writes=0 renames=0 removes=0 nvs=0 hostUs=0  | calls>8opens=0  totals: opens=0 dirEntries=0 writes=0 removes=0 nvs=0
+      Text badge now=1
+== 7. Targeted mutations: SKIPPED (SKIP_MUTATIONS=1)
+== RESULT: all steps passed
+exit 0

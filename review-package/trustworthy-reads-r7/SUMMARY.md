@@ -94,15 +94,15 @@ One retry costs one failed open. No listing is made.
 
 **Other results:**
 - `notify_test`: 119 passed.
-- Full `run_all.sh` suites: `evidence/run_all_suites_0f2e76b.txt`.
+- Full `run_all.sh` suites: **all passed** (`evidence/run_all_suites_0f2e76b.txt`).
 - **Mutations:**
-  - `mutate_notify.py`: 191 mutants, 8 new; the 4 obsolete absence-confirmation mutants and their equivalent entry are removed, and 2 anchors updated (`evidence/mutate_notify.txt`).
-  - `mutate_room.py`: `evidence/mutate_room.txt`.
+  - `mutate_notify.py`: 191 mutants, 8 new; the 4 obsolete absence-confirmation mutants and their equivalent entry are removed, and 2 anchors updated. **189/191 caught, 0 unexplained, 0 build errors**; the 2 survivors are the equivalents assessed in earlier rounds (`evidence/mutate_notify.txt`). Before that full run, 10 targeted runs of the new mutants were all caught.
+  - `mutate_room.py`: **104/107**, with its 3 existing "redundant guard" equivalents (`evidence/mutate_room.txt`). It was re-run because the shared stub changed.
 
 ## 4. Performance
 
 - Nothing returns to the cursor enqueue path: `readMovedOnto()` still neither writes nor lists.
-- **The uncertain-request retry path (PO9):** about once a minute, one failed open, no listing. Over 300 s: 8 attempts; per background pass at most 4 opens and 0 writes.
+- **The uncertain-request retry path (PO9):** about once a minute, one failed open, no listing. Over 300 s: 8 attempts; per background pass at most 4 opens and 0 writes. The 13 directory entries per pass in that test are Carol's recount, not the retry. On `5af4695` the same request was dropped after 2 attempts.
 - No existing performance assertion was loosened.
 - **Limit still visible:** replaying 40 held moves in one pass makes about 44 file opens in that UI pass (PO1). Input handling is not uniformly latency-bounded.
 

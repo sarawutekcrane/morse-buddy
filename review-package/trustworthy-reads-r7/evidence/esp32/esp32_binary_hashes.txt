@@ -1,0 +1,7 @@
+# ESP32 build of 0f2e76ba34b6f259a756811f438a76ea4415c275 (git archive of that commit; 87 files compared, 0 differ; pio run, espressif32@6.13.0). Not flashed.
+# Static DRAM: dram0_0_seg 124580 B; used = .dram0.heap_start - 0x3ffbdb5c.
+RAM:   [====      ]  38.0% (used 124508 bytes from 327680 bytes)
+Flash: [========  ]  83.9% (used 1208953 bytes from 1441792 bytes)
+static DRAM used 124516 of 124580 B, headroom 64 B (5af4695: 64 B)
+178f584474ea6a93271c6f4aea30d8d791530bbfd7c291c77f1589107f17b6b3  firmware.bin
+afbc12a7470c5f3d1586a0e47961541b4e90d8676e9d11bdae716e1dc9859e7d  firmware.elf

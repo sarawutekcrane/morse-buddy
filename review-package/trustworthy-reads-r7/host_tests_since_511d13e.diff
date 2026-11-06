@@ -1,0 +1,2142 @@
+diff --git a/host_tests/race_r3_r5/fake/Preferences.h b/host_tests/race_r3_r5/fake/Preferences.h
+index b96e5f7..80cf816 100644
+--- a/host_tests/race_r3_r5/fake/Preferences.h
++++ b/host_tests/race_r3_r5/fake/Preferences.h
+@@ -33,6 +33,13 @@ class Preferences {
+     return it->second.size();
+   }
+   bool isKey(const char* key) { return kv.count(key) != 0; }
++  std::function<bool(const char*)> failRemove;  // true -> this remove fails (the key stays)
++  int removes = 0;
++  bool remove(const char* key) {  // nvs_erase_key: false if absent or on error
++    removes++;
++    if (failRemove && failRemove(key)) return false;
++    return kv.erase(key) != 0;
++  }
+   bool begin(const char*, bool) { return true; }
+   uint32_t getULong(const char* key, uint32_t def) {
+     uint32_t v = def;
+diff --git a/host_tests/race_r3_r5/fake_fs/LittleFS.cpp b/host_tests/race_r3_r5/fake_fs/LittleFS.cpp
+index b0edb93..e7424e0 100644
+--- a/host_tests/race_r3_r5/fake_fs/LittleFS.cpp
++++ b/host_tests/race_r3_r5/fake_fs/LittleFS.cpp
+@@ -40,6 +40,7 @@ File File::openNextFile() {
+ }
+ std::string File::getNextFileName(bool* isDir) {
+   if (!p_ || !p_->dir || p_->next >= p_->entries.size()) return "";
++  if (LittleFS.endListing && LittleFS.endListing(p_->path, p_->next)) return "";
+   std::string child = (p_->path == "/" ? "" : p_->path) + "/" + p_->entries[p_->next++];
+   g_fs.dirEntries++;
+   std::error_code ec;
+diff --git a/host_tests/race_r3_r5/fake_fs/LittleFS.h b/host_tests/race_r3_r5/fake_fs/LittleFS.h
+index 4da0f3d..5f4d7d8 100644
+--- a/host_tests/race_r3_r5/fake_fs/LittleFS.h
++++ b/host_tests/race_r3_r5/fake_fs/LittleFS.h
+@@ -52,6 +52,10 @@ struct HostLittleFS {
+   std::function<bool(const std::string&)> failRemove;  // true -> this remove() fails (nothing removed)
+   std::function<bool(const std::string&)> failRename;  // true (given the target) -> this rename() fails
+   std::function<void(const std::string&)> onFileOpen;  // runs on every successful file open (a device-cost model)
++  // true (given the directory and the entry's position) -> getNextFileName()
++  // returns "" there: a readdir error, which the Arduino API reports exactly
++  // like the end of the directory.
++  std::function<bool(const std::string& dir, size_t pos)> endListing;
+   bool reverseListing = false;  // directories list in reverse name order (LittleFS promises no order)
+   bool begin(bool = false, const char* = "/littlefs", int = 10, const char* = "spiffs") { return true; }
+   File open(const char* path, const char* mode = "r");
+diff --git a/host_tests/race_r3_r5/legacy_store.h b/host_tests/race_r3_r5/legacy_store.h
+index eeef528..fc0c2cf 100644
+--- a/host_tests/race_r3_r5/legacy_store.h
++++ b/host_tests/race_r3_r5/legacy_store.h
+@@ -65,7 +65,7 @@ inline MessageRef writeLegacyRecordBytes(const char* group, const char* contact,
+   if (!MessageStore::loadMessage(ref, &v) || v.header.direction != dir || v.header.flags != flags ||
+       v.header.effective_sort_timestamp != ts || v.header.local_write_sequence != seq ||
+       strcmp(v.envelope.message_id, env.message_id) != 0 || v.envelope.message_type != env.message_type) {
+-    printf("legacy record does not read back through MessageStore::loadMessage (format drift)\n");
++    printf("legacy record does not read back through MessageStore::loadMessage (format drift) [%s/%s seq %u: dir %d/%d flags %u/%u ts %u/%u]\n", group, contact, seq, (int)v.header.direction, (int)dir, v.header.flags, flags, v.header.effective_sort_timestamp, ts);
+     exit(3);
+   }
+   MessageStore::notifyExternalStorageMutationAttempted();  // written outside the store: its caches are stale
+diff --git a/host_tests/race_r3_r5/mutate_notify.py b/host_tests/race_r3_r5/mutate_notify.py
+index a37f0e6..358a254 100644
+--- a/host_tests/race_r3_r5/mutate_notify.py
++++ b/host_tests/race_r3_r5/mutate_notify.py
+@@ -6,33 +6,69 @@
+ # mutation must fail at least one of them.
+ import os, subprocess, sys, shutil, tempfile
+ H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
+-NT, TX, EN, SM, OB, IQ = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h"
++NT, TX, EN, SM, OB, IQ, HD = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h", "history_dates.h"
+ muts = [
+- # ---- reading in the chats ----
+- (TX, "Text: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
+- (EN, "Enigma: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
+- (TX, "Text: every message in the chat marked read on entry", "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n",
+-  "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n    for (uint16_t k = 0; k < MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey); k++) Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, k, MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey));\n"),
+  # ---- categories ----
+  (NT, "GAME record does not light the Text badge", "    if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0 || s.unread[SLOT_GAME] > 0)) return true;", "    if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0)) return true;"),
+  (NT, "categories merged again (any unread lights every badge)", "    if (s.state == SUMMARY_FREE) continue;  // COUNTED: counts; UNRESOLVED: category flags -- same test\n", "    if (s.state == SUMMARY_FREE) continue;\n    if (totalUnread(s) > 0 && (mask & (BADGE_TEXT | BADGE_ENIGMA))) return true;\n"),
+  (NT, "clear decrements the wrong category", "  int slot = slotForType(view.envelope.message_type);\n  if (slot >= 0 && s->unread[slot] > 0) {", "  int slot = SLOT_GAME;\n  if (slot >= 0 && s->unread[slot] > 0) {"),
+  (NT, "arrival counted under a guessed category when the stored type is known", "    int slot = loaded ? slotForType(view.envelope.message_type) : -1;", "    int slot = loaded ? SLOT_GAME : -1;"),
+- # ---- read up to the selection (hardware finding 1 on 23293c5) ----
+- (NT, "read-up ignores the message type", "  if (a.type != type || !sameConversation(", "  if (!sameConversation("),
+- (NT, "read-up ignores the sequence (a later arrival with an older timestamp is read)", "  if (sequence > a.sequence) return false;\n", ""),
+- (NT, "read-up reads newer messages too", "  if (sortTs != a.sortTs) return sortTs < a.sortTs;", "  if (sortTs != a.sortTs) return true;"),
+- (NT, "read-up never saved (lost at reboot)", "  r.items[r.count++] = add;\n  readUpsChanged();\n  return true;", "  r.items[r.count++] = add;\n  return true;"),
+- (NT, "read-up written to NVS on the encoder path", "  r.items[r.count++] = add;\n  readUpsChanged();\n  return true;", "  r.items[r.count++] = add;\n  writeReadUps();\n  return true;"),
+- (NT, "read-up rewrites the flags on the encoder path", "  if (!addReadUp(r)) return;  // covered by an earlier selection\n",
+-  "  if (!addReadUp(r)) return;  // covered by an earlier selection\n  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);\n"),
+- (NT, "read-up attempt ends after one pass even if a rewrite failed", "  if (left && j.pass + 1 < kReadUpPasses) {", "  if (false) {"),
+- (NT, "read-up marked done while a read or rewrite is still unsuccessful", "  if (left) {\n    ReadUp* x = findReadUp(j.readUp);", "  if (false) {\n    ReadUp* x = findReadUp(j.readUp);"),
+- (NT, "a failing read-up is retried at once, every time (no backoff; starves the other work)", "      if (r.done || (r.retryAtMs != 0 && static_cast<int32_t>(now - r.retryAtMs) < 0)) continue;", "      if (r.done) continue;"),
+- (NT, "a failing read-up is never retried", "      if (r.done || (r.retryAtMs != 0 && static_cast<int32_t>(now - r.retryAtMs) < 0)) continue;", "      if (r.done || r.retryAtMs != 0) continue;"),
+- (NT, "badge waits for the background (no immediate count)", "  if (s->state == SUMMARY_COUNTED) {\n    if (s->unread[slot] == remaining) return;\n    s->unread[slot] = remaining;\n  } else {\n    s->unread[slot] = remaining > 0 ? 1 : 0;\n  }", "  (void)remaining;"),
+- (NT, "recount ignores pending read-ups", "      if (slot >= 0 && !coveredByPendingReadUp(j.group_code, j.contact_key, view.header, view.envelope, ref.sequence))", "      if (slot >= 0)"),
+- (NT, "a read-up does not restart a recount under way", "  conversationChanged(group_code, contact_key);  // a recount under way may have counted what is now read\n", ""),
++ # ---- per-message read (round 5: replaces read up to the selection) ----
++ (TX, "Text: a move onto a message does not read it", "      readMessageMovedOnto(fromMessage, fromSeq);\n", "\n"),
++ (EN, "Enigma: a move onto a message does not read it", "      readMessageMovedOnto(fromMessage, fromSeq);\n", "\n"),
++ (TX, "Text: the selection is read every pass (restored or followed selections, arrivals under it)", "  if (g_inputLost && !g_sendRanThisTick) {\n", "  readMessageMovedOnto(false, 0);\n  if (g_inputLost && !g_sendRanThisTick) {\n"),
++ (EN, "Enigma: the selection is read every pass (restored or followed selections, arrivals under it)", "  if (g_inputLost && !g_sendRanThisTick) {\n", "  readMessageMovedOnto(false, 0);\n  if (g_inputLost && !g_sendRanThisTick) {\n"),
++ (TX, "Text: an arrival in the open chat is read again", "Notifications::BADGE_TEXT, conversationOpen, false);", "Notifications::BADGE_TEXT, conversationOpen);"),
++ (EN, "Enigma: an arrival in the open chat is read again", "Notifications::BADGE_ENIGMA, conversationOpen, false);", "Notifications::BADGE_ENIGMA, conversationOpen);"),
++ (TX, "Text: no unread marker", "            if (info.unread) Display::printLineColored(kUnreadMarkerX, y, \"*\", ST77XX_YELLOW);\n", ""),
++ (EN, "Enigma: no unread marker", "            if (info.unread) Display::printLineColored(kUnreadMarkerX, y, \"*\", ST77XX_YELLOW);\n", ""),
++ (TX, "Text: a marker on every message (sent and read too)", "    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);", "    out->unread = e != nullptr;"),
++ (EN, "Enigma: a marker on every message (sent and read too)", "    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);", "    out->unread = e != nullptr;"),
++ (TX, "Text: a change kept current in the index is not redrawn (stale marker)", "  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;\n", ""),
++ (EN, "Enigma: a change kept current in the index is not redrawn (stale marker)", "  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;\n", ""),
++ (NT, "a read is counted before (or without) its rewrite succeeding", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) {\n    // Retried.", "  if (MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD) && false) {\n    // Retried."),
++ (NT, "a read whose rewrite failed is dropped (not retried)", "    if (applyRead(p) == ReadOutcome::DONE) {", "    if (applyRead(p) == ReadOutcome::DONE || true) {"),
++ (NT, "a failing read is retried every step (no backoff; starves the other work)", "    if (p.retryAtMs != 0 && static_cast<int32_t>(now - p.retryAtMs) < 0) continue;\n", ""),
++ (NT, "a read is applied without checking the message id (another message under the same sequence is read)", "  if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {", "  if (false) {"),
++ (NT, "a pending read waits behind the other background work", "  if (stepPendingRead()) return;  // the user is looking at it: before any job\n", "  if (g_job == nullptr && g_sweep == nullptr && stepPendingRead()) return;\n"),
++ (NT, "a read does not restart a recount under way", "  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread\n", ""),
++ (NT, "a read decrements an UNRESOLVED summary's category flag", "  if (s != nullptr && s->state == SUMMARY_COUNTED && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;", "  if (s != nullptr && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;"),
++ (NT, "after a failed attempt, a changed or vanished record is not recounted", "  if (p.failures == 0) return;\n  invalidateCount(p.group_code, p.contact_key);", "  return;\n  invalidateCount(p.group_code, p.contact_key);"),
++ (NT, "the explicit DOT read is counted although its rewrite failed", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return;  // still unread: still counted", "  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);"),
++ (NT, "the earlier read-up record is never erased", "  if (p.remove(kOldReadUpKey)) Serial.println", "  if (false) Serial.println"),
++ (NT, "an arrival in an open Text/Enigma chat is read (readIfOpen ignored)", "  if (conversationCurrentlyOpen && readIfOpen) {", "  if (conversationCurrentlyOpen) {"),
++ # ---- round 6: finite pending-read list, no write on the movement path, confirmed absence ----
++ (NT, "a refused read is reported as accepted", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return false;", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return true;"),
++ (NT, "a full list applies the read at once (round 5: a synchronous rewrite on the movement path)", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return false;", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return applyRead(r) == ReadOutcome::DONE;"),
++ (NT, "no memory for the list: the read applied at once (round 5)", "                    static_cast<unsigned long>(sequence));\n      return false;\n    }\n    g_reads->count = 0;", "                    static_cast<unsigned long>(sequence));\n      return applyRead(r) == ReadOutcome::DONE;\n    }\n    g_reads->count = 0;"),
++ (NT, "the full list overwrites the newest pending read", "  if (g_reads->count >= kMaxPendingReads) {", "  if (g_reads->count >= kMaxPendingReads) {\n    g_reads->items[g_reads->count - 1] = r;\n    return true;\n  }\n  if (false) {"),
++ (TX, "Text: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
++ (EN, "Enigma: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
++ # ---- round 7: trustworthy completion only; uncertain failures keep the request ----
++ (NT, "a record that cannot be loaded ends its request (taken as gone)", "  if (!MessageStore::loadMessage(ref, &view)) return ReadOutcome::RETRY;", "  if (!MessageStore::loadMessage(ref, &view)) return ReadOutcome::DONE;"),
++ (NT, "a deleted group's reads are still applied", "  if (!isConfiguredGroup(p.group_code)) return ReadOutcome::DONE;  // the group was deleted: nothing of it is shown\n", ""),
++ (NT, "an unknown rewrite outcome leaves the count as it was", "    if (!same) invalidateCount(p.group_code, p.contact_key);\n", ""),
++ (NT, "an eviction does not end its pending read", "  conversationChanged(ref.group_code, ref.contact_key);\n  forgetPendingReads(ref.group_code, ref.contact_key, &ref.sequence);\n  if (!(flags", "  conversationChanged(ref.group_code, ref.contact_key);\n  if (!(flags"),
++ (NT, "the explicit DOT read leaves its pending request", "  forgetPendingReads(group_code, contact_key, &ref.sequence, view.envelope.message_id);  // read: nothing left to do\n", ""),
++ (NT, "ending a request ignores its sequence (another message's request ends too)", "strcmp(p.contact_key, contact_key) != 0 || p.sequence != *sequence) continue;", "strcmp(p.contact_key, contact_key) != 0) continue;"),
++ (SM, "an evicted record whose header could not be read is not reported", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (removed && notifyIfUnread && haveHdr && (hdr.flags & FLAG_UNREAD) && g_onEvicted != nullptr) {"),
++ (SM, "a failed removal is reported as an eviction", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {"),
++ # ---- date headings (round 5) ----
++ (HD, "headings in UTC, not Thailand time", "  return (ts + kThaiOffsetSeconds) / 86400u;", "  return ts / 86400u;"),
++ (HD, "untrusted timestamps shown with an invented date (only 0 is unknown)", "  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;", "  if (ts == 0) return kUnknownDay;"),
++ (HD, "a heading before every message", "  return p == nullptr || thaiDay(p->effective_sort_timestamp) != thaiDay(e->effective_sort_timestamp);", "  return true;"),
++ (HD, "no heading for the first shown message", "  if (index == 0) return true;\n", "  if (index == 0) return false;\n"),
++ (HD, "the redraw signature ignores the unread flags", "    mix(e->flags & MessageStore::FLAG_UNREAD);\n", ""),
++ (TX, "Text: no headings drawn (rows still counted)", "          drawDateHeading(i, y);\n          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n", "          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n"),
++ (EN, "Enigma: no headings drawn (rows still counted)", "          drawDateHeading(i, y);\n          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n", "          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n"),
++ (TX, "Text: the viewport ignores headings", "    uint16_t rows = countVisualRowsFor(idx, labelX, &rowReliable);", "    uint16_t rows = countHistoryRowsFor(idx, labelX, &rowReliable);"),
++ (EN, "Enigma: the viewport ignores headings", "    uint16_t rows = countVisualRowsFor(idx, labelX);", "    uint16_t rows = countHistoryRowsFor(idx, labelX);"),
++ (TX, "Text: the cursor's row ignores its heading", "  return static_cast<uint16_t>((HistoryDates::startsDay(g_historyCursor) ? 1 : 0) + g_historyRowOffset);", "  return g_historyRowOffset;"),
++ (EN, "Enigma: the cursor's row ignores its heading", "  return static_cast<uint16_t>((HistoryDates::startsDay(g_historyCursor) ? 1 : 0) + g_historyRowOffset);", "  return g_historyRowOffset;"),
++ (TX, "Text: scrolling up to a message's first row leaves its heading off screen", "uint16_t cursorVisualTop() { return g_historyRowOffset == 0 ? 0 : cursorVisualRow(); }", "uint16_t cursorVisualTop() { return cursorVisualRow(); }"),
++ (EN, "Enigma: scrolling up to a message's first row leaves its heading off screen", "uint16_t cursorVisualTop() { return g_historyRowOffset == 0 ? 0 : cursorVisualRow(); }", "uint16_t cursorVisualTop() { return cursorVisualRow(); }"),
++ (TX, "Text: a row's position ignores its message's heading", "    uint16_t limit = (i == targetIdx) ? static_cast<uint16_t>(info.headerRows + targetRowIdx) : countVisualRows(info);", "    uint16_t limit = (i == targetIdx) ? targetRowIdx : countVisualRows(info);"),
++ (EN, "Enigma: a row's position ignores its message's heading", "    uint16_t limit = (i == targetIdx) ? static_cast<uint16_t>(info.headerRows + targetRowIdx) : countVisualRows(info);", "    uint16_t limit = (i == targetIdx) ? targetRowIdx : countVisualRows(info);"),
+  # ---- loading, migration, saving ----
+  (NT, "migration stores an approximate count of zero (badges of the old mask lost)", "      markUnresolved(&s, mask != 0 ? mask : static_cast<uint8_t>(BADGE_TEXT | BADGE_ENIGMA));", "      s.state = SUMMARY_COUNTED; (void)mask;"),
+  (NT, "legacy read failure taken as an empty migration", "  if (!migrateLegacyInto(dst)) {\n    memset(dst, 0, sizeof(Summary) * kMaxSummaries);\n    return LOAD_RETRY_LEGACY;\n  }", "  if (!migrateLegacyInto(dst)) {\n    memset(dst, 0, sizeof(Summary) * kMaxSummaries);\n    return LOAD_OK;\n  }"),
+@@ -71,9 +107,9 @@ muts = [
+  (NT, "several deletions per step", "    return;  // at most one deletion per step", "    continue;"),
+  (NT, "the walk reads every directory entry in one step", "constexpr uint8_t kWalkEntriesPerStep = 16;", "constexpr uint8_t kWalkEntriesPerStep = 255;"),
+  (NT, "an unreadable record is skipped (recount applied anyway)", "      j.unreliable = true;\n      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord(", "      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord("),
+- (NT, "an arrival does not restart a recount under way", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {\n  conversationChanged(group_code, contact_key);", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {"),
++ (NT, "an arrival does not restart a recount under way", "                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen) {\n  conversationChanged(group_code, contact_key);", "                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen) {"),
+  (NT, "a whole conversation per step (unbounded)", "constexpr uint8_t kLoadsPerStep = 4;", "constexpr uint8_t kLoadsPerStep = 255;"),
+- (NT, "several rewrites per step", "      j.rewrites++;\n      return;  // at most one rewrite per step", "      j.rewrites++;"),
++ (NT, "several per-message reads (rewrites) per step", "      removePendingRead(i);\n      return true;", "      removePendingRead(i);\n      if (g_reads == nullptr) return true;\n      i--;\n      continue;"),
+  # ---- message store listing ----
+  (SM, "appends keep the earlier 300-record retention", "  if (msgCount >= kRetainedMessagesPerThread) {", "  if (msgCount >= kMaxMessagesPerThread) {"),
+  (SM, "a truncated listing is reported complete", "  if (outReliable != nullptr) *outReliable = !openFailed && !truncated;", "  if (outReliable != nullptr) *outReliable = !openFailed;"),
+@@ -222,7 +258,7 @@ def one(k, mut):
+     target, name, old, new = mut
+     out = os.path.join(H, "out", "mutn%d" % k)
+     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
+-    for x in (NT, TX, EN, SM, OB, IQ, "notifications.h", "storage_messages.h", "held_input.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
++    for x in (NT, TX, EN, SM, OB, IQ, HD, "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+     p = out + "/core/" + target; src = open(p).read()
+     open(p, "w").write(src.replace(old, new))
+     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])
+diff --git a/host_tests/race_r3_r5/notify_test.cpp b/host_tests/race_r3_r5/notify_test.cpp
+index a606468..13dfcb3 100644
+--- a/host_tests/race_r3_r5/notify_test.cpp
++++ b/host_tests/race_r3_r5/notify_test.cpp
+@@ -15,10 +15,14 @@
+ 
+ // ---- the MessageStore/Storage/Sleep/sound hooks notifications.cpp needs ----
+ namespace MessageStore {
+-void updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
++bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
++  bool found = false;
+   for (auto& r : T::store)
+-    if (r.ref.sequence == ref.sequence && !strcmp(r.ref.group_code, ref.group_code) && !strcmp(r.ref.contact_key, ref.contact_key))
++    if (r.ref.sequence == ref.sequence && !strcmp(r.ref.group_code, ref.group_code) && !strcmp(r.ref.contact_key, ref.contact_key)) {
+       r.hdr.flags = static_cast<uint16_t>((r.hdr.flags | setMask) & ~clearMask);
++      found = true;
++    }
++  return found;
+ }
+ void setOnEvictedCallback(EvictedCallback) {}
+ }  // namespace MessageStore
+@@ -58,7 +62,7 @@ inline void resetRetryClock() { Notifications::g_nextRetryMs = T::now; }
+ inline int stateField(const Notifications::Summary* x) { return x->state; }
+ // Every piece of volatile notification state goes back to its power-on value:
+ // a reboot keeps only the simulated durable storage (g_notifyPrefs, T::store).
+-// Heap objects (sweep, job, read-up list) are freed before their pointers
++// Heap objects (sweep, job, pending reads) are freed before their pointers
+ // are cleared. -DNOTIFY_HEAD builds against 23293c5's notifications.cpp
+ // (no jobs or read-ups) for before/after evidence.
+ inline void resetVolatile() {
+@@ -72,12 +76,10 @@ inline void resetVolatile() {
+   Notifications::g_recountFailures = 0;
+   delete Notifications::g_job;
+   Notifications::g_job = nullptr;
+-  delete Notifications::g_readUps;
+-  Notifications::g_readUps = nullptr;
+-  Notifications::g_readUpsDirty = false;
++  delete Notifications::g_reads;
++  Notifications::g_reads = nullptr;
+   Notifications::g_nextStepMs = T::now;
+   Notifications::g_saveDueMs = 0;
+-  Notifications::g_readUpsDueMs = 0;
+ #endif
+   memset(Notifications::g_summaries, 0, sizeof(Notifications::g_summaries));
+   Notifications::g_loadState = Notifications::LOAD_OK;
+@@ -200,8 +202,8 @@ static void notifyTick(int n = 1) {
+     while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; T_beginServiceRound(); NV::serviceTick(); }
+   }
+ }
+-// The device stays on for 3 s: deferred writes (summary after 2 s, read-up
+-// record after 1 s) are made, and background work advances.
++// The device stays on for 3 s: deferred writes (summary after 2 s) are made,
++// pending reads are applied, and background work advances.
+ static void stayOn() {
+   uint32_t end = T::now + 3000;
+   while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; T_beginServiceRound(); NV::serviceTick(); }
+@@ -236,23 +238,27 @@ int main() {
+   openText();
+   CHECK(textBadge() && unread(m), "entering the chat (nothing selected) marked it read");
+   rot(-1); tick(2);
+-  CHECK(!textBadge(), "selected: badge %d (it follows at once)", textBadge());
++  CHECK(textBadge() && unread(m), "selected, not yet written: badge %d unread %d (round 5: the count follows the rewrite)", textBadge(),
++        unread(m));
+   stayOn();  // the flag on flash is cleared in the background
+   CHECK(!textBadge() && !unread(m), "selected: badge %d unread %d", textBadge(), unread(m));
+   back();
+   CHECK(!textBadge() && !TextMessage::isConversationOpen(kG, kBob), "after Back: badge %d", textBadge());
+ 
+-  g_test = "NR2 read up to the selection: a newer message stays unread; selecting the newest reads both (finding 1 on 23293c5)";
++  g_test = "NR2 per-message read: one move reads the newest only; two moves in one batch read both moved onto (round 5; was: read up to the selection)";
+   reset();
++  MessageRef oldest = arrive(PacketCodec::MSG_TYPE_TEXT, "ZERO");
+   MessageRef older = arrive(PacketCodec::MSG_TYPE_TEXT, "ONE");
+   MessageRef newer = arrive(PacketCodec::MSG_TYPE_TEXT, "TWO");
+   openText();
+-  rot(-1); rot(-1); tick(2);  // two detents in one batch: passes over the newest, lands on the older one
++  rot(-1); tick(2);  // the newest
+   stayOn();
+-  CHECK(unread(newer) && !unread(older) && textBadge(), "newer %d older %d badge %d", unread(newer), unread(older), textBadge());
+-  rot(+1); tick(2);  // now the newest
++  CHECK(!unread(newer) && unread(older) && unread(oldest) && textBadge(), "newer %d older %d oldest %d badge %d", unread(newer), unread(older),
++        unread(oldest), textBadge());
++  rot(+1); tick(2);  // back to compose
++  rot(-1); rot(-1); rot(-1); tick(2);  // one batch: newest (read), older, oldest
+   stayOn();
+-  CHECK(!unread(newer) && !unread(older) && !textBadge(), "newer %d older %d badge %d", unread(newer), unread(older), textBadge());
++  CHECK(!unread(older) && !unread(oldest) && !textBadge(), "older %d oldest %d badge %d", unread(older), unread(oldest), textBadge());
+   back();
+ 
+   g_test = "NR3 Enigma chat: rotating onto a received Enigma message marks it read";
+@@ -272,13 +278,13 @@ int main() {
+   MessageRef e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");
+   CHECK(textBadge() && enigmaBadge(), "precondition");
+   openText();
+-  rot(-1); rot(-1); tick(2);  // two detents in one input batch: passes over the Enigma message without drawing it selected
++  rot(-1); tick(2);  // the Enigma message (newest, Unified Thread)
+   stayOn();
+-  CHECK(!unread(t1) && unread(e1) && !textBadge() && enigmaBadge(),
+-        "only the message left selected is read: text %d enigma %d badges %d/%d", unread(t1), unread(e1), textBadge(), enigmaBadge());
+-  rot(+1); tick(2);  // now the Enigma message (Unified Thread) is selected
++  CHECK(unread(t1) && !unread(e1) && textBadge() && !enigmaBadge(), "only the message moved onto is read: text %d enigma %d badges %d/%d",
++        unread(t1), unread(e1), textBadge(), enigmaBadge());
++  rot(-1); tick(2);  // the Text message
+   stayOn();
+-  CHECK(!unread(e1) && !textBadge() && !enigmaBadge(), "badges text %d enigma %d", textBadge(), enigmaBadge());
++  CHECK(!unread(t1) && !textBadge() && !enigmaBadge(), "badges text %d enigma %d", textBadge(), enigmaBadge());
+   back();
+   reset();
+   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
+@@ -310,7 +316,8 @@ int main() {
+   tick(3);
+   CHECK(g_historyCursor == cursor && MessageStore::getIndexEntry(g_historyCursor)->sequence == m.sequence,
+         "selection moved: cursor %u", g_historyCursor);
+-  CHECK(!unread(later), "an arrival into the open chat is read (unchanged rule)");
++  CHECK(unread(later) && textBadge(), "an arrival into the open chat stays unread (round 5; was: read on arrival): unread %d badge %d", unread(later),
++        textBadge());
+   rot(+1); rot(+1); tick(2);  // back to compose
+   CHECK(strcmp(g_composeText, "DRAFT") == 0 && g_historyCursor == kNoHistoryCursor, "draft '%s' cursor %u", g_composeText,
+         g_historyCursor);
+diff --git a/host_tests/race_r3_r5/pm_overflow_tests.inc b/host_tests/race_r3_r5/pm_overflow_tests.inc
+new file mode 100644
+index 0000000..dac4143
+--- /dev/null
++++ b/host_tests/race_r3_r5/pm_overflow_tests.inc
+@@ -0,0 +1,398 @@
++// Included into pm_tests.inc (round 6): the finite pending-read list. No
++// read is ever written on the cursor-movement path; an accepted read is
++// kept by exact identity and retried until written (or its record is
++// confirmed gone); one that cannot be accepted (the list full, or no memory
++// for it) leaves its message unread and is reported ("Read not saved
++// (busy)"). Real store, real Notifications, real chats; Text and Enigma.
++{
++  const char* kBusy = "Read not saved (busy)";
++  auto busyShown = [&]() { return T::visibleJoined().find(kBusy) != std::string::npos; };
++  static bool failingWrites;
++  auto failWrites = [](bool on) {
++    failingWrites = on;
++    LittleFS.failOpen = on ? [](const std::string& p) {
++      return failingWrites && p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0;
++    } : std::function<bool(const std::string&)>();
++  };
++  // Moves onto messages, one per pass, recording the UI's work in each pass.
++  auto movesUp = [&](int n) {
++    for (int i = 0; i < n; i++) rot(-1);
++  };
++  // Indices [from, to) of refs, as a vector.
++  auto idx = [](int from, int to) {
++    std::vector<int> v;
++    for (int i = from; i < to; i++) v.push_back(i);
++    return v;
++  };
++  auto cat = [](std::vector<int> a, const std::vector<int>& b) {
++    a.insert(a.end(), b.begin(), b.end());
++    return a;
++  };
++
++  g_test = "PO1 a replay burst of 40 distinct unread selections: 32 accepted (read later, exact), 8 refused and shown unread; no write or listing in the UI pass; one rewrite per background pass";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 45, kDay06 + 600);
++    powerOn(); runFor(30);
++    // Held while the chat loads (cold), replayed in one pass once it is ready.
++    coldIndex();
++    if (enigma) Enigma::navigateToChatDirect(kG, kBob);
++    else TextMessage::navigateToChatDirect(kG, kBob);
++    loopPass();
++    bool loading = T::visibleJoined().find("Loading messages") != std::string::npos;
++    // 40 moves while loading: 32 held, 8 left in the input queue; all replayed
++    // in the pass the load completes.
++    for (int i = 0; i < 40; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    g_uiMax = PassMax();
++    int passes = 0;
++    do loopPass(); while (T::visibleJoined().find("Loading messages") != std::string::npos && passes++ < 3000);
++    PassMax ui = g_uiMax;
++    int pendingAfter = pendingReads();
++    bool unreadAfter = unreadOf(bob).size() == 45;
++    bool shown = busyShown();
++    CHECK(loading && pendingAfter == 32 && unreadAfter && shown,
++          "%s: loading %d; right after the moves: %d pending, %zu unread, busy shown %d", kChatName[enigma], loading, pendingAfter,
++          unreadOf(bob).size(), shown);
++    CHECK(ui.writes == 0 && ui.renames == 0 && ui.removes == 0 && ui.dirEntries == 0 && ui.nvs == 0,
++          "%s: UI passes (replay and the batch): writes %llu renames %llu removes %llu dirEntries %llu nvs %d", kChatName[enigma],
++          (unsigned long long)ui.writes, (unsigned long long)ui.renames, (unsigned long long)ui.removes, (unsigned long long)ui.dirEntries, ui.nvs);
++    g_svcMax = PassMax();
++    bool mismatch = false;
++    for (int i = 0; i < 500; i++) {
++      loopPass();
++      mismatch = mismatch || !countsMatch(kBob);
++    }
++    // moved onto: bob[44] .. bob[5]; accepted the first 32 (44..13), refused 12..5
++    CHECK(unreadOf(bob) == idx(0, 13) && !mismatch && pendingReads() == 0,
++          "%s: %zu unread (expected 0..12), counts ever differed from flash %d, %d still pending", kChatName[enigma], unreadOf(bob).size(), mismatch,
++          pendingReads());
++    CHECK(g_svcMax.renames <= 1 && g_svcMax.opens <= 8 && g_svcMax.nvs <= 1, "%s: per background pass: %llu rewrites, %llu opens, %d NVS",
++          kChatName[enigma], (unsigned long long)g_svcMax.renames, (unsigned long long)g_svcMax.opens, g_svcMax.nvs);
++    printf("   PO1 %s measured: UI passes max opens %llu writes %llu dirEntries %llu; background max per pass opens %llu rewrites %llu dirEntries %llu nvs %d\n",
++           kChatName[enigma], (unsigned long long)ui.opens, (unsigned long long)ui.writes, (unsigned long long)ui.dirEntries,
++           (unsigned long long)g_svcMax.opens, (unsigned long long)g_svcMax.renames, (unsigned long long)g_svcMax.dirEntries, g_svcMax.nvs);
++    back();
++  }
++
++  g_test = "PO2 the list full from earlier passes while writes keep failing: later selections refused (unread, reported), unrelated work goes on; on recovery every accepted read is written without another visit";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 45, kDay06 + 600);
++    for (int i = 0; i < 5; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, true, kDay06 + i * 60);
++    powerOn(); runFor(30);
++    failWrites(true);
++    open(enigma, kBob);
++    g_uiMax = PassMax();
++    // A failed rewrite leaves the open chat's index stale: it reloads (a
++    // stepped listing) and the moves wait for it, in order.
++    movesUp(32);  // all accepted, all failing
++    runFor(3);
++    int pending32 = pendingReads();
++    bool shownAt32 = busyShown();
++    movesUp(5);   // refused
++    runFor(3);
++    PassMax ui = g_uiMax;
++    printf("   PO2 %s measured: UI passes while writes fail: max opens %llu, dirEntries %llu (the chat's own reload), writes %llu\n", kChatName[enigma],
++           (unsigned long long)ui.opens, (unsigned long long)ui.dirEntries, (unsigned long long)ui.writes);
++    CHECK(pending32 == 32 && !shownAt32 && pendingReads() == 32 && busyShown() && unreadOf(bob).size() == 45,
++          "%s: pending %d after 32 moves (busy shown %d); after 5 more: pending %d, busy shown %d, %zu unread", kChatName[enigma], pending32,
++          shownAt32, pendingReads(), busyShown(), unreadOf(bob).size());
++    CHECK(ui.renames == 0 && ui.writes == 0 && ui.dirEntries <= 45 && ui.opens <= 24 && ui.nvs == 0,  // (24: ST6's bound for a rotation pass)
++          "%s: UI passes: renamed %llu, wrote %llu, listed %llu entries (at most the chat's own reload, one listing), %llu opens, %d NVS",
++          kChatName[enigma], (unsigned long long)ui.renames, (unsigned long long)ui.writes, (unsigned long long)ui.dirEntries,
++          (unsigned long long)ui.opens, ui.nvs);
++    // Unrelated background work while every read keeps failing: Carol recounted.
++    Notifications::Summary* carol = Notifications::findSummary(kG, kCarol);
++    if (carol != nullptr) Notifications::markUnresolved(carol, 0);
++    g_svcMax = PassMax();
++    bool mismatch = false;
++    for (int i = 0; i < 3000; i++) {  // 60 s
++      loopPass();
++      mismatch = mismatch || !countsMatch(kBob);
++    }
++    carol = Notifications::findSummary(kG, kCarol);
++    CHECK(carol != nullptr && carol->state == Notifications::SUMMARY_COUNTED && Notifications::getUnreadCount(kG, kCarol) == 5,
++          "%s: unrelated work stalled behind the failing reads (Carol state %d)", kChatName[enigma], carol ? carol->state : -1);
++    CHECK(pendingReads() == 32 && unreadOf(bob).size() == 45 && !mismatch && g_svcMax.renames == 0 && g_svcMax.dirEntries <= 300 &&
++              g_svcMax.opens <= 8,
++          "%s: while failing: %d pending, %zu unread, mismatch %d; per background pass opens %llu dirEntries %llu", kChatName[enigma],
++          pendingReads(), unreadOf(bob).size(), mismatch, (unsigned long long)g_svcMax.opens, (unsigned long long)g_svcMax.dirEntries);
++    printf("   PO2 %s measured (60 s, writes failing, 32 pending): background max per pass opens %llu writes %llu dirEntries %llu nvs %d\n",
++           kChatName[enigma], (unsigned long long)g_svcMax.opens, (unsigned long long)g_svcMax.writes, (unsigned long long)g_svcMax.dirEntries,
++           g_svcMax.nvs);
++    back();  // left the chat: the accepted reads are not the screen's
++    failWrites(false);
++    g_svcMax = PassMax();
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) {
++      loopPass();
++      mismatch = mismatch || !countsMatch(kBob);
++    }
++    // moved onto bob[44]..bob[8]; accepted 44..13; refused 12..8
++    CHECK(unreadOf(bob) == idx(0, 13) && !mismatch && g_svcMax.renames <= 1,
++          "%s: after recovery: %zu unread (expected 0..12), mismatch %d, up to %llu rewrites per pass", kChatName[enigma], unreadOf(bob).size(),
++          mismatch, (unsigned long long)g_svcMax.renames);
++  }
++
++  g_test = "PO3 no memory for the pending list: the selection is refused (unread, reported), no write; once memory returns, a selection is accepted and read";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    FsStats before = g_fs;
++    g_failNothrowNew = true;  // only for this pass's UI: the list cannot be allocated
++    T::now += 20;
++    Menu::tick();
++    g_failNothrowNew = false;
++    uint64_t uiRenames = g_fs.renames - before.renames, uiWrites = g_fs.writes - before.writes;
++    bool refused = pendingReads() == 0 && busyShown();
++    runFor(5);
++    CHECK(refused && isUnread(bob[2]) && Notifications::getUnreadCount(kG, kBob) == 3 && uiRenames == 0 && uiWrites == 0,
++          "%s: refused %d (pending %d, busy shown %d); bob[2] unread %d; count %u", kChatName[enigma], refused, pendingReads(), busyShown(),
++          isUnread(bob[2]), Notifications::getUnreadCount(kG, kBob));
++    rot(-1);  // bob[1]: memory is back
++    runFor(2);
++    rot(1);   // back onto bob[2]
++    runFor(2);
++    CHECK(!isUnread(bob[1]) && !isUnread(bob[2]) && isUnread(bob[0]) && countsMatch(kBob),
++          "%s: after recovery: bob[2] %d bob[1] %d bob[0] %d", kChatName[enigma], isUnread(bob[2]), isUnread(bob[1]), isUnread(bob[0]));
++    back();
++  }
++
++  g_test = "PO4 Back while the pending-read list and both input queues are full leaves at once; nothing more is read; the accepted reads are written after recovery";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 40, kDay06 + 600);
++    std::vector<MessageRef> all;
++    for (int i = 0; i < 40; i++) all.push_back(storeText(MessageStore::kEveryone, kBob, true, true, kDay06 + 600 + i * 60, "E"));
++    powerOn(); runFor(60);
++    failWrites(true);
++    open(enigma, kBob);
++    movesUp(32);
++    runFor(3);
++    back();
++    int full = pendingReads();
++    coldIndex();
++    LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
++    T::inputCap = 32;
++    if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
++    else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++    loopPass();
++    for (int i = 0; i < 32; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    loopPass();  // held: 32
++    for (int i = 0; i < 32; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));  // the queue full; the Back displaces one
++    FsStats a = g_fs;
++    loopPass();
++    bool left = !TextMessage::isAnyConversationOpen();
++    uint64_t opens = g_fs.fileOpens - a.fileOpens;
++    LittleFS.onFileOpen = nullptr;
++    T::inputCap = 0;
++    CHECK(full == 32 && left && opens <= 6 && pendingReads() == 32 && unreadOf(all).size() == 40,
++          "%s: pending list %d; left in that pass %d (%llu opens); pending %d; Everyone unread %zu", kChatName[enigma], full, left,
++          (unsigned long long)opens, pendingReads(), unreadOf(all).size());
++    if (TextMessage::isAnyConversationOpen()) back();
++    failWrites(false);
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(unreadOf(bob) == idx(0, 8) && unreadOf(all).size() == 40 && countsMatch(kBob) && countsMatch(MessageStore::kEveryone),
++          "%s: after recovery: Bob %zu unread (expected 0..7), Everyone %zu unread", kChatName[enigma], unreadOf(bob).size(), unreadOf(all).size());
++    loopPass(3);
++  }
++
++  g_test = "PO5 moves in two conversations while writes fail, then leaving: exactly the messages moved onto are read after recovery, in each conversation";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 5, kDay06 + 600);
++    std::vector<MessageRef> carol = unreadRun(kCarol, enigma, 5, kDay06 + 600);
++    powerOn(); runFor(30);
++    failWrites(true);
++    open(enigma, kBob);
++    movesUp(2);  // bob[4], bob[3]
++    runFor(3);
++    back();
++    open(enigma, kCarol);
++    movesUp(1);  // carol[4]
++    runFor(3);
++    back();
++    runFor(5);
++    bool none = unreadOf(bob).size() == 5 && unreadOf(carol).size() == 5 && pendingReads() == 3;
++    failWrites(false);
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(none && unreadOf(bob) == idx(0, 3) && unreadOf(carol) == idx(0, 4) && countsMatch(kBob) && countsMatch(kCarol),
++          "%s: before recovery nothing read %d; Bob %zu unread (expected 0..2), Carol %zu (expected 0..3)", kChatName[enigma], none,
++          unreadOf(bob).size(), unreadOf(carol).size());
++  }
++
++  g_test = "PO6 a record that cannot be loaded keeps its read pending: deleted unreported, unreadable, a listing cut short, no memory, no directory, a truncated listing (round 7; was: dropped after two absent listings)";
++  {
++    // (a) deleted
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    static std::string target;
++    static int attempts;
++    char p[160];
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[2].sequence));
++    target = p;
++    failWrites(true);
++    openText(kBob);
++    rot(-1);
++    loopPass(2);  // first rewrite failed: retried later
++    back();
++    failWrites(false);
++    MessageStore::deleteMessage(bob[2]);  // gone, Notifications not told (deleteMessage() reports nothing)
++    attempts = 0;
++    LittleFS.failOpen = [](const std::string& q) { attempts += q == target; return false; };  // counts open attempts only
++    runFor(120);
++    LittleFS.failOpen = nullptr;
++    // Round 7: a disappearance nothing reported is not confirmed absence: the
++    // request keeps its slot and is retried with backoff (known deletions: PO8).
++    CHECK(pendingReads() == 1 && attempts >= 3 && attempts <= 8, "deleted unreported: %d pending (expected 1, kept), %d attempts in 120 s",
++          pendingReads(), attempts);
++
++    // (b) unreadable for a minute, then readable: read without another visit
++    freshDevice();
++    bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[2].sequence));
++    target = p;
++    openText(kBob);
++    rot(-1);
++    coldIndex();  // nothing cached: the record is read from flash (and fails)
++    LittleFS.failOpen = [](const std::string& q) { return q == target; };
++    back();
++    runFor(60);
++    bool stillPending = pendingReads() == 1;
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(stillPending && !isUnread(bob[2]) && countsMatch(kBob), "unreadable: pending while unreadable %d; read after %d", stillPending,
++          !isUnread(bob[2]));
++
++    // (c) a listing cut short once (a readdir error looks like the end): not taken as absence
++    freshDevice();
++    bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[2].sequence));
++    target = p;
++    static int cuts;
++    cuts = 0;
++    openText(kBob);
++    rot(-1);
++    coldIndex();
++    LittleFS.failOpen = [](const std::string& q) { return q == target; };
++    LittleFS.endListing = [](const std::string& d, size_t) { return d.find(kBob) != std::string::npos && cuts++ < 1; };
++    back();
++    runFor(30);
++    bool keptAfterCut = pendingReads() == 1 && cuts >= 1;
++    LittleFS.endListing = nullptr;
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(keptAfterCut && !isUnread(bob[2]) && countsMatch(kBob), "cut listing: kept %d (cuts %d); read after %d", keptAfterCut, cuts,
++          !isUnread(bob[2]));
++
++    // (c2) absent, then shown, then absent again (the read's listing cut short
++    // on its attempts 1 and 3): two absent listings that are not consecutive
++    // do not confirm absence. No outside change is signalled (that would start
++    // a recount listing the same directory): the record leaves the record
++    // cache (10 slots) by reading 12 others.
++    freshDevice();
++    bob = unreadRun(kBob, false, 13, kDay06 + 600);
++    powerOn(); runFor(30);
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[12].sequence));
++    target = p;
++    static int readAttempts;
++    static uint32_t lastFail;
++    readAttempts = 0;
++    lastFail = 0;
++    failWrites(true);  // the first attempt fails on its write: the read stays pending
++    openText(kBob);
++    rot(-1);
++    loopPass(2);
++    back();             // left: no chat reload lists the directory from here on
++    failWrites(false);
++    for (int i = 0; i < 12; i++) {
++      StoredMessageView v;
++      MessageStore::loadMessage(bob[i], &v);
++    }
++    LittleFS.failOpen = [](const std::string& q) {
++      if (q == target && T::now != lastFail) {
++        readAttempts++;
++        lastFail = T::now;
++      }
++      return q == target;
++    };
++    LittleFS.endListing = [](const std::string& d, size_t pos) {  // the listing in the same step as the failed read
++      return d.find(kBob) != std::string::npos && pos == 0 && T::now == lastFail && (readAttempts == 1 || readAttempts == 3);
++    };
++    runFor(60);
++    bool keptAfterTwoCuts = pendingReads() == 1 && readAttempts >= 4;
++    LittleFS.endListing = nullptr;
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(keptAfterTwoCuts && !isUnread(bob[12]) && countsMatch(kBob), "absent, present, absent: kept %d (read attempts %d); read after %d",
++          keptAfterTwoCuts, readAttempts, !isUnread(bob[12]));
++
++    // (d) no memory for the listing: kept
++    freshDevice();
++    bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[2].sequence));
++    target = p;
++    openText(kBob);
++    rot(-1);
++    coldIndex();
++    LittleFS.failOpen = [](const std::string& q) { return q == target; };
++    g_failNothrowArrayNew = true;
++    back();
++    runFor(30);
++    g_failNothrowArrayNew = false;
++    bool keptNoMem = pendingReads() == 1;
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(keptNoMem && !isUnread(bob[2]) && countsMatch(kBob), "no memory for the listing: kept %d; read after %d", keptNoMem, !isUnread(bob[2]));
++
++    // (f) the conversation directory cannot be opened (no listing at all): kept
++    freshDevice();
++    bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[2].sequence));
++    target = p;
++    openText(kBob);
++    rot(-1);
++    coldIndex();
++    LittleFS.failOpen = [](const std::string& q) {
++      return q == target || q == target.substr(0, target.rfind('/'));  // the record, and its directory
++    };
++    back();
++    runFor(30);
++    bool keptNoDir = pendingReads() == 1;
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(keptNoDir && !isUnread(bob[2]) && countsMatch(kBob), "no directory listing: kept %d; read after %d", keptNoDir, !isUnread(bob[2]));
++
++    // (e) an incomplete (truncated) listing: more records than a listing holds
++    // (300); the pending record is outside the lowest 300 returned. Requested
++    // through the production API (the chat's index holds the lowest 300 too).
++    freshDevice();
++    for (int i = 0; i < 300; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_TEXT, false, kDay06 + i * 60);
++    MessageRef last = storeText(kCarol, kCarol, true, true, kDay06 + 400 * 60, "E");  // sequence 301
++    powerOn();
++    StoredMessageView v;
++    MessageStore::loadMessage(last, &v);
++    coldIndex();  // then nothing cached
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kCarol, static_cast<unsigned long>(last.sequence));
++    target = p;
++    attempts = 0;
++    LittleFS.failOpen = [](const std::string& q) { attempts += q == target; return q == target; };
++    TextMessage::setOpenConversation(kG, kCarol);  // (keeps the sweep from trimming it meanwhile)
++    Notifications::readMovedOnto(kG, kCarol, last.sequence, v.envelope.message_id);
++    for (int i = 0; i < 400 && attempts < 3; i++) loopPass();
++    bool keptTruncated = pendingReads() == 1 && attempts >= 3 && onFlash(kG, kCarol).size() == 301;
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    TextMessage::clearOpenConversation();
++    CHECK(keptTruncated && !isUnread(last), "truncated listing: kept %d (attempts %d, %zu records); read after %d", keptTruncated, attempts,
++          onFlash(kG, kCarol).size(), !isUnread(last));
++  }
++}
+diff --git a/host_tests/race_r3_r5/pm_tests.inc b/host_tests/race_r3_r5/pm_tests.inc
+new file mode 100644
+index 0000000..961caf8
+--- /dev/null
++++ b/host_tests/race_r3_r5/pm_tests.inc
+@@ -0,0 +1,733 @@
++// Included into storage_test.cpp's main() (round 5): per-message read in the
++// Text and Enigma chats, date headings in their histories, and the old
++// "readup" NVS record. Real store, real Notifications, real chats.
++{
++  // ---- helpers -------------------------------------------------------------
++  auto markers = []() {
++    int n = 0;
++    for (auto& d : T::screen) n += d.text == "*";
++    return n;
++  };
++  auto shownY = [](const std::string& s) -> int {
++    for (auto& d : T::screen)
++      if (d.text == s) return d.y;
++    return -1;
++  };
++  auto shownCount = [](const std::string& s) {
++    int n = 0;
++    for (auto& d : T::screen) n += d.text == s;
++    return n;
++  };
++  auto cursorY = []() -> int {
++    for (auto& d : T::screen)
++      if (d.text == "#CURSOR") return d.y;
++    return -1;
++  };
++  // Whether a "*" is drawn on screen row y.
++  auto markerOnRow = [](int y) {
++    for (auto& d : T::screen)
++      if (d.text == "*" && d.y == y) return true;
++    return false;
++  };
++  auto countsMatch = [](const char* contact) {
++    TypeCount t = truth(contact);
++    return Notifications::getUnreadCount(kG, contact) == t.text + t.enigma + t.game;
++  };
++  // The unread ones of `refs`, as indices into it.
++  auto unreadOf = [](const std::vector<MessageRef>& refs) {
++    std::vector<int> v;
++    for (size_t i = 0; i < refs.size(); i++)
++      if (isUnread(refs[i])) v.push_back(static_cast<int>(i));
++    return v;
++  };
++  auto range = [](int from, int to) {  // [from, to)
++    std::vector<int> v;
++    for (int i = from; i < to; i++) v.push_back(i);
++    return v;
++  };
++  auto open = [&](bool enigma, const char* contact) {
++    if (enigma) openEnigma(contact);
++    else openText(contact);
++  };
++  auto ofType = [](bool enigma) { return enigma ? PacketCodec::MSG_TYPE_ENIGMA : PacketCodec::MSG_TYPE_TEXT; };
++  // n received unread messages of a type, one minute apart from ts0 (Text: "E").
++  auto unreadRun = [&](const char* contact, bool enigma, int n, uint32_t ts0) {
++    std::vector<MessageRef> refs;
++    for (int i = 0; i < n; i++) {
++      if (enigma) refs.push_back(storeOnly(contact, PacketCodec::MSG_TYPE_ENIGMA, true, ts0 + i * 60));
++      else refs.push_back(storeText(contact, contact, true, true, ts0 + i * 60, "E"));
++    }
++    return refs;
++  };
++  const char* kChatName[2] = {"Text", "Enigma"};
++  // A received message as the radio delivers it: through the ACTUAL
++  // PK_MESSAGE dispatcher and the type's own arrival handler (Text's or
++  // Enigma's), which tell Notifications whether its chat is open.
++  auto arriveLive = [&](const char* contact, uint8_t type, uint32_t ts) {
++    PacketCodec::MessageEnvelope env = envOf(contact, type, ts);
++    // An id never used before in this run: the store's duplicate filter (RAM)
++    // outlives freshDevice(), which restarts envOf()'s numbering.
++    static uint32_t liveNo = 0;
++    snprintf(env.message_id, sizeof(env.message_id), "LIVE%019u", ++liveNo);
++    uint8_t payload[96];
++    size_t pn = PacketCodec::encodeTextPayload("E", payload, sizeof(payload));
++    uint8_t wire[256];
++    size_t n = PacketCodec::encodeMessagePacket(env, payload, static_cast<uint16_t>(pn), wire, sizeof(wire));
++    PacketCodec::Header h;
++    const uint8_t* body = nullptr;
++    PacketCodec::decodeHeader(wire, n, &h, &body);
++    handleIncomingMessagePacket(kG, "direct", body, h.payload_length);
++    MessageRef ref{};
++    MessageStore::findMessageById(kG, contact, env.message_id, &ref);
++    return ref;
++  };
++  constexpr uint32_t kDay06 = 1793898000u;  // 06/11/2026 00:00:00 in Thailand (UTC+7) = 2026-11-05T17:00:00Z
++  // First rows of received messages on screen (their sender name, "Bob ...").
++  auto firstRows = []() {
++    int n = 0;
++    for (auto& d : T::screen) n += d.text.rfind("Bob", 0) == 0 && d.color != 0xFFFF;  // the name (coloured), not its divider
++    return n;
++  };
++  // The screen as drawn (texts, positions, cursor): unchanged by a move that
++  // did nothing.
++  auto screenKey = []() {
++    std::string k;
++    for (auto& d : T::screen) k += d.text + "@" + std::to_string(d.x) + "," + std::to_string(d.y) + "|";
++    return k;
++  };
++
++  g_test = "PM1 entering, rendering, a cold stepped load, a cached re-entry and a parked restore read nothing; each shown unread message has one marker";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 6, kDay06 + 600);
++    storeText(kCarol, kCarol, true, false, kDay06 + 100, "T");
++    powerOn(); runFor(30);
++    coldIndex();
++    open(enigma, kBob); runFor(5);
++    int shownMarkers = markers(), shownFirst = firstRows();
++    CHECK(unreadOf(bob) == range(0, 6) && Notifications::getUnreadCount(kG, kBob) == 6, "%s: cold entry read something (%zu unread, count %u)",
++          kChatName[enigma], unreadOf(bob).size(), Notifications::getUnreadCount(kG, kBob));
++    CHECK(shownMarkers >= 2 && shownMarkers == shownFirst, "%s: %d markers for the %d unread messages whose first row is shown", kChatName[enigma],
++          shownMarkers, shownFirst);
++    back();
++    open(enigma, kBob); runFor(5);  // cached
++    CHECK(unreadOf(bob) == range(0, 6) && markers() == shownMarkers, "%s: cached re-entry read something", kChatName[enigma]);
++    back();
++    open(enigma, kCarol); runFor(2); back();
++    open(enigma, kBob); runFor(5);  // parked index swapped back
++    CHECK(unreadOf(bob) == range(0, 6) && Notifications::getUnreadCount(kG, kBob) == 6 && (enigma ? enigmaBadge() : textBadge()),
++          "%s: parked restore read something", kChatName[enigma]);
++    back();
++  }
++
++  g_test = "PM1b restoring a selection is not a move: the selected message deleted, the selection falls on an unread neighbour, which stays unread";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 6, kDay06 + 600);
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    rot(-1); rot(-1); rot(-1);  // bob[5], bob[4], bob[3] read
++    runFor(2);
++    MessageStore::updateLocalFlags(bob[4], MessageStore::FLAG_UNREAD, 0);  // bob[4] unread again (as if never read)
++    Notifications::onMessageArrived(kG, kBob, bob[4], enigma ? Notifications::BADGE_ENIGMA : Notifications::BADGE_TEXT, false);
++    MessageStore::deleteMessage(bob[3]);  // the selected message: the selection keeps its row, now bob[4]
++    runFor(5);
++    CHECK(isUnread(bob[4]) && countsMatch(kBob), "%s: the neighbour the selection fell on was read (unread %d)", kChatName[enigma], isUnread(bob[4]));
++    back();
++  }
++
++  g_test = "PM2 moving onto one unread message reads exactly that one; the others on screen keep their markers";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 6, kDay06 + 600);
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    int before = markers();
++    rot(-1);  // the newest
++    int selY = cursorY();
++    runFor(1);
++    CHECK(unreadOf(bob) == range(0, 5), "%s: unread after one move: %zu (expected the 5 older)", kChatName[enigma], unreadOf(bob).size());
++    CHECK(markers() == before - 1 && selY >= 0 && !markerOnRow(selY), "%s: markers %d -> %d; the read one still marked %d", kChatName[enigma],
++          before, markers(), markerOnRow(selY));
++    CHECK(Notifications::getUnreadCount(kG, kBob) == 5 && countsMatch(kBob), "%s: count %u", kChatName[enigma],
++          Notifications::getUnreadCount(kG, kBob));
++    back();
++  }
++
++  g_test = "PM3 forward and reverse moves, a batch of queued moves and moves held while loading read exactly the messages moved onto";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 10, kDay06 + 600);
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    rot(-1); rot(-1); rot(-1);  // 9, 8, 7
++    rot(1);                     // back to 8 (already read)
++    runFor(1);
++    CHECK(unreadOf(bob) == range(0, 7), "%s: after 3 up and 1 down: %zu unread", kChatName[enigma], unreadOf(bob).size());
++    rot(-1);  // 7 again
++    for (int i = 0; i < 3; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    loopPass();  // one batch: 6, 5, 4
++    runFor(2);
++    CHECK(unreadOf(bob) == range(0, 4), "%s: after a batch of 3: %zu unread (expected 0..3)", kChatName[enigma], unreadOf(bob).size());
++    back();
++    // Held while the chat loads (cold, device-cost model), replayed in order.
++    coldIndex();
++    LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
++    if (enigma) Enigma::navigateToChatDirect(kG, kBob);
++    else TextMessage::navigateToChatDirect(kG, kBob);
++    loopPass();
++    bool loading = T::visibleJoined().find("Loading messages") != std::string::npos;
++    for (int i = 0; i < 7; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));  // 9..4 (read), 3
++    loopPass();
++    for (int i = 0; i < 3000 && T::visibleJoined().find("Loading messages") != std::string::npos; i++) loopPass();
++    runFor(2);
++    LittleFS.onFileOpen = nullptr;
++    CHECK(loading && unreadOf(bob) == range(0, 3), "%s: loading %d; after 7 held moves: %zu unread (expected 0..2)", kChatName[enigma], loading,
++          unreadOf(bob).size());
++    back();
++  }
++
++  g_test = "PM4 isolation: conversations, and the other type in the same history; a sent message gets no marker and no write";
++  {
++    freshDevice();
++    MessageRef t0 = storeText(kBob, kBob, true, true, kDay06 + 100, "E");
++    MessageRef e1 = storeOnly(kBob, PacketCodec::MSG_TYPE_ENIGMA, true, kDay06 + 200);
++    MessageRef t2 = storeText(kBob, kBob, true, true, kDay06 + 300, "E");
++    MessageRef s3 = storeText(kBob, "DEADBEEFAAAA", false, false, kDay06 + 400, "T");
++    MessageRef c0 = storeText(kCarol, kCarol, true, true, kDay06 + 100, "E");
++    MessageRef v0 = storeText(MessageStore::kEveryone, kCarol, true, true, kDay06 + 100, "E");
++    powerOn(); runFor(30);
++    openText(kBob);
++    int m0 = markers();
++    FsStats a = g_fs;
++    rot(-1);  // s3, sent
++    int sentY = cursorY();
++    runFor(1);
++    CHECK(g_fs.renames == a.renames && g_fs.writes == a.writes && sentY >= 0 && !markerOnRow(sentY) && markers() == m0,
++          "a sent message: %llu renames, marker on its row %d", (unsigned long long)(g_fs.renames - a.renames), markerOnRow(sentY));
++    rot(-1);  // t2
++    runFor(1);
++    CHECK(!isUnread(t2) && isUnread(t0) && isUnread(e1) && isUnread(c0) && isUnread(v0),
++          "Text chat, t2: t2 %d t0 %d e1 %d carol %d everyone %d", isUnread(t2), isUnread(t0), isUnread(e1), isUnread(c0), isUnread(v0));
++    CHECK(textBadge() && enigmaBadge(), "badges: text %d enigma %d", textBadge(), enigmaBadge());
++    back();
++    openEnigma(kBob);
++    rot(-1); rot(-1); rot(-1);  // s3, t2 (read), e1
++    runFor(1);
++    CHECK(!isUnread(e1) && isUnread(t0) && isUnread(c0) && !enigmaBadge() && textBadge(),
++          "Enigma chat, e1: e1 %d t0 %d carol %d; enigma badge %d text badge %d", isUnread(e1), isUnread(t0), isUnread(c0), enigmaBadge(),
++          textBadge());
++    CHECK(countsMatch(kBob) && countsMatch(kCarol) && countsMatch(MessageStore::kEveryone), "counts differ from flash");
++    back();
++    (void)s3;
++  }
++
++  g_test = "PM5 the badge stays lit until the last qualifying unread message is read";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    auto badge = [&]() { return enigma ? enigmaBadge() : textBadge(); };
++    open(enigma, kBob);
++    rot(-1); runFor(1);
++    bool lit1 = badge();
++    rot(-1); runFor(1);
++    bool lit2 = badge();
++    rot(-1); runFor(1);
++    bool lit3 = badge();
++    CHECK(lit1 && lit2 && !lit3 && unreadOf(bob).empty() && Notifications::getUnreadCount(kG, kBob) == 0,
++          "%s: badge after 1, 2, 3 reads: %d %d %d", kChatName[enigma], lit1, lit2, lit3);
++    back();
++  }
++
++  g_test = "PM5b a read while the conversation is UNRESOLVED keeps the badge lit while another unread message remains";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 2, kDay06 + 600);
++    powerOn(); runFor(30);
++    auto badge = [&]() { return enigma ? enigmaBadge() : textBadge(); };
++    open(enigma, kBob);
++    // UNRESOLVED (as after an unreadable record or an eviction): its count is a
++    // category flag until recounted -- and the read is applied before that.
++    Notifications::Summary* sum = Notifications::findSummary(kG, kBob);
++    if (sum != nullptr) Notifications::markUnresolved(sum, 0);
++    bool unresolved = sum != nullptr && sum->state == Notifications::SUMMARY_UNRESOLVED;
++    rot(-1);
++    bool alwaysLit = true;
++    for (int i = 0; i < 3000; i++) {
++      loopPass();
++      alwaysLit = alwaysLit && badge();
++    }
++    CHECK(unresolved && alwaysLit && !isUnread(bob[1]) && isUnread(bob[0]) && Notifications::getUnreadCount(kG, kBob) == 1,
++          "%s: unresolved at the read %d; badge always lit %d; count %u", kChatName[enigma], unresolved, alwaysLit,
++          Notifications::getUnreadCount(kG, kBob));
++    back();
++  }
++
++  g_test = "PM11 a read is applied promptly while long background work runs (the boot sweep over 8 x 300 records)";
++  {
++    freshDevice();
++    char contact[16];
++    for (int c = 0; c < 8; c++) {
++      snprintf(contact, sizeof(contact), "C%011d", c);
++      for (int i = 0; i < 300; i++) storeOnly(contact, PacketCodec::MSG_TYPE_TEXT, false, 1700000000u + i * 60);
++    }
++    std::vector<MessageRef> bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(5);
++    openText(kBob);
++    bool sweeping = Notifications::g_sweep != nullptr;
++    rot(-1);
++    loopPass(50);  // 1 s
++    CHECK(sweeping && Notifications::g_sweep != nullptr && !isUnread(bob[2]),
++          "sweep running %d (still %d); the read applied within 1 s %d", sweeping, Notifications::g_sweep != nullptr, !isUnread(bob[2]));
++    back();
++  }
++
++  g_test = "PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    static bool failing;
++    failing = true;
++    LittleFS.failOpen = [](const std::string& p) { return failing && p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };
++    open(enigma, kBob);
++    rot(-1);
++    int selY = cursorY();
++    bool everMismatch = false;
++    for (int i = 0; i < 500; i++) {  // 10 s of failing writes
++      loopPass();
++      everMismatch = everMismatch || !countsMatch(kBob);
++    }
++    CHECK(isUnread(bob[2]) && markerOnRow(selY) && Notifications::getUnreadCount(kG, kBob) == 3 && (enigma ? enigmaBadge() : textBadge()),
++          "%s: while failing: unread %d, marker %d, count %u", kChatName[enigma], isUnread(bob[2]), markerOnRow(selY),
++          Notifications::getUnreadCount(kG, kBob));
++    // The explicit DOT read of the same message, writes still failing: not counted as read.
++    T::raw.push_back(InputEvent(InputEventType::DOT_PRESS_START, 0, 0, T::now));
++    T::raw.push_back(InputEvent(InputEventType::DOT_RELEASE, 0, 60, T::now + 60));
++    loopPass(2);
++    CHECK(isUnread(bob[2]) && Notifications::getUnreadCount(kG, kBob) == 3 && countsMatch(kBob),
++          "%s: explicit DOT read with writes failing: unread %d, count %u", kChatName[enigma], isUnread(bob[2]),
++          Notifications::getUnreadCount(kG, kBob));
++    failing = false;
++    for (int i = 0; i < 4000 && isUnread(bob[2]); i++) {
++      loopPass();
++      everMismatch = everMismatch || !countsMatch(kBob);
++    }
++    runFor(1);
++    CHECK(unreadOf(bob) == range(0, 2) && !markerOnRow(selY) && !everMismatch && Notifications::getUnreadCount(kG, kBob) == 2,
++          "%s: after writes recover: %zu unread, marker %d, count ever differed from flash %d", kChatName[enigma], unreadOf(bob).size(),
++          markerOnRow(selY), everMismatch);
++    LittleFS.failOpen = nullptr;
++    // Power lost right after the move, before the background rewrite.
++    rot(-1);  // bob[1]: the move is handled; its rewrite is the next pass's work
++    reboot(); TextMessage::clearOpenConversation(); runFor(30);  // power lost: the chat's RAM too
++    CHECK(isUnread(bob[1]) && countsMatch(kBob) && Notifications::getUnreadCount(kG, kBob) == 2,
++          "%s: reboot before the rewrite: unread %d count %u", kChatName[enigma], isUnread(bob[1]), Notifications::getUnreadCount(kG, kBob));
++    // After the rewrite: kept.
++    open(enigma, kBob);
++    rot(-1); rot(-1);  // bob[2] (read), bob[1]
++    loopPass(2);
++    reboot(); TextMessage::clearOpenConversation(); runFor(30);
++    CHECK(!isUnread(bob[1]) && isUnread(bob[0]) && countsMatch(kBob) && Notifications::getUnreadCount(kG, kBob) == 1,
++          "%s: reboot after the rewrite: bob[1] unread %d, bob[0] unread %d, count %u", kChatName[enigma], isUnread(bob[1]),
++          isUnread(bob[0]), Notifications::getUnreadCount(kG, kBob));
++  }
++
++  g_test = "PM7 an arrival in the open chat is not read: unread on flash, counted, marked; the selection does not follow it";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    storeText(kBob, kBob, true, false, kDay06 + 100, "T");
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    rot(-1);  // the history is focused on the (read) message
++    int m0 = markers();
++    MessageRef late = arriveLive(kBob, ofType(enigma), kDay06 + 900);
++    runFor(2);
++    CHECK(isUnread(late) && Notifications::getUnreadCount(kG, kBob) == 1 && (enigma ? enigmaBadge() : textBadge()) && markers() == m0 + 1,
++          "%s: arrival: unread %d count %u markers %d -> %d", kChatName[enigma], isUnread(late), Notifications::getUnreadCount(kG, kBob), m0,
++          markers());
++    back();
++  }
++
++  g_test = "PM8 input retained while loading: only the kept moves read; moves the full queue dropped read nothing; Back with both queues full reads nothing";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    for (int variant = 0; variant < 2; variant++) {
++      freshDevice();
++      std::vector<MessageRef> refs;
++      for (int i = 0; i < 40; i++)
++        refs.push_back(storeText(MessageStore::kEveryone, kBob, true, true, kDay06 + 600 + i * 60, "E"));
++      powerOn(); runFor(60);
++      coldIndex();
++      LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
++      T::inputCap = 32;
++      if (enigma) Enigma::navigateToChatDirect(kG, MessageStore::kEveryone);
++      else TextMessage::navigateToChatDirect(kG, MessageStore::kEveryone);
++      loopPass();
++      // Pass 1: 28 key events and 4 moves: all held (32).
++      std::vector<InputEvent> keys;
++      morseEvents(std::string(30, 'E').c_str(), keys);  // 60 events
++      for (int i = 0; i < 28; i++) T::raw.push_back(keys[i]);
++      for (int i = 0; i < 4; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++      loopPass();
++      // Pass 2: 32 more key events fill the queue; 3 moves dropped (and, variant 1, a Back).
++      for (int i = 28; i < 60; i++) T::raw.push_back(keys[i]);
++      for (int i = 0; i < 3; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++      if (variant == 1) T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 800, T::now));
++      loopPass();
++      bool left = !TextMessage::isAnyConversationOpen();
++      for (int i = 0; i < 3000 && T::visibleJoined().find("Loading messages") != std::string::npos; i++) loopPass();
++      runFor(3);
++      LittleFS.onFileOpen = nullptr;
++      T::inputCap = 0;
++      if (variant == 0) {
++        CHECK(unreadOf(refs) == range(0, 36) && countsMatch(MessageStore::kEveryone),
++              "%s: %zu unread (expected the 36 older: the 4 kept moves read, the 3 dropped not)", kChatName[enigma], unreadOf(refs).size());
++      } else {
++        CHECK(left && unreadOf(refs) == range(0, 40), "%s: Back with the queues full: left %d, %zu unread (expected 40)", kChatName[enigma], left,
++              unreadOf(refs).size());
++      }
++      if (TextMessage::isAnyConversationOpen()) back();
++      loopPass(3);
++    }
++  }
++
++  g_test = "PM9 more moves in one batch (40) than the pending list holds (32): the first 32 are accepted and read in the background; the other 8 are refused, left unread and reported; no rewrite in the UI pass (round 6; was: 8 rewritten synchronously)";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 45, kDay06 + 600);
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    g_uiMax = PassMax();
++    for (int i = 0; i < 40; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
++    loopPass();
++    uint64_t uiRenames = g_uiMax.renames, uiWrites = g_uiMax.writes, uiDir = g_uiMax.dirEntries;
++    g_svcMax = PassMax();
++    runFor(10);
++    CHECK(unreadOf(bob) == range(0, 13) && Notifications::getUnreadCount(kG, kBob) == 13 && countsMatch(kBob),
++          "%s: %zu unread after 40 moves (expected 0..12: the 8 refused and the 5 never moved onto), count %u", kChatName[enigma],
++          unreadOf(bob).size(), Notifications::getUnreadCount(kG, kBob));
++    CHECK(uiRenames == 0 && uiWrites == 0 && uiDir == 0, "%s: the batch pass wrote %llu, renamed %llu, listed %llu entries", kChatName[enigma],
++          (unsigned long long)uiWrites, (unsigned long long)uiRenames, (unsigned long long)uiDir);
++    CHECK(g_svcMax.renames <= 1 && g_svcMax.nvs <= 1, "%s: the 32 queued reads: up to %llu rewrites and %d NVS writes in one service pass",
++          kChatName[enigma], (unsigned long long)g_svcMax.renames, g_svcMax.nvs);
++    back();
++  }
++
++  g_test = "PM10 exact identity: a pending read whose record was replaced under the same sequence by another message does not read it";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    static int tmpFailures;
++    tmpFailures = 0;
++    LittleFS.failOpen = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0 && tmpFailures++ < 1; };
++    open(enigma, kBob);
++    rot(-1);      // bob[2]
++    loopPass(2);  // its first rewrite fails: retried in about 2 s
++    LittleFS.failOpen = nullptr;
++    back();
++    MessageStore::deleteMessage(bob[2]);                              // gone without Notifications seeing it
++    MessageRef newcomer = arrive(kBob, ofType(enigma), kDay06 + 5000);  // takes the same sequence
++    runFor(10);
++    CHECK(tmpFailures == 1 && newcomer.sequence == bob[2].sequence && isUnread(newcomer),
++          "%s: the newcomer (sequence %u, the read one's %u) was read: unread %d", kChatName[enigma], newcomer.sequence, bob[2].sequence,
++          isUnread(newcomer));
++    runFor(60);
++    CHECK(countsMatch(kBob) && Notifications::getUnreadCount(kG, kBob) == 3, "%s: count %u (expected 3, as on flash)", kChatName[enigma],
++          Notifications::getUnreadCount(kG, kBob));
++  }
++
++  g_test = "DS1 date headings: one per Thai (UTC+7) calendar day, before its first message; the UTC midnight does not split a day";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    storeText(kBob, kBob, true, false, kDay06 - 1, "E");     // 05/11/2026 23:59:59 (+7)
++    storeText(kBob, kBob, true, false, kDay06, "E");         // 06/11/2026 00:00:00 (+7)
++    storeText(kBob, "DEADBEEFAAAA", false, false, kDay06 + 60, "T");  // same day, sent
++    storeText(kCarol, kCarol, true, false, 1793923199u, "E");  // 2026-11-05T23:59:59Z = 06/11 06:59:59 (+7)
++    storeText(kCarol, kCarol, true, false, 1793923200u, "E");  // 2026-11-06T00:00:00Z = 06/11 07:00:00 (+7)
++    storeText(kCarol, "DEADBEEFAAAA", false, false, 1793923260u, "T");
++    powerOn(); runFor(30);
++    open(enigma, kCarol);
++    bool one = true;
++    for (int i = 0; i < 3; i++) {  // s2, c1, c0: at every step at most one heading, never 05/11
++      rot(-1);
++      one = one && shownCount("06/11/2026") <= 1 && shownCount("05/11/2026") == 0;
++    }
++    CHECK(one && shownY("06/11/2026") == 16 && cursorY() == 16 + 23, "%s: Carol (one Thai day across the UTC midnight): 06/11 at y %d, cursor at y %d",
++          kChatName[enigma], shownY("06/11/2026"), cursorY());
++    back();
++    open(enigma, kBob);
++    rot(-1); rot(-1);  // s2, m1: its heading right above it
++    int y06 = shownY("06/11/2026"), cy1 = cursorY();
++    rot(-1);  // m0
++    int y05 = shownY("05/11/2026"), cy0 = cursorY();
++    CHECK(y06 >= 16 && y06 == cy1 - 23 && y05 == 16 && cy0 == 16 + 23 && shownCount("05/11/2026") == 1,
++          "%s: Bob: 06/11 at y %d above m1 at %d; 05/11 at y %d above m0 at %d", kChatName[enigma], y06, cy1, y05, cy0);
++    back();
++  }
++
++  g_test = "DS2 untrustworthy timestamps get an unknown-date heading; a wrapped message has one heading and one marker; headings are never selected";
++  {
++    int textMoves = -1;
++    for (int enigma = 0; enigma < 2; enigma++) {
++      freshDevice();
++      storeText(kBob, kBob, true, false, 0, "E");          // unsynced clock
++      storeText(kBob, kBob, true, false, 1000u, "E");      // 1970: not trusted
++      std::string longText(24, 'T');  // "- - ...": two rows
++      MessageRef wrapped = storeText(kBob, kBob, true, true, kDay06 + 60, longText.c_str());  // wraps
++      T::realWrap = true;  // (reset by the next freshDevice())
++      powerOn(); runFor(30);
++      open(enigma, kBob);
++      // On entry (bottom-anchored) its heading and both rows are shown: one
++      // marker, on its first row only.
++      CHECK(markers() == 1 && shownCount("06/11/2026") == 1 && markerOnRow(shownY("06/11/2026") + 23),
++            "%s: the wrapped unread message: %d markers, heading x%d, marker on its first row %d", kChatName[enigma], markers(),
++            shownCount("06/11/2026"), markerOnRow(shownY("06/11/2026") + 23));
++      int wrappedMarkers = -1;
++      // From the compose row up to the very first row: no move ever puts the
++      // cursor on a heading row; a move that changes nothing ends it.
++      bool onHeading = false;
++      int moves = 0;
++      for (int i = 0; i < 40; i++) {
++        std::string k0 = screenKey();
++        rot(-1);
++        runFor(1);
++        if (screenKey() == k0) break;
++        moves++;
++        int cy = cursorY();
++        for (auto& d : T::screen)
++          if ((d.text == "Unknown date" || d.text == "06/11/2026") && d.y == cy) onHeading = true;
++        if (shownCount("06/11/2026") == 1 && wrappedMarkers < 0) wrappedMarkers = markers();  // its first row is in view
++      }
++      CHECK(wrappedMarkers == 0, "%s: the wrapped message (read when moved onto) shows %d markers", kChatName[enigma], wrappedMarkers);
++      CHECK(!onHeading && shownCount("Unknown date") == 1 && shownY("Unknown date") == 16 && cursorY() == 16 + 23 &&
++                T::visibleJoined().find("1970") == std::string::npos,
++            "%s: on a heading %d after %d moves; Unknown date x%d at y %d, cursor at y %d", kChatName[enigma], onHeading, moves,
++            shownCount("Unknown date"), shownY("Unknown date"), cursorY());
++      if (!enigma) {
++        textMoves = moves;
++        CHECK(g_historyCursor == 0 && g_historyRowOffset == 0 && moves >= 4, "Text: ended at %u/%u after %d moves (the wrapped one not wrapping?)",
++              g_historyCursor, g_historyRowOffset, moves);
++      } else {
++        CHECK(moves == textMoves, "Enigma: %d moves (Text: %d): the same rows, headings skipped", moves, textMoves);
++      }
++      CHECK(!isUnread(wrapped) && markers() == 0, "%s: moving onto the wrapped message did not read it (or a marker is left)", kChatName[enigma]);
++      back();
++    }
++  }
++
++  g_test = "DS4 a heading per message (one per day): on entry the newest message is on the bottom row; scrolling up and down keeps the cursor on screen, on a message row";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    for (int i = 0; i < 10; i++) storeText(kBob, kBob, true, false, kDay06 + i * 86400, i % 2 ? "E" : "T");
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    int composeY = cursorY();
++    // The newest day's heading and, right below it, the newest message (the
++    // last history row: Enigma keeps a status row above its compose row).
++    const char* lastDay = "15/11/2026";  // kDay06 + 9 days
++    int headY = shownY(lastDay);
++    bool newestShown = false, belowIt = false;
++    for (auto& d : T::screen) {
++      if (headY >= 16 && d.y == headY + 23 && d.text.find('/') == std::string::npos && d.text[0] != '#') newestShown = true;
++      if (headY >= 16 && d.y > headY + 23 && d.y < composeY && !d.text.empty()) belowIt = true;
++    }
++    CHECK(newestShown && !belowIt, "%s: on entry: heading %s at y %d, the newest below it %d, history rows below that %d (compose at %d)",
++          kChatName[enigma], lastDay, headY, newestShown, belowIt, composeY);
++    bool visible = true;
++    int moves = 0;
++    auto cursorOk = [&]() {
++      int cy = cursorY();
++      bool ok = cy >= 16 && cy < composeY;
++      for (auto& d : T::screen)
++        if (d.y == cy && d.text.find('/') != std::string::npos) ok = false;  // a heading row
++      return ok;
++    };
++    for (int i = 0; i < 10; i++, moves++) { rot(-1); visible = visible && cursorOk(); }
++    for (int i = 0; i < 9; i++, moves++) { rot(1); visible = visible && cursorOk(); }
++    CHECK(visible, "%s: the cursor left the screen (or sat on a heading) during %d moves", kChatName[enigma], moves);
++    back();
++  }
++
++  g_test = "DS5 scrolling up inside a message taller than the screen (with a heading): the focused row becomes the top row; its first row shows its heading above it";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    storeText(kBob, kBob, true, false, kDay06 - 86400, "E");   // 05/11
++    std::string tall(90, 'T');                                  // 06/11: several rows
++    storeText(kBob, kBob, true, false, kDay06 + 60, tall.c_str());
++    T::realWrap = true;
++    powerOn(); runFor(30);
++    open(enigma, kBob);
++    std::vector<int> ys;
++    for (int i = 0; i < 30; i++) {
++      rot(-1);
++      ys.push_back(cursorY());
++      if (shownY("06/11/2026") >= 16 && cursorY() == shownY("06/11/2026") + 23) break;  // its first row, its heading above
++    }
++    size_t n = ys.size();
++    bool reached = shownY("06/11/2026") == 16 && n >= 3;
++    CHECK(reached && ys[n - 2] == 16, "%s: reached the first row %d after %zu moves; the cursor on its second row at y %d (expected 16, the top row)",
++          kChatName[enigma], reached, n, n >= 2 ? ys[n - 2] : -1);
++    back();
++  }
++
++  g_test = "DS2b retention cut into a day: the first remaining message still gets its day's heading";
++  {
++    freshDevice();
++    for (int i = 0; i < 3; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, false, kDay06 - 86400 * 2 + i * 60);  // 04/11
++    for (int i = 0; i < 100; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, false, kDay06 + i * 60);           // 06/11
++    powerOn(); runFor(600);  // trimmed to the latest 100: the 04/11 messages are gone
++    // An appended one evicts the first 06/11 message too (the cap keeps 100).
++    arrive(kBob, PacketCodec::MSG_TYPE_TEXT, kDay06 + 86400 + 60);  // 07/11
++    runFor(30);
++    openText(kBob);
++    for (int i = 0; i < 120 && !(g_historyCursor == 0 && g_historyRowOffset == 0); i++) rot(-1);
++    CHECK(onFlash(kG, kBob).size() == 100 && shownCount("06/11/2026") == 1 && shownY("06/11/2026") == 16 && shownCount("04/11/2026") == 0,
++          "kept %zu; at the top: 06/11 x%d at y %d, 04/11 x%d", onFlash(kG, kBob).size(), shownCount("06/11/2026"), shownY("06/11/2026"),
++          shownCount("04/11/2026"));
++    back();
++  }
++
++  g_test = "DS3 arrivals and eviction at the 100 cap while the chat is open: headings follow, the arrival stays unread, counts follow flash";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    for (int i = 0; i < 100; i++) storeText(kBob, kBob, true, i == 0, kDay06 + i * 60, "E");  // the oldest unread
++    powerOn(); runFor(120);
++    open(enigma, kBob);
++    CHECK(shownCount("07/11/2026") == 0, "%s: precondition", kChatName[enigma]);
++    MessageRef late = arriveLive(kBob, ofType(enigma), kDay06 + 86400 + 30);  // 07/11, evicts the unread oldest
++    runFor(3);
++    CHECK(shownCount("07/11/2026") == 1 && isUnread(late) && onFlash(kG, kBob).size() == 100, "%s: 07/11 heading x%d; arrival unread %d; kept %zu",
++          kChatName[enigma], shownCount("07/11/2026"), isUnread(late), onFlash(kG, kBob).size());
++    runFor(60);
++    CHECK(countsMatch(kBob) && Notifications::getUnreadCount(kG, kBob) == 1, "%s: count %u", kChatName[enigma],
++          Notifications::getUnreadCount(kG, kBob));
++    back();
++  }
++
++  g_test = "PM12 an old pending read-up record is discarded unapplied (erased once), never reinterpreted; already-read messages stay read";
++  for (int variant = 0; variant < 2; variant++) {
++    freshDevice();
++    std::vector<MessageRef> refs;
++    for (int i = 0; i < 10; i++) refs.push_back(storeText(kBob, kBob, true, i >= 5, kDay06 + i * 60, "E"));  // 0..4 read already
++    // The earlier firmware's record (notifications.cpp at 511d13e): a done
++    // read-up up to refs[4] and a pending one up to refs[7].
++    struct OldReadUp {
++      char group_code[33];
++      char contact_key[MessageStore::kContactKeyLen];
++      uint8_t type;
++      uint8_t done;
++      uint32_t sortTs;
++      char messageId[PacketCodec::kMessageIdLen];
++      uint32_t sequence;
++      uint8_t failures;
++      uint32_t retryAtMs;
++    };
++    struct OldReadUpRecord {
++      uint8_t count;
++      OldReadUp items[8];
++    };
++    static_assert(sizeof(OldReadUp) == 92 && sizeof(OldReadUpRecord) == 740, "layout as stored by 511d13e");
++    OldReadUpRecord rec;
++    memset(&rec, 0, sizeof(rec));
++    rec.count = 2;
++    int upTo[2] = {4, 7};
++    for (int k = 0; k < 2; k++) {
++      StoredMessageView v;
++      MessageStore::loadMessage(refs[upTo[k]], &v);
++      OldReadUp& r = rec.items[k];
++      strncpy(r.group_code, kG, sizeof(r.group_code) - 1);
++      strncpy(r.contact_key, kBob, sizeof(r.contact_key) - 1);
++      r.type = PacketCodec::MSG_TYPE_TEXT;
++      r.done = k == 0;
++      r.sortTs = v.header.effective_sort_timestamp;
++      memcpy(r.messageId, v.envelope.message_id, sizeof(r.messageId));
++      r.sequence = refs[upTo[k]].sequence;
++    }
++    g_notifyPrefs.putBytes("readup", &rec, sizeof(rec));
++    if (variant == 1) g_notifyPrefs.failRemove = [](const char*) { return true; };
++    powerOn(); runFor(60);
++    CHECK(unreadOf(refs) == range(5, 10) && Notifications::getUnreadCount(kG, kBob) == 5 && countsMatch(kBob) && textBadge(),
++          "variant %d: %zu unread (expected 5..9, nothing applied), count %u", variant, unreadOf(refs).size(),
++          Notifications::getUnreadCount(kG, kBob));
++    CHECK(g_notifyPrefs.isKey("readup") == (variant == 1), "variant %d: the old record %s", variant,
++          g_notifyPrefs.isKey("readup") ? "is still stored" : "was erased");
++    if (variant == 1) {
++      g_notifyPrefs.failRemove = nullptr;
++      reboot(); runFor(30);
++      CHECK(!g_notifyPrefs.isKey("readup") && unreadOf(refs) == range(5, 10), "a later boot: erased %d, %zu unread", !g_notifyPrefs.isKey("readup"),
++            unreadOf(refs).size());
++    }
++    openText(kBob);
++    CHECK(markers() == 4, "variant %d: %d markers on the 4 shown unread messages", variant, markers());
++    back();
++  }
++
++#include "pm_overflow_tests.inc"
++#include "pm_uncertain_tests.inc"
++
++  // ---- measurements (printed, not checked): device-cost model, 63 ms per open ----
++  {
++    auto measure = [&](const char* what, std::function<void()> act) {
++      FsStats a = g_fs;
++      int na = g_notifyPrefs.writes;
++      g_svcMax = PassMax(); g_uiMax = PassMax();
++      uint32_t t0 = T::now;
++      act();
++      printf("MEASURE %-34s opens %4llu writes %3llu renames %3llu removes %3llu dirEntries %4llu nvs %3d | per pass max: ui opens %llu writes %llu renames %llu; services opens %llu writes %llu renames %llu nvs %d | model %u ms\n",
++             what, (unsigned long long)(g_fs.fileOpens - a.fileOpens), (unsigned long long)(g_fs.writes - a.writes),
++             (unsigned long long)(g_fs.renames - a.renames), (unsigned long long)(g_fs.removes - a.removes),
++             (unsigned long long)(g_fs.dirEntries - a.dirEntries), g_notifyPrefs.writes - na, (unsigned long long)g_uiMax.opens,
++             (unsigned long long)g_uiMax.writes, (unsigned long long)g_uiMax.renames, (unsigned long long)g_svcMax.opens,
++             (unsigned long long)g_svcMax.writes, (unsigned long long)g_svcMax.renames, g_svcMax.nvs, T::now - t0);
++    };
++    for (int enigma = 0; enigma < 2; enigma++) {
++      freshDevice();
++      for (int i = 0; i < 90; i++) {
++        bool received = i % 3 != 0;
++        storeText(MessageStore::kEveryone, received ? kBob : "DEADBEEFAAAA", received, received && i >= 50, kDay06 + i * 600, "E");
++      }
++      powerOn(); runFor(120);
++      LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
++      printf("MEASURE -- %s chat, Everyone: 90 messages (27 received unread among the newest 40), several days\n", kChatName[enigma]);
++      coldIndex();
++      measure("cold entry (until drawn)", [&]() { open(enigma, MessageStore::kEveryone); });
++      back();
++      measure("cached re-entry (until drawn)", [&]() { open(enigma, MessageStore::kEveryone); });
++      back();
++      // scrolling: the same history with every message read
++      LittleFS.onFileOpen = nullptr;
++      freshDevice();
++      for (int i = 0; i < 90; i++) {
++        bool received = i % 3 != 0;
++        storeText(MessageStore::kEveryone, received ? kBob : "DEADBEEFAAAA", received, false, kDay06 + i * 600, "E");
++      }
++      powerOn(); runFor(120);
++      open(enigma, MessageStore::kEveryone);
++      LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
++      measure("scroll: 40 single moves, all read", [&]() {
++        for (int i = 0; i < 40; i++) rot(-1);
++      });
++      back();
++      // reading: fresh flags again
++      LittleFS.onFileOpen = nullptr;
++      freshDevice();
++      for (int i = 0; i < 90; i++) {
++        bool received = i % 3 != 0;
++        storeText(MessageStore::kEveryone, received ? kBob : "DEADBEEFAAAA", received, received && i >= 50, kDay06 + i * 600, "E");
++      }
++      powerOn(); runFor(120);
++      open(enigma, MessageStore::kEveryone);
++      LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
++      measure("read: 20 moves over the newest (14 unread), then 10 s", [&]() {
++        for (int i = 0; i < 20; i++) rot(-1);
++        runFor(10);
++      });
++      printf("MEASURE   flash: %d unread left of 27 (count %u)\n", truth(MessageStore::kEveryone).text,
++             Notifications::getUnreadCount(kG, MessageStore::kEveryone));
++      LittleFS.onFileOpen = nullptr;
++      back();
++    }
++  }
++}
+diff --git a/host_tests/race_r3_r5/pm_uncertain_tests.inc b/host_tests/race_r3_r5/pm_uncertain_tests.inc
+new file mode 100644
+index 0000000..3bf8847
+--- /dev/null
++++ b/host_tests/race_r3_r5/pm_uncertain_tests.inc
+@@ -0,0 +1,264 @@
++// Included into pm_tests.inc (round 7): an accepted read is cancelled only by
++// a trustworthy event (its record's deletion or eviction known to have
++// succeeded, the record loaded and found read or holding another message);
++// storage failures that cannot be told from absence keep it pending, retried
++// with backoff, occupying one slot. Faults are tied to the read's own
++// attempts: the target record is taken out of the record cache by reading
++// other records (no outside-change signal, which would start recounts and
++// other listings), and its opens are the read's.
++{
++  // The record on flash, read from the host file itself (never through the store).
++  auto rawState = [](const char* contact, uint32_t seq, bool* unread) {
++    auto f = onFlash(kG, contact);
++    auto it = f.find(seq);
++    if (it == f.end() || it->second.size() < 3) return false;
++    uint16_t flags = static_cast<uint16_t>(static_cast<uint8_t>(it->second[1]) | (static_cast<uint8_t>(it->second[2]) << 8));
++    *unread = (flags & MessageStore::FLAG_UNREAD) != 0;
++    return true;
++  };
++  auto evictFromCache = [](const std::vector<MessageRef>& others) {
++    for (auto& r : others) {
++      StoredMessageView v;
++      MessageStore::loadMessage(r, &v);
++    }
++  };
++  auto pathOf = [](const char* contact, uint32_t seq) {
++    char p[160];
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, contact, static_cast<unsigned long>(seq));
++    return std::string(p);
++  };
++  static std::string target, targetTmp;
++  static int attempts;
++  static uint32_t lastAttempt;
++  static bool faulty;
++
++  g_test = "PO7 two (and many) consecutive premature listings while the record's opens fail: the record stays on flash, unread; the read stays pending throughout and is applied on recovery without another visit";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 13, kDay06 + 600);  // target bob[12]; 12 others to push it out of the cache
++    powerOn(); runFor(30);
++    target = pathOf(kBob, bob[12].sequence);
++    targetTmp = target + ".tmp";
++    attempts = 0;
++    lastAttempt = 0;
++    faulty = true;
++    // The first attempt fails on the rewrite (the record stays readable and
++    // unread): the read is then pending, with the chat already left.
++    LittleFS.failOpen = [](const std::string& q) { return faulty && q == targetTmp; };
++    open(enigma, kBob);
++    rot(-1);
++    loopPass(2);
++    back();
++    std::vector<MessageRef> others(bob.begin(), bob.begin() + 12);
++    evictFromCache(others);
++    // From now on, every read attempt: the open of the record fails, and the
++    // listing in that same step ends at once (a readdir error looks like the end).
++    LittleFS.failOpen = [](const std::string& q) {
++      if (faulty && q == target && T::now != lastAttempt) {
++        attempts++;
++        lastAttempt = T::now;
++      }
++      return faulty && (q == target || q == targetTmp);
++    };
++    LittleFS.endListing = [](const std::string& d, size_t) { return faulty && d.find(kBob) != std::string::npos && T::now == lastAttempt; };
++    bool alwaysPending = true, alwaysOnFlash = true;
++    int pendingAt2 = -1;
++    for (int i = 0; i < 12000 && attempts < 6; i++) {  // six failed attempts (2+4+8+16+32+60 s of backoff)
++      loopPass();
++      bool u = false;
++      alwaysPending = alwaysPending && pendingReads() == 1;
++      alwaysOnFlash = alwaysOnFlash && rawState(kBob, bob[12].sequence, &u) && u;
++      if (attempts == 2 && pendingAt2 < 0) pendingAt2 = pendingReads();
++    }
++    CHECK(attempts >= 6 && pendingAt2 == 1 && alwaysPending && alwaysOnFlash,
++          "%s: %d failed attempts; pending after two consecutive empty listings %d; pending throughout %d; on flash and unread throughout %d",
++          kChatName[enigma], attempts, pendingAt2, alwaysPending, alwaysOnFlash);
++    faulty = false;
++    LittleFS.failOpen = nullptr;
++    LittleFS.endListing = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    bool u = true;
++    CHECK(rawState(kBob, bob[12].sequence, &u) && !u && unreadOf(bob) == range(0, 12) && countsMatch(kBob),
++          "%s: after recovery: bob[12] read on flash %d; %zu unread (expected 12)", kChatName[enigma], !u, unreadOf(bob).size());
++  }
++
++  g_test = "PO8 a known successful eviction cancels exactly its request (another stays); a failed deletion does not cancel";
++  for (int variant = 0; variant < 3; variant++) {  // 0 evicted, 1 eviction fails, 2 evicted with its header unreadable
++    freshDevice();
++    std::vector<MessageRef> bob;
++    for (int i = 0; i < 100; i++) bob.push_back(storeText(kBob, kBob, true, i == 0 || i == 50, kDay06 + i * 60, "E"));
++    powerOn(); runFor(60);
++    // Requests for the oldest (the next to be evicted) and for bob[50],
++    // through the production API; their rewrites fail, so both stay pending.
++    target = pathOf(kBob, bob[0].sequence);
++    targetTmp = target + ".tmp";
++    static std::string tmp50;
++    tmp50 = pathOf(kBob, bob[50].sequence) + ".tmp";
++    LittleFS.failOpen = [](const std::string& q) { return q == targetTmp || q == tmp50; };
++    for (int k : {0, 50}) {
++      StoredMessageView v;
++      MessageStore::loadMessage(bob[k], &v);
++      Notifications::readMovedOnto(kG, kBob, bob[k].sequence, v.envelope.message_id);
++    }
++    runFor(1);
++    int before = pendingReads();
++    if (variant == 1) LittleFS.failRemove = [](const std::string& q) { return q == target; };
++    static int targetOpens;
++    targetOpens = 0;
++    if (variant == 2) {
++      // The eviction reads the oldest record's header twice: to choose it
++      // (succeeds), then in the removal itself (fails here) -- removed, its
++      // flags unknown.
++      evictFromCache(std::vector<MessageRef>(bob.begin() + 1, bob.begin() + 13));
++      LittleFS.failOpen = [](const std::string& q) {
++        if (q == target) targetOpens++;
++        return q == targetTmp || q == tmp50 || (q == target && targetOpens == 2);
++      };
++    }
++    arrive(kBob, PacketCodec::MSG_TYPE_TEXT, kDay06 + 86400);  // the 101st: evicts bob[0] (variant 1: its removal fails)
++    bool u = false;
++    bool stillThere = rawState(kBob, bob[0].sequence, &u);
++    int after = pendingReads();
++    LittleFS.failRemove = nullptr;
++    if (variant == 2) CHECK(targetOpens >= 2, "variant 2: the removal's header read was not reached (%d opens)", targetOpens);
++    if (variant != 1) {
++      CHECK(before == 2 && !stillThere && after == 1, "variant %d evicted: %d pending before, record still on flash %d, %d pending after (expected 1)",
++            variant, before, stillThere, after);
++    } else {
++      CHECK(before == 2 && stillThere && after == 2, "eviction failed: %d pending before, record on flash %d, %d pending after (expected 2)", before,
++            stillThere, after);
++    }
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(!isUnread(bob[50]) && pendingReads() == 0, "variant %d: bob[50] read after recovery %d", variant, !isUnread(bob[50]));
++    runFor(60);
++    CHECK(countsMatch(kBob), "variant %d: count %u differs from flash", variant, Notifications::getUnreadCount(kG, kBob));
++  }
++
++  g_test = "PO9 a record gone without any notification: its request stays pending (one slot), retried with backoff; other reads and other work go on";
++  {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    std::vector<MessageRef> carol = unreadRun(kCarol, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    target = pathOf(kBob, bob[2].sequence);
++    targetTmp = target + ".tmp";
++    LittleFS.failOpen = [](const std::string& q) { return q == targetTmp; };
++    openText(kBob);
++    rot(-1);
++    loopPass(2);
++    back();
++    LittleFS.failOpen = nullptr;
++    // Gone from flash behind the store's back (no deletion it could report).
++    std::error_code ec;
++    std::filesystem::remove(LittleFS.root + target, ec);
++    evictFromCache(std::vector<MessageRef>(bob.begin(), bob.begin() + 2));
++    evictFromCache(carol);
++    evictFromCache(unreadRun(kCarol, false, 10, kDay06 + 9000));  // (also more Carol messages, unread)
++    attempts = 0;
++    lastAttempt = 0;
++    LittleFS.failOpen = [](const std::string& q) {
++      if (q == target && T::now != lastAttempt) {
++        attempts++;
++        lastAttempt = T::now;
++      }
++      return false;
++    };
++    // Meanwhile: another message of the same conversation (the index still
++    // lists the vanished one: moving over it is a duplicate request), reads
++    // in another conversation, and a recount.
++    openText(kBob);
++    rot(-1); rot(-1);  // bob[2] (already pending), bob[1]
++    back();
++    openText(kCarol);
++    rot(-1); rot(-1);
++    back();
++    Notifications::Summary* cs = Notifications::findSummary(kG, kCarol);
++    if (cs != nullptr) Notifications::markUnresolved(cs, 0);
++    g_svcMax = PassMax();
++    runFor(300);
++    PassMax svc = g_svcMax;
++    LittleFS.failOpen = nullptr;
++    cs = Notifications::findSummary(kG, kCarol);
++    CHECK(pendingReads() == 1 && attempts >= 4 && attempts <= 12, "the request: %d pending (expected 1, kept), %d attempts in 300 s (backoff)",
++          pendingReads(), attempts);
++    CHECK(!isUnread(bob[1]) && pendingReads() == 1, "the same conversation: bob[1] read %d; %d pending (the uncertain one only)", !isUnread(bob[1]),
++          pendingReads());
++    CHECK(truth(kCarol).text == 11 && cs != nullptr && cs->state == Notifications::SUMMARY_COUNTED && countsMatch(kCarol),
++          "other work: Carol %d unread on flash (expected 11), summary state %d", truth(kCarol).text, cs ? cs->state : -1);
++    CHECK(svc.renames <= 1 && svc.dirEntries <= 300 && svc.opens <= 8, "per background pass: %llu rewrites, %llu entries listed, %llu opens",
++          (unsigned long long)svc.renames, (unsigned long long)svc.dirEntries, (unsigned long long)svc.opens);
++    printf("   PO9 measured (300 s, one uncertain request): %d attempts; background max per pass opens %llu writes %llu dirEntries %llu\n", attempts,
++           (unsigned long long)svc.opens, (unsigned long long)svc.writes, (unsigned long long)svc.dirEntries);
++  }
++
++  g_test = "PO10 a rewrite whose rename fails after the old file was removed loses the record: the request stays pending (uncertain), the count is recounted to match flash";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    target = pathOf(kBob, bob[2].sequence);
++    LittleFS.failRename = [](const std::string& q) { return q == target; };
++    open(enigma, kBob);
++    rot(-1);
++    loopPass(2);  // the rewrite: old file removed, rename failed -- the record is gone
++    LittleFS.failRename = nullptr;
++    back();
++    bool u = false;
++    bool gone = !rawState(kBob, bob[2].sequence, &u);
++    runFor(120);
++    TypeCount t = truth(kBob);
++    CHECK(gone && pendingReads() == 1 && t.text + t.enigma == 2 && countsMatch(kBob) && Notifications::getUnreadCount(kG, kBob) == 2,
++          "%s: record gone %d; %d pending (expected 1); flash %d unread, count %u", kChatName[enigma], gone, pendingReads(), t.text + t.enigma,
++          Notifications::getUnreadCount(kG, kBob));
++  }
++
++  g_test = "PO11 the same message read by its explicit DOT action ends its pending request at once (exact identity); the others stay";
++  {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    static int tmpFailures;
++    tmpFailures = 0;
++    LittleFS.failOpen = [](const std::string& q) { return q.size() > 4 && q.compare(q.size() - 4, 4, ".tmp") == 0 && tmpFailures++ < 2; };
++    openText(kBob);
++    rot(-1); rot(-1);  // bob[2], bob[1]: both first rewrites fail
++    loopPass(3);
++    LittleFS.failOpen = nullptr;
++    int before = pendingReads();
++    T::raw.push_back(InputEvent(InputEventType::DOT_PRESS_START, 0, 0, T::now));  // on bob[1], selected
++    T::raw.push_back(InputEvent(InputEventType::DOT_RELEASE, 0, 60, T::now + 60));
++    T::now += 20;
++    Menu::tick();  // the UI only: the DOT read, no background step
++    int after = pendingReads();
++    CHECK(before == 2 && after == 1 && !isUnread(bob[1]) && isUnread(bob[2]), "pending %d -> %d (expected 2 -> 1); bob[1] read %d, bob[2] unread %d",
++          before, after, !isUnread(bob[1]), isUnread(bob[2]));
++    back();
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(!isUnread(bob[2]) && countsMatch(kBob), "bob[2] read after the retry %d", !isUnread(bob[2]));
++  }
++
++  g_test = "PO12 a pending read of a group no longer configured (deleted) ends at its next attempt; its record is not rewritten";
++  {
++    freshDevice();
++    std::vector<MessageRef> bob = unreadRun(kBob, false, 3, kDay06 + 600);
++    powerOn(); runFor(30);
++    target = pathOf(kBob, bob[2].sequence);
++    targetTmp = target + ".tmp";
++    LittleFS.failOpen = [](const std::string& q) { return q == targetTmp; };
++    openText(kBob);
++    rot(-1);
++    loopPass(2);
++    back();
++    LittleFS.failOpen = nullptr;
++    int before = pendingReads();
++    T::groupConfigured = false;  // as Settings::deleteGroup() leaves it
++    FsStats a = g_fs;
++    runFor(10);
++    uint64_t renames = g_fs.renames - a.renames;
++    T::groupConfigured = true;
++    bool u = false;
++    CHECK(before == 1 && pendingReads() == 0 && renames == 0 && rawState(kBob, bob[2].sequence, &u) && u,
++          "pending %d -> %d; %llu rewrites; record unread %d", before, pendingReads(), (unsigned long long)renames, u);
++  }
++}
+diff --git a/host_tests/race_r3_r5/storage_test.cpp b/host_tests/race_r3_r5/storage_test.cpp
+index 236f023..67f53df 100644
+--- a/host_tests/race_r3_r5/storage_test.cpp
++++ b/host_tests/race_r3_r5/storage_test.cpp
+@@ -4,9 +4,10 @@
+ // text_message.cpp and enigma.cpp. Flash truth (each record's FLAG_UNREAD) is
+ // read back through the real store, never through a fake.
+ //
+-// Covers hardware findings 1 and 3 on 23293c5: read up to the selected
+-// message (scoped to group, contact and message type), legacy unread flags,
+-// reboot and failure recovery, and bounded work per main-loop pass.
++// Covers hardware findings 1 and 3 on 23293c5 (legacy unread flags, reboot
++// and failure recovery, bounded work per main-loop pass) and, from round 5,
++// the per-message read that replaced "read up to the selection": moving the
++// cursor onto a message reads exactly that message (pm_tests.inc).
+ #include "stubs.h"
+ #include "core/menu.cpp"
+ #include "core/notifications.cpp"
+@@ -28,6 +29,16 @@
+ 
+ // Allocation-failure injection: while set, every nothrow array new fails
+ // (the held-input buffer, the record cache), as on a device out of heap.
++// While set, every nothrow scalar new fails (e.g. the pending-read list).
++static bool g_failNothrowNew = false;
++void* operator new(size_t n, const std::nothrow_t&) noexcept {
++  if (g_failNothrowNew) return nullptr;
++  try {
++    return ::operator new(n);  // paired with the ordinary delete
++  } catch (...) {
++    return nullptr;
++  }
++}
+ static bool g_failNothrowArrayNew = false;
+ void* operator new[](size_t n, const std::nothrow_t&) noexcept {
+   if (g_failNothrowArrayNew) return nullptr;
+@@ -60,6 +71,39 @@ static const char* kBob = "B0B000000001";
+ static const char* kCarol = "CA201000000001";
+ static uint32_t g_msgNo = 0;
+ 
++// ---- pending reads (RAM only) ---------------------------------------------
++// -DNOTIFY_READUP builds these tests against the read-up firmware (511d13e)
++// for before/after evidence: its pending state was the read-up list.
++#ifdef NOTIFY_READUP
++static int pendingReads() {
++  int n = 0;
++  if (Notifications::g_readUps != nullptr)
++    for (uint8_t i = 0; i < Notifications::g_readUps->count; i++) n += !Notifications::g_readUps->items[i].done;
++  return n;
++}
++static int pendingFailures() {
++  if (Notifications::g_readUps != nullptr)
++    for (uint8_t i = 0; i < Notifications::g_readUps->count; i++)
++      if (!Notifications::g_readUps->items[i].done) return Notifications::g_readUps->items[i].failures;
++  return 0;
++}
++static void dropPendingReads() {
++  delete Notifications::g_readUps;
++  Notifications::g_readUps = nullptr;
++  Notifications::g_readUpsDirty = false;
++  Notifications::g_readUpsDueMs = 0;
++}
++#else
++static int pendingReads() { return Notifications::g_reads != nullptr ? Notifications::g_reads->count : 0; }
++static int pendingFailures() {
++  return Notifications::g_reads != nullptr && Notifications::g_reads->count > 0 ? Notifications::g_reads->items[0].failures : 0;
++}
++static void dropPendingReads() {
++  delete Notifications::g_reads;
++  Notifications::g_reads = nullptr;
++}
++#endif
++
+ // ---- volatile state of the notification service (a reboot loses it) -------
+ static void resetNotifyVolatile() {
+ #ifdef NOTIFY_HEAD  // 23293c5's notifications.cpp
+@@ -74,13 +118,10 @@ static void resetNotifyVolatile() {
+   Notifications::g_recountFailures = 0;
+   delete Notifications::g_job;
+   Notifications::g_job = nullptr;
+-  delete Notifications::g_readUps;
+-  Notifications::g_readUps = nullptr;
+-  Notifications::g_readUpsDirty = false;
++  dropPendingReads();  // RAM only
+   Notifications::g_reconcileCursor = 0;
+   Notifications::g_nextStepMs = T::now;
+   Notifications::g_saveDueMs = 0;
+-  Notifications::g_readUpsDueMs = 0;
+ #endif
+   memset(Notifications::g_summaries, 0, sizeof(Notifications::g_summaries));
+   Notifications::g_loadState = Notifications::LOAD_OK;
+@@ -301,9 +342,11 @@ static void freshDevice() {
+   LittleFS.failRename = nullptr;
+   LittleFS.onFileOpen = nullptr;
+   LittleFS.reverseListing = false;
++  LittleFS.endListing = nullptr;
+   LittleFS.wipe();
++  MessageStore::notifyExternalStorageMutationAttempted();  // a wiped device: nothing cached survives (as after the reboot that follows)
+   T::reset();
+-  g_notifyPrefs.kv.clear(); g_notifyPrefs.failRead = nullptr; g_notifyPrefs.failWrite = nullptr;
++  g_notifyPrefs.kv.clear(); g_notifyPrefs.failRead = nullptr; g_notifyPrefs.failWrite = nullptr; g_notifyPrefs.failRemove = nullptr;
+   MessageStore::init();
+   g_msgNo = 0;
+ }
+@@ -325,7 +368,7 @@ int main(int argc, char** argv) {
+   back(); reboot(); runFor(30);
+   CHECK(!isUnread(t1) && !textBadge(), "after reboot: flash unread %d badge %d", isUnread(t1), textBadge());
+ 
+-  g_test = "ST2 legacy flags: selecting the newest received message reads every older one of that type";
++  g_test = "ST2 legacy flags: selecting the newest received message reads that message only (round 5; was: every older one of its type)";
+   freshDevice();
+   for (int i = 0; i < 60; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, i % 5 != 4, 1700000000u + i * 60);
+   powerOn(); runFor(60);
+@@ -335,19 +378,16 @@ int main(int argc, char** argv) {
+   CHECK(truth(kBob).text == 48, "a sent message selected read something");
+   rot(-1);  // newest received message
+   runFor(30);
+-  CHECK(truth(kBob).text == 0 && truth(kBob).files == 60, "after selecting the newest: unread %d files %d", truth(kBob).text,
++  CHECK(truth(kBob).text == 47 && truth(kBob).files == 60, "after selecting the newest: unread %d files %d", truth(kBob).text,
+         truth(kBob).files);
+-  // With no fault, the first attempt verifies its own rewrites (a second
+-  // pass) and completes: no failure recorded, no retry pause.
+-  CHECK(Notifications::g_readUps != nullptr && Notifications::g_readUps->count == 1 && Notifications::g_readUps->items[0].done &&
+-            Notifications::g_readUps->items[0].failures == 0,
+-        "a fault-free read-up was not completed by its first attempt");
++  CHECK(pendingReads() == 0, "a fault-free read is still pending");
+   back();
+-  CHECK(!textBadge(), "badge still lit");
++  CHECK(textBadge() && Notifications::getUnreadCount(kG, kBob) == 47, "badge %d count %u", textBadge(), Notifications::getUnreadCount(kG, kBob));
+   reboot(); runFor(60);
+-  CHECK(!textBadge() && truth(kBob).text == 0, "after reboot: badge %d unread %d", textBadge(), truth(kBob).text);
++  CHECK(textBadge() && truth(kBob).text == 47 && Notifications::getUnreadCount(kG, kBob) == 47, "after reboot: badge %d unread %d count %u",
++        textBadge(), truth(kBob).text, Notifications::getUnreadCount(kG, kBob));
+ 
+-  g_test = "ST3 read up to selection is scoped to the message type; newer messages stay unread";
++  g_test = "ST3 the messages moved onto are read, nothing older and no other type; newer messages stay unread (round 5; was: read up to the selection)";
+   freshDevice(); powerOn();
+   MessageRef a1 = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000100u);
+   MessageRef e1 = arrive(kBob, PacketCodec::MSG_TYPE_ENIGMA, 1700000200u);
+@@ -357,7 +397,7 @@ int main(int argc, char** argv) {
+   openText(kBob);
+   rot(-1); rot(-1);  // a3, then a2 selected
+   runFor(10);
+-  CHECK(!isUnread(a1) && !isUnread(a2), "older Text not read: a1 %d a2 %d", isUnread(a1), isUnread(a2));
++  CHECK(isUnread(a1) && !isUnread(a2), "a1 (older, not moved onto) %d, a2 (moved onto) %d", isUnread(a1), isUnread(a2));
+   CHECK(isUnread(e1) && isUnread(g1), "other types read: enigma %d game %d", isUnread(e1), isUnread(g1));
+   back();
+   CHECK(textBadge() && enigmaBadge(), "badges: text %d enigma %d", textBadge(), enigmaBadge());
+@@ -374,7 +414,7 @@ int main(int argc, char** argv) {
+   CHECK(isUnread(e1) && isUnread(g1), "selecting a Text message read enigma %d game %d", isUnread(e1), isUnread(g1));
+   back();
+ 
+-  g_test = "ST3b stored earlier but shown below the selection (later timestamp): stays unread";
++  g_test = "ST3b two moves in one batch read both messages moved onto, the one passed over included (round 5; was: it stayed unread)";
+   freshDevice(); powerOn();
+   MessageRef below = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000900u);  // stored first, newest timestamp
+   MessageRef sel = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000500u);    // stored second, shown above it
+@@ -382,14 +422,14 @@ int main(int argc, char** argv) {
+   T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
+   rot(-1);  // two detents in one batch: passes over `below`, selects `sel`
+   runFor(10);
+-  CHECK(!isUnread(sel) && isUnread(below), "selected %d below %d", isUnread(sel), isUnread(below));
++  CHECK(!isUnread(sel) && !isUnread(below), "selected %d passed over %d", isUnread(sel), isUnread(below));
+   back();
+ 
+-  g_test = "ST3c stored after the selection but shown above it, while the read-up is still pending: stays unread";
++  g_test = "ST3c stored after the selection but shown above it, while the selection's read is still pending: stays unread";
+   freshDevice(); powerOn();
+   MessageRef s1 = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000500u);
+   openText(kBob);
+-  rot(-1);  // selects s1; the read-up is recorded, not yet applied
++  rot(-1);  // selects s1; its read is queued, not yet applied
+   MessageRef late = storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000100u);  // older timestamp, stored later
+   runFor(10);
+   CHECK(!isUnread(s1) && isUnread(late), "selected %d later-stored %d", isUnread(s1), isUnread(late));
+@@ -403,17 +443,17 @@ int main(int argc, char** argv) {
+   openText(kCarol); runFor(10); back(); runFor(10);
+   CHECK(truth(kCarol).enigma == 20 && enigmaBadge(), "entering cleared: unread %d badge %d", truth(kCarol).enigma, enigmaBadge());
+ 
+-  g_test = "ST5 reboot while the read is still being applied: it resumes after reboot";
++  g_test = "ST5 reboot after a move: the one message read stays read; nothing else is read, nothing resumed (round 5; was: a read-up resumed)";
+   freshDevice();
+-  for (int i = 0; i < 150; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++  for (int i = 0; i < 90; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+   powerOn(); runFor(5);
+   openText(kBob);
+   rot(-1);
+-  loopPass(150);  // 3 s: saved, not finished
+-  int midway = truth(kBob).text;
+-  CHECK(midway > 0, "precondition: already finished (%d left)", midway);
++  loopPass(150);  // 3 s: applied
++  CHECK(truth(kBob).text == 89, "precondition: %d unread (expected 149)", truth(kBob).text);
+   reboot(); runFor(120);
+-  CHECK(truth(kBob).text == 0 && !textBadge(), "after reboot: unread %d badge %d", truth(kBob).text, textBadge());
++  CHECK(truth(kBob).text == 89 && textBadge() && Notifications::getUnreadCount(kG, kBob) == 89, "after reboot: unread %d badge %d count %u",
++        truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
+ 
+   g_test = "ST6 UI work per rotation is bounded: no file rewrite or NVS write during the encoder pass";
+   freshDevice();
+@@ -455,12 +495,13 @@ int main(int argc, char** argv) {
+   powerOn(); runFor(10);
+   g_notifyPrefs.failWrite = [](const char*) { return true; };
+   openText(kBob); rot(-1); runFor(60);
+-  CHECK(truth(kBob).text == 0, "with NVS failing: unread %d", truth(kBob).text);
++  CHECK(truth(kBob).text == 39, "with NVS failing: unread %d (expected 39)", truth(kBob).text);
+   back();
+   reboot(); runFor(60);
+   g_notifyPrefs.failWrite = nullptr;
+   runFor(30);
+-  CHECK(truth(kBob).text == 0 && !textBadge(), "after reboot: unread %d badge %d", truth(kBob).text, textBadge());
++  CHECK(truth(kBob).text == 39 && textBadge() && Notifications::getUnreadCount(kG, kBob) == 39, "after reboot: unread %d badge %d count %u",
++        truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
+ 
+   g_test = "ST9 unreliable directory: background recount retries, then converges";
+   freshDevice();
+@@ -482,7 +523,7 @@ int main(int argc, char** argv) {
+   CHECK(Notifications::getUnreadCount(kG, kBob) == truth(kBob).text && truth(kBob).text == 91,
+         "count %u flash %d", Notifications::getUnreadCount(kG, kBob), truth(kBob).text);
+ 
+-  g_test = "ST11 a record rewrite fails during a read-up: the next pass retries it, nothing is left unread";
++  g_test = "ST11 a read's record rewrite fails five times: retried with backoff until written; only that message read (round 5; was: a read-up's passes)";
+   freshDevice();
+   for (int i = 0; i < 20; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+   powerOn(); runFor(30);
+@@ -492,31 +533,47 @@ int main(int argc, char** argv) {
+     LittleFS.failOpen = [](const std::string& p) {  // the first 5 temp-file writes fail
+       return p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0 && tmpFailures++ < 5;
+     };
+-    openText(kBob); rot(-1); runFor(60);
++    openText(kBob); rot(-1); runFor(90);  // retries after 2, 4, 8, 16 and 32 s
+     LittleFS.failOpen = nullptr;
+-    CHECK(tmpFailures >= 5 && truth(kBob).text == 0, "left unread %d (write failures %d)", truth(kBob).text, tmpFailures);
++    CHECK(tmpFailures >= 5 && truth(kBob).text == 19 && Notifications::getUnreadCount(kG, kBob) == 19,
++          "left unread %d, count %u (write failures %d)", truth(kBob).text, Notifications::getUnreadCount(kG, kBob), tmpFailures);
+     back();
+   }
+ 
+-  g_test = "ST12 a recount already under way when a read-up is selected does not light the badge again";
++  g_test = "ST12 a recount already under way when the last unread message is read does not light the badge again";
+   freshDevice();
+-  for (int i = 0; i < 300; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
++  // The unread one is stored first (listed, and recounted, first) but shown
++  // newest: the recount under way has counted it before it is read.
++  // (100 records: none trimmed away by the sweep)
++  storeText(kBob, kBob, true, true, 1700000000u + 400 * 60, "E");
++  for (int i = 0; i < 99; i++) storeText(kBob, kBob, true, false, 1700000000u + i * 60, "E");
+   powerOn();
+   {
+     Notifications::Summary* b = nullptr;
+-    runFor(60);  // counted: 300
++    runFor(60);  // counted: 1 (sweep done)
+     // the stored summary is now exact; a reboot makes it UNRESOLVED and queues its recount
+     reboot();
+-    loopPass(3);  // that recount has started
++    loopPass(10);  // that recount has started, and counted the unread one
+ #ifndef NOTIFY_HEAD
+     CHECK(Notifications::g_job != nullptr && Notifications::g_job->kind == Notifications::JOB_RECOUNT, "precondition: recount running");
+ #endif
+     openText(kBob); rot(-1);
+-    bool relit = false;
+-    for (int i = 0; i < 4000 && truth(kBob).text > 0; i++) {
++    for (int i = 0; i < 4000 && truth(kBob).text > 0; i++) loopPass();
++    // Lit while the summary is UNRESOLVED (the read was applied while it was
++    // being recounted); once dark it must never light again.
++    // Whenever no recount of it is under way, a COUNTED summary is exact (a
++    // recount that had counted the message before it was read starts over).
++    bool dark = false, relit = false, stale = false;
++    for (int i = 0; i < 4000; i++) {
+       loopPass();
+-      if (textBadge()) relit = true;
++      if (!textBadge()) dark = true;
++      else if (dark) relit = true;
++      Notifications::Summary* cur = Notifications::findSummary(kG, kBob);
++      bool bobJob = Notifications::g_job != nullptr && strcmp(Notifications::g_job->contact_key, kBob) == 0;
++      if (cur != nullptr && cur->state == Notifications::SUMMARY_COUNTED && !bobJob && Notifications::getUnreadCount(kG, kBob) != truth(kBob).text)
++        stale = true;
+     }
++    CHECK(!stale, "a recount finished with a stale count (counted the message before it was read)");
+     b = Notifications::findSummary(kG, kBob);
+     CHECK(!relit && !textBadge() && truth(kBob).text == 0, "badge relit %d now %d unread %d state %d", relit, textBadge(),
+           truth(kBob).text, b ? b->state : -1);
+@@ -652,7 +709,7 @@ int main(int argc, char** argv) {
+           Notifications::getUnreadCount(kG, kDave));
+   }
+ 
+-  g_test = "ST19 read-up rewrites failing far beyond three passes (and across a reboot): never marked done, completes once writes work";
++  g_test = "ST19 a read whose rewrite keeps failing stays pending (retried with backoff, not dropped) without stalling other work; a reboot loses it and the message stays unread (round 5; was: a persisted read-up resumed)";
+   freshDevice();
+   for (int i = 0; i < 30; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+   for (int i = 0; i < 5; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_ENIGMA, true, 1700000000u + i * 60);
+@@ -662,36 +719,36 @@ int main(int argc, char** argv) {
+     failing = true;
+     LittleFS.failOpen = [](const std::string& p) { return failing && p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };
+     openText(kBob); rot(-1); back();
++    storeOnly(kCarol, PacketCodec::MSG_TYPE_ENIGMA, true, 1800000000u);  // found by a recount only
++    coldIndex();                                                         // (an outside change: everything recounted)
++    reboot();                                                            // ... by the boot sweep; the read is lost with it
++    openText(kBob); rot(-1); back();                                     // so it is made again, writes still failing
+     runFor(300);
+-    CHECK(truth(kBob).text == 30, "precondition: writes failing, nothing cleared (%d left)", truth(kBob).text);
+-    CHECK(Notifications::g_readUps != nullptr && Notifications::g_readUps->count == 1 && !Notifications::g_readUps->items[0].done &&
+-              Notifications::g_readUps->items[0].failures >= 2,
+-          "the failing read-up was dropped or marked done (or never retried)");
+-    storeOnly(kCarol, PacketCodec::MSG_TYPE_ENIGMA, true, 1800000000u);  // power-loss arrival: only the boot sweep finds it
+-    reboot();
+-    runFor(300);
+-    CHECK(truth(kBob).text == 30, "precondition after reboot: still failing (%d left)", truth(kBob).text);
+-    // The read-up is first in line after boot; the sweep must still get its turns.
+-    CHECK(Notifications::getUnreadCount(kG, kCarol) == 6, "other work stalled behind the failing read-up: Carol %u",
++    CHECK(truth(kBob).text == 30 && Notifications::getUnreadCount(kG, kBob) == 30, "precondition: writes failing, nothing cleared (%d left)",
++          truth(kBob).text);
++    CHECK(pendingReads() == 1 && pendingFailures() >= 4 && pendingFailures() <= 12,
++          "the failing read was dropped, never retried, or retried without backoff (%d pending, %d failures in 300 s)", pendingReads(),
++          pendingFailures());
++    CHECK(Notifications::getUnreadCount(kG, kCarol) == 6, "other work stalled behind the failing read: Carol %u",
+           Notifications::getUnreadCount(kG, kCarol));
++    reboot();
+     failing = false;
+-    runFor(600);
+-    CHECK(truth(kBob).text == 0 && Notifications::getUnreadCount(kG, kBob) == 0, "after writes work again: %d left, count %u",
+-          truth(kBob).text, Notifications::getUnreadCount(kG, kBob));
++    runFor(300);
++    CHECK(truth(kBob).text == 30 && Notifications::getUnreadCount(kG, kBob) == 30, "after reboot: Bob %d unread (count %u)", truth(kBob).text,
++          Notifications::getUnreadCount(kG, kBob));
+     LittleFS.failOpen = nullptr;
+   }
+ 
+-  g_test = "ST20 power lost before the deferred read-up save: the selection is lost, nothing is wrongly read, counts follow flash";
++  g_test = "ST20 power lost right after a move, before its rewrite: the read is lost, nothing is wrongly read, counts follow flash";
+   freshDevice();
+   for (int i = 0; i < 40; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+   powerOn(); runFor(30);
+   openText(kBob); rot(-1);
+-  loopPass(10);  // 200 ms: before the ~1 s deferred save
+-  CHECK(!g_notifyPrefs.isKey("readup") || g_notifyPrefs.kv["readup"][0] == 0, "precondition: the read-up was already saved");
+-  reboot();
++  CHECK(pendingReads() == 1, "precondition: the read is not pending");
++  reboot(); TextMessage::clearOpenConversation();
+   runFor(120);
+-  CHECK(truth(kBob).text > 0 && textBadge() && Notifications::getUnreadCount(kG, kBob) == static_cast<uint16_t>(truth(kBob).text),
+-        "flash %d badge %d count %u", truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
++  CHECK(truth(kBob).text == 40 && textBadge() && Notifications::getUnreadCount(kG, kBob) == 40, "flash %d badge %d count %u",
++        truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
+ 
+   g_test = "ST21 400 conversations in 4 groups (and 200 empty group directories): the walk reads a bounded number of directory entries per pass and skips none";
+   freshDevice();
+@@ -2232,6 +2289,8 @@ int main(int argc, char** argv) {
+           pubsFor("msg/" + std::string(kCarol)), s_watchOpens);
+   }
+ 
++#include "pm_tests.inc"
++
+   printf("%d checks passed, %d failed\n", g_pass, g_fail);
+   return g_fail == 0 ? 0 : 1;
+ }
+diff --git a/host_tests/race_r3_r5/stubs.cpp b/host_tests/race_r3_r5/stubs.cpp
+index f378061..19ab874 100644
+--- a/host_tests/race_r3_r5/stubs.cpp
++++ b/host_tests/race_r3_r5/stubs.cpp
+@@ -44,6 +44,8 @@ size_t inputCap = 0;
+ uint32_t inputDropped = 0;
+ uint32_t unixTime = 1700000000u;
+ bool realGlyphs = false;
++bool realWrap = false;
++bool groupConfigured = true;
+ bool scanUnreliable = false;
+ bool listUnreliable = false;
+ unsigned listings = 0;
+@@ -52,7 +54,7 @@ void reset() {
+   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0; deviceQueue().clear();
+   connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
+   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
+-  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; scanUnreliable = false; listUnreliable = false; listings = 0;
++  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; realWrap = false; groupConfigured = true; scanUnreliable = false; listUnreliable = false; listings = 0;
+ }
+ std::string visibleJoined() { std::string s; for (auto& d : screen) { s += d.text; s += '|'; } return s; }
+ std::string rowAt(int y) {
+@@ -124,8 +126,23 @@ void drawSenderDivider(int16_t x, int16_t y, const char* t, uint16_t) { draw(x,
+ uint8_t wrapText(const char* text, int16_t, uint16_t* starts, uint16_t* lens, uint8_t maxLines) {
+   if (maxLines == 0) return 0; starts[0] = 0; lens[0] = static_cast<uint16_t>(strlen(text)); return 1;
+ }
+-bool wrapLineAt(const char* text, size_t from, int16_t, uint16_t* s, uint16_t* l) {
+-  size_t n = strlen(text); if (from >= n) return false; *s = static_cast<uint16_t>(from); *l = static_cast<uint16_t>(n - from); return true;
++bool wrapLineAt(const char* text, size_t from, int16_t width, uint16_t* s, uint16_t* l) {
++  size_t n = strlen(text); if (from >= n) return false;
++  if (!T::realWrap) { *s = static_cast<uint16_t>(from); *l = static_cast<uint16_t>(n - from); return true; }
++  // Opt-in (T::realWrap): greedy word wrap at `width` px (per-glyph advances),
++  // a word longer than the row is split; leading spaces of a row skipped.
++  while (from < n && text[from] == ' ') from++;
++  if (from >= n) return false;
++  int w = 0; size_t end = from, lastSpace = 0; bool haveSpace = false;
++  while (end < n) {
++    char c = text[end];
++    int adv = (c >= 0x20 && c <= 0x7E) ? kAdv[c - 0x20] : 0;
++    if (w + adv > width && end > from) break;
++    if (c == ' ') { lastSpace = end; haveSpace = true; }
++    w += adv; end++;
++  }
++  if (end < n && haveSpace) end = lastSpace;
++  *s = static_cast<uint16_t>(from); *l = static_cast<uint16_t>(end - from); return true;
+ }
+ }  // namespace Display
+ 
+@@ -346,13 +363,13 @@ void nextId(char* out, size_t n) { snprintf(out, n, "ID%014u", ++g_counter); T::
+ namespace IdentityColor { bool isValid(uint8_t i) { return i < kColorCount; } uint16_t color565(uint8_t) { return 0; } }
+ #ifndef REAL_NOTIFICATIONS
+ namespace Notifications {
+-void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool) { T::notifications++; }
++void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool, bool) { T::notifications++; }
+ void clearUnread(const char*, const char*, const MessageRef&) {}
+-void readUpTo(const char*, const char*, uint16_t, uint16_t) {}
++bool readMovedOnto(const char*, const char*, uint32_t, const char*) { return true; }
+ }
+ #endif
+ namespace Settings {
+-FamilyGroup getGroup(uint8_t) { FamilyGroup g{}; g.configured = true; strcpy(g.name, "Fam"); strcpy(g.code, "GROUP1"); return g; }
++FamilyGroup getGroup(uint8_t) { FamilyGroup g{}; g.configured = T::groupConfigured; strcpy(g.name, "Fam"); strcpy(g.code, "GROUP1"); return g; }
+ uint8_t getGroupCount() { return 1; }
+ const char* getMyName() { return ""; }
+ uint8_t getMyColorIndex() { return IdentityColor::kInvalidColor; }
+diff --git a/host_tests/race_r3_r5/stubs.h b/host_tests/race_r3_r5/stubs.h
+index 194af33..3a14106 100644
+--- a/host_tests/race_r3_r5/stubs.h
++++ b/host_tests/race_r3_r5/stubs.h
+@@ -48,6 +48,12 @@ extern uint32_t unixTime;  // WifiManager::getUnixTime()
+ // (font_metrics.h) with Adafruit getTextBounds() semantics, and printLine()
+ // clipping exactly as display.cpp does. Reset by reset().
+ extern bool realGlyphs;
++// Display fake wrapping: false (default) = wrapLineAt() returns the rest of
++// the text as one row; true = a greedy word wrap at the row width. Reset by reset().
++extern bool realWrap;
++// Settings stub: whether its one group (GROUP1) is configured (false: as
++// after deleting it). Reset by reset().
++extern bool groupConfigured;
+ // REAL_NOTIFICATIONS builds only: MessageStore::findMessagesByPredicate()
+ // scans the fake store; true makes it report the scan as unreliable.
+ extern bool scanUnreliable;

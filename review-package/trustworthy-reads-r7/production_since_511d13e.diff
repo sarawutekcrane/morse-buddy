@@ -1,0 +1,1597 @@
+diff --git a/src/core/display.h b/src/core/display.h
+index 86abe16..7fc1bb9 100644
+--- a/src/core/display.h
++++ b/src/core/display.h
+@@ -141,6 +141,10 @@ void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
+ constexpr int16_t kCursorCellWidth = 11;     // fixed horizontal budget callers reserve for this cursor's cell
+ constexpr int16_t kCursorTriangleWidth = 4;  // point-to-base width
+ constexpr int16_t kCursorTriangleHeight = 7; // base height
++// Text/Enigma history rows: a fixed cell right after the cursor cell for a
++// received message's unread marker ("*", on its first row only). Reserved on
++// every history row, read or not, so reading a message never re-wraps it.
++constexpr int16_t kUnreadMarkerCellWidth = 8;
+ 
+ // Draws the triangle with its leftmost (base) edge at x, vertically
+ // centered within the PRIMARY text row that starts at rowTop (using the
+diff --git a/src/core/enigma.cpp b/src/core/enigma.cpp
+index c258e17..9c92d61 100644
+--- a/src/core/enigma.cpp
++++ b/src/core/enigma.cpp
+@@ -7,6 +7,7 @@
+ #include "core/enigma_crypto.h"
+ #include "core/enigma_keys.h"
+ #include "core/held_input.h"
++#include "core/history_dates.h"
+ #include "core/hooks.h"
+ #include "core/identity.h"
+ #include "core/identity_color.h"
+@@ -939,6 +940,10 @@ HeldInput g_heldInput;
+ bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
+ bool g_chatDrawnThisVisit = false;
+ uint32_t g_chatIndexGeneration = 0;  // as in text_message.cpp: a stale index is reloaded once per change
++// As in text_message.cpp: what the shown history was drawn from (order, days,
++// unread markers); a change kept current in the index redraws the rows.
++uint32_t g_drawnIndexSignature = 0;
++bool g_historyStale = false;
+ 
+ void refreshIndexIfNeeded() {
+   if (!g_indexDirty) return;
+@@ -987,6 +992,7 @@ bool syncIndexWithStore() {
+   g_chatIndexGeneration = now;
+   g_indexTotal = MessageStore::getIndexCount();
+   followCursorMessage();
++  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;
+   return true;
+ }
+ 
+@@ -1135,12 +1141,22 @@ struct HistoryRowInfo {
+   // colors and message-body WHITE are entirely unaffected. Hardware Fix
+   // #4.8b: also the color the sender-divider bar itself is drawn in.
+   uint16_t senderColor565;
++  // Presentation only, from the index (no record read): a date heading row
++  // before this message (the first of its day), and its unread marker.
++  uint8_t headerRows;
++  bool unread;
+ };
+ 
+ // Loads history entry `index` and computes where its body text wraps.
+ // `labelX` is the fixed compact-cursor-cell-relative icon-cell X already
+-// used by every history row's TRUE first row (2 + Display::kCursorCellWidth).
++// used by every history row's TRUE first row (kHistoryLabelX: after the
++// cursor cell and the unread-marker cell).
+ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
++  {
++    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(index);
++    out->headerRows = HistoryDates::startsDay(index) ? 1 : 0;
++    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);
++  }
+   out->lineBuf[0] = '?';
+   out->lineBuf[1] = '\0';
+   out->senderPrefix[0] = '\0';
+@@ -1211,6 +1227,31 @@ uint16_t countHistoryRowsFor(uint16_t index, int16_t labelX) {
+   return countHistoryRows(info);
+ }
+ 
++// As in text_message.cpp: the rows a message occupies on screen (its date
++// heading, if any, and its body rows). The cursor (g_historyRowOffset)
++// moves over body rows only, never onto a heading.
++uint16_t countVisualRows(const HistoryRowInfo& info) { return static_cast<uint16_t>(info.headerRows + countHistoryRows(info)); }
++uint16_t countVisualRowsFor(uint16_t index, int16_t labelX) {
++  HistoryRowInfo info;
++  loadHistoryRow(index, labelX, &info);
++  return countVisualRows(info);
++}
++uint16_t cursorVisualRow() {
++  return static_cast<uint16_t>((HistoryDates::startsDay(g_historyCursor) ? 1 : 0) + g_historyRowOffset);
++}
++uint16_t cursorVisualTop() { return g_historyRowOffset == 0 ? 0 : cursorVisualRow(); }
++
++constexpr int16_t kUnreadMarkerX = 2 + Display::kCursorCellWidth;
++constexpr int16_t kHistoryLabelX = kUnreadMarkerX + Display::kUnreadMarkerCellWidth;
++
++void drawDateHeading(uint16_t index, int16_t y) {
++  char text[HistoryDates::kTextCap];
++  HistoryDates::headingFor(index, text, sizeof(text));
++  int16_t w = Display::textWidth(text);
++  int16_t x = static_cast<int16_t>(w < Display::kScreenWidth ? (Display::kScreenWidth - w) / 2 : 0);
++  Display::printLineColored(x, y, text, 0x8410);  // grey
++}
++
+ // Picks the history viewport's starting position as a (message index,
+ // rows-already-scrolled-past-within-that-message) pair instead of a plain
+ // message index (Hardware Fix #4.3a issue 1), so a single logical message
+@@ -1240,7 +1281,7 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+   bool placedAny = false;
+   while (idx > 0) {
+     idx--;
+-    uint16_t rows = countHistoryRowsFor(idx, labelX);
++    uint16_t rows = countVisualRowsFor(idx, labelX);
+     if (static_cast<int32_t>(rows) <= budget) {
+       budget -= rows;
+       defIdx = idx;
+@@ -1268,11 +1309,12 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+     return;
+   }
+ 
+-  if (g_historyCursor < defIdx || (g_historyCursor == defIdx && g_historyRowOffset < defSkip)) {
++  if (g_historyCursor < defIdx || (g_historyCursor == defIdx && cursorVisualTop() < defSkip)) {
+     // Focus is above (older than) the default window -- scroll up so the
+-    // focused row becomes the viewport's first row.
++    // focused row (with its heading, on a message's first row) becomes the
++    // viewport's first row.
+     *outStartIdx = g_historyCursor;
+-    *outStartRowSkip = g_historyRowOffset;
++    *outStartRowSkip = cursorVisualTop();
+     return;
+   }
+ 
+@@ -1283,13 +1325,13 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+     HistoryRowInfo first;
+     loadHistoryRow(defIdx, labelX, &first);
+     if (defIdx == g_historyCursor) {
+-      rowsBefore = static_cast<int32_t>(g_historyRowOffset) - static_cast<int32_t>(defSkip);
++      rowsBefore = static_cast<int32_t>(cursorVisualRow()) - static_cast<int32_t>(defSkip);
+     } else {
+-      rowsBefore = static_cast<int32_t>(countHistoryRows(first)) - static_cast<int32_t>(defSkip);
++      rowsBefore = static_cast<int32_t>(countVisualRows(first)) - static_cast<int32_t>(defSkip);
+       for (uint16_t i = static_cast<uint16_t>(defIdx + 1); i < g_historyCursor; i++) {
+-        rowsBefore += countHistoryRowsFor(i, labelX);
++        rowsBefore += countVisualRowsFor(i, labelX);
+       }
+-      rowsBefore += g_historyRowOffset;
++      rowsBefore += cursorVisualRow();
+     }
+   }
+ 
+@@ -1306,7 +1348,7 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+   uint16_t curIdx = defIdx;
+   uint16_t curSkip = defSkip;
+   while (rowsBefore >= static_cast<int32_t>(viewportLines)) {
+-    uint16_t rows = countHistoryRowsFor(curIdx, labelX);
++    uint16_t rows = countVisualRowsFor(curIdx, labelX);
+     if (static_cast<uint16_t>(curSkip + 1) < rows) {
+       curSkip++;
+     } else {
+@@ -1319,8 +1361,9 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+   *outStartRowSkip = curSkip;
+ }
+ 
+-// Y of visual row `targetRowIdx` of history index `targetIdx`, given the
+-// viewport currently starts at (startIdx, startRowSkip).
++// Y of body row `targetRowIdx` of history index `targetIdx`, given the
++// viewport currently starts at (startIdx, startRowSkip) -- visual rows,
++// date headings included.
+ int16_t historyRowY(uint16_t startIdx, uint16_t startRowSkip, uint16_t targetIdx, uint16_t targetRowIdx,
+                     int16_t labelX, int16_t contentTop, int16_t lh) {
+   int32_t rows = 0;
+@@ -1328,7 +1371,7 @@ int16_t historyRowY(uint16_t startIdx, uint16_t startRowSkip, uint16_t targetIdx
+     HistoryRowInfo info;
+     loadHistoryRow(i, labelX, &info);
+     uint16_t skip = (i == startIdx) ? startRowSkip : 0;
+-    uint16_t limit = (i == targetIdx) ? targetRowIdx : countHistoryRows(info);
++    uint16_t limit = (i == targetIdx) ? static_cast<uint16_t>(info.headerRows + targetRowIdx) : countVisualRows(info);
+     if (limit > skip) rows += static_cast<int32_t>(limit - skip);
+   }
+   return static_cast<int16_t>(contentTop + rows * lh);
+@@ -1761,20 +1804,19 @@ void handleHistoryFocusEvent(const InputEvent& e) {
+   }
+ }
+ 
+-// Selecting a history item (rotating onto it) reads it and every older
+-// received message of the same type in this conversation
+-// (Notifications::readUpTo; same rule as Text's chat). Being in view, or
+-// entering the chat, reads nothing. Checked once per newly selected message.
+-bool g_readCheckDone = false;
+-uint32_t g_readCheckSequence = 0;
+-
+-void markSelectedHistoryRead() {
++// As in text_message.cpp: a user move (a rotation, live or held and
++// replayed) put the cursor onto another message: that one message is read
++// if its index entry is unread (Notifications::readMovedOnto()). Entering,
++// drawing, a restored or followed selection and moving within one message's
++// rows read nothing.
++bool g_readRefused = false;  // a move's read was refused (Notifications::readMovedOnto())
++void readMessageMovedOnto(bool hadMessage, uint32_t previousSeq) {
+   if (g_historyCursor == kNoHistoryCursor) return;
+-  const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(g_historyCursor);
+-  if (entry == nullptr || (g_readCheckDone && entry->sequence == g_readCheckSequence)) return;
+-  g_readCheckDone = true;
+-  g_readCheckSequence = entry->sequence;
+-  Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, g_historyCursor, g_indexTotal);
++  const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
++  if (e == nullptr || (hadMessage && e->sequence == previousSeq)) return;
++  if (!(e->flags & MessageStore::FLAG_UNREAD)) return;
++  if (!Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id))
++    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled
+ }
+ 
+ bool g_enigmaChatDirty = true;
+@@ -1865,7 +1907,8 @@ void screenEnigmaChatTick() {
+   if (Menu::consumeJustEntered()) {
+     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
+     clearDraft();
+-    g_readCheckDone = false;  // a selection after (re)entry is checked afresh
++    g_historyStale = false;
++    g_readRefused = false;  // (a refusal is reported in its own visit only)
+     g_historyCursor = kNoHistoryCursor;
+     g_historyRowOffset = 0;
+     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
+@@ -1980,7 +2023,11 @@ void screenEnigmaChatTick() {
+       // message the whole time a multi-row message is being read, and
+       // every one of its rows becomes reachable this way, never just the
+       // first few.
+-      int16_t rotLabelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);
++      int16_t rotLabelX = kHistoryLabelX;
++      const MessageStore::ConversationIndexEntry* fromEntry =
++          g_historyCursor != kNoHistoryCursor ? MessageStore::getIndexEntry(g_historyCursor) : nullptr;
++      bool fromMessage = fromEntry != nullptr;
++      uint32_t fromSeq = fromMessage ? fromEntry->sequence : 0;
+       if (g_historyCursor == kNoHistoryCursor) {
+         if (e.value < 0 && g_indexTotal > 0) {
+           g_historyCursor = static_cast<uint16_t>(g_indexTotal - 1);
+@@ -2007,6 +2054,7 @@ void screenEnigmaChatTick() {
+           g_historyRowOffset = 0;
+         }
+       }
++      readMessageMovedOnto(fromMessage, fromSeq);
+     } else if (g_historyCursor != kNoHistoryCursor) {
+       handleHistoryFocusEvent(e);
+     } else {
+@@ -2049,11 +2097,14 @@ void screenEnigmaChatTick() {
+     return;
+   }
+   if (wasIndexDirty) g_enigmaChatDirty = true;
+-  markSelectedHistoryRead();  // against the complete index
+   if (g_inputLost && !g_sendRanThisTick) {
+     g_inputLost = false;
+     setSendStatus({"Input lost while loading", true});
+   }
++  if (g_readRefused && !g_sendRanThisTick) {
++    g_readRefused = false;
++    setSendStatus({"Read not saved (busy)", true});
++  }
+ 
+   Display::drawStatusBar();
+   if (!g_enigmaChatDirty) return;
+@@ -2085,8 +2136,8 @@ void screenEnigmaChatTick() {
+   // instead of the old PRIMARY-font ">" glyph + padding, on both history
+   // and compose -- compose has no sender prefix, so its text starts right
+   // after this same cell (Part G).
+-  int16_t labelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // history icon-cell X
+-  int16_t composePrefixX = labelX;                                       // compose shares the same left margin
++  int16_t labelX = kHistoryLabelX;  // history icon-cell X (after the cursor and unread-marker cells)
++  int16_t composePrefixX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // compose: right after the cursor cell
+   int16_t composeWidth = static_cast<int16_t>(Display::kScreenWidth - composePrefixX);
+ 
+   // Compose text (Hardware Fix #4.3 issue E): word-wrapped by real pixel
+@@ -2124,7 +2175,7 @@ void screenEnigmaChatTick() {
+   // coordinate below the status bar shifted, so history, error, and
+   // compose all need a full repaint together (Hardware Fix #4.3 issue E).
+   bool historyLayoutChanged = firstDraw || (viewportLines != g_enigmaChatLastViewportLines);
+-  bool contentChanged = !historyLayoutChanged && wasIndexDirty;
++  bool contentChanged = !historyLayoutChanged && (wasIndexDirty || g_historyStale);
+   bool scrolled = !historyLayoutChanged && !contentChanged &&
+                   (static_cast<int16_t>(startIdx) != g_enigmaChatLastStartIdx ||
+                    static_cast<int16_t>(startRowSkip) != g_enigmaChatLastStartRowSkip);
+@@ -2153,7 +2204,16 @@ void screenEnigmaChatTick() {
+     for (uint16_t i = startIdx; i < g_indexTotal && rowsDrawn < viewportLines; i++) {
+       HistoryRowInfo info;
+       loadHistoryRow(i, labelX, &info);
+-      uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;
++      uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;  // visual rows, its heading first
++      if (info.headerRows > 0) {
++        if (rowSkip == 0) {
++          drawDateHeading(i, y);
++          y = static_cast<int16_t>(y + lh);
++          rowsDrawn++;
++        } else {
++          rowSkip--;
++        }
++      }
+       size_t len = strlen(info.lineBuf);
+       size_t pos = 0;
+       uint16_t rowIdx = 0;
+@@ -2172,6 +2232,7 @@ void screenEnigmaChatTick() {
+             // rows start at that same sender X (Hardware Fix #4 issues
+             // 2/5, extended for issue E/4.3a, Hardware Fix #4.7 Part E,
+             // #4.7b Part C).
++            if (info.unread) Display::printLineColored(kUnreadMarkerX, y, "*", ST77XX_YELLOW);
+             drawRowIcon(labelX, y, info.icon);
+             int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
+             int16_t textX = static_cast<int16_t>(labelX + iconWidth);
+@@ -2208,6 +2269,8 @@ void screenEnigmaChatTick() {
+     }
+     g_enigmaChatNeedsFullRedraw = false;
+     g_chatDrawnThisVisit = true;  // a later reload keeps this on screen instead of "Loading messages..."
++    g_drawnIndexSignature = HistoryDates::indexSignature(g_indexTotal);
++    g_historyStale = false;
+   } else if (selectionOnlyChanged && viewportLines > 0) {
+     // Hardware Fix #4.3a issue 1 audit: guarded on viewportLines > 0 so a
+     // focused message never gets its cursor marker drawn into the
+@@ -2429,7 +2492,7 @@ void handleEnigmaArrival(const char* group_code, const char* contact_key, const
+ 
+   bool conversationOpen = TextMessage::isConversationOpen(group_code, contact_key);
+   if (conversationOpen) markIndexDirty();
+-  Notifications::onMessageArrived(group_code, contact_key, ref, Notifications::BADGE_ENIGMA, conversationOpen);
++  Notifications::onMessageArrived(group_code, contact_key, ref, Notifications::BADGE_ENIGMA, conversationOpen, false);
+ }
+ 
+ // =============================================================================
+diff --git a/src/core/history_dates.h b/src/core/history_dates.h
+new file mode 100644
+index 0000000..c8beeb1
+--- /dev/null
++++ b/src/core/history_dates.h
+@@ -0,0 +1,90 @@
++#pragma once
++// Date headings in the Text and Enigma chat histories (presentation only:
++// nothing here is stored, counted or selectable). A heading precedes the
++// first shown message of each calendar day in Thailand time (UTC+7), taken
++// from the message's stored effective_sort_timestamp -- sent and received
++// messages alike, in the history's own order. A timestamp that cannot be
++// trusted (the clock was not set: 0, or anything before 2020 or from 2100 on)
++// gets an "Unknown date" heading instead of an invented date; consecutive
++// such messages share it. Thai glyphs are not in the display font
++// (FreeSans9pt7b, ASCII), so the date is shown as dd/mm/yyyy.
++#include <stdint.h>
++#include <stdio.h>
++
++#include "core/storage_messages.h"
++
++namespace HistoryDates {
++
++constexpr uint32_t kUnknownDay = 0xFFFFFFFFu;
++constexpr uint32_t kTrustedFrom = 1577836800u;   // 2020-01-01T00:00:00Z
++constexpr uint32_t kTrustedUntil = 4102444800u;  // 2100-01-01T00:00:00Z
++constexpr uint32_t kThaiOffsetSeconds = 7u * 3600u;
++constexpr size_t kTextCap = 16;
++
++// Days since 1970-01-01 in Thailand time, or kUnknownDay.
++inline uint32_t thaiDay(uint32_t ts) {
++  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;
++  return (ts + kThaiOffsetSeconds) / 86400u;
++}
++
++// Whether history entry `index` (the open chat's conversation index) is the
++// first of its day: the first entry, or a different day from the one before.
++inline bool startsDay(uint16_t index) {
++  const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(index);
++  if (e == nullptr) return false;
++  if (index == 0) return true;
++  const MessageStore::ConversationIndexEntry* p = MessageStore::getIndexEntry(static_cast<uint16_t>(index - 1));
++  return p == nullptr || thaiDay(p->effective_sort_timestamp) != thaiDay(e->effective_sort_timestamp);
++}
++
++// "dd/mm/yyyy" for a day from thaiDay() (civil-from-days, proleptic
++// Gregorian), or "Unknown date".
++inline void formatDay(uint32_t day, char* out, size_t cap) {
++  if (day == kUnknownDay) {
++    snprintf(out, cap, "Unknown date");
++    return;
++  }
++  int32_t z = static_cast<int32_t>(day) + 719468;
++  int32_t era = z / 146097;
++  uint32_t doe = static_cast<uint32_t>(z - era * 146097);
++  uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++  int32_t y = static_cast<int32_t>(yoe) + era * 400;
++  uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++  uint32_t mp = (5 * doy + 2) / 153;
++  uint32_t d = doy - (153 * mp + 2) / 5 + 1;
++  uint32_t m = mp < 10 ? mp + 3 : mp - 9;
++  if (m <= 2) y++;
++  // (narrow types: d 1..31, m 1..12, y 2019..2100 for a trusted day)
++  snprintf(out, cap, "%02u/%02u/%04u", static_cast<unsigned>(static_cast<uint8_t>(d)), static_cast<unsigned>(static_cast<uint8_t>(m)),
++           static_cast<unsigned>(static_cast<uint16_t>(y)));
++}
++
++// The heading text for history entry `index`.
++inline void headingFor(uint16_t index, char* out, size_t cap) {
++  const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(index);
++  formatDay(e != nullptr ? thaiDay(e->effective_sort_timestamp) : kUnknownDay, out, cap);
++}
++
++// A signature of what the history draws from the index: order, days and
++// unread markers. A change (an arrival, a removal, a read) means the shown
++// rows must be redrawn even when the index itself stayed current.
++inline uint32_t indexSignature(uint16_t total) {
++  uint32_t h = 2166136261u;
++  auto mix = [&h](uint32_t v) {
++    for (int i = 0; i < 4; i++) {
++      h ^= (v >> (8 * i)) & 0xFFu;
++      h *= 16777619u;
++    }
++  };
++  mix(total);
++  for (uint16_t i = 0; i < total; i++) {
++    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
++    if (e == nullptr) continue;
++    mix(e->sequence);
++    mix(thaiDay(e->effective_sort_timestamp));
++    mix(e->flags & MessageStore::FLAG_UNREAD);
++  }
++  return h;
++}
++
++}  // namespace HistoryDates
+diff --git a/src/core/notifications.cpp b/src/core/notifications.cpp
+index 755bf27..b5cf07d 100644
+--- a/src/core/notifications.cpp
++++ b/src/core/notifications.cpp
+@@ -56,56 +56,75 @@ struct LegacySummary {
+ 
+ constexpr const char* kSummaryKey = "summary2";
+ constexpr const char* kLegacyKey = "summary";
+-constexpr const char* kReadUpKey = "readup";
++// The earlier firmware's "read up to a selection" record (511d13e and
++// before). Never read or applied by this firmware: erased once at boot
++// (discardOldReadUpRecord()).
++constexpr const char* kOldReadUpKey = "readup";
+ 
+-// ---- reading up to a selection (hardware findings 1 and 3 on 23293c5) -----
++// ---- per-message read (Text and Enigma chats) --------------------------
+ //
+-// Selecting a received message in a chat reads it AND every older received
+-// message of the same type in that conversation: older means at or above it
+-// in the history (sort key (effective_sort_timestamp, message_id) <= the
+-// selected one's) and stored no later than it (sequence <= its sequence), so
+-// a message shown below it, or one that arrived after it (even with an older
+-// timestamp), stays unread. Text, Enigma and Friend-game records are separate
+-// types: reading one never reads another. Older firmware never cleared a
+-// stored record's unread flag on viewing, so long-used devices hold many such
+-// flags; this is how they get cleared without selecting each one.
++// Moving a chat's cursor onto a received message reads exactly that message
++// (readMovedOnto()): nothing older, nothing else on screen, no other type,
++// conversation or category. Entering a chat, drawing it, its initial or a
++// restored selection, a load completing and an arrival read nothing.
+ //
+-// The selection itself only records the request: in RAM at once, and in the
+-// "readup" NVS record about kReadUpSaveDelayMs later (coalesced). A power
+-// loss before that write loses the selection: its messages stay unread
+-// (never wrongly read) and are counted as such after the reboot; flags
+-// already cleared on flash stay cleared. Once written, a reboot resumes it.
+-// Clearing the flags on flash is background work done a few records per
+-// step (below); until then counts and recounts treat a covered message as
+-// read. A read-up is marked done only after a pass finds nothing left to
+-// clear and nothing it could not read; until then it is retried, with a
+-// growing pause between attempts so the other background work goes on.
+-constexpr uint8_t kMaxReadUps = 8;
+-struct ReadUp {
++// An accepted request is kept in RAM only, by exact identity (group,
++// contact, sequence and message id), and applied by the background work:
++// one record rewrite per step (serviceTick()), before any other job. Nothing
++// is written or listed on the cursor-movement path. The count is decremented
++// only once the rewrite clearing FLAG_UNREAD succeeded, so counts and badges
++// describe what is on flash, except after a rewrite whose outcome is unknown
++// (see applyRead(): the conversation is then recounted). A rewrite (or
++// read) that fails is retried (kBackoffMinMs doubling, at most
++// kBackoffMaxMs) and moved behind the others.
++//
++// Trustworthy completion only. A request ends when its rewrite succeeded;
++// when its record, loaded, is already read or holds another message (its
++// sequence reused); when the store reports that record's removal as done
++// (eviction, trimming: forgetPendingReads()); when the same message was
++// read by its explicit DOT action; or when its group is no longer
++// configured (deleted). A record that cannot be loaded is never taken as
++// gone: through the Arduino API a failed open, or a directory listing cut
++// short by a read error, looks exactly like absence. Such a request keeps
++// its slot and is retried with backoff -- until the record loads again, or
++// until reboot if it really disappeared without a removal the store could
++// report (a rewrite whose rename failed, a file removed outside the store).
++// One retry is one failed open, about once a minute at most; it never
++// blocks the other requests or the other background work.
++//
++// Finite capacity: at most kMaxPendingReads accepted requests. A request
++// that finds the list full (a burst of moves, or earlier requests waiting
++// for storage to recover), or no memory for the list, is refused:
++// readMovedOnto() returns false, nothing is recorded, the message stays
++// unread (its marker stays) and the chat says so ("Read not saved (busy)").
++// Moving onto it again later, once there is room, reads it.
++//
++// Nothing is persisted: a power loss between the move and the rewrite's
++// rename loses the read -- the message stays unread on flash (marker shown,
++// counted after the reboot); never wrongly read.
++constexpr uint8_t kMaxPendingReads = 32;
++struct PendingRead {
+   char group_code[33];
+   char contact_key[MessageStore::kContactKeyLen];
+-  uint8_t type;
+-  uint8_t done;  // applied and verified on flash; kept only so a covered selection adds nothing
+-  uint32_t sortTs;
+   char messageId[PacketCodec::kMessageIdLen];
+   uint32_t sequence;
+-  uint8_t failures;    // attempts that ended with something left (RAM; reset at load)
+-  uint32_t retryAtMs;  // no attempt before this (RAM; reset at load)
++  uint32_t retryAtMs;  // 0: due now
++  uint8_t failures;    // rewrites (or reads) that failed so far
+ };
+-struct ReadUpRecord {
++struct PendingReads {
+   uint8_t count;
+-  ReadUp items[kMaxReadUps];
++  PendingRead items[kMaxPendingReads];  // oldest first
+ };
+ 
+ // ---- background work: bounded per main-loop pass -------------------------
+ //
+-// Recounts (UNRESOLVED conversations, the sweep below) and read-ups are jobs
++// Recounts (UNRESOLVED conversations, the sweep below) and trims are jobs
+ // over one conversation, run one step at a time from serviceTick(), at most
+ // one step per kStepMs. A step is ONE of: one conversation directory listing
+ // (names only, at most 300 entries), up to kLoadsPerStep record reads, one
+-// record rewrite (plus the reads before it in that step), one NVS write, or
+-// one retry of an unreadable summary record. Nothing on the arrival, read or
+-// eviction paths scans a whole conversation.
++// record deletion, one per-message read (a record rewrite), one NVS write,
++// or one retry of an unreadable summary record. Nothing on the arrival, read
++// or eviction paths scans a whole conversation.
+ //
+ // After every successful load (at boot, or when an unreadable record becomes
+ // readable) every stored conversation is visited once (the sweep): first
+@@ -132,10 +151,7 @@ constexpr uint8_t kLoadsPerStep = 4;
+ // A step also ends once this much time went into it (device A on 2ed04b6:
+ // about 63 ms per record open, so 4 reads were 250-480 ms passes).
+ constexpr uint32_t kStepBudgetMs = 20;
+-constexpr uint8_t kCountLoads = 4;       // record reads a selection may spend to count what stays unread
+ constexpr uint32_t kSaveDelayMs = 2000;  // summary writes are coalesced
+-constexpr uint32_t kReadUpSaveDelayMs = 1000;
+-constexpr uint8_t kReadUpPasses = 3;     // passes per attempt; a pass that rewrote anything is checked by the next
+ constexpr uint8_t kWalkEntriesPerStep = 16;
+ constexpr uint8_t kJobAttempts = 5;      // unreliable listings or passes before a job gives way (and backs off)
+ constexpr uint32_t kBackoffMinMs = 2000;
+@@ -154,22 +170,19 @@ struct Sweep {
+   uint32_t backoffMs;
+ };
+ 
+-enum JobKind : uint8_t { JOB_RECOUNT = 1, JOB_READUP = 2, JOB_TRIM = 3 };
++enum JobKind : uint8_t { JOB_RECOUNT = 1, JOB_TRIM = 3 };
+ struct Job {
+   JobKind kind;
+   bool fromSweep;
+   bool listed;      // seqs[] holds the conversation's records
+   bool restart;     // the conversation changed under a recount: list and count again
+   bool unreliable;  // a record could not be read in this pass
+-  uint8_t pass;     // read-up: passes made
+   uint8_t attempts; // unreliable listings or passes so far
+-  uint16_t rewrites;
+   uint16_t excess;  // trim: records still to delete
+   uint16_t n, pos;
+   uint16_t tally[kTypeSlots];
+   char group_code[33];
+   char contact_key[MessageStore::kContactKeyLen];
+-  ReadUp readUp;
+   uint32_t seqs[MessageStore::kMaxMessagesPerThread];
+ };
+ 
+@@ -193,9 +206,7 @@ uint8_t g_reconcileCursor = 0;
+ Sweep* g_sweep = nullptr;          // non-null while a sweep runs (or waits for its next pass)
+ uint32_t g_recountRetryMs = 0;     // a recount that gave way: UNRESOLVED ones wait until then
+ Job* g_job = nullptr;              // non-null while a job runs
+-ReadUpRecord* g_readUps = nullptr;  // non-null while any read-up is kept
+-bool g_readUpsDirty = false;
+-uint32_t g_readUpsDueMs = 0;
++PendingReads* g_reads = nullptr;    // non-null while a per-message read is pending
+ 
+ int slotForType(uint8_t messageType) {
+   switch (messageType) {
+@@ -249,132 +260,6 @@ void writeSummaries() {
+   g_saveDueMs = millis() + kRetryMs;
+ }
+ 
+-// ---- read-up records ------------------------------------------------------
+-
+-// a covers b: same conversation and type, and b is at or above a in the
+-// history and stored no later than it.
+-bool readUpCovers(const ReadUp& a, const char* group_code, const char* contact_key, uint8_t type, uint32_t sortTs,
+-                  const char* messageId, uint32_t sequence) {
+-  if (a.type != type || !sameConversation(a.group_code, a.contact_key, group_code, contact_key)) return false;
+-  if (sequence > a.sequence) return false;
+-  if (sortTs != a.sortTs) return sortTs < a.sortTs;
+-  return strncmp(messageId, a.messageId, PacketCodec::kMessageIdLen) <= 0;
+-}
+-
+-// True if a pending (not yet applied) read-up covers this received record.
+-bool coveredByPendingReadUp(const char* group_code, const char* contact_key, const MessageStore::StoredHeader& header,
+-                            const PacketCodec::MessageEnvelope& envelope, uint32_t sequence) {
+-  if (g_readUps == nullptr || header.direction != MessageStore::Direction::RECEIVED) return false;
+-  for (uint8_t i = 0; i < g_readUps->count; i++) {
+-    const ReadUp& r = g_readUps->items[i];
+-    if (!r.done && readUpCovers(r, group_code, contact_key, envelope.message_type, header.effective_sort_timestamp,
+-                                envelope.message_id, sequence))
+-      return true;
+-  }
+-  return false;
+-}
+-
+-void readUpsChanged() {
+-  if (!g_readUpsDirty) g_readUpsDueMs = millis() + kReadUpSaveDelayMs;
+-  g_readUpsDirty = true;
+-}
+-
+-void writeReadUps() {
+-  ReadUpRecord empty;
+-  memset(&empty, 0, sizeof(empty));
+-  const ReadUpRecord* r = g_readUps != nullptr ? g_readUps : &empty;
+-  if (Storage::notify().putBytes(kReadUpKey, r, sizeof(*r)) == sizeof(*r)) {
+-    g_readUpsDirty = false;
+-    return;
+-  }
+-  Serial.println("[NOTIFY] read-up record not saved; retrying (the flags are still cleared meanwhile)");
+-  g_readUpsDueMs = millis() + kRetryMs;
+-}
+-
+-void loadReadUps() {
+-  Preferences& p = Storage::notify();
+-  if (!p.isKey(kReadUpKey)) return;
+-  ReadUpRecord* r = new (std::nothrow) ReadUpRecord;
+-  if (r == nullptr) return;
+-  if (p.getBytes(kReadUpKey, r, sizeof(*r)) != sizeof(*r) || r->count > kMaxReadUps) {
+-    // Unreadable: its selections are lost and those messages stay unread
+-    // (never wrongly read); the record is replaced at the next selection.
+-    Serial.println("[NOTIFY] read-up record unreadable; ignored");
+-    delete r;
+-    return;
+-  }
+-  for (uint8_t i = 0; i < r->count; i++) {
+-    r->items[i].group_code[sizeof(r->items[i].group_code) - 1] = '\0';
+-    r->items[i].contact_key[sizeof(r->items[i].contact_key) - 1] = '\0';
+-    r->items[i].failures = 0;  // a new boot retries at once
+-    r->items[i].retryAtMs = 0;
+-  }
+-  if (r->count == 0) {
+-    delete r;
+-    return;
+-  }
+-  g_readUps = r;
+-}
+-
+-// Adds a read-up for the selected record. False if an existing one already
+-// covers it (nothing new to read).
+-bool addReadUp(const ReadUp& add) {
+-  if (g_readUps == nullptr) {
+-    g_readUps = new (std::nothrow) ReadUpRecord;
+-    if (g_readUps == nullptr) return false;
+-    memset(g_readUps, 0, sizeof(*g_readUps));
+-  }
+-  ReadUpRecord& r = *g_readUps;
+-  for (uint8_t i = 0; i < r.count; i++) {
+-    if (readUpCovers(r.items[i], add.group_code, add.contact_key, add.type, add.sortTs, add.messageId, add.sequence))
+-      return false;
+-  }
+-  // Drop what the new one covers, then make room: a finished one first, else
+-  // the oldest pending one (its messages stay unread -- never wrongly read).
+-  uint8_t out = 0;
+-  for (uint8_t i = 0; i < r.count; i++) {
+-    const ReadUp& x = r.items[i];
+-    if (!readUpCovers(add, x.group_code, x.contact_key, x.type, x.sortTs, x.messageId, x.sequence)) r.items[out++] = x;
+-  }
+-  r.count = out;
+-  if (r.count == kMaxReadUps) {
+-    uint8_t victim = 0;
+-    for (uint8_t i = 0; i < r.count; i++) {
+-      if (r.items[i].done) {
+-        victim = i;
+-        break;
+-      }
+-    }
+-    if (!r.items[victim].done) Serial.println("[NOTIFY] read-up list full; oldest selection dropped");
+-    for (uint8_t i = victim; i + 1 < r.count; i++) r.items[i] = r.items[i + 1];
+-    r.count--;
+-  }
+-  r.items[r.count++] = add;
+-  readUpsChanged();
+-  return true;
+-}
+-
+-// The same selection (the RAM-only retry fields aside).
+-bool sameReadUp(const ReadUp& a, const ReadUp& b) {
+-  return a.type == b.type && a.sortTs == b.sortTs && a.sequence == b.sequence &&
+-         sameConversation(a.group_code, a.contact_key, b.group_code, b.contact_key) &&
+-         strncmp(a.messageId, b.messageId, PacketCodec::kMessageIdLen) == 0;
+-}
+-
+-ReadUp* findReadUp(const ReadUp& r) {
+-  if (g_readUps == nullptr) return nullptr;
+-  for (uint8_t i = 0; i < g_readUps->count; i++)
+-    if (sameReadUp(g_readUps->items[i], r)) return &g_readUps->items[i];
+-  return nullptr;
+-}
+-
+-void markReadUpDone(const ReadUp& finished) {
+-  ReadUp* x = findReadUp(finished);
+-  if (x == nullptr) return;
+-  x->done = 1;
+-  readUpsChanged();
+-}
+-
+ uint32_t backoffMs(uint8_t failures) {
+   uint32_t ms = kBackoffMinMs;
+   for (uint8_t i = 1; i < failures && ms < kBackoffMaxMs; i++) ms *= 2;
+@@ -663,19 +548,10 @@ void sweepStep() {
+ }
+ 
+ // Starts the next job, or advances the sweep (one step's work at most).
+-// Order: a pending read-up that is due (the user is waiting to see it), then
+-// an UNRESOLVED conversation, then the sweep.
++// Order: an UNRESOLVED conversation, then the sweep. (Per-message reads go
++// before any job: serviceTick().)
+ void startNextJob() {
+   uint32_t now = millis();
+-  if (g_readUps != nullptr) {
+-    for (uint8_t i = 0; i < g_readUps->count; i++) {
+-      const ReadUp& r = g_readUps->items[i];
+-      if (r.done || (r.retryAtMs != 0 && static_cast<int32_t>(now - r.retryAtMs) < 0)) continue;
+-      g_job = newJob(JOB_READUP, r.group_code, r.contact_key);
+-      if (g_job != nullptr) g_job->readUp = r;
+-      return;
+-    }
+-  }
+   if (g_loadState != LOAD_OK) return;  // recounts need the stored summary
+   if (g_recountFailures == 0 || static_cast<int32_t>(now - g_recountRetryMs) >= 0) {
+     for (uint8_t k = 0; k < kMaxSummaries; k++) {
+@@ -715,40 +591,132 @@ void finishRecount() {
+   endJob();
+ }
+ 
+-// A read-up pass is complete. A pass that rewrote anything is checked by
+-// another (a rewrite can fail and leave the flag set); one that rewrote
+-// nothing and read everything finishes it, and the conversation is
+-// recounted. An attempt that still leaves something after kReadUpPasses
+-// passes keeps the read-up pending (never marked done) and retries it after
+-// a growing pause, while the other work goes on.
+-void finishReadUp() {
+-  Job& j = *g_job;
+-  bool left = j.rewrites > 0 || j.unreliable;
+-  if (left && j.pass + 1 < kReadUpPasses) {
+-    j.pass++;
+-    j.rewrites = 0;
+-    j.unreliable = false;
+-    j.listed = false;
+-    return;
++// ---- per-message read (see PendingRead above) -----------------------------
++
++void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence,
++                        const char* messageId = nullptr);
++
++// The conversation's count may no longer describe flash (a rewrite whose
++// outcome is unknown): recounted from the flags.
++void invalidateCount(const char* group_code, const char* contact_key) {
++  Summary* s = findSummary(group_code, contact_key);
++  if (s == nullptr || s->state != SUMMARY_COUNTED) return;
++  markUnresolved(s, 0);
++  saveSummaries();
++}
++
++enum class ReadOutcome : uint8_t { DONE, RETRY };
++
++// After a failed attempt, the record may have changed without its count
++// following. Recount rather than guess.
++void recountAfterFailedAttempt(const PendingRead& p) {
++  if (p.failures == 0) return;
++  invalidateCount(p.group_code, p.contact_key);
++}
++
++// Clears this one message's FLAG_UNREAD on flash and, only once that
++// succeeded, its count. DONE also when there is nothing (left) to do.
++ReadOutcome applyRead(PendingRead& p) {
++  MessageRef ref;
++  memset(&ref, 0, sizeof(ref));
++  strncpy(ref.group_code, p.group_code, sizeof(ref.group_code) - 1);
++  strncpy(ref.contact_key, p.contact_key, sizeof(ref.contact_key) - 1);
++  ref.sequence = p.sequence;
++  if (!isConfiguredGroup(p.group_code)) return ReadOutcome::DONE;  // the group was deleted: nothing of it is shown
++  StoredMessageView view;
++  // Not loadable: unreadable for now, or gone -- which cannot be told apart
++  // (see above). Kept, retried.
++  if (!MessageStore::loadMessage(ref, &view)) return ReadOutcome::RETRY;
++  if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {
++    recountAfterFailedAttempt(p);  // another message holds the sequence now: it is not read
++    return ReadOutcome::DONE;
+   }
+-  if (left) {
+-    ReadUp* x = findReadUp(j.readUp);
+-    if (x != nullptr) {
+-      if (x->failures < 255) x->failures++;
+-      x->retryAtMs = millis() + backoffMs(x->failures);
+-      if (x->retryAtMs == 0) x->retryAtMs = 1;
+-    }
+-    Serial.println("[NOTIFY] read-up not complete; retried later");
+-    endJob();
+-    return;
++  if (view.header.direction != MessageStore::Direction::RECEIVED || !(view.header.flags & MessageStore::FLAG_UNREAD)) {
++    recountAfterFailedAttempt(p);  // already read
++    return ReadOutcome::DONE;
+   }
+-  markReadUpDone(j.readUp);
+-  Summary* s = findSummary(j.group_code, j.contact_key);
+-  if (s != nullptr && s->state == SUMMARY_COUNTED) {
+-    markUnresolved(s, 0);  // recounted next, from the flags just written
++  Summary* s = findSummary(p.group_code, p.contact_key);
++  int slot = slotForType(view.envelope.message_type);
++  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) {
++    // Retried. The record, read back: still there (a plain failure; should
++    // the flag be cleared after all, the next attempt finds it read and
++    // recounts), or not loadable -- the rewrite's outcome unknown (a failed
++    // rename may have lost it, see atomicRewrite()): its count is recounted.
++    StoredMessageView after;
++    bool same = MessageStore::loadMessage(ref, &after) &&
++                strncmp(after.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) == 0;
++    if (!same) invalidateCount(p.group_code, p.contact_key);
++    return ReadOutcome::RETRY;
++  }
++  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread
++  if (s != nullptr && s->state == SUMMARY_COUNTED && slot >= 0 && s->unread[slot] > 0) {
++    s->unread[slot]--;
+     saveSummaries();
+   }
+-  endJob();
++  return ReadOutcome::DONE;  // (an UNRESOLVED summary is recounted from the flags)
++}
++
++void removePendingRead(uint8_t i) {
++  for (uint8_t k = i; k + 1 < g_reads->count; k++) g_reads->items[k] = g_reads->items[k + 1];
++  g_reads->count--;
++  if (g_reads->count == 0) {
++    delete g_reads;
++    g_reads = nullptr;
++  }
++}
++
++// Applies the oldest due per-message read (one record rewrite). False if
++// none is due.
++bool stepPendingRead() {
++  if (g_reads == nullptr) return false;
++  uint32_t now = millis();
++  for (uint8_t i = 0; i < g_reads->count; i++) {
++    PendingRead& p = g_reads->items[i];
++    if (p.retryAtMs != 0 && static_cast<int32_t>(now - p.retryAtMs) < 0) continue;
++    if (applyRead(p) == ReadOutcome::DONE) {
++      removePendingRead(i);
++      return true;
++    }
++    // Retried later, behind the others (it never blocks them).
++    PendingRead again = p;
++    if (again.failures < 255) again.failures++;
++    again.retryAtMs = now + backoffMs(again.failures);
++    if (again.retryAtMs == 0) again.retryAtMs = 1;
++    Serial.printf("[NOTIFY] read of %s/%s #%lu not written; retried in %lu ms\n", again.group_code, again.contact_key,
++                  static_cast<unsigned long>(again.sequence), static_cast<unsigned long>(again.retryAtMs - now));
++    for (uint8_t k = i; k + 1 < g_reads->count; k++) g_reads->items[k] = g_reads->items[k + 1];
++    g_reads->items[g_reads->count - 1] = again;
++    return true;
++  }
++  return false;
++}
++
++// Ends the pending reads of one record whose removal the store reported
++// done (group, contact and sequence), or -- message id given too -- of that
++// exact message once read another way. Nothing of any other record,
++// conversation or group.
++void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence, const char* messageId) {
++  if (g_reads == nullptr || contact_key == nullptr || sequence == nullptr) return;
++  for (uint8_t i = g_reads->count; i-- > 0;) {
++    const PendingRead& p = g_reads->items[i];
++    if (strcmp(p.group_code, group_code) != 0 || strcmp(p.contact_key, contact_key) != 0 || p.sequence != *sequence) continue;
++    if (messageId != nullptr && strncmp(p.messageId, messageId, PacketCodec::kMessageIdLen) != 0) continue;
++    removePendingRead(i);
++    if (g_reads == nullptr) return;
++  }
++}
++
++// The earlier firmware kept a "read up to this selection" request in NVS
++// until it was applied. Its ranges are never applied or turned into
++// per-message reads: the record is erased (once; if erasing fails it is
++// ignored again at the next boot). Messages it had already cleared on flash
++// stay read; those it had not reached keep their (truthful) unread flag, and
++// the boot sweep recounts every conversation from the flags.
++void discardOldReadUpRecord() {
++  Preferences& p = Storage::notify();
++  if (!p.isKey(kOldReadUpKey)) return;
++  if (p.remove(kOldReadUpKey)) Serial.println("[NOTIFY] earlier read-up record discarded, not applied");
++  else Serial.println("[NOTIFY] earlier read-up record not erased; ignored (erased at a later boot)");
+ }
+ 
+ // One trim step: at most kLoadsPerStep record reads (pending-outbox records
+@@ -790,8 +758,7 @@ void stepTrim(Job& j) {
+     }
+     int slot = slotForType(view.envelope.message_type);
+     bool counted = view.header.direction == MessageStore::Direction::RECEIVED &&
+-                   (view.header.flags & MessageStore::FLAG_UNREAD) && slot >= 0 &&
+-                   !coveredByPendingReadUp(j.group_code, j.contact_key, view.header, view.envelope, ref.sequence);
++                   (view.header.flags & MessageStore::FLAG_UNREAD) && slot >= 0;
+     if (!MessageStore::deleteMessage(ref)) {
+       Serial.println("[NOTIFY] trim: a record could not be deleted; retried later");
+       giveWay(j);
+@@ -800,6 +767,7 @@ void stepTrim(Job& j) {
+     }
+     j.pos++;
+     j.excess--;
++    forgetPendingReads(ref.group_code, ref.contact_key, &ref.sequence);
+     if (counted) {  // uncounted only now that it is gone
+       Summary* s = findSummary(j.group_code, j.contact_key);
+       if (s != nullptr && s->state == SUMMARY_COUNTED && s->unread[slot] > 0) {
+@@ -840,12 +808,6 @@ void stepJob() {
+     j.listed = reliable;
+     if (!reliable) {
+       if (++j.attempts >= kJobAttempts) {  // the listing keeps failing: give way, retried later
+-        if (j.kind == JOB_READUP) {
+-          j.unreliable = true;
+-          j.pass = kReadUpPasses;  // this attempt ends with something left
+-          finishReadUp();
+-          return;
+-        }
+         giveWay(j);
+         if (j.kind == JOB_TRIM) continueWithRecount(j);
+         else endJob();
+@@ -888,31 +850,17 @@ void stepJob() {
+     if (j.kind == JOB_RECOUNT)
+       MessageStore::feedIndexRecord(ref.group_code, ref.contact_key, ref.sequence, &view.header, view.envelope.message_id);
+     if (view.header.direction != MessageStore::Direction::RECEIVED || !(view.header.flags & MessageStore::FLAG_UNREAD)) continue;
+-    if (j.kind == JOB_RECOUNT) {
+-      int slot = slotForType(view.envelope.message_type);
+-      if (slot >= 0 && !coveredByPendingReadUp(j.group_code, j.contact_key, view.header, view.envelope, ref.sequence))
+-        j.tally[slot]++;
+-      continue;
+-    }
+-    if (readUpCovers(j.readUp, j.group_code, j.contact_key, view.envelope.message_type, view.header.effective_sort_timestamp,
+-                     view.envelope.message_id, ref.sequence)) {
+-      MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
+-      j.rewrites++;
+-      return;  // at most one rewrite per step
+-    }
++    int slot = slotForType(view.envelope.message_type);
++    if (slot >= 0) j.tally[slot]++;
+   }
+   if (j.pos < j.n) return;
+-  if (j.kind == JOB_RECOUNT) {
+-    if (j.restart) return;  // relisted at the next step
+-    finishRecount();
+-  } else {
+-    finishReadUp();
+-  }
++  if (j.restart) return;  // relisted at the next step
++  finishRecount();
+ }
+ 
+ // One bounded step of background work per kStepMs, in priority order: retry
+-// an unreadable stored summary (every kRetryMs), write a due summary or
+-// read-up record, then advance (or start) a job. A summary write that keeps
++// an unreadable stored summary (every kRetryMs), write a due summary, apply
++// a due per-message read, then advance (or start) a job. A summary write that keeps
+ // failing is retried every kRetryMs without stopping the other work.
+ void serviceTick() {
+   uint32_t now = millis();
+@@ -930,15 +878,12 @@ void serviceTick() {
+     writeSummaries();
+     return;
+   }
+-  if (g_readUpsDirty && static_cast<int32_t>(now - g_readUpsDueMs) >= 0) {
+-    writeReadUps();
+-    return;
+-  }
+   // One background storage step per main-loop pass, shared with the Outbox.
+   if (!claimBackgroundStorageStep(BG_NOTIFICATIONS)) {
+     g_nextStepMs = now;  // not this pass: the next one
+     return;
+   }
++  if (stepPendingRead()) return;  // the user is looking at it: before any job
+   if (g_job != nullptr) {
+     stepJob();
+     return;
+@@ -955,14 +900,16 @@ bool hasBadge(uint8_t mask) {
+   return false;  // no stored message type maps to BADGE_TRAINING_GAME (Race ORs in its own flag)
+ }
+ 
+-// An UNREAD record was evicted (the append path's retention cap or low-space
+-// cleanup; background trimming deletes through deleteMessage(), uncounting as
+-// it goes, and never comes here).
++// An UNREAD record (or one whose header could not be read) was evicted --
++// its removal succeeded (the append path's retention cap or low-space
++// cleanup; background trimming deletes through deleteMessage(), uncounting
++// and forgetting as it goes, and never comes here).
+ // Its type can no longer be read, so the conversation becomes UNRESOLVED (its
+ // badges stay lit) and is recounted in the background -- never here: this
+ // runs inside an append, on the arrival path.
+ void onMessageEvicted(const MessageRef& ref, uint16_t flags) {
+   conversationChanged(ref.group_code, ref.contact_key);
++  forgetPendingReads(ref.group_code, ref.contact_key, &ref.sequence);
+   if (!(flags & MessageStore::FLAG_UNREAD)) return;
+   Summary* s = findSummary(ref.group_code, ref.contact_key);
+   if (s == nullptr) return;  // not listed: nothing to correct (the sweep covers the rest)
+@@ -982,10 +929,12 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
+     }
+   }
+   if (changed) saveSummaries();
++  // (Its pending reads end at their next attempt, once the group is no
++  // longer configured: applyRead().)
+ }
+ 
+ void serviceInit() {
+-  loadReadUps();
++  discardOldReadUpRecord();
+   loadSummaries();
+   registerSettingsChangeHook(onSettingsChanged);
+   MessageStore::setOnEvictedCallback(onMessageEvicted);
+@@ -1007,11 +956,11 @@ Registrar g_registrar;
+ }  // namespace
+ 
+ void onMessageArrived(const char* group_code, const char* contact_key, const MessageRef& ref,
+-                      uint8_t badgeMask, bool conversationCurrentlyOpen) {
++                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen) {
+   conversationChanged(group_code, contact_key);
+   StoredMessageView view;
+   bool loaded = MessageStore::loadMessage(ref, &view);
+-  if (conversationCurrentlyOpen) {
++  if (conversationCurrentlyOpen && readIfOpen) {
+     if (!loaded || (view.header.flags & MessageStore::FLAG_UNREAD))
+       MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
+     return;
+@@ -1035,6 +984,7 @@ void onMessageArrived(const char* group_code, const char* contact_key, const Mes
+     saveSummaries();
+   }
+ 
++  if (conversationCurrentlyOpen) return;  // on screen already (and still unread: readIfOpen false)
+   playTone(1000, 150, SOUND_NOTIFICATION);
+   Sleep::notifyActivity();
+ }
+@@ -1044,11 +994,11 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
+   if (!MessageStore::loadMessage(ref, &view)) return;
+   if (!(view.header.flags & MessageStore::FLAG_UNREAD)) return;
+ 
+-  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
++  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return;  // still unread: still counted
+   conversationChanged(group_code, contact_key);
++  forgetPendingReads(group_code, contact_key, &ref.sequence, view.envelope.message_id);  // read: nothing left to do
+   Summary* s = findSummary(group_code, contact_key);
+   if (s == nullptr || s->state == SUMMARY_UNRESOLVED) return;  // an UNRESOLVED one is recounted in the background
+-  if (coveredByPendingReadUp(group_code, contact_key, view.header, view.envelope, ref.sequence)) return;  // counted as read already
+   int slot = slotForType(view.envelope.message_type);
+   if (slot >= 0 && s->unread[slot] > 0) {
+     s->unread[slot]--;
+@@ -1056,69 +1006,37 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
+   }
+ }
+ 
+-void readUpTo(const char* group_code, const char* contact_key, uint16_t selectedIndex, uint16_t indexTotal) {
+-  const MessageStore::ConversationIndexEntry* sel = MessageStore::getIndexEntry(selectedIndex);
+-  if (sel == nullptr || selectedIndex >= indexTotal) return;
+-  // Nothing at or above it that may be unread: nothing to read (the index's
+-  // flags can only over-report: a cleared flag shows as unread until the
+-  // chat reloads its index).
+-  bool anyUnread = false;
+-  for (uint16_t i = 0; i <= selectedIndex && !anyUnread; i++) {
+-    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
+-    anyUnread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD) && e->sequence <= sel->sequence;
+-  }
+-  if (!anyUnread) return;
+-
+-  MessageRef ref;
+-  strncpy(ref.group_code, group_code, sizeof(ref.group_code) - 1);
+-  ref.group_code[sizeof(ref.group_code) - 1] = '\0';
+-  strncpy(ref.contact_key, contact_key, sizeof(ref.contact_key) - 1);
+-  ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
+-  ref.sequence = sel->sequence;
+-  StoredMessageView view;
+-  if (!MessageStore::loadMessage(ref, &view)) return;
+-  if (view.header.direction != MessageStore::Direction::RECEIVED) return;
+-  int slot = slotForType(view.envelope.message_type);
+-  if (slot < 0) return;
+-
+-  ReadUp r;
++bool readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id) {
++  if (group_code == nullptr || contact_key == nullptr || message_id == nullptr) return false;
++  PendingRead r;
+   memset(&r, 0, sizeof(r));
+   strncpy(r.group_code, group_code, sizeof(r.group_code) - 1);
+   strncpy(r.contact_key, contact_key, sizeof(r.contact_key) - 1);
+-  r.type = view.envelope.message_type;
+-  r.sortTs = view.header.effective_sort_timestamp;
+-  memcpy(r.messageId, view.envelope.message_id, sizeof(r.messageId));
+-  r.sequence = sel->sequence;
+-  if (!addReadUp(r)) return;  // covered by an earlier selection
+-  conversationChanged(group_code, contact_key);  // a recount under way may have counted what is now read
+-
+-  // The badge follows at once when what stays unread of this type can be
+-  // counted with a few reads: records below the selection, or stored after
+-  // it, whose index flag shows unread. Otherwise the recount after the
+-  // read-up sets it (the categories stay lit meanwhile).
+-  Summary* s = findSummary(group_code, contact_key);
+-  if (s == nullptr) return;
+-  uint16_t remaining = 0;
+-  uint8_t loads = 0;
+-  for (uint16_t i = 0; i < indexTotal; i++) {
+-    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
+-    if (e == nullptr || !(e->flags & MessageStore::FLAG_UNREAD)) continue;
+-    if (i <= selectedIndex && e->sequence <= r.sequence) continue;  // at or above it: read now (if this type)
+-    if (loads++ == kCountLoads) return;
+-    ref.sequence = e->sequence;
+-    StoredMessageView v;
+-    if (!MessageStore::loadMessage(ref, &v)) return;
+-    if (v.header.direction == MessageStore::Direction::RECEIVED && (v.header.flags & MessageStore::FLAG_UNREAD) &&
+-        v.envelope.message_type == r.type && !coveredByPendingReadUp(group_code, contact_key, v.header, v.envelope, e->sequence))
+-      remaining++;
+-  }
+-  if (s->state == SUMMARY_COUNTED) {
+-    if (s->unread[slot] == remaining) return;
+-    s->unread[slot] = remaining;
++  memcpy(r.messageId, message_id, sizeof(r.messageId));
++  r.sequence = sequence;
++  if (g_reads != nullptr) {
++    for (uint8_t i = 0; i < g_reads->count; i++) {
++      const PendingRead& p = g_reads->items[i];
++      if (p.sequence == sequence && sameConversation(p.group_code, p.contact_key, group_code, contact_key) &&
++          strncmp(p.messageId, r.messageId, sizeof(r.messageId)) == 0)
++        return true;  // already accepted
++    }
+   } else {
+-    s->unread[slot] = remaining > 0 ? 1 : 0;
++    g_reads = new (std::nothrow) PendingReads;
++    if (g_reads == nullptr) {
++      Serial.printf("[NOTIFY] read of %s/%s #%lu refused: no memory; left unread\n", group_code, contact_key,
++                    static_cast<unsigned long>(sequence));
++      return false;
++    }
++    g_reads->count = 0;
+   }
+-  saveSummaries();
++  if (g_reads->count >= kMaxPendingReads) {
++    Serial.printf("[NOTIFY] read of %s/%s #%lu refused: %u reads pending; left unread\n", group_code, contact_key,
++                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));
++    return false;
++  }
++  g_reads->items[g_reads->count++] = r;
++  return true;
+ }
+ 
+ uint16_t getUnreadCount(const char* group_code, const char* contact_key) {
+diff --git a/src/core/notifications.h b/src/core/notifications.h
+index 32d3815..4ac5632 100644
+--- a/src/core/notifications.h
++++ b/src/core/notifications.h
+@@ -18,28 +18,34 @@ enum BadgeCategory : uint8_t {
+ };
+ 
+ // Call right after appendStoredMessage() for an incoming record. If the
+-// exact conversation is currently open, this saves it as read (no
+-// tone/badge); otherwise it marks UNREAD, counts it in the per-conversation
+-// summary under its stored message type, sounds the notification tone, and
+-// resets the Sleep timer. The badges follow the stored type (TEXT -> Text,
+-// ENIGMA -> Enigma, GAME -> both); badgeMask is used only if the record
+-// cannot be read back.
++// exact conversation is currently open and readIfOpen is true (the Friend
++// game's arrivals), this saves it as read (no tone/badge). Otherwise it
++// marks UNREAD and counts it in the per-conversation summary under its
++// stored message type; and, unless the conversation is open, sounds the
++// notification tone and resets the Sleep timer. The Text and Enigma chats
++// pass readIfOpen false: an arrival is never read by being on screen (only
++// a move onto it reads it, readMovedOnto()). The badges follow the stored
++// type (TEXT -> Text, ENIGMA -> Enigma, GAME -> both); badgeMask is used only
++// if the record cannot be read back.
+ void onMessageArrived(const char* group_code, const char* contact_key, const MessageRef& ref,
+-                      uint8_t badgeMask, bool conversationCurrentlyOpen);
++                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen = true);
+ 
+ // Call on a received message's explicit DOT action: reads that one message.
+-// No-op if it is already read.
++// No-op if it is already read; the count follows only a successful rewrite.
+ void clearUnread(const char* group_code, const char* contact_key, const MessageRef& ref);
+ 
+-// Call when a history item becomes the selected one, with the open chat's
+-// conversation index (MessageStore::getIndexEntry) still loaded: if it is a
+-// received message, it and every older received message of the same type in
+-// this conversation become read -- older meaning at or above it in the
+-// history and stored no later than it. Messages below it, or stored after it,
+-// stay unread; other types are untouched. Bounded work here (a few record
+-// reads, no rewrite and no NVS write): the flags on flash are cleared in the
+-// background, and the request is saved so a reboot doesn't lose it.
+-void readUpTo(const char* group_code, const char* contact_key, uint16_t selectedIndex, uint16_t indexTotal);
++// Call when the user moves a Text or Enigma chat's cursor onto a message
++// whose index entry is unread (every such move, moves held while the chat
++// loaded and replayed included -- never for an initial, restored or
++// followed selection). Asks to read exactly that message, identified by
++// sequence AND message id: nothing older, nothing else. Never writes or
++// lists storage. True: accepted (or already pending) -- the flag is cleared
++// on flash by the background work, one rewrite per step, retried after a
++// failure; the count follows only once that rewrite succeeded. Kept in RAM
++// only: a power loss before the rewrite leaves the message unread. False:
++// refused (32 reads already pending, or no memory for the list) -- nothing
++// recorded; the message stays unread and the caller tells the user.
++bool readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id);
+ 
+ uint16_t getUnreadCount(const char* group_code, const char* contact_key);
+ 
+diff --git a/src/core/storage_messages.cpp b/src/core/storage_messages.cpp
+index 299fa1b..f5d2022 100644
+--- a/src/core/storage_messages.cpp
++++ b/src/core/storage_messages.cpp
+@@ -296,14 +296,17 @@ bool removeRecordFile(const char* group_code, const char* contact_key, uint32_t
+   bool removed = LittleFS.remove(path);
+   dropCachedRecord(group_code, contact_key, seq);
+   afterRecordRemove(group_code, contact_key, seq, removed);
+-  if (removed && notifyIfUnread && haveHdr && (hdr.flags & FLAG_UNREAD) && g_onEvicted != nullptr) {
++  // A removed record whose header could not be read is reported too, as
++  // unread (conservatively): its count is then recounted, and a pending read
++  // of it ends -- its removal is known to have succeeded.
++  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {
+     MessageRef ref;
+     strncpy(ref.group_code, group_code, sizeof(ref.group_code) - 1);
+     ref.group_code[sizeof(ref.group_code) - 1] = '\0';
+     strncpy(ref.contact_key, contact_key, sizeof(ref.contact_key) - 1);
+     ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
+     ref.sequence = seq;
+-    g_onEvicted(ref, hdr.flags);
++    g_onEvicted(ref, haveHdr ? hdr.flags : static_cast<uint16_t>(FLAG_UNREAD));
+   }
+   return removed;
+ }
+@@ -1903,12 +1906,12 @@ void updateLocalStatus(const MessageRef& ref, uint16_t newFlags) {
+   atomicRewrite(ref, hdr, view.wirePacket, view.wirePacketLen, view.localPayload, view.localPayloadLen);
+ }
+ 
+-void updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
++bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
+   StoredMessageView view;
+-  if (!loadMessage(ref, &view)) return;
++  if (!loadMessage(ref, &view)) return false;
+   StoredHeader hdr = view.header;
+   hdr.flags = static_cast<uint16_t>((hdr.flags & ~clearMask) | setMask);
+-  atomicRewrite(ref, hdr, view.wirePacket, view.wirePacketLen, view.localPayload, view.localPayloadLen);
++  return atomicRewrite(ref, hdr, view.wirePacket, view.wirePacketLen, view.localPayload, view.localPayloadLen);
+ }
+ 
+ bool updateTypeLocalPayload(const MessageRef& ref, const uint8_t* localPayload, uint16_t localPayloadLen) {
+diff --git a/src/core/storage_messages.h b/src/core/storage_messages.h
+index 7617508..80ae510 100644
+--- a/src/core/storage_messages.h
++++ b/src/core/storage_messages.h
+@@ -82,8 +82,10 @@ struct ConversationIndexEntry {
+   uint16_t flags;
+ };
+ 
+-// Called whenever an UNREAD record is evicted (FIFO or global low-space),
+-// so Notifications can decrement its per-conversation summary. Optional.
++// Called whenever an UNREAD record (or one whose header could not be read,
++// reported with FLAG_UNREAD) is evicted (FIFO or global low-space) -- only
++// once its removal succeeded -- so Notifications can correct its
++// per-conversation summary and end a pending read of it. Optional.
+ using EvictedCallback = void (*)(const MessageRef& ref, uint16_t flags);
+ void setOnEvictedCallback(EvictedCallback cb);
+ 
+@@ -206,7 +208,9 @@ void feedIndexRecord(const char* group_code, const char* contact_key, uint32_t s
+                      const char* message_id);
+ 
+ void updateLocalStatus(const MessageRef& ref, uint16_t newFlags);
+-void updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask);
++// True once the rewritten record is in place (false: unchanged, or -- a
++// failed rename -- see atomicRewrite()).
++bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask);
+ bool updateTypeLocalPayload(const MessageRef& ref, const uint8_t* localPayload, uint16_t localPayloadLen);
+ 
+ bool findMessageById(const char* group_code, const char* contact_key, const char* message_id, MessageRef* outRef);
+diff --git a/src/core/text_message.cpp b/src/core/text_message.cpp
+index 4422b8f..0400922 100644
+--- a/src/core/text_message.cpp
++++ b/src/core/text_message.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "core/display.h"
+ #include "core/held_input.h"
++#include "core/history_dates.h"
+ #include "core/hooks.h"
+ #include "core/identity.h"
+ #include "core/identity_color.h"
+@@ -35,8 +36,9 @@ char g_selectedGroupCode[33];
+ char g_selectedContactKey[MessageStore::kContactKeyLen];
+ 
+ // "Exact conversation currently open" — read by the incoming-message
+-// handler so a message that arrives while its own Chat is open is saved
+-// as already-read, no tone/badge (Phase 2 section 13).
++// handlers: an arrival in the open chat is shown (no tone), and stays
++// unread until the cursor is moved onto it (Text and Enigma; the Friend
++// game's arrivals are still saved as read).
+ bool g_chatIsOpen = false;
+ char g_chatOpenGroup[33];
+ char g_chatOpenContact[MessageStore::kContactKeyLen];
+@@ -124,6 +126,11 @@ bool g_chatDrawnThisVisit = false;
+ // reloaded -- once per change, so an index that cannot be cached (a record
+ // unreadable) is not reloaded every pass.
+ uint32_t g_chatIndexGeneration = 0;
++// What the shown history was drawn from (order, days, unread markers): a
++// change kept current in the index (a read, an arrival, a removal) redraws
++// the history rows.
++uint32_t g_drawnIndexSignature = 0;
++bool g_historyStale = false;
+ 
+ void refreshIndexIfNeeded() {
+   if (!g_indexDirty) return;
+@@ -153,6 +160,7 @@ bool syncIndexWithStore() {
+   g_chatIndexGeneration = now;
+   g_indexTotal = MessageStore::getIndexCount();
+   followCursorMessage();
++  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;
+   return true;
+ }
+ 
+@@ -554,11 +562,16 @@ struct HistoryRowInfo {
+   // untouched (always WHITE, drawn via plain printLine()). Hardware Fix
+   // #4.8b: also the color the sender-divider bar itself is drawn in.
+   uint16_t senderColor565;
++  // Presentation only, from the index (no record read): a date heading row
++  // before this message (the first of its day), and its unread marker.
++  uint8_t headerRows;
++  bool unread;
+ };
+ 
+ // Loads history entry `index` and computes where its body text wraps.
+ // `labelX` is the fixed compact-cursor-cell-relative icon-cell X already
+-// used by every history row's TRUE first row (2 + Display::kCursorCellWidth).
++// used by every history row's TRUE first row (kHistoryLabelX: after the
++// cursor cell and the unread-marker cell).
+ //
+ // Hardware Diagnostic #4.9l: optional trailing output, defaulted to
+ // nullptr so every existing call site is unaffected. When non-null, set
+@@ -575,6 +588,11 @@ struct HistoryRowInfo {
+ // the existing behavior.
+ void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out, bool* outReliable = nullptr) {
+   if (outReliable != nullptr) *outReliable = true;
++  {
++    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(index);
++    out->headerRows = HistoryDates::startsDay(index) ? 1 : 0;
++    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);
++  }
+   out->senderPrefix[0] = '\0';
+   out->icon = MessageIconKind::NONE;
+   out->senderColor565 = ST77XX_CYAN;  // safe default; overwritten below once a sender is actually known
+@@ -676,6 +694,36 @@ uint16_t countHistoryRowsFor(uint16_t index, int16_t labelX, bool* outReliable =
+   return countHistoryRows(info);
+ }
+ 
++// Rows a message occupies on screen: its date heading (if any) and its body
++// rows. The viewport and row positions count these; the cursor
++// (g_historyRowOffset) moves over body rows only, never onto a heading.
++uint16_t countVisualRows(const HistoryRowInfo& info) { return static_cast<uint16_t>(info.headerRows + countHistoryRows(info)); }
++uint16_t countVisualRowsFor(uint16_t index, int16_t labelX, bool* outReliable = nullptr) {
++  HistoryRowInfo info;
++  loadHistoryRow(index, labelX, &info, outReliable);
++  return countVisualRows(info);
++}
++
++// The selection's own visual row within its message, and the first visual
++// row that must be on screen with it: its heading too when the selection is
++// on the message's first row.
++uint16_t cursorVisualRow() {
++  return static_cast<uint16_t>((HistoryDates::startsDay(g_historyCursor) ? 1 : 0) + g_historyRowOffset);
++}
++uint16_t cursorVisualTop() { return g_historyRowOffset == 0 ? 0 : cursorVisualRow(); }
++
++// The x of the unread-marker cell, and of the history rows' icon cell after it.
++constexpr int16_t kUnreadMarkerX = 2 + Display::kCursorCellWidth;
++constexpr int16_t kHistoryLabelX = kUnreadMarkerX + Display::kUnreadMarkerCellWidth;
++
++void drawDateHeading(uint16_t index, int16_t y) {
++  char text[HistoryDates::kTextCap];
++  HistoryDates::headingFor(index, text, sizeof(text));
++  int16_t w = Display::textWidth(text);
++  int16_t x = static_cast<int16_t>(w < Display::kScreenWidth ? (Display::kScreenWidth - w) / 2 : 0);
++  Display::printLineColored(x, y, text, 0x8410);  // grey
++}
++
+ // Picks the history viewport's starting position as a (message index,
+ // rows-already-scrolled-past-within-that-message) pair instead of a plain
+ // message index, so a single logical message taller than the viewport can
+@@ -715,7 +763,7 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+   while (idx > 0) {
+     idx--;
+     bool rowReliable = true;
+-    uint16_t rows = countHistoryRowsFor(idx, labelX, &rowReliable);
++    uint16_t rows = countVisualRowsFor(idx, labelX, &rowReliable);
+     if (!rowReliable && outReliable != nullptr) *outReliable = false;
+     if (static_cast<int32_t>(rows) <= budget) {
+       budget -= rows;
+@@ -741,9 +789,9 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+     return;
+   }
+ 
+-  if (g_historyCursor < defIdx || (g_historyCursor == defIdx && g_historyRowOffset < defSkip)) {
++  if (g_historyCursor < defIdx || (g_historyCursor == defIdx && cursorVisualTop() < defSkip)) {
+     *outStartIdx = g_historyCursor;
+-    *outStartRowSkip = g_historyRowOffset;
++    *outStartRowSkip = cursorVisualTop();
+     return;
+   }
+ 
+@@ -754,15 +802,15 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+     loadHistoryRow(defIdx, labelX, &first, &firstReliable);
+     if (!firstReliable && outReliable != nullptr) *outReliable = false;
+     if (defIdx == g_historyCursor) {
+-      rowsBefore = static_cast<int32_t>(g_historyRowOffset) - static_cast<int32_t>(defSkip);
++      rowsBefore = static_cast<int32_t>(cursorVisualRow()) - static_cast<int32_t>(defSkip);
+     } else {
+-      rowsBefore = static_cast<int32_t>(countHistoryRows(first)) - static_cast<int32_t>(defSkip);
++      rowsBefore = static_cast<int32_t>(countVisualRows(first)) - static_cast<int32_t>(defSkip);
+       for (uint16_t i = static_cast<uint16_t>(defIdx + 1); i < g_historyCursor; i++) {
+         bool rowReliable = true;
+-        rowsBefore += countHistoryRowsFor(i, labelX, &rowReliable);
++        rowsBefore += countVisualRowsFor(i, labelX, &rowReliable);
+         if (!rowReliable && outReliable != nullptr) *outReliable = false;
+       }
+-      rowsBefore += g_historyRowOffset;
++      rowsBefore += cursorVisualRow();
+     }
+   }
+ 
+@@ -776,7 +824,7 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+   uint16_t curSkip = defSkip;
+   while (rowsBefore >= static_cast<int32_t>(viewportLines)) {
+     bool rowReliable = true;
+-    uint16_t rows = countHistoryRowsFor(curIdx, labelX, &rowReliable);
++    uint16_t rows = countVisualRowsFor(curIdx, labelX, &rowReliable);
+     if (!rowReliable && outReliable != nullptr) *outReliable = false;
+     if (static_cast<uint16_t>(curSkip + 1) < rows) {
+       curSkip++;
+@@ -790,8 +838,9 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
+   *outStartRowSkip = curSkip;
+ }
+ 
+-// Y of visual row `targetRowIdx` of history index `targetIdx`, given the
+-// viewport currently starts at (startIdx, startRowSkip).
++// Y of body row `targetRowIdx` of history index `targetIdx`, given the
++// viewport currently starts at (startIdx, startRowSkip) -- visual rows,
++// date headings included.
+ int16_t historyRowY(uint16_t startIdx, uint16_t startRowSkip, uint16_t targetIdx, uint16_t targetRowIdx,
+                     int16_t labelX, int16_t contentTop, int16_t lh) {
+   int32_t rows = 0;
+@@ -799,7 +848,7 @@ int16_t historyRowY(uint16_t startIdx, uint16_t startRowSkip, uint16_t targetIdx
+     HistoryRowInfo info;
+     loadHistoryRow(i, labelX, &info);
+     uint16_t skip = (i == startIdx) ? startRowSkip : 0;
+-    uint16_t limit = (i == targetIdx) ? targetRowIdx : countHistoryRows(info);
++    uint16_t limit = (i == targetIdx) ? static_cast<uint16_t>(info.headerRows + targetRowIdx) : countVisualRows(info);
+     if (limit > skip) rows += static_cast<int32_t>(limit - skip);
+   }
+   return static_cast<int16_t>(contentTop + rows * lh);
+@@ -1332,21 +1381,18 @@ void handleHistoryFocusEvent(const InputEvent& e) {
+   }
+ }
+ 
+-// Selecting a history item (rotating onto it) reads it and every older
+-// received message of the same type in this conversation
+-// (Notifications::readUpTo; hardware findings on 30ed514 and 23293c5). Being
+-// in view, or entering the chat, reads nothing. Checked once per newly
+-// selected message.
+-bool g_readCheckDone = false;
+-uint32_t g_readCheckSequence = 0;
+-
+-void markSelectedHistoryRead() {
++// A user move (a rotation, live or held and replayed) put the cursor onto
++// another message: that one message is read if its index entry is unread
++// (Notifications::readMovedOnto()). Entering, drawing, a restored or
++// followed selection and moving within one message's rows read nothing.
++bool g_readRefused = false;  // a move's read was refused (Notifications::readMovedOnto())
++void readMessageMovedOnto(bool hadMessage, uint32_t previousSeq) {
+   if (g_historyCursor == kNoHistoryCursor) return;
+-  const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(g_historyCursor);
+-  if (entry == nullptr || (g_readCheckDone && entry->sequence == g_readCheckSequence)) return;
+-  g_readCheckDone = true;
+-  g_readCheckSequence = entry->sequence;
+-  Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, g_historyCursor, g_indexTotal);
++  const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
++  if (e == nullptr || (hadMessage && e->sequence == previousSeq)) return;
++  if (!(e->flags & MessageStore::FLAG_UNREAD)) return;
++  if (!Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id))
++    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled
+ }
+ 
+ bool g_chatRenderDirty = true;
+@@ -1555,7 +1601,8 @@ void screenChatTick() {
+     // across entries.
+     g_chatViewportCacheValid = false;
+     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
+-    g_readCheckDone = false;  // a selection after (re)entry is checked afresh
++    g_historyStale = false;
++    g_readRefused = false;  // (a refusal is reported in its own visit only)
+     clearRetainedInput();
+     g_chatLoadingShown = false;
+     g_chatDrawnThisVisit = false;
+@@ -1684,7 +1731,11 @@ void screenChatTick() {
+       // own rows (g_historyRowOffset) before moving to the next/previous
+       // logical message -- identical to enigma.cpp's ENCODER_ROTATE
+       // handler (Hardware Fix #4.3a issue 1).
+-      int16_t rotLabelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);
++      int16_t rotLabelX = kHistoryLabelX;
++      const MessageStore::ConversationIndexEntry* fromEntry =
++          g_historyCursor != kNoHistoryCursor ? MessageStore::getIndexEntry(g_historyCursor) : nullptr;
++      bool fromMessage = fromEntry != nullptr;
++      uint32_t fromSeq = fromMessage ? fromEntry->sequence : 0;
+       if (g_historyCursor == kNoHistoryCursor) {
+         if (e.value < 0 && g_indexTotal > 0) {
+           g_historyCursor = static_cast<uint16_t>(g_indexTotal - 1);
+@@ -1711,6 +1762,7 @@ void screenChatTick() {
+           g_historyRowOffset = 0;
+         }
+       }
++      readMessageMovedOnto(fromMessage, fromSeq);
+     } else if (g_historyCursor != kNoHistoryCursor) {
+       handleHistoryFocusEvent(e);
+     } else {
+@@ -1775,13 +1827,16 @@ void screenChatTick() {
+     g_chatRenderDirty = true;  // index actually reloaded: content may have changed
+     indexReloadOccurred = true;
+   }
+-  markSelectedHistoryRead();  // against the complete index
+   if (g_inputLost && !g_sendRanThisTick) {
+     // Shown once the retained input was replayed (a key pressed after it
+     // clears it, like a Send outcome).
+     g_inputLost = false;
+     setSendStatus({"Input lost while loading", true});
+   }
++  if (g_readRefused && !g_sendRanThisTick) {
++    g_readRefused = false;
++    setSendStatus({"Read not saved (busy)", true});
++  }
+ 
+   Display::drawStatusBar();
+   if (!g_chatRenderDirty) {
+@@ -1826,8 +1881,8 @@ void screenChatTick() {
+   // instead of the old PRIMARY-font ">" glyph + padding, on both history
+   // and compose -- compose has no sender prefix, so its text starts right
+   // after this same cell (Part G).
+-  int16_t labelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // history icon-cell X
+-  int16_t composePrefixX = labelX;                                       // compose shares the same left margin
++  int16_t labelX = kHistoryLabelX;  // history icon-cell X (after the cursor and unread-marker cells)
++  int16_t composePrefixX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // compose: right after the cursor cell
+   int16_t composeWidth = static_cast<int16_t>(Display::kScreenWidth - composePrefixX);
+ 
+   // Compose text (Hardware Fix #4.4 issue B): word-wrapped by real pixel
+@@ -2000,7 +2055,7 @@ void screenChatTick() {
+   // coordinate below the status bar shifted, so history and compose both
+   // need a full repaint together (Hardware Fix #4.4 issues B/C).
+   bool historyLayoutChanged = firstDraw || (viewportLines != g_chatLastViewportLines);
+-  bool contentChanged = !historyLayoutChanged && wasIndexDirty;
++  bool contentChanged = !historyLayoutChanged && (wasIndexDirty || g_historyStale);
+   bool scrolled = !historyLayoutChanged && !contentChanged &&
+                   (static_cast<int16_t>(startIdx) != g_chatLastStartIdx ||
+                    static_cast<int16_t>(startRowSkip) != g_chatLastStartRowSkip);
+@@ -2034,7 +2089,16 @@ void screenChatTick() {
+       bool rowReliable = true;
+       loadHistoryRow(i, labelX, &info, &rowReliable);
+       if (!rowReliable) renderObservedUnreliable = true;
+-      uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;
++      uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;  // visual rows, its heading first
++      if (info.headerRows > 0) {
++        if (rowSkip == 0) {
++          drawDateHeading(i, y);
++          y = static_cast<int16_t>(y + lh);
++          rowsDrawn++;
++        } else {
++          rowSkip--;
++        }
++      }
+       size_t len = strlen(info.lineBuf);
+       size_t pos = 0;
+       uint16_t rowIdx = 0;
+@@ -2053,6 +2117,7 @@ void screenChatTick() {
+             // true FIRST row only; continuation rows start at that same
+             // sender X, with no icon/sender repeated (Hardware Fix #4.7
+             // Part E, #4.7b Part C).
++            if (info.unread) Display::printLineColored(kUnreadMarkerX, y, "*", ST77XX_YELLOW);
+             drawRowIcon(labelX, y, info.icon);
+             int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
+             int16_t textX = static_cast<int16_t>(labelX + iconWidth);
+@@ -2087,6 +2152,8 @@ void screenChatTick() {
+     }
+     g_chatNeedsFullRedraw = false;
+     g_chatDrawnThisVisit = true;  // a later reload keeps this on screen instead of "Loading messages..."
++    g_drawnIndexSignature = HistoryDates::indexSignature(g_indexTotal);
++    g_historyStale = false;
+   } else if (selectionOnlyChanged && viewportLines > 0) {
+     // Guarded on viewportLines > 0 so a focused message never gets its
+     // cursor marker drawn into the compose region below just because the
+@@ -2293,7 +2360,7 @@ void handleTextArrival(const char* group_code, const char* contact_key, const Pa
+ 
+   bool conversationOpen = isChatOpenFor(group_code, contact_key);
+   if (conversationOpen) markIndexDirty();
+-  Notifications::onMessageArrived(group_code, contact_key, ref, Notifications::BADGE_TEXT, conversationOpen);
++  Notifications::onMessageArrived(group_code, contact_key, ref, Notifications::BADGE_TEXT, conversationOpen, false);
+ }
+ 
+ void handleIncomingMessagePacket(const char* group_code, const char* topic, const uint8_t* payload,
