@@ -392,7 +392,7 @@
     }
   }
 
-  g_test = "PM9 more moves in one batch (40) than the pending list holds (32): every message moved onto is read, the rest applied at once";
+  g_test = "PM9 more moves in one batch (40) than the pending list holds (32): the first 32 are accepted and read in the background; the other 8 are refused, left unread and reported; no rewrite in the UI pass (round 6; was: 8 rewritten synchronously)";
   for (int enigma = 0; enigma < 2; enigma++) {
     freshDevice();
     std::vector<MessageRef> bob = unreadRun(kBob, enigma, 45, kDay06 + 600);
@@ -401,16 +401,16 @@
     g_uiMax = PassMax();
     for (int i = 0; i < 40; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
     loopPass();
-    uint64_t uiRenames = g_uiMax.renames;
+    uint64_t uiRenames = g_uiMax.renames, uiWrites = g_uiMax.writes, uiDir = g_uiMax.dirEntries;
     g_svcMax = PassMax();
     runFor(10);
-    CHECK(unreadOf(bob) == range(0, 5) && Notifications::getUnreadCount(kG, kBob) == 5 && countsMatch(kBob),
-          "%s: %zu unread after 40 moves (expected 0..4), count %u", kChatName[enigma], unreadOf(bob).size(),
-          Notifications::getUnreadCount(kG, kBob));
+    CHECK(unreadOf(bob) == range(0, 13) && Notifications::getUnreadCount(kG, kBob) == 13 && countsMatch(kBob),
+          "%s: %zu unread after 40 moves (expected 0..12: the 8 refused and the 5 never moved onto), count %u", kChatName[enigma],
+          unreadOf(bob).size(), Notifications::getUnreadCount(kG, kBob));
+    CHECK(uiRenames == 0 && uiWrites == 0 && uiDir == 0, "%s: the batch pass wrote %llu, renamed %llu, listed %llu entries", kChatName[enigma],
+          (unsigned long long)uiWrites, (unsigned long long)uiRenames, (unsigned long long)uiDir);
     CHECK(g_svcMax.renames <= 1 && g_svcMax.nvs <= 1, "%s: the 32 queued reads: up to %llu rewrites and %d NVS writes in one service pass",
           kChatName[enigma], (unsigned long long)g_svcMax.renames, g_svcMax.nvs);
-    printf("   PM9 %s measured: the batch pass rewrote %llu records synchronously (40 moves, 32 queued)\n", kChatName[enigma],
-           (unsigned long long)uiRenames);
     back();
   }
 
@@ -663,6 +663,8 @@
     CHECK(markers() == 4, "variant %d: %d markers on the 4 shown unread messages", variant, markers());
     back();
   }
+
+#include "pm_overflow_tests.inc"
 
   // ---- measurements (printed, not checked): device-cost model, 63 ms per open ----
   {

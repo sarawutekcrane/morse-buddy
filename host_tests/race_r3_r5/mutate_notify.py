@@ -30,7 +30,6 @@ muts = [
  (NT, "a read whose rewrite failed is dropped (not retried)", "    if (applyRead(p) == ReadOutcome::DONE) {", "    if (applyRead(p) == ReadOutcome::DONE || true) {"),
  (NT, "a failing read is retried every step (no backoff; starves the other work)", "    if (p.retryAtMs != 0 && static_cast<int32_t>(now - p.retryAtMs) < 0) continue;\n", ""),
  (NT, "a read is applied without checking the message id (another message under the same sequence is read)", "  if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {", "  if (false) {"),
- (NT, "a read when the pending list is full is dropped (not applied at once)", "  if (applyRead(r) != ReadOutcome::DONE)\n", "  if (false)\n"),
  (NT, "a pending read waits behind the other background work", "  if (stepPendingRead()) return;  // the user is looking at it: before any job\n", "  if (g_job == nullptr && g_sweep == nullptr && stepPendingRead()) return;\n"),
  (NT, "a read does not restart a recount under way", "  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread\n", ""),
  (NT, "a read decrements an UNRESOLVED summary's category flag", "  if (s != nullptr && s->state == SUMMARY_COUNTED && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;", "  if (s != nullptr && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;"),
@@ -38,6 +37,17 @@ muts = [
  (NT, "the explicit DOT read is counted although its rewrite failed", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return;  // still unread: still counted", "  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);"),
  (NT, "the earlier read-up record is never erased", "  if (p.remove(kOldReadUpKey)) Serial.println", "  if (false) Serial.println"),
  (NT, "an arrival in an open Text/Enigma chat is read (readIfOpen ignored)", "  if (conversationCurrentlyOpen && readIfOpen) {", "  if (conversationCurrentlyOpen) {"),
+ # ---- round 6: finite pending-read list, no write on the movement path, confirmed absence ----
+ (NT, "a refused read is reported as accepted", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return false;", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return true;"),
+ (NT, "a full list applies the read at once (round 5: a synchronous rewrite on the movement path)", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return false;", "                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));\n    return applyRead(r) == ReadOutcome::DONE;"),
+ (NT, "no memory for the list: the read applied at once (round 5)", "                    static_cast<unsigned long>(sequence));\n      return false;\n    }\n    g_reads->count = 0;", "                    static_cast<unsigned long>(sequence));\n      return applyRead(r) == ReadOutcome::DONE;\n    }\n    g_reads->count = 0;"),
+ (NT, "the full list overwrites the newest pending read", "  if (g_reads->count >= kMaxPendingReads) {", "  if (g_reads->count >= kMaxPendingReads) {\n    g_reads->items[g_reads->count - 1] = r;\n    return true;\n  }\n  if (false) {"),
+ (NT, "absence taken from a single listing", "    if (!p.absentSeen) {  // absent once: confirmed only by a later, second listing", "    if (false) {"),
+ (NT, "absence is remembered across a listing that shows the record (not reset)", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone\n      p.absentSeen = 0;", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone"),
+ (NT, "a failed listing taken as confirmation of absence", "  return reliable && !truncated && !listed;", "  return !truncated && !listed;"),
+ (NT, "an incomplete (truncated) listing taken as complete", "  return reliable && !truncated && !listed;", "  return reliable && !listed;"),
+ (TX, "Text: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "\n"),
+ (EN, "Enigma: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "\n"),
  # ---- date headings (round 5) ----
  (HD, "headings in UTC, not Thailand time", "  return (ts + kThaiOffsetSeconds) / 86400u;", "  return ts / 86400u;"),
  (HD, "untrusted timestamps shown with an invented date (only 0 is unknown)", "  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;", "  if (ts == 0) return kUnknownDay;"),
@@ -206,6 +216,7 @@ muts = [
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
+ "an incomplete (truncated) listing taken as complete": "listMessageSequences() itself reports a truncated listing as unreliable (storage_messages.cpp: *outReliable = !openFailed && !truncated), so the explicit !truncated guard cannot change an outcome; PO6(e) shows a record outside a truncated listing kept pending either way",
  "the feed ignores the open chat (replaces the index it draws from)": "a current open-chat index is still protected by the cache check, and a stale one is reloaded by the chat's per-pass re-sync (CE23) anyway: the flag only saves that reload (cost, not correctness)",
  "an unreadable record is fed as read": "without the explicit nullptr feed the next fed record is out of step, which drops the feed; either way the fed index is never used and the chat loads itself",
 }

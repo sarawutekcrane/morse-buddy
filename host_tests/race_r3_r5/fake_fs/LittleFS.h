@@ -52,6 +52,10 @@ struct HostLittleFS {
   std::function<bool(const std::string&)> failRemove;  // true -> this remove() fails (nothing removed)
   std::function<bool(const std::string&)> failRename;  // true (given the target) -> this rename() fails
   std::function<void(const std::string&)> onFileOpen;  // runs on every successful file open (a device-cost model)
+  // true (given the directory and the entry's position) -> getNextFileName()
+  // returns "" there: a readdir error, which the Arduino API reports exactly
+  // like the end of the directory.
+  std::function<bool(const std::string& dir, size_t pos)> endListing;
   bool reverseListing = false;  // directories list in reverse name order (LittleFS promises no order)
   bool begin(bool = false, const char* = "/littlefs", int = 10, const char* = "spiffs") { return true; }
   File open(const char* path, const char* mode = "r");

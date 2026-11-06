@@ -37,13 +37,15 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
 // Call when the user moves a Text or Enigma chat's cursor onto a message
 // whose index entry is unread (every such move, moves held while the chat
 // loaded and replayed included -- never for an initial, restored or
-// followed selection). Reads exactly that message, identified by sequence
-// AND message id: nothing older, nothing else. No storage work here while
-// there is room to queue it (32 pending): the flag is cleared on flash by
-// the background work, one rewrite per step, and the count follows only
-// once that rewrite succeeded (a failed one is retried). Kept in RAM only:
-// a power loss before the rewrite leaves the message unread.
-void readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id);
+// followed selection). Asks to read exactly that message, identified by
+// sequence AND message id: nothing older, nothing else. Never writes or
+// lists storage. True: accepted (or already pending) -- the flag is cleared
+// on flash by the background work, one rewrite per step, retried after a
+// failure; the count follows only once that rewrite succeeded. Kept in RAM
+// only: a power loss before the rewrite leaves the message unread. False:
+// refused (32 reads already pending, or no memory for the list) -- nothing
+// recorded; the message stays unread and the caller tells the user.
+bool readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id);
 
 uint16_t getUnreadCount(const char* group_code, const char* contact_key);
 

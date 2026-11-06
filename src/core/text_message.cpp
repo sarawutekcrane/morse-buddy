@@ -1385,12 +1385,14 @@ void handleHistoryFocusEvent(const InputEvent& e) {
 // another message: that one message is read if its index entry is unread
 // (Notifications::readMovedOnto()). Entering, drawing, a restored or
 // followed selection and moving within one message's rows read nothing.
+bool g_readRefused = false;  // a move's read was refused (Notifications::readMovedOnto())
 void readMessageMovedOnto(bool hadMessage, uint32_t previousSeq) {
   if (g_historyCursor == kNoHistoryCursor) return;
   const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
   if (e == nullptr || (hadMessage && e->sequence == previousSeq)) return;
   if (!(e->flags & MessageStore::FLAG_UNREAD)) return;
-  Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id);
+  if (!Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id))
+    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled
 }
 
 bool g_chatRenderDirty = true;
@@ -1600,6 +1602,7 @@ void screenChatTick() {
     g_chatViewportCacheValid = false;
     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
     g_historyStale = false;
+    g_readRefused = false;  // (a refusal is reported in its own visit only)
     clearRetainedInput();
     g_chatLoadingShown = false;
     g_chatDrawnThisVisit = false;
@@ -1829,6 +1832,10 @@ void screenChatTick() {
     // clears it, like a Send outcome).
     g_inputLost = false;
     setSendStatus({"Input lost while loading", true});
+  }
+  if (g_readRefused && !g_sendRanThisTick) {
+    g_readRefused = false;
+    setSendStatus({"Read not saved (busy)", true});
   }
 
   Display::drawStatusBar();

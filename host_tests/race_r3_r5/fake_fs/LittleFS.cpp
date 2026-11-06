@@ -40,6 +40,7 @@ File File::openNextFile() {
 }
 std::string File::getNextFileName(bool* isDir) {
   if (!p_ || !p_->dir || p_->next >= p_->entries.size()) return "";
+  if (LittleFS.endListing && LittleFS.endListing(p_->path, p_->next)) return "";
   std::string child = (p_->path == "/" ? "" : p_->path) + "/" + p_->entries[p_->next++];
   g_fs.dirEntries++;
   std::error_code ec;

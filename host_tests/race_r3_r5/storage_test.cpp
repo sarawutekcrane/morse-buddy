@@ -29,6 +29,16 @@
 
 // Allocation-failure injection: while set, every nothrow array new fails
 // (the held-input buffer, the record cache), as on a device out of heap.
+// While set, every nothrow scalar new fails (e.g. the pending-read list).
+static bool g_failNothrowNew = false;
+void* operator new(size_t n, const std::nothrow_t&) noexcept {
+  if (g_failNothrowNew) return nullptr;
+  try {
+    return ::operator new(n);  // paired with the ordinary delete
+  } catch (...) {
+    return nullptr;
+  }
+}
 static bool g_failNothrowArrayNew = false;
 void* operator new[](size_t n, const std::nothrow_t&) noexcept {
   if (g_failNothrowArrayNew) return nullptr;
@@ -332,6 +342,7 @@ static void freshDevice() {
   LittleFS.failRename = nullptr;
   LittleFS.onFileOpen = nullptr;
   LittleFS.reverseListing = false;
+  LittleFS.endListing = nullptr;
   LittleFS.wipe();
   MessageStore::notifyExternalStorageMutationAttempted();  // a wiped device: nothing cached survives (as after the reboot that follows)
   T::reset();

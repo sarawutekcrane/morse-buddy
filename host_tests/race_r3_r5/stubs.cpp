@@ -364,7 +364,7 @@ namespace IdentityColor { bool isValid(uint8_t i) { return i < kColorCount; } ui
 namespace Notifications {
 void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool, bool) { T::notifications++; }
 void clearUnread(const char*, const char*, const MessageRef&) {}
-void readMovedOnto(const char*, const char*, uint32_t, const char*) {}
+bool readMovedOnto(const char*, const char*, uint32_t, const char*) { return true; }
 }
 #endif
 namespace Settings {
