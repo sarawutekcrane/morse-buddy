@@ -1,0 +1,51 @@
+   CE1 measured: max 4 opens/pass, 4 opens total, content after 1 passes
+   CE1b measured: max 6 opens/pass, 94 opens total, content after 23 passes
+   CE2 measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE2b measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE3 measured: 4 opens to store an arrival (with its eviction) and show it in the open chat
+   CE17 measured: 80 file opens for the boot sweep of 80 records
+   CE21 variant 0 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 1 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 2 measured: 3 opens on entry, content after 1 passes
+   CE11 measured: 95 opens to load 90 records with an arrival during the load
+   DM1 1 s after boot: chat drawn after 68 passes, 5959 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   DM2 after boot work settled: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 1)
+   DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 335 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   IN6 measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   IN6c measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   OB7b measured: in 300 s, 25 reads of the unreadable record offline (sweep), 26 online: 1 Outbox passes
+FAIL [PM9 more moves in one batch (40) than the pending list holds (32): the first 32 are accepted and read in the background; the other 8 are refused, left unread and reported; no rewrite in the UI pass (round 6; was: 8 rewritten synchronously)] line 407: Text: 5 unread after 40 moves (expected 0..12: the 8 refused and the 5 never moved onto), count 5
+FAIL [PM9 more moves in one batch (40) than the pending list holds (32): the first 32 are accepted and read in the background; the other 8 are refused, left unread and reported; no rewrite in the UI pass (round 6; was: 8 rewritten synchronously)] line 410: Text: the batch pass wrote 8, renamed 8, listed 0 entries
+FAIL [PM9 more moves in one batch (40) than the pending list holds (32): the first 32 are accepted and read in the background; the other 8 are refused, left unread and reported; no rewrite in the UI pass (round 6; was: 8 rewritten synchronously)] line 407: Enigma: 5 unread after 40 moves (expected 0..12: the 8 refused and the 5 never moved onto), count 5
+FAIL [PM9 more moves in one batch (40) than the pending list holds (32): the first 32 are accepted and read in the background; the other 8 are refused, left unread and reported; no rewrite in the UI pass (round 6; was: 8 rewritten synchronously)] line 410: Enigma: the batch pass wrote 8, renamed 8, listed 0 entries
+FAIL [PO1 a replay burst of 40 distinct unread selections: 32 accepted (read later, exact), 8 refused and shown unread; no write or listing in the UI pass; one rewrite per background pass] line 53: Text: loading 1; right after the moves: 32 pending, 37 unread, busy shown 0
+FAIL [PO1 a replay burst of 40 distinct unread selections: 32 accepted (read later, exact), 8 refused and shown unread; no write or listing in the UI pass; one rewrite per background pass] line 56: Text: UI passes (replay and the batch): writes 8 renames 8 removes 8 dirEntries 0 nvs 0
+FAIL [PO1 a replay burst of 40 distinct unread selections: 32 accepted (read later, exact), 8 refused and shown unread; no write or listing in the UI pass; one rewrite per background pass] line 66: Text: 5 unread (expected 0..12), counts ever differed from flash 0, 0 still pending
+   PO1 Text measured: UI passes max opens 53 writes 8 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+FAIL [PO1 a replay burst of 40 distinct unread selections: 32 accepted (read later, exact), 8 refused and shown unread; no write or listing in the UI pass; one rewrite per background pass] line 53: Enigma: loading 1; right after the moves: 32 pending, 37 unread, busy shown 0
+FAIL [PO1 a replay burst of 40 distinct unread selections: 32 accepted (read later, exact), 8 refused and shown unread; no write or listing in the UI pass; one rewrite per background pass] line 56: Enigma: UI passes (replay and the batch): writes 8 renames 8 removes 8 dirEntries 0 nvs 0
+FAIL [PO1 a replay burst of 40 distinct unread selections: 32 accepted (read later, exact), 8 refused and shown unread; no write or listing in the UI pass; one rewrite per background pass] line 66: Enigma: 5 unread (expected 0..12), counts ever differed from flash 0, 0 still pending
+   PO1 Enigma measured: UI passes max opens 52 writes 8 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+   PO2 Text measured: UI passes while writes fail: max opens 16, dirEntries 45 (the chat's own reload), writes 0
+FAIL [PO2 the list full from earlier passes while writes keep failing: later selections refused (unread, reported), unrelated work goes on; on recovery every accepted read is written without another visit] line 97: Text: pending 32 after 32 moves (busy shown 0); after 5 more: pending 32, busy shown 0, 45 unread
+   PO2 Text measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+   PO2 Enigma measured: UI passes while writes fail: max opens 15, dirEntries 45 (the chat's own reload), writes 0
+FAIL [PO2 the list full from earlier passes while writes keep failing: later selections refused (unread, reported), unrelated work goes on; on recovery every accepted read is written without another visit] line 97: Enigma: pending 32 after 32 moves (busy shown 0); after 5 more: pending 32, busy shown 0, 45 unread
+   PO2 Enigma measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+FAIL [PO3 no memory for the pending list: the selection is refused (unread, reported), no write; once memory returns, a selection is accepted and read] line 151: Text: refused 0 (pending 0, busy shown 0); bob[2] unread 0; count 2
+FAIL [PO3 no memory for the pending list: the selection is refused (unread, reported), no write; once memory returns, a selection is accepted and read] line 151: Enigma: refused 0 (pending 0, busy shown 0); bob[2] unread 0; count 2
+FAIL [PO6 absence must be confirmed: a deleted record is dropped only after two complete listings without it; an unreadable record, a listing cut short once, or no memory for the listing keep the read pending] line 254: deleted: pending after the first absent listing 0 (expected 1), read attempts 1 (expected 2), pending now 0, count 2
+FAIL [PO6 absence must be confirmed: a deleted record is dropped only after two complete listings without it; an unreadable record, a listing cut short once, or no memory for the listing keep the read pending] line 295: cut listing: kept 0 (cuts 13); read after 0
+MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   36 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3068 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   30 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12290 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+MEASURE -- Enigma chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   93 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 4 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7679 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   31 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12353 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+294 checks passed, 16 failed

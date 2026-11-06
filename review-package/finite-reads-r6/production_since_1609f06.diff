@@ -1,0 +1,256 @@
+diff --git a/src/core/enigma.cpp b/src/core/enigma.cpp
+index 44c62d7..9c92d61 100644
+--- a/src/core/enigma.cpp
++++ b/src/core/enigma.cpp
+@@ -1809,12 +1809,14 @@ void handleHistoryFocusEvent(const InputEvent& e) {
+ // if its index entry is unread (Notifications::readMovedOnto()). Entering,
+ // drawing, a restored or followed selection and moving within one message's
+ // rows read nothing.
++bool g_readRefused = false;  // a move's read was refused (Notifications::readMovedOnto())
+ void readMessageMovedOnto(bool hadMessage, uint32_t previousSeq) {
+   if (g_historyCursor == kNoHistoryCursor) return;
+   const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
+   if (e == nullptr || (hadMessage && e->sequence == previousSeq)) return;
+   if (!(e->flags & MessageStore::FLAG_UNREAD)) return;
+-  Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id);
++  if (!Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id))
++    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled
+ }
+ 
+ bool g_enigmaChatDirty = true;
+@@ -1906,6 +1908,7 @@ void screenEnigmaChatTick() {
+     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
+     clearDraft();
+     g_historyStale = false;
++    g_readRefused = false;  // (a refusal is reported in its own visit only)
+     g_historyCursor = kNoHistoryCursor;
+     g_historyRowOffset = 0;
+     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
+@@ -2098,6 +2101,10 @@ void screenEnigmaChatTick() {
+     g_inputLost = false;
+     setSendStatus({"Input lost while loading", true});
+   }
++  if (g_readRefused && !g_sendRanThisTick) {
++    g_readRefused = false;
++    setSendStatus({"Read not saved (busy)", true});
++  }
+ 
+   Display::drawStatusBar();
+   if (!g_enigmaChatDirty) return;
+diff --git a/src/core/notifications.cpp b/src/core/notifications.cpp
+index 070e26b..83a7d76 100644
+--- a/src/core/notifications.cpp
++++ b/src/core/notifications.cpp
+@@ -68,19 +68,27 @@ constexpr const char* kOldReadUpKey = "readup";
+ // conversation or category. Entering a chat, drawing it, its initial or a
+ // restored selection, a load completing and an arrival read nothing.
+ //
+-// The request is kept in RAM only, by exact identity (group, contact,
+-// sequence and message id), and applied by the background work: one record
+-// rewrite per step (serviceTick()), before any other job. The count is
+-// decremented only once the rewrite clearing FLAG_UNREAD succeeded, so counts
+-// and badges always describe what is on flash. A rewrite that fails is
++// An accepted request is kept in RAM only, by exact identity (group,
++// contact, sequence and message id), and applied by the background work:
++// one record rewrite per step (serviceTick()), before any other job. Nothing
++// is written or listed on the cursor-movement path. The count is decremented
++// only once the rewrite clearing FLAG_UNREAD succeeded, so counts and badges
++// always describe what is on flash. A rewrite (or read) that fails is
+ // retried (kBackoffMinMs doubling, at most kBackoffMaxMs) and moved behind
+-// the others; a record found gone (confirmed by a reliable listing), now
+-// holding another message, or no longer unread is dropped. Nothing is
+-// persisted: a power loss between the move and the rewrite's rename loses
+-// the read -- the message stays unread on flash (marker shown, counted after
+-// the reboot); never wrongly read. When the list is full, or cannot be
+-// allocated, the read is applied at once (a synchronous rewrite); if that
+-// fails the message stays unread and is not retried.
++// the others, until it succeeds or the request is dropped: its record gone
++// (seen absent by two complete listings, on two attempts), now holding
++// another message, or no longer unread.
++//
++// Finite capacity: at most kMaxPendingReads accepted requests. A request
++// that finds the list full (a burst of moves, or earlier requests waiting
++// for storage to recover), or no memory for the list, is refused:
++// readMovedOnto() returns false, nothing is recorded, the message stays
++// unread (its marker stays) and the chat says so ("Read not saved (busy)").
++// Moving onto it again later, once there is room, reads it.
++//
++// Nothing is persisted: a power loss between the move and the rewrite's
++// rename loses the read -- the message stays unread on flash (marker shown,
++// counted after the reboot); never wrongly read.
+ constexpr uint8_t kMaxPendingReads = 32;
+ struct PendingRead {
+   char group_code[33];
+@@ -89,6 +97,7 @@ struct PendingRead {
+   uint32_t sequence;
+   uint32_t retryAtMs;  // 0: due now
+   uint8_t failures;    // rewrites (or reads) that failed so far
++  uint8_t absentSeen;  // the last attempt found the record absent from a complete listing
+ };
+ struct PendingReads {
+   uint8_t count;
+@@ -574,8 +583,11 @@ void finishRecount() {
+ 
+ void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence);
+ 
+-// Whether a reliable listing of the conversation shows the record gone. A
+-// failed listing, or no memory for it, is not a confirmation.
++// Whether a complete, reliable listing of the conversation shows the record
++// gone. A failed or incomplete (truncated: more records than a listing holds)
++// listing, or no memory for it, is not a confirmation. (A directory read
++// error that ends the listing early cannot be told from its end through the
++// Arduino API: hence the second listing applyRead() requires.)
+ bool recordConfirmedGone(const MessageRef& ref) {
+   uint32_t* seqs = new (std::nothrow) uint32_t[MessageStore::kMaxMessagesPerThread];
+   if (seqs == nullptr) return false;
+@@ -585,7 +597,7 @@ bool recordConfirmedGone(const MessageRef& ref) {
+   bool listed = false;
+   for (uint16_t i = 0; i < n && !listed; i++) listed = seqs[i] == ref.sequence;
+   delete[] seqs;
+-  return reliable && !listed;
++  return reliable && !truncated && !listed;
+ }
+ 
+ enum class ReadOutcome : uint8_t { DONE, RETRY };
+@@ -604,7 +616,7 @@ void recountAfterFailedAttempt(const PendingRead& p) {
+ 
+ // Clears this one message's FLAG_UNREAD on flash and, only once that
+ // succeeded, its count. DONE also when there is nothing (left) to do.
+-ReadOutcome applyRead(const PendingRead& p) {
++ReadOutcome applyRead(PendingRead& p) {
+   MessageRef ref;
+   memset(&ref, 0, sizeof(ref));
+   strncpy(ref.group_code, p.group_code, sizeof(ref.group_code) - 1);
+@@ -612,10 +624,18 @@ ReadOutcome applyRead(const PendingRead& p) {
+   ref.sequence = p.sequence;
+   StoredMessageView view;
+   if (!MessageStore::loadMessage(ref, &view)) {
+-    if (!recordConfirmedGone(ref)) return ReadOutcome::RETRY;  // unreadable for now: never assumed gone
+-    recountAfterFailedAttempt(p);                              // deleted or evicted: nothing to read
++    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone
++      p.absentSeen = 0;
++      return ReadOutcome::RETRY;
++    }
++    if (!p.absentSeen) {  // absent once: confirmed only by a later, second listing
++      p.absentSeen = 1;
++      return ReadOutcome::RETRY;
++    }
++    recountAfterFailedAttempt(p);  // deleted or evicted: nothing to read
+     return ReadOutcome::DONE;
+   }
++  p.absentSeen = 0;
+   if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {
+     recountAfterFailedAttempt(p);  // another message holds the sequence now: it is not read
+     return ReadOutcome::DONE;
+@@ -981,8 +1001,8 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
+   }
+ }
+ 
+-void readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id) {
+-  if (group_code == nullptr || contact_key == nullptr || message_id == nullptr) return;
++bool readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id) {
++  if (group_code == nullptr || contact_key == nullptr || message_id == nullptr) return false;
+   PendingRead r;
+   memset(&r, 0, sizeof(r));
+   strncpy(r.group_code, group_code, sizeof(r.group_code) - 1);
+@@ -994,21 +1014,24 @@ void readMovedOnto(const char* group_code, const char* contact_key, uint32_t seq
+       const PendingRead& p = g_reads->items[i];
+       if (p.sequence == sequence && sameConversation(p.group_code, p.contact_key, group_code, contact_key) &&
+           strncmp(p.messageId, r.messageId, sizeof(r.messageId)) == 0)
+-        return;  // already pending
++        return true;  // already accepted
+     }
+   } else {
+     g_reads = new (std::nothrow) PendingReads;
+-    if (g_reads != nullptr) g_reads->count = 0;
++    if (g_reads == nullptr) {
++      Serial.printf("[NOTIFY] read of %s/%s #%lu refused: no memory; left unread\n", group_code, contact_key,
++                    static_cast<unsigned long>(sequence));
++      return false;
++    }
++    g_reads->count = 0;
+   }
+-  if (g_reads != nullptr && g_reads->count < kMaxPendingReads) {
+-    g_reads->items[g_reads->count++] = r;
+-    return;
++  if (g_reads->count >= kMaxPendingReads) {
++    Serial.printf("[NOTIFY] read of %s/%s #%lu refused: %u reads pending; left unread\n", group_code, contact_key,
++                  static_cast<unsigned long>(sequence), static_cast<unsigned>(g_reads->count));
++    return false;
+   }
+-  // No room (or no memory) to keep it: applied now; if that fails, the
+-  // message stays unread (shown so) and nothing claims otherwise.
+-  if (applyRead(r) != ReadOutcome::DONE)
+-    Serial.printf("[NOTIFY] read of %s/%s #%lu not written (no room to retry); left unread\n", group_code, contact_key,
+-                  static_cast<unsigned long>(sequence));
++  g_reads->items[g_reads->count++] = r;
++  return true;
+ }
+ 
+ uint16_t getUnreadCount(const char* group_code, const char* contact_key) {
+diff --git a/src/core/notifications.h b/src/core/notifications.h
+index ec9a871..4ac5632 100644
+--- a/src/core/notifications.h
++++ b/src/core/notifications.h
+@@ -37,13 +37,15 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
+ // Call when the user moves a Text or Enigma chat's cursor onto a message
+ // whose index entry is unread (every such move, moves held while the chat
+ // loaded and replayed included -- never for an initial, restored or
+-// followed selection). Reads exactly that message, identified by sequence
+-// AND message id: nothing older, nothing else. No storage work here while
+-// there is room to queue it (32 pending): the flag is cleared on flash by
+-// the background work, one rewrite per step, and the count follows only
+-// once that rewrite succeeded (a failed one is retried). Kept in RAM only:
+-// a power loss before the rewrite leaves the message unread.
+-void readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id);
++// followed selection). Asks to read exactly that message, identified by
++// sequence AND message id: nothing older, nothing else. Never writes or
++// lists storage. True: accepted (or already pending) -- the flag is cleared
++// on flash by the background work, one rewrite per step, retried after a
++// failure; the count follows only once that rewrite succeeded. Kept in RAM
++// only: a power loss before the rewrite leaves the message unread. False:
++// refused (32 reads already pending, or no memory for the list) -- nothing
++// recorded; the message stays unread and the caller tells the user.
++bool readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id);
+ 
+ uint16_t getUnreadCount(const char* group_code, const char* contact_key);
+ 
+diff --git a/src/core/text_message.cpp b/src/core/text_message.cpp
+index 68f7bf8..0400922 100644
+--- a/src/core/text_message.cpp
++++ b/src/core/text_message.cpp
+@@ -1385,12 +1385,14 @@ void handleHistoryFocusEvent(const InputEvent& e) {
+ // another message: that one message is read if its index entry is unread
+ // (Notifications::readMovedOnto()). Entering, drawing, a restored or
+ // followed selection and moving within one message's rows read nothing.
++bool g_readRefused = false;  // a move's read was refused (Notifications::readMovedOnto())
+ void readMessageMovedOnto(bool hadMessage, uint32_t previousSeq) {
+   if (g_historyCursor == kNoHistoryCursor) return;
+   const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
+   if (e == nullptr || (hadMessage && e->sequence == previousSeq)) return;
+   if (!(e->flags & MessageStore::FLAG_UNREAD)) return;
+-  Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id);
++  if (!Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id))
++    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled
+ }
+ 
+ bool g_chatRenderDirty = true;
+@@ -1600,6 +1602,7 @@ void screenChatTick() {
+     g_chatViewportCacheValid = false;
+     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
+     g_historyStale = false;
++    g_readRefused = false;  // (a refusal is reported in its own visit only)
+     clearRetainedInput();
+     g_chatLoadingShown = false;
+     g_chatDrawnThisVisit = false;
+@@ -1830,6 +1833,10 @@ void screenChatTick() {
+     g_inputLost = false;
+     setSendStatus({"Input lost while loading", true});
+   }
++  if (g_readRefused && !g_sendRanThisTick) {
++    g_readRefused = false;
++    setSendStatus({"Read not saved (busy)", true});
++  }
+ 
+   Display::drawStatusBar();
+   if (!g_chatRenderDirty) {
