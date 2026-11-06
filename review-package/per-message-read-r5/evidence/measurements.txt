@@ -1,0 +1,32 @@
+# Host model only (63 ms per file open added to the mock clock); not device timing. Same tests, same workloads.
+## 511d13e (read up to the selection)
+   PM9 Text measured: the batch pass rewrote 0 records synchronously (40 moves, 32 queued)
+   PM9 Enigma measured: the batch pass rewrote 0 records synchronously (40 moves, 32 queued)
+MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   36 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3068 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens  303 writes  27 renames  27 removes  27 dirEntries  270 nvs   5 | per pass max: ui opens 1 writes 0 renames 0; services opens 3 writes 1 renames 1 nvs 1 | model 29489 ms
+MEASURE   flash: 0 unread left of 27 (count 0)
+MEASURE -- Enigma chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   93 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 4 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7679 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens  304 writes  27 renames  27 removes  27 dirEntries  270 nvs   5 | per pass max: ui opens 1 writes 0 renames 0; services opens 3 writes 1 renames 1 nvs 1 | model 29552 ms
+MEASURE   flash: 0 unread left of 27 (count 0)
+
+## 1609f06 (per-message read)
+   PM9 Text measured: the batch pass rewrote 8 records synchronously (40 moves, 32 queued)
+   PM9 Enigma measured: the batch pass rewrote 8 records synchronously (40 moves, 32 queued)
+MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   36 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3068 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   30 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12290 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+MEASURE -- Enigma chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   93 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 4 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7679 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   31 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12353 ms
+MEASURE   flash: 13 unread left of 27 (count 13)

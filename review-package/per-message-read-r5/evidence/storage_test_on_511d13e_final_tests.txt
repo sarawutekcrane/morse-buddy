@@ -1,0 +1,109 @@
+FAIL [ST2 legacy flags: selecting the newest received message reads that message only (round 5; was: every older one of its type)] line 370: after selecting the newest: unread 0 files 60
+FAIL [ST2 legacy flags: selecting the newest received message reads that message only (round 5; was: every older one of its type)] line 374: badge 0 count 0
+FAIL [ST2 legacy flags: selecting the newest received message reads that message only (round 5; was: every older one of its type)] line 376: after reboot: badge 0 unread 0 count 0
+FAIL [ST3 the messages moved onto are read, nothing older and no other type; newer messages stay unread (round 5; was: read up to the selection)] line 389: a1 (older, not moved onto) 0, a2 (moved onto) 0
+FAIL [ST3b two moves in one batch read both messages moved onto, the one passed over included (round 5; was: it stayed unread)] line 414: selected 0 passed over 1
+FAIL [ST5 reboot after a move: the one message read stays read; nothing else is read, nothing resumed (round 5; was: a read-up resumed)] line 442: precondition: 19 unread (expected 149)
+FAIL [ST5 reboot after a move: the one message read stays read; nothing else is read, nothing resumed (round 5; was: a read-up resumed)] line 444: after reboot: unread 0 badge 0 count 0
+FAIL [ST8 NVS writes failing: the read is still applied to flash, and stays applied after reboot] line 487: with NVS failing: unread 0 (expected 39)
+FAIL [ST8 NVS writes failing: the read is still applied to flash, and stays applied after reboot] line 492: after reboot: unread 0 badge 0 count 0
+FAIL [ST11 a read's record rewrite fails five times: retried with backoff until written; only that message read (round 5; was: a read-up's passes)] line 527: left unread 0, count 0 (write failures 25)
+FAIL [ST19 a read whose rewrite keeps failing stays pending (retried with backoff, not dropped) without stalling other work; a reboot loses it and the message stays unread (round 5; was: a persisted read-up resumed)] line 716: precondition: writes failing, nothing cleared (30 left)
+FAIL [ST19 a read whose rewrite keeps failing stays pending (retried with backoff, not dropped) without stalling other work; a reboot loses it and the message stays unread (round 5; was: a persisted read-up resumed)] line 726: after reboot: Bob 0 unread (count 0)
+   CE1 measured: max 4 opens/pass, 4 opens total, content after 1 passes
+   CE1b measured: max 6 opens/pass, 94 opens total, content after 23 passes
+   CE2 measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE2b measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE3 measured: 4 opens to store an arrival (with its eviction) and show it in the open chat
+   CE17 measured: 80 file opens for the boot sweep of 80 records
+   CE21 variant 0 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 1 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 2 measured: 4 opens on entry, content after 1 passes
+   CE11 measured: 96 opens to load 90 records with an arrival during the load
+   DM1 1 s after boot: chat drawn after 68 passes, 5959 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   DM2 after boot work settled: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 1)
+   DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 335 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   IN6 measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   IN6c measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   OB7b measured: in 300 s, 25 reads of the unreadable record offline (sweep), 26 online: 1 Outbox passes
+FAIL [PM1 entering, rendering, a cold stepped load, a cached re-entry and a parked restore read nothing; each shown unread message has one marker] line 110: Text: 0 markers for the 4 unread messages whose first row is shown
+FAIL [PM1 entering, rendering, a cold stepped load, a cached re-entry and a parked restore read nothing; each shown unread message has one marker] line 110: Enigma: 0 markers for the 3 unread messages whose first row is shown
+FAIL [PM2 moving onto one unread message reads exactly that one; the others on screen keep their markers] line 149: Text: unread after one move: 0 (expected the 5 older)
+FAIL [PM2 moving onto one unread message reads exactly that one; the others on screen keep their markers] line 150: Text: markers 0 -> 0; the read one still marked 0
+FAIL [PM2 moving onto one unread message reads exactly that one; the others on screen keep their markers] line 152: Text: count 0
+FAIL [PM2 moving onto one unread message reads exactly that one; the others on screen keep their markers] line 149: Enigma: unread after one move: 0 (expected the 5 older)
+FAIL [PM2 moving onto one unread message reads exactly that one; the others on screen keep their markers] line 150: Enigma: markers 0 -> 0; the read one still marked 0
+FAIL [PM2 moving onto one unread message reads exactly that one; the others on screen keep their markers] line 152: Enigma: count 0
+FAIL [PM3 forward and reverse moves, a batch of queued moves and moves held while loading read exactly the messages moved onto] line 166: Text: after 3 up and 1 down: 0 unread
+FAIL [PM3 forward and reverse moves, a batch of queued moves and moves held while loading read exactly the messages moved onto] line 171: Text: after a batch of 3: 0 unread (expected 0..3)
+FAIL [PM3 forward and reverse moves, a batch of queued moves and moves held while loading read exactly the messages moved onto] line 185: Text: loading 1; after 7 held moves: 0 unread (expected 0..2)
+FAIL [PM3 forward and reverse moves, a batch of queued moves and moves held while loading read exactly the messages moved onto] line 166: Enigma: after 3 up and 1 down: 0 unread
+FAIL [PM3 forward and reverse moves, a batch of queued moves and moves held while loading read exactly the messages moved onto] line 171: Enigma: after a batch of 3: 0 unread (expected 0..3)
+FAIL [PM3 forward and reverse moves, a batch of queued moves and moves held while loading read exactly the messages moved onto] line 185: Enigma: loading 1; after 7 held moves: 0 unread (expected 0..2)
+FAIL [PM4 isolation: conversations, and the other type in the same history; a sent message gets no marker and no write] line 210: Text chat, t2: t2 0 t0 0 e1 1 carol 1 everyone 1
+FAIL [PM4 isolation: conversations, and the other type in the same history; a sent message gets no marker and no write] line 217: Enigma chat, e1: e1 0 t0 0 carol 1; enigma badge 0 text badge 1
+FAIL [PM5 the badge stays lit until the last qualifying unread message is read] line 238: Text: badge after 1, 2, 3 reads: 0 0 0
+FAIL [PM5 the badge stays lit until the last qualifying unread message is read] line 238: Enigma: badge after 1, 2, 3 reads: 0 0 0
+FAIL [PM5b a read while the conversation is UNRESOLVED keeps the badge lit while another unread message remains] line 261: Text: unresolved at the read 1; badge always lit 0; count 0
+FAIL [PM5b a read while the conversation is UNRESOLVED keeps the badge lit while another unread message remains] line 261: Enigma: unresolved at the read 1; badge always lit 0; count 0
+FAIL [PM11 a read is applied promptly while long background work runs (the boot sweep over 8 x 300 records)] line 281: sweep running 1 (still 1); the read applied within 1 s 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 302: Text: while failing: unread 1, marker 0, count 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 309: Text: explicit DOT read with writes failing: unread 1, count 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 318: Text: after writes recover: 0 unread, marker 0, count ever differed from flash 1
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 325: Text: reboot before the rewrite: unread 0 count 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 332: Text: reboot after the rewrite: bob[1] unread 0, bob[0] unread 0, count 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 302: Enigma: while failing: unread 1, marker 0, count 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 309: Enigma: explicit DOT read with writes failing: unread 1, count 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 318: Enigma: after writes recover: 0 unread, marker 0, count ever differed from flash 1
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 325: Enigma: reboot before the rewrite: unread 0 count 0
+FAIL [PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it] line 332: Enigma: reboot after the rewrite: bob[1] unread 0, bob[0] unread 0, count 0
+FAIL [PM7 an arrival in the open chat is not read: unread on flash, counted, marked; the selection does not follow it] line 347: Text: arrival: unread 0 count 0 markers 0 -> 0
+FAIL [PM7 an arrival in the open chat is not read: unread on flash, counted, marked; the selection does not follow it] line 347: Enigma: arrival: unread 0 count 0 markers 0 -> 0
+FAIL [PM8 input retained while loading: only the kept moves read; moves the full queue dropped read nothing; Back with both queues full reads nothing] line 384: Text: 3 unread (expected the 36 older: the 4 kept moves read, the 3 dropped not)
+FAIL [PM8 input retained while loading: only the kept moves read; moves the full queue dropped read nothing; Back with both queues full reads nothing] line 384: Enigma: 3 unread (expected the 36 older: the 4 kept moves read, the 3 dropped not)
+FAIL [PM9 more moves in one batch (40) than the pending list holds (32): every message moved onto is read, the rest applied at once] line 407: Text: 39 unread after 40 moves (expected 0..4), count 39
+   PM9 Text measured: the batch pass rewrote 0 records synchronously (40 moves, 32 queued)
+FAIL [PM9 more moves in one batch (40) than the pending list holds (32): every message moved onto is read, the rest applied at once] line 407: Enigma: 39 unread after 40 moves (expected 0..4), count 39
+   PM9 Enigma measured: the batch pass rewrote 0 records synchronously (40 moves, 32 queued)
+FAIL [PM10 exact identity: a pending read whose record was replaced under the same sequence by another message does not read it] line 433: Text: the newcomer (sequence 3, the read one's 3) was read: unread 1
+FAIL [PM10 exact identity: a pending read whose record was replaced under the same sequence by another message does not read it] line 437: Text: count 1 (expected 3, as on flash)
+FAIL [PM10 exact identity: a pending read whose record was replaced under the same sequence by another message does not read it] line 433: Enigma: the newcomer (sequence 3, the read one's 3) was read: unread 1
+FAIL [PM10 exact identity: a pending read whose record was replaced under the same sequence by another message does not read it] line 437: Enigma: count 1 (expected 3, as on flash)
+FAIL [DS1 date headings: one per Thai (UTC+7) calendar day, before its first message; the UTC midnight does not split a day] line 457: Text: Carol (one Thai day across the UTC midnight): 06/11 at y -1, cursor at y 16
+FAIL [DS1 date headings: one per Thai (UTC+7) calendar day, before its first message; the UTC midnight does not split a day] line 465: Text: Bob: 06/11 at y -1 above m1 at 39; 05/11 at y -1 above m0 at 16
+FAIL [DS1 date headings: one per Thai (UTC+7) calendar day, before its first message; the UTC midnight does not split a day] line 457: Enigma: Carol (one Thai day across the UTC midnight): 06/11 at y -1, cursor at y 16
+FAIL [DS1 date headings: one per Thai (UTC+7) calendar day, before its first message; the UTC midnight does not split a day] line 465: Enigma: Bob: 06/11 at y -1 above m1 at 39; 05/11 at y -1 above m0 at 16
+FAIL [DS2 untrustworthy timestamps get an unknown-date heading; a wrapped message has one heading and one marker; headings are never selected] line 484: Text: the wrapped unread message: 0 markers, heading x0, marker on its first row 0
+FAIL [DS2 untrustworthy timestamps get an unknown-date heading; a wrapped message has one heading and one marker; headings are never selected] line 503: Text: the wrapped message (read when moved onto) shows -1 markers
+FAIL [DS2 untrustworthy timestamps get an unknown-date heading; a wrapped message has one heading and one marker; headings are never selected] line 504: Text: on a heading 0 after 4 moves; Unknown date x0 at y -1, cursor at y 16
+FAIL [DS2 untrustworthy timestamps get an unknown-date heading; a wrapped message has one heading and one marker; headings are never selected] line 484: Enigma: the wrapped unread message: 0 markers, heading x0, marker on its first row 0
+FAIL [DS2 untrustworthy timestamps get an unknown-date heading; a wrapped message has one heading and one marker; headings are never selected] line 503: Enigma: the wrapped message (read when moved onto) shows -1 markers
+FAIL [DS2 untrustworthy timestamps get an unknown-date heading; a wrapped message has one heading and one marker; headings are never selected] line 504: Enigma: on a heading 0 after 4 moves; Unknown date x0 at y -1, cursor at y 16
+FAIL [DS4 a heading per message (one per day): on entry the newest message is on the bottom row; scrolling up and down keeps the cursor on screen, on a message row] line 536: Text: on entry: heading 15/11/2026 at y -1, the newest below it 0, history rows below that 0 (compose at 108)
+FAIL [DS4 a heading per message (one per day): on entry the newest message is on the bottom row; scrolling up and down keeps the cursor on screen, on a message row] line 536: Enigma: on entry: heading 15/11/2026 at y -1, the newest below it 0, history rows below that 0 (compose at 108)
+FAIL [DS5 scrolling up inside a message taller than the screen (with a heading): the focused row becomes the top row; its first row shows its heading above it] line 570: Text: reached the first row 0 after 30 moves; the cursor on its second row at y 16 (expected 16, the top row)
+FAIL [DS5 scrolling up inside a message taller than the screen (with a heading): the focused row becomes the top row; its first row shows its heading above it] line 570: Enigma: reached the first row 0 after 30 moves; the cursor on its second row at y 16 (expected 16, the top row)
+FAIL [DS2b retention cut into a day: the first remaining message still gets its day's heading] line 586: kept 100; at the top: 06/11 x0 at y -1, 04/11 x0
+FAIL [DS3 arrivals and eviction at the 100 cap while the chat is open: headings follow, the arrival stays unread, counts follow flash] line 601: Text: 07/11 heading x0; arrival unread 0; kept 100
+FAIL [DS3 arrivals and eviction at the 100 cap while the chat is open: headings follow, the arrival stays unread, counts follow flash] line 604: Text: count 0
+FAIL [DS3 arrivals and eviction at the 100 cap while the chat is open: headings follow, the arrival stays unread, counts follow flash] line 601: Enigma: 07/11 heading x0; arrival unread 0; kept 100
+FAIL [DS3 arrivals and eviction at the 100 cap while the chat is open: headings follow, the arrival stays unread, counts follow flash] line 604: Enigma: count 0
+FAIL [PM12 an old pending read-up record is discarded unapplied (erased once), never reinterpreted; already-read messages stay read] line 651: variant 0: 2 unread (expected 5..9, nothing applied), count 2
+FAIL [PM12 an old pending read-up record is discarded unapplied (erased once), never reinterpreted; already-read messages stay read] line 654: variant 0: the old record is still stored
+FAIL [PM12 an old pending read-up record is discarded unapplied (erased once), never reinterpreted; already-read messages stay read] line 663: variant 0: 0 markers on the 4 shown unread messages
+FAIL [PM12 an old pending read-up record is discarded unapplied (erased once), never reinterpreted; already-read messages stay read] line 651: variant 1: 2 unread (expected 5..9, nothing applied), count 2
+FAIL [PM12 an old pending read-up record is discarded unapplied (erased once), never reinterpreted; already-read messages stay read] line 659: a later boot: erased 0, 2 unread
+FAIL [PM12 an old pending read-up record is discarded unapplied (erased once), never reinterpreted; already-read messages stay read] line 663: variant 1: 0 markers on the 4 shown unread messages
+MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   36 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3068 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens  303 writes  27 renames  27 removes  27 dirEntries  270 nvs   5 | per pass max: ui opens 1 writes 0 renames 0; services opens 3 writes 1 renames 1 nvs 1 | model 29489 ms
+MEASURE   flash: 0 unread left of 27 (count 0)
+MEASURE -- Enigma chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   93 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 4 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7679 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens  304 writes  27 renames  27 removes  27 dirEntries  270 nvs   5 | per pass max: ui opens 1 writes 0 renames 0; services opens 3 writes 1 renames 1 nvs 1 | model 29552 ms
+MEASURE   flash: 0 unread left of 27 (count 0)
+196 checks passed, 78 failed
