@@ -36,6 +36,7 @@ FAIL [PO3 no memory for the pending list: the selection is refused (unread, repo
 FAIL [PO3 no memory for the pending list: the selection is refused (unread, reported), no write; once memory returns, a selection is accepted and read] line 151: Enigma: refused 0 (pending 0, busy shown 0); bob[2] unread 0; count 2
 FAIL [PO6 absence must be confirmed: a deleted record is dropped only after two complete listings without it; an unreadable record, a listing cut short once, or no memory for the listing keep the read pending] line 254: deleted: pending after the first absent listing 0 (expected 1), read attempts 1 (expected 2), pending now 0, count 2
 FAIL [PO6 absence must be confirmed: a deleted record is dropped only after two complete listings without it; an unreadable record, a listing cut short once, or no memory for the listing keep the read pending] line 295: cut listing: kept 0 (cuts 13); read after 0
+FAIL [PO6 absence must be confirmed: a deleted record is dropped only after two complete listings without it; an unreadable record, a listing cut short once, or no memory for the listing keep the read pending] line 337: absent, present, absent: kept 0 (read attempts 26); read after 0
 MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
 MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
 MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
@@ -48,4 +49,4 @@ MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 rem
 MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
 MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   31 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12353 ms
 MEASURE   flash: 13 unread left of 27 (count 13)
-294 checks passed, 16 failed
+294 checks passed, 17 failed

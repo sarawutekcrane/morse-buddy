@@ -32,4 +32,4 @@ MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 rem
 MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
 MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   31 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12353 ms
 MEASURE   flash: 13 unread left of 27 (count 13)
-310 checks passed, 0 failed
+311 checks passed, 0 failed

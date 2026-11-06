@@ -57,7 +57,7 @@ index eeef528..fc0c2cf 100644
    }
    MessageStore::notifyExternalStorageMutationAttempted();  // written outside the store: its caches are stale
 diff --git a/host_tests/race_r3_r5/mutate_notify.py b/host_tests/race_r3_r5/mutate_notify.py
-index a37f0e6..6fc3c6b 100644
+index a37f0e6..fa73cf7 100644
 --- a/host_tests/race_r3_r5/mutate_notify.py
 +++ b/host_tests/race_r3_r5/mutate_notify.py
 @@ -6,33 +6,64 @@
@@ -125,8 +125,8 @@ index a37f0e6..6fc3c6b 100644
 + (NT, "absence is remembered across a listing that shows the record (not reset)", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone\n      p.absentSeen = 0;", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone"),
 + (NT, "a failed listing taken as confirmation of absence", "  return reliable && !truncated && !listed;", "  return !truncated && !listed;"),
 + (NT, "an incomplete (truncated) listing taken as complete", "  return reliable && !truncated && !listed;", "  return reliable && !listed;"),
-+ (TX, "Text: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "\n"),
-+ (EN, "Enigma: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "\n"),
++ (TX, "Text: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
++ (EN, "Enigma: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
 + # ---- date headings (round 5) ----
 + (HD, "headings in UTC, not Thailand time", "  return (ts + kThaiOffsetSeconds) / 86400u;", "  return ts / 86400u;"),
 + (HD, "untrusted timestamps shown with an invented date (only 0 is unknown)", "  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;", "  if (ts == 0) return kUnknownDay;"),
@@ -296,10 +296,10 @@ index a606468..13dfcb3 100644
          g_historyCursor);
 diff --git a/host_tests/race_r3_r5/pm_overflow_tests.inc b/host_tests/race_r3_r5/pm_overflow_tests.inc
 new file mode 100644
-index 0000000..df235cc
+index 0000000..31fa90e
 --- /dev/null
 +++ b/host_tests/race_r3_r5/pm_overflow_tests.inc
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,402 @@
 +// Included into pm_tests.inc (round 6): the finite pending-read list. No
 +// read is ever written on the cursor-movement path; an accepted read is
 +// kept by exact identity and retried until written (or its record is
@@ -596,6 +596,48 @@ index 0000000..df235cc
 +    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
 +    CHECK(keptAfterCut && !isUnread(bob[2]) && countsMatch(kBob), "cut listing: kept %d (cuts %d); read after %d", keptAfterCut, cuts,
 +          !isUnread(bob[2]));
++
++    // (c2) absent, then shown, then absent again (the read's listing cut short
++    // on its attempts 1 and 3): two absent listings that are not consecutive
++    // do not confirm absence. No outside change is signalled (that would start
++    // a recount listing the same directory): the record leaves the record
++    // cache (10 slots) by reading 12 others.
++    freshDevice();
++    bob = unreadRun(kBob, false, 13, kDay06 + 600);
++    powerOn(); runFor(30);
++    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[12].sequence));
++    target = p;
++    static int readAttempts;
++    static uint32_t lastFail;
++    readAttempts = 0;
++    lastFail = 0;
++    failWrites(true);  // the first attempt fails on its write: the read stays pending
++    openText(kBob);
++    rot(-1);
++    loopPass(2);
++    back();             // left: no chat reload lists the directory from here on
++    failWrites(false);
++    for (int i = 0; i < 12; i++) {
++      StoredMessageView v;
++      MessageStore::loadMessage(bob[i], &v);
++    }
++    LittleFS.failOpen = [](const std::string& q) {
++      if (q == target && T::now != lastFail) {
++        readAttempts++;
++        lastFail = T::now;
++      }
++      return q == target;
++    };
++    LittleFS.endListing = [](const std::string& d, size_t pos) {  // the listing in the same step as the failed read
++      return d.find(kBob) != std::string::npos && pos == 0 && T::now == lastFail && (readAttempts == 1 || readAttempts == 3);
++    };
++    runFor(60);
++    bool keptAfterTwoCuts = pendingReads() == 1 && readAttempts >= 4;
++    LittleFS.endListing = nullptr;
++    LittleFS.failOpen = nullptr;
++    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
++    CHECK(keptAfterTwoCuts && !isUnread(bob[12]) && countsMatch(kBob), "absent, present, absent: kept %d (read attempts %d); read after %d",
++          keptAfterTwoCuts, readAttempts, !isUnread(bob[12]));
 +
 +    // (d) no memory for the listing: kept
 +    freshDevice();

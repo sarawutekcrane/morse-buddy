@@ -1,5 +1,5 @@
 # Host model (63 ms per open where noted); not device timing.
-## 5139cf3
+## 5af4695
    PO1 Text measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
    PO1 Enigma measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
    PO2 Text measured: UI passes while writes fail: max opens 16, dirEntries 45 (the chat's own reload), writes 0

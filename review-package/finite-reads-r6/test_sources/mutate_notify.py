@@ -46,8 +46,8 @@ muts = [
  (NT, "absence is remembered across a listing that shows the record (not reset)", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone\n      p.absentSeen = 0;", "    if (!recordConfirmedGone(ref)) {  // unreadable for now: never assumed gone"),
  (NT, "a failed listing taken as confirmation of absence", "  return reliable && !truncated && !listed;", "  return !truncated && !listed;"),
  (NT, "an incomplete (truncated) listing taken as complete", "  return reliable && !truncated && !listed;", "  return reliable && !listed;"),
- (TX, "Text: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "\n"),
- (EN, "Enigma: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "\n"),
+ (TX, "Text: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
+ (EN, "Enigma: a refused read is not reported", "    g_readRefused = true;  // still unread (its marker stays): reported once the input is handled\n", "    (void)0;\n"),
  # ---- date headings (round 5) ----
  (HD, "headings in UTC, not Thailand time", "  return (ts + kThaiOffsetSeconds) / 86400u;", "  return ts / 86400u;"),
  (HD, "untrusted timestamps shown with an invented date (only 0 is unknown)", "  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;", "  if (ts == 0) return kUnknownDay;"),

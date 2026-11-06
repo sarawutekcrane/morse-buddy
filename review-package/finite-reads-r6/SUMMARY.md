@@ -4,7 +4,8 @@
 |---|---|
 | Previous candidate (source, tests, build) | `1609f069c8881b14fdead46190692e40686620c6` |
 | Its package-only commit | `5c2bebeabe4af087eaa5a84290d40ccdea864b32` |
-| This candidate (source, tests, ESP32 build) | `5139cf318cf9379d48a273c0023de0215e0d1aa3` |
+| This candidate (source and tests) | `5af469509fa1d652ed23a06d14232ce090fa3958` |
+| ESP32 build source: production identical to `5af4695` (`git diff 5139cf3 5af4695 -- src` is empty; only tests changed after it) | `5139cf318cf9379d48a273c0023de0215e0d1aa3` |
 | Base of the cumulative diffs | `511d13e586432e22141be9691c1401e70eac4e41` |
 
 **Preflight:**
@@ -16,7 +17,7 @@
 - `production_since_1609f06.diff`: incremental, 4 files.
 - `production_since_511d13e.diff`: cumulative.
 - `host_tests_since_1609f06.diff` and `host_tests_since_511d13e.diff`: these include the new files.
-- `test_sources/`: every test, fake and script source used, as at `5139cf3`.
+- `test_sources/`: every test, fake and script source used, as at `5af4695`.
 
 **Not done:** nothing flashed, erased, uploaded or merged. No OTA or release change. `test/hw-functional-ui-fix4` was not touched. No persistent format. No change to Friend behaviour, the date format or storage migration.
 
@@ -66,7 +67,8 @@
 - Arduino's `getNextFileName()` returns `""` both at the end of a directory and on a read error.
 - A listing cut short by an error therefore looks complete and reliable.
 - On `1609f06`, one such listing dropped a still-valid pending read (PO6(c) fails there).
-- Now absence must be seen in two complete listings on two separate attempts, with backoff between them, and the record unreadable both times. A listing that shows the record resets this.
+- Now absence must be seen in two complete listings on two consecutive attempts, with backoff between them, and the record unreadable both times.
+- A listing that shows the record resets this. PO6(c2) covers that: absent, present, absent is not a confirmation.
 - On `1609f06`, a deleted record was dropped after one listing (PO6(a) fails there).
 
 **Left pending:**
@@ -81,15 +83,15 @@ All are read once the condition clears, without another visit.
 
 | `storage_test` | Result |
 |---|---|
-| on `1609f06` | 294 passed, **16 failed** (`storage_test_on_1609f06_same_tests.txt`) |
-| on `5139cf3` | **310 passed, 0 failed** (`storage_test_on_5139cf3.txt`) |
+| on `1609f06` | 294 passed, **17 failed** (`storage_test_on_1609f06_same_tests.txt`) |
+| on `5af4695` | **311 passed, 0 failed** (`storage_test_on_5af4695.txt`) |
 
-The 16 failures on `1609f06`:
+The 17 failures on `1609f06`:
 - **PM9 and PO1:** 8 rewrites in the UI pass (writes 8, renames 8).
 - **PO2:** the full list silently dropped 5 more selections, with no report.
 - **PO3:** no memory meant the read was written at once on the cursor path.
 - **PO6(a):** a deleted record dropped after one listing.
-- **PO6(c):** a pending read dropped by a listing cut short.
+- **PO6(c) and (c2):** a pending read dropped by a listing cut short.
 
 **New tests** (`pm_overflow_tests.inc`; Text and Enigma; real store, Notifications and chats):
 
@@ -100,7 +102,7 @@ The 16 failures on `1609f06`:
 | PO3 | No memory for the list in the UI pass: refused, reported, no write, not retried. Once memory returns, moves onto the same message read it. |
 | PO4 | Back with the read list (32), the held buffer (32) and the input queue (32) full, during a cold load in the device-cost model: it leaves in that pass. |
 | PO5 | Moves in Bob, then Carol, with writes failing, then leaving. Exactly bob[4], bob[3] and carol[4] are read after recovery. |
-| PO6(a)–(f) | Deletion versus unreadable records, cut listings, no memory, no directory and truncated listings, as in 2. |
+| PO6(a)–(f), (c2) | Deletion versus unreadable records, cut listings (once; absent then present then absent), no memory, no directory and truncated listings, as in 2. |
 
 - **Changed:** PM9 now expects refusal rather than synchronous rewrites (32 read, 13 unread, no UI write). Its name says "round 6; was: 8 rewritten synchronously".
 - **Test infrastructure added:**
@@ -110,10 +112,16 @@ The 16 failures on `1609f06`:
 
 **Other results:**
 - `notify_test`: 119 passed.
-- Full `run_all.sh` suites: all passed (`evidence/run_all_suites_5139cf3.txt`).
+- Full `run_all.sh` suites: all passed (`evidence/run_all_suites_5af4695.txt`).
 - **Mutations**, each script run alone:
-  - `mutate_notify.py`: 187 mutants, 10 of them new in this round. See `evidence/mutate_notify.txt`.
-  - `mutate_room.py`: see `evidence/mutate_room.txt`.
+  - `mutate_notify.py`: 187 mutants; 10 new in this round, and 1 removed (it targeted the deleted synchronous fallback). See `evidence/mutate_notify.txt` (final run on `5af4695`).
+  - The first full run, on `5139cf3` (`evidence/mutate_notify_first_run_5139cf3.txt`), caught 181/187:
+    - 1 unexplained survivor, "absence remembered across a listing that shows the record". This was a test gap, now closed by PO6(c2).
+    - 2 build errors: the two "refused read is not reported" mutants did not compile. They are fixed and now caught by PO1.
+  - Survivors assessed equivalent:
+    - the explicit `!truncated` guard (see 2);
+    - the two from earlier rounds.
+  - `mutate_room.py`: 104/107, with its 3 existing "redundant guard" equivalents (`evidence/mutate_room.txt`). The race files are unchanged since round 4.
 
 ## 4. Per-pass measurements (`evidence/measurements.txt`; host counts, not device timing)
 
@@ -128,7 +136,7 @@ The 16 failures on `1609f06`:
 
 ## 5. ESP32 (`evidence/esp32/`)
 
-- Built from a `git archive` of `5139cf3`, verified file by file, with `pio run` and espressif32@6.13.0. Not flashed.
+- Built from a `git archive` of `5139cf3`, whose `src`, `platformio.ini` and `partitions.csv` are identical to `5af4695`. Verified file by file; `pio run`, espressif32@6.13.0. Not flashed.
 - RAM 124,508 B; flash 1,208,933 B (83.8%); 0 warnings.
 - **Static DRAM headroom: exactly 64 B** (used 124,516 of 124,580 B), unchanged. The two new per-chat flags fit in existing padding.
 - **Heap:** unchanged.

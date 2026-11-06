@@ -295,6 +295,48 @@
     CHECK(keptAfterCut && !isUnread(bob[2]) && countsMatch(kBob), "cut listing: kept %d (cuts %d); read after %d", keptAfterCut, cuts,
           !isUnread(bob[2]));
 
+    // (c2) absent, then shown, then absent again (the read's listing cut short
+    // on its attempts 1 and 3): two absent listings that are not consecutive
+    // do not confirm absence. No outside change is signalled (that would start
+    // a recount listing the same directory): the record leaves the record
+    // cache (10 slots) by reading 12 others.
+    freshDevice();
+    bob = unreadRun(kBob, false, 13, kDay06 + 600);
+    powerOn(); runFor(30);
+    snprintf(p, sizeof(p), "/messages/%s/%s/%08lu.msg", kG, kBob, static_cast<unsigned long>(bob[12].sequence));
+    target = p;
+    static int readAttempts;
+    static uint32_t lastFail;
+    readAttempts = 0;
+    lastFail = 0;
+    failWrites(true);  // the first attempt fails on its write: the read stays pending
+    openText(kBob);
+    rot(-1);
+    loopPass(2);
+    back();             // left: no chat reload lists the directory from here on
+    failWrites(false);
+    for (int i = 0; i < 12; i++) {
+      StoredMessageView v;
+      MessageStore::loadMessage(bob[i], &v);
+    }
+    LittleFS.failOpen = [](const std::string& q) {
+      if (q == target && T::now != lastFail) {
+        readAttempts++;
+        lastFail = T::now;
+      }
+      return q == target;
+    };
+    LittleFS.endListing = [](const std::string& d, size_t pos) {  // the listing in the same step as the failed read
+      return d.find(kBob) != std::string::npos && pos == 0 && T::now == lastFail && (readAttempts == 1 || readAttempts == 3);
+    };
+    runFor(60);
+    bool keptAfterTwoCuts = pendingReads() == 1 && readAttempts >= 4;
+    LittleFS.endListing = nullptr;
+    LittleFS.failOpen = nullptr;
+    for (int i = 0; i < 6000 && pendingReads() > 0; i++) loopPass();
+    CHECK(keptAfterTwoCuts && !isUnread(bob[12]) && countsMatch(kBob), "absent, present, absent: kept %d (read attempts %d); read after %d",
+          keptAfterTwoCuts, readAttempts, !isUnread(bob[12]));
+
     // (d) no memory for the listing: kept
     freshDevice();
     bob = unreadRun(kBob, false, 3, kDay06 + 600);
