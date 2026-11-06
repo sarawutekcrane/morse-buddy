@@ -1903,12 +1903,12 @@ void updateLocalStatus(const MessageRef& ref, uint16_t newFlags) {
   atomicRewrite(ref, hdr, view.wirePacket, view.wirePacketLen, view.localPayload, view.localPayloadLen);
 }
 
-void updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
+bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
   StoredMessageView view;
-  if (!loadMessage(ref, &view)) return;
+  if (!loadMessage(ref, &view)) return false;
   StoredHeader hdr = view.header;
   hdr.flags = static_cast<uint16_t>((hdr.flags & ~clearMask) | setMask);
-  atomicRewrite(ref, hdr, view.wirePacket, view.wirePacketLen, view.localPayload, view.localPayloadLen);
+  return atomicRewrite(ref, hdr, view.wirePacket, view.wirePacketLen, view.localPayload, view.localPayloadLen);
 }
 
 bool updateTypeLocalPayload(const MessageRef& ref, const uint8_t* localPayload, uint16_t localPayloadLen) {

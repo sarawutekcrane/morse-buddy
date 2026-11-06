@@ -6,33 +6,54 @@
 # mutation must fail at least one of them.
 import os, subprocess, sys, shutil, tempfile
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
-NT, TX, EN, SM, OB, IQ = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h"
+NT, TX, EN, SM, OB, IQ, HD = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h", "history_dates.h"
 muts = [
- # ---- reading in the chats ----
- (TX, "Text: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
- (EN, "Enigma: selection does not mark read", "  markSelectedHistoryRead();  // against the complete index\n", "\n"),
- (TX, "Text: every message in the chat marked read on entry", "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n",
-  "    g_readCheckDone = false;  // a selection after (re)entry is checked afresh\n    for (uint16_t k = 0; k < MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey); k++) Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, k, MessageStore::loadConversationIndex(g_selectedGroupCode, g_selectedContactKey));\n"),
  # ---- categories ----
  (NT, "GAME record does not light the Text badge", "    if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0 || s.unread[SLOT_GAME] > 0)) return true;", "    if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0)) return true;"),
  (NT, "categories merged again (any unread lights every badge)", "    if (s.state == SUMMARY_FREE) continue;  // COUNTED: counts; UNRESOLVED: category flags -- same test\n", "    if (s.state == SUMMARY_FREE) continue;\n    if (totalUnread(s) > 0 && (mask & (BADGE_TEXT | BADGE_ENIGMA))) return true;\n"),
  (NT, "clear decrements the wrong category", "  int slot = slotForType(view.envelope.message_type);\n  if (slot >= 0 && s->unread[slot] > 0) {", "  int slot = SLOT_GAME;\n  if (slot >= 0 && s->unread[slot] > 0) {"),
  (NT, "arrival counted under a guessed category when the stored type is known", "    int slot = loaded ? slotForType(view.envelope.message_type) : -1;", "    int slot = loaded ? SLOT_GAME : -1;"),
- # ---- read up to the selection (hardware finding 1 on 23293c5) ----
- (NT, "read-up ignores the message type", "  if (a.type != type || !sameConversation(", "  if (!sameConversation("),
- (NT, "read-up ignores the sequence (a later arrival with an older timestamp is read)", "  if (sequence > a.sequence) return false;\n", ""),
- (NT, "read-up reads newer messages too", "  if (sortTs != a.sortTs) return sortTs < a.sortTs;", "  if (sortTs != a.sortTs) return true;"),
- (NT, "read-up never saved (lost at reboot)", "  r.items[r.count++] = add;\n  readUpsChanged();\n  return true;", "  r.items[r.count++] = add;\n  return true;"),
- (NT, "read-up written to NVS on the encoder path", "  r.items[r.count++] = add;\n  readUpsChanged();\n  return true;", "  r.items[r.count++] = add;\n  writeReadUps();\n  return true;"),
- (NT, "read-up rewrites the flags on the encoder path", "  if (!addReadUp(r)) return;  // covered by an earlier selection\n",
-  "  if (!addReadUp(r)) return;  // covered by an earlier selection\n  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);\n"),
- (NT, "read-up attempt ends after one pass even if a rewrite failed", "  if (left && j.pass + 1 < kReadUpPasses) {", "  if (false) {"),
- (NT, "read-up marked done while a read or rewrite is still unsuccessful", "  if (left) {\n    ReadUp* x = findReadUp(j.readUp);", "  if (false) {\n    ReadUp* x = findReadUp(j.readUp);"),
- (NT, "a failing read-up is retried at once, every time (no backoff; starves the other work)", "      if (r.done || (r.retryAtMs != 0 && static_cast<int32_t>(now - r.retryAtMs) < 0)) continue;", "      if (r.done) continue;"),
- (NT, "a failing read-up is never retried", "      if (r.done || (r.retryAtMs != 0 && static_cast<int32_t>(now - r.retryAtMs) < 0)) continue;", "      if (r.done || r.retryAtMs != 0) continue;"),
- (NT, "badge waits for the background (no immediate count)", "  if (s->state == SUMMARY_COUNTED) {\n    if (s->unread[slot] == remaining) return;\n    s->unread[slot] = remaining;\n  } else {\n    s->unread[slot] = remaining > 0 ? 1 : 0;\n  }", "  (void)remaining;"),
- (NT, "recount ignores pending read-ups", "      if (slot >= 0 && !coveredByPendingReadUp(j.group_code, j.contact_key, view.header, view.envelope, ref.sequence))", "      if (slot >= 0)"),
- (NT, "a read-up does not restart a recount under way", "  conversationChanged(group_code, contact_key);  // a recount under way may have counted what is now read\n", ""),
+ # ---- per-message read (round 5: replaces read up to the selection) ----
+ (TX, "Text: a move onto a message does not read it", "      readMessageMovedOnto(fromMessage, fromSeq);\n", "\n"),
+ (EN, "Enigma: a move onto a message does not read it", "      readMessageMovedOnto(fromMessage, fromSeq);\n", "\n"),
+ (TX, "Text: the selection is read every pass (restored or followed selections, arrivals under it)", "  if (g_inputLost && !g_sendRanThisTick) {\n", "  readMessageMovedOnto(false, 0);\n  if (g_inputLost && !g_sendRanThisTick) {\n"),
+ (EN, "Enigma: the selection is read every pass (restored or followed selections, arrivals under it)", "  if (g_inputLost && !g_sendRanThisTick) {\n", "  readMessageMovedOnto(false, 0);\n  if (g_inputLost && !g_sendRanThisTick) {\n"),
+ (TX, "Text: an arrival in the open chat is read again", "Notifications::BADGE_TEXT, conversationOpen, false);", "Notifications::BADGE_TEXT, conversationOpen);"),
+ (EN, "Enigma: an arrival in the open chat is read again", "Notifications::BADGE_ENIGMA, conversationOpen, false);", "Notifications::BADGE_ENIGMA, conversationOpen);"),
+ (TX, "Text: no unread marker", "            if (info.unread) Display::printLineColored(kUnreadMarkerX, y, \"*\", ST77XX_YELLOW);\n", ""),
+ (EN, "Enigma: no unread marker", "            if (info.unread) Display::printLineColored(kUnreadMarkerX, y, \"*\", ST77XX_YELLOW);\n", ""),
+ (TX, "Text: a marker on every message (sent and read too)", "    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);", "    out->unread = e != nullptr;"),
+ (EN, "Enigma: a marker on every message (sent and read too)", "    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);", "    out->unread = e != nullptr;"),
+ (TX, "Text: a change kept current in the index is not redrawn (stale marker)", "  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;\n", ""),
+ (EN, "Enigma: a change kept current in the index is not redrawn (stale marker)", "  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;\n", ""),
+ (NT, "a read is counted before (or without) its rewrite succeeding", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return ReadOutcome::RETRY;", "  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);"),
+ (NT, "a read whose rewrite failed is dropped (not retried)", "    if (applyRead(p) == ReadOutcome::DONE) {", "    if (applyRead(p) == ReadOutcome::DONE || true) {"),
+ (NT, "a failing read is retried every step (no backoff; starves the other work)", "    if (p.retryAtMs != 0 && static_cast<int32_t>(now - p.retryAtMs) < 0) continue;\n", ""),
+ (NT, "a read is applied without checking the message id (another message under the same sequence is read)", "  if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {", "  if (false) {"),
+ (NT, "a read when the pending list is full is dropped (not applied at once)", "  if (applyRead(r) != ReadOutcome::DONE)\n", "  if (false)\n"),
+ (NT, "a pending read waits behind the other background work", "  if (stepPendingRead()) return;  // the user is looking at it: before any job\n", "  if (g_job == nullptr && g_sweep == nullptr && stepPendingRead()) return;\n"),
+ (NT, "a read does not restart a recount under way", "  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread\n", ""),
+ (NT, "a read decrements an UNRESOLVED summary's category flag", "  if (s != nullptr && s->state == SUMMARY_COUNTED && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;", "  if (s != nullptr && slot >= 0 && s->unread[slot] > 0) {\n    s->unread[slot]--;\n    saveSummaries();\n  }\n  return ReadOutcome::DONE;"),
+ (NT, "after a failed attempt, a changed or vanished record is not recounted", "  if (p.failures == 0) return;\n  Summary* s = findSummary(p.group_code, p.contact_key);", "  return;\n  Summary* s = findSummary(p.group_code, p.contact_key);"),
+ (NT, "the explicit DOT read is counted although its rewrite failed", "  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return;  // still unread: still counted", "  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);"),
+ (NT, "the earlier read-up record is never erased", "  if (p.remove(kOldReadUpKey)) Serial.println", "  if (false) Serial.println"),
+ (NT, "an arrival in an open Text/Enigma chat is read (readIfOpen ignored)", "  if (conversationCurrentlyOpen && readIfOpen) {", "  if (conversationCurrentlyOpen) {"),
+ # ---- date headings (round 5) ----
+ (HD, "headings in UTC, not Thailand time", "  return (ts + kThaiOffsetSeconds) / 86400u;", "  return ts / 86400u;"),
+ (HD, "untrusted timestamps shown with an invented date (only 0 is unknown)", "  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;", "  if (ts == 0) return kUnknownDay;"),
+ (HD, "a heading before every message", "  return p == nullptr || thaiDay(p->effective_sort_timestamp) != thaiDay(e->effective_sort_timestamp);", "  return true;"),
+ (HD, "no heading for the first shown message", "  if (index == 0) return true;\n", "  if (index == 0) return false;\n"),
+ (HD, "the redraw signature ignores the unread flags", "    mix(e->flags & MessageStore::FLAG_UNREAD);\n", ""),
+ (TX, "Text: no headings drawn (rows still counted)", "          drawDateHeading(i, y);\n          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n", "          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n"),
+ (EN, "Enigma: no headings drawn (rows still counted)", "          drawDateHeading(i, y);\n          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n", "          y = static_cast<int16_t>(y + lh);\n          rowsDrawn++;\n"),
+ (TX, "Text: the viewport ignores headings", "    uint16_t rows = countVisualRowsFor(idx, labelX, &rowReliable);", "    uint16_t rows = countHistoryRowsFor(idx, labelX, &rowReliable);"),
+ (EN, "Enigma: the viewport ignores headings", "    uint16_t rows = countVisualRowsFor(idx, labelX);", "    uint16_t rows = countHistoryRowsFor(idx, labelX);"),
+ (TX, "Text: the cursor's row ignores its heading", "  return static_cast<uint16_t>((HistoryDates::startsDay(g_historyCursor) ? 1 : 0) + g_historyRowOffset);", "  return g_historyRowOffset;"),
+ (EN, "Enigma: the cursor's row ignores its heading", "  return static_cast<uint16_t>((HistoryDates::startsDay(g_historyCursor) ? 1 : 0) + g_historyRowOffset);", "  return g_historyRowOffset;"),
+ (TX, "Text: scrolling up to a message's first row leaves its heading off screen", "uint16_t cursorVisualTop() { return g_historyRowOffset == 0 ? 0 : cursorVisualRow(); }", "uint16_t cursorVisualTop() { return cursorVisualRow(); }"),
+ (EN, "Enigma: scrolling up to a message's first row leaves its heading off screen", "uint16_t cursorVisualTop() { return g_historyRowOffset == 0 ? 0 : cursorVisualRow(); }", "uint16_t cursorVisualTop() { return cursorVisualRow(); }"),
+ (TX, "Text: a row's position ignores its message's heading", "    uint16_t limit = (i == targetIdx) ? static_cast<uint16_t>(info.headerRows + targetRowIdx) : countVisualRows(info);", "    uint16_t limit = (i == targetIdx) ? targetRowIdx : countVisualRows(info);"),
+ (EN, "Enigma: a row's position ignores its message's heading", "    uint16_t limit = (i == targetIdx) ? static_cast<uint16_t>(info.headerRows + targetRowIdx) : countVisualRows(info);", "    uint16_t limit = (i == targetIdx) ? targetRowIdx : countVisualRows(info);"),
  # ---- loading, migration, saving ----
  (NT, "migration stores an approximate count of zero (badges of the old mask lost)", "      markUnresolved(&s, mask != 0 ? mask : static_cast<uint8_t>(BADGE_TEXT | BADGE_ENIGMA));", "      s.state = SUMMARY_COUNTED; (void)mask;"),
  (NT, "legacy read failure taken as an empty migration", "  if (!migrateLegacyInto(dst)) {\n    memset(dst, 0, sizeof(Summary) * kMaxSummaries);\n    return LOAD_RETRY_LEGACY;\n  }", "  if (!migrateLegacyInto(dst)) {\n    memset(dst, 0, sizeof(Summary) * kMaxSummaries);\n    return LOAD_OK;\n  }"),
@@ -71,9 +92,9 @@ muts = [
  (NT, "several deletions per step", "    return;  // at most one deletion per step", "    continue;"),
  (NT, "the walk reads every directory entry in one step", "constexpr uint8_t kWalkEntriesPerStep = 16;", "constexpr uint8_t kWalkEntriesPerStep = 255;"),
  (NT, "an unreadable record is skipped (recount applied anyway)", "      j.unreliable = true;\n      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord(", "      if (j.kind == JOB_RECOUNT) MessageStore::feedIndexRecord("),
- (NT, "an arrival does not restart a recount under way", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {\n  conversationChanged(group_code, contact_key);", "                      uint8_t badgeMask, bool conversationCurrentlyOpen) {"),
+ (NT, "an arrival does not restart a recount under way", "                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen) {\n  conversationChanged(group_code, contact_key);", "                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen) {"),
  (NT, "a whole conversation per step (unbounded)", "constexpr uint8_t kLoadsPerStep = 4;", "constexpr uint8_t kLoadsPerStep = 255;"),
- (NT, "several rewrites per step", "      j.rewrites++;\n      return;  // at most one rewrite per step", "      j.rewrites++;"),
+ (NT, "several per-message reads (rewrites) per step", "      removePendingRead(i);\n      return true;", "      removePendingRead(i);\n      if (g_reads == nullptr) return true;\n      i--;\n      continue;"),
  # ---- message store listing ----
  (SM, "appends keep the earlier 300-record retention", "  if (msgCount >= kRetainedMessagesPerThread) {", "  if (msgCount >= kMaxMessagesPerThread) {"),
  (SM, "a truncated listing is reported complete", "  if (outReliable != nullptr) *outReliable = !openFailed && !truncated;", "  if (outReliable != nullptr) *outReliable = !openFailed;"),
@@ -222,7 +243,7 @@ def one(k, mut):
     target, name, old, new = mut
     out = os.path.join(H, "out", "mutn%d" % k)
     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
-    for x in (NT, TX, EN, SM, OB, IQ, "notifications.h", "storage_messages.h", "held_input.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+    for x in (NT, TX, EN, SM, OB, IQ, HD, "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
     p = out + "/core/" + target; src = open(p).read()
     open(p, "w").write(src.replace(old, new))
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])

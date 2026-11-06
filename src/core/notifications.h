@@ -18,28 +18,32 @@ enum BadgeCategory : uint8_t {
 };
 
 // Call right after appendStoredMessage() for an incoming record. If the
-// exact conversation is currently open, this saves it as read (no
-// tone/badge); otherwise it marks UNREAD, counts it in the per-conversation
-// summary under its stored message type, sounds the notification tone, and
-// resets the Sleep timer. The badges follow the stored type (TEXT -> Text,
-// ENIGMA -> Enigma, GAME -> both); badgeMask is used only if the record
-// cannot be read back.
+// exact conversation is currently open and readIfOpen is true (the Friend
+// game's arrivals), this saves it as read (no tone/badge). Otherwise it
+// marks UNREAD and counts it in the per-conversation summary under its
+// stored message type; and, unless the conversation is open, sounds the
+// notification tone and resets the Sleep timer. The Text and Enigma chats
+// pass readIfOpen false: an arrival is never read by being on screen (only
+// a move onto it reads it, readMovedOnto()). The badges follow the stored
+// type (TEXT -> Text, ENIGMA -> Enigma, GAME -> both); badgeMask is used only
+// if the record cannot be read back.
 void onMessageArrived(const char* group_code, const char* contact_key, const MessageRef& ref,
-                      uint8_t badgeMask, bool conversationCurrentlyOpen);
+                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen = true);
 
 // Call on a received message's explicit DOT action: reads that one message.
-// No-op if it is already read.
+// No-op if it is already read; the count follows only a successful rewrite.
 void clearUnread(const char* group_code, const char* contact_key, const MessageRef& ref);
 
-// Call when a history item becomes the selected one, with the open chat's
-// conversation index (MessageStore::getIndexEntry) still loaded: if it is a
-// received message, it and every older received message of the same type in
-// this conversation become read -- older meaning at or above it in the
-// history and stored no later than it. Messages below it, or stored after it,
-// stay unread; other types are untouched. Bounded work here (a few record
-// reads, no rewrite and no NVS write): the flags on flash are cleared in the
-// background, and the request is saved so a reboot doesn't lose it.
-void readUpTo(const char* group_code, const char* contact_key, uint16_t selectedIndex, uint16_t indexTotal);
+// Call when the user moves a Text or Enigma chat's cursor onto a message
+// whose index entry is unread (every such move, moves held while the chat
+// loaded and replayed included -- never for an initial, restored or
+// followed selection). Reads exactly that message, identified by sequence
+// AND message id: nothing older, nothing else. No storage work here while
+// there is room to queue it (32 pending): the flag is cleared on flash by
+// the background work, one rewrite per step, and the count follows only
+// once that rewrite succeeded (a failed one is retried). Kept in RAM only:
+// a power loss before the rewrite leaves the message unread.
+void readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id);
 
 uint16_t getUnreadCount(const char* group_code, const char* contact_key);
 

@@ -44,6 +44,7 @@ size_t inputCap = 0;
 uint32_t inputDropped = 0;
 uint32_t unixTime = 1700000000u;
 bool realGlyphs = false;
+bool realWrap = false;
 bool scanUnreliable = false;
 bool listUnreliable = false;
 unsigned listings = 0;
@@ -52,7 +53,7 @@ void reset() {
   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0; deviceQueue().clear();
   connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
-  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; scanUnreliable = false; listUnreliable = false; listings = 0;
+  seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; realWrap = false; scanUnreliable = false; listUnreliable = false; listings = 0;
 }
 std::string visibleJoined() { std::string s; for (auto& d : screen) { s += d.text; s += '|'; } return s; }
 std::string rowAt(int y) {
@@ -124,8 +125,23 @@ void drawSenderDivider(int16_t x, int16_t y, const char* t, uint16_t) { draw(x, 
 uint8_t wrapText(const char* text, int16_t, uint16_t* starts, uint16_t* lens, uint8_t maxLines) {
   if (maxLines == 0) return 0; starts[0] = 0; lens[0] = static_cast<uint16_t>(strlen(text)); return 1;
 }
-bool wrapLineAt(const char* text, size_t from, int16_t, uint16_t* s, uint16_t* l) {
-  size_t n = strlen(text); if (from >= n) return false; *s = static_cast<uint16_t>(from); *l = static_cast<uint16_t>(n - from); return true;
+bool wrapLineAt(const char* text, size_t from, int16_t width, uint16_t* s, uint16_t* l) {
+  size_t n = strlen(text); if (from >= n) return false;
+  if (!T::realWrap) { *s = static_cast<uint16_t>(from); *l = static_cast<uint16_t>(n - from); return true; }
+  // Opt-in (T::realWrap): greedy word wrap at `width` px (per-glyph advances),
+  // a word longer than the row is split; leading spaces of a row skipped.
+  while (from < n && text[from] == ' ') from++;
+  if (from >= n) return false;
+  int w = 0; size_t end = from, lastSpace = 0; bool haveSpace = false;
+  while (end < n) {
+    char c = text[end];
+    int adv = (c >= 0x20 && c <= 0x7E) ? kAdv[c - 0x20] : 0;
+    if (w + adv > width && end > from) break;
+    if (c == ' ') { lastSpace = end; haveSpace = true; }
+    w += adv; end++;
+  }
+  if (end < n && haveSpace) end = lastSpace;
+  *s = static_cast<uint16_t>(from); *l = static_cast<uint16_t>(end - from); return true;
 }
 }  // namespace Display
 
@@ -346,9 +362,9 @@ void nextId(char* out, size_t n) { snprintf(out, n, "ID%014u", ++g_counter); T::
 namespace IdentityColor { bool isValid(uint8_t i) { return i < kColorCount; } uint16_t color565(uint8_t) { return 0; } }
 #ifndef REAL_NOTIFICATIONS
 namespace Notifications {
-void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool) { T::notifications++; }
+void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool, bool) { T::notifications++; }
 void clearUnread(const char*, const char*, const MessageRef&) {}
-void readUpTo(const char*, const char*, uint16_t, uint16_t) {}
+void readMovedOnto(const char*, const char*, uint32_t, const char*) {}
 }
 #endif
 namespace Settings {

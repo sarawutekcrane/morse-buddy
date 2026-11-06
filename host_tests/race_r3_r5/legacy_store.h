@@ -65,7 +65,7 @@ inline MessageRef writeLegacyRecordBytes(const char* group, const char* contact,
   if (!MessageStore::loadMessage(ref, &v) || v.header.direction != dir || v.header.flags != flags ||
       v.header.effective_sort_timestamp != ts || v.header.local_write_sequence != seq ||
       strcmp(v.envelope.message_id, env.message_id) != 0 || v.envelope.message_type != env.message_type) {
-    printf("legacy record does not read back through MessageStore::loadMessage (format drift)\n");
+    printf("legacy record does not read back through MessageStore::loadMessage (format drift) [%s/%s seq %u: dir %d/%d flags %u/%u ts %u/%u]\n", group, contact, seq, (int)v.header.direction, (int)dir, v.header.flags, flags, v.header.effective_sort_timestamp, ts);
     exit(3);
   }
   MessageStore::notifyExternalStorageMutationAttempted();  // written outside the store: its caches are stale

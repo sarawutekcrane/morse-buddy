@@ -141,6 +141,10 @@ void drawLockIcon(int16_t x, int16_t y, bool open, uint16_t color565);
 constexpr int16_t kCursorCellWidth = 11;     // fixed horizontal budget callers reserve for this cursor's cell
 constexpr int16_t kCursorTriangleWidth = 4;  // point-to-base width
 constexpr int16_t kCursorTriangleHeight = 7; // base height
+// Text/Enigma history rows: a fixed cell right after the cursor cell for a
+// received message's unread marker ("*", on its first row only). Reserved on
+// every history row, read or not, so reading a message never re-wraps it.
+constexpr int16_t kUnreadMarkerCellWidth = 8;
 
 // Draws the triangle with its leftmost (base) edge at x, vertically
 // centered within the PRIMARY text row that starts at rowTop (using the

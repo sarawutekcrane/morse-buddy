@@ -15,10 +15,14 @@
 
 // ---- the MessageStore/Storage/Sleep/sound hooks notifications.cpp needs ----
 namespace MessageStore {
-void updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
+bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
+  bool found = false;
   for (auto& r : T::store)
-    if (r.ref.sequence == ref.sequence && !strcmp(r.ref.group_code, ref.group_code) && !strcmp(r.ref.contact_key, ref.contact_key))
+    if (r.ref.sequence == ref.sequence && !strcmp(r.ref.group_code, ref.group_code) && !strcmp(r.ref.contact_key, ref.contact_key)) {
       r.hdr.flags = static_cast<uint16_t>((r.hdr.flags | setMask) & ~clearMask);
+      found = true;
+    }
+  return found;
 }
 void setOnEvictedCallback(EvictedCallback) {}
 }  // namespace MessageStore
@@ -58,7 +62,7 @@ inline void resetRetryClock() { Notifications::g_nextRetryMs = T::now; }
 inline int stateField(const Notifications::Summary* x) { return x->state; }
 // Every piece of volatile notification state goes back to its power-on value:
 // a reboot keeps only the simulated durable storage (g_notifyPrefs, T::store).
-// Heap objects (sweep, job, read-up list) are freed before their pointers
+// Heap objects (sweep, job, pending reads) are freed before their pointers
 // are cleared. -DNOTIFY_HEAD builds against 23293c5's notifications.cpp
 // (no jobs or read-ups) for before/after evidence.
 inline void resetVolatile() {
@@ -72,12 +76,10 @@ inline void resetVolatile() {
   Notifications::g_recountFailures = 0;
   delete Notifications::g_job;
   Notifications::g_job = nullptr;
-  delete Notifications::g_readUps;
-  Notifications::g_readUps = nullptr;
-  Notifications::g_readUpsDirty = false;
+  delete Notifications::g_reads;
+  Notifications::g_reads = nullptr;
   Notifications::g_nextStepMs = T::now;
   Notifications::g_saveDueMs = 0;
-  Notifications::g_readUpsDueMs = 0;
 #endif
   memset(Notifications::g_summaries, 0, sizeof(Notifications::g_summaries));
   Notifications::g_loadState = Notifications::LOAD_OK;
@@ -200,8 +202,8 @@ static void notifyTick(int n = 1) {
     while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; T_beginServiceRound(); NV::serviceTick(); }
   }
 }
-// The device stays on for 3 s: deferred writes (summary after 2 s, read-up
-// record after 1 s) are made, and background work advances.
+// The device stays on for 3 s: deferred writes (summary after 2 s) are made,
+// pending reads are applied, and background work advances.
 static void stayOn() {
   uint32_t end = T::now + 3000;
   while (static_cast<int32_t>(end - T::now) > 0) { T::now += 25; T_beginServiceRound(); NV::serviceTick(); }
@@ -236,23 +238,27 @@ int main() {
   openText();
   CHECK(textBadge() && unread(m), "entering the chat (nothing selected) marked it read");
   rot(-1); tick(2);
-  CHECK(!textBadge(), "selected: badge %d (it follows at once)", textBadge());
+  CHECK(textBadge() && unread(m), "selected, not yet written: badge %d unread %d (round 5: the count follows the rewrite)", textBadge(),
+        unread(m));
   stayOn();  // the flag on flash is cleared in the background
   CHECK(!textBadge() && !unread(m), "selected: badge %d unread %d", textBadge(), unread(m));
   back();
   CHECK(!textBadge() && !TextMessage::isConversationOpen(kG, kBob), "after Back: badge %d", textBadge());
 
-  g_test = "NR2 read up to the selection: a newer message stays unread; selecting the newest reads both (finding 1 on 23293c5)";
+  g_test = "NR2 per-message read: one move reads the newest only; two moves in one batch read both moved onto (round 5; was: read up to the selection)";
   reset();
+  MessageRef oldest = arrive(PacketCodec::MSG_TYPE_TEXT, "ZERO");
   MessageRef older = arrive(PacketCodec::MSG_TYPE_TEXT, "ONE");
   MessageRef newer = arrive(PacketCodec::MSG_TYPE_TEXT, "TWO");
   openText();
-  rot(-1); rot(-1); tick(2);  // two detents in one batch: passes over the newest, lands on the older one
+  rot(-1); tick(2);  // the newest
   stayOn();
-  CHECK(unread(newer) && !unread(older) && textBadge(), "newer %d older %d badge %d", unread(newer), unread(older), textBadge());
-  rot(+1); tick(2);  // now the newest
+  CHECK(!unread(newer) && unread(older) && unread(oldest) && textBadge(), "newer %d older %d oldest %d badge %d", unread(newer), unread(older),
+        unread(oldest), textBadge());
+  rot(+1); tick(2);  // back to compose
+  rot(-1); rot(-1); rot(-1); tick(2);  // one batch: newest (read), older, oldest
   stayOn();
-  CHECK(!unread(newer) && !unread(older) && !textBadge(), "newer %d older %d badge %d", unread(newer), unread(older), textBadge());
+  CHECK(!unread(older) && !unread(oldest) && !textBadge(), "older %d oldest %d badge %d", unread(older), unread(oldest), textBadge());
   back();
 
   g_test = "NR3 Enigma chat: rotating onto a received Enigma message marks it read";
@@ -272,13 +278,13 @@ int main() {
   MessageRef e1 = arrive(PacketCodec::MSG_TYPE_ENIGMA, "ENIG");
   CHECK(textBadge() && enigmaBadge(), "precondition");
   openText();
-  rot(-1); rot(-1); tick(2);  // two detents in one input batch: passes over the Enigma message without drawing it selected
+  rot(-1); tick(2);  // the Enigma message (newest, Unified Thread)
   stayOn();
-  CHECK(!unread(t1) && unread(e1) && !textBadge() && enigmaBadge(),
-        "only the message left selected is read: text %d enigma %d badges %d/%d", unread(t1), unread(e1), textBadge(), enigmaBadge());
-  rot(+1); tick(2);  // now the Enigma message (Unified Thread) is selected
+  CHECK(unread(t1) && !unread(e1) && textBadge() && !enigmaBadge(), "only the message moved onto is read: text %d enigma %d badges %d/%d",
+        unread(t1), unread(e1), textBadge(), enigmaBadge());
+  rot(-1); tick(2);  // the Text message
   stayOn();
-  CHECK(!unread(e1) && !textBadge() && !enigmaBadge(), "badges text %d enigma %d", textBadge(), enigmaBadge());
+  CHECK(!unread(t1) && !textBadge() && !enigmaBadge(), "badges text %d enigma %d", textBadge(), enigmaBadge());
   back();
   reset();
   t1 = arrive(PacketCodec::MSG_TYPE_TEXT, "TEXT");
@@ -310,7 +316,8 @@ int main() {
   tick(3);
   CHECK(g_historyCursor == cursor && MessageStore::getIndexEntry(g_historyCursor)->sequence == m.sequence,
         "selection moved: cursor %u", g_historyCursor);
-  CHECK(!unread(later), "an arrival into the open chat is read (unchanged rule)");
+  CHECK(unread(later) && textBadge(), "an arrival into the open chat stays unread (round 5; was: read on arrival): unread %d badge %d", unread(later),
+        textBadge());
   rot(+1); rot(+1); tick(2);  // back to compose
   CHECK(strcmp(g_composeText, "DRAFT") == 0 && g_historyCursor == kNoHistoryCursor, "draft '%s' cursor %u", g_composeText,
         g_historyCursor);

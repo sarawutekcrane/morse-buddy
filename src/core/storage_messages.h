@@ -206,7 +206,9 @@ void feedIndexRecord(const char* group_code, const char* contact_key, uint32_t s
                      const char* message_id);
 
 void updateLocalStatus(const MessageRef& ref, uint16_t newFlags);
-void updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask);
+// True once the rewritten record is in place (false: unchanged, or -- a
+// failed rename -- see atomicRewrite()).
+bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask);
 bool updateTypeLocalPayload(const MessageRef& ref, const uint8_t* localPayload, uint16_t localPayloadLen);
 
 bool findMessageById(const char* group_code, const char* contact_key, const char* message_id, MessageRef* outRef);

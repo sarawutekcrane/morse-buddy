@@ -4,9 +4,10 @@
 // text_message.cpp and enigma.cpp. Flash truth (each record's FLAG_UNREAD) is
 // read back through the real store, never through a fake.
 //
-// Covers hardware findings 1 and 3 on 23293c5: read up to the selected
-// message (scoped to group, contact and message type), legacy unread flags,
-// reboot and failure recovery, and bounded work per main-loop pass.
+// Covers hardware findings 1 and 3 on 23293c5 (legacy unread flags, reboot
+// and failure recovery, bounded work per main-loop pass) and, from round 5,
+// the per-message read that replaced "read up to the selection": moving the
+// cursor onto a message reads exactly that message (pm_tests.inc).
 #include "stubs.h"
 #include "core/menu.cpp"
 #include "core/notifications.cpp"
@@ -74,13 +75,11 @@ static void resetNotifyVolatile() {
   Notifications::g_recountFailures = 0;
   delete Notifications::g_job;
   Notifications::g_job = nullptr;
-  delete Notifications::g_readUps;
-  Notifications::g_readUps = nullptr;
-  Notifications::g_readUpsDirty = false;
+  delete Notifications::g_reads;  // pending per-message reads: RAM only
+  Notifications::g_reads = nullptr;
   Notifications::g_reconcileCursor = 0;
   Notifications::g_nextStepMs = T::now;
   Notifications::g_saveDueMs = 0;
-  Notifications::g_readUpsDueMs = 0;
 #endif
   memset(Notifications::g_summaries, 0, sizeof(Notifications::g_summaries));
   Notifications::g_loadState = Notifications::LOAD_OK;
@@ -302,8 +301,9 @@ static void freshDevice() {
   LittleFS.onFileOpen = nullptr;
   LittleFS.reverseListing = false;
   LittleFS.wipe();
+  MessageStore::notifyExternalStorageMutationAttempted();  // a wiped device: nothing cached survives (as after the reboot that follows)
   T::reset();
-  g_notifyPrefs.kv.clear(); g_notifyPrefs.failRead = nullptr; g_notifyPrefs.failWrite = nullptr;
+  g_notifyPrefs.kv.clear(); g_notifyPrefs.failRead = nullptr; g_notifyPrefs.failWrite = nullptr; g_notifyPrefs.failRemove = nullptr;
   MessageStore::init();
   g_msgNo = 0;
 }
@@ -325,7 +325,7 @@ int main(int argc, char** argv) {
   back(); reboot(); runFor(30);
   CHECK(!isUnread(t1) && !textBadge(), "after reboot: flash unread %d badge %d", isUnread(t1), textBadge());
 
-  g_test = "ST2 legacy flags: selecting the newest received message reads every older one of that type";
+  g_test = "ST2 legacy flags: selecting the newest received message reads that message only (round 5; was: every older one of its type)";
   freshDevice();
   for (int i = 0; i < 60; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, i % 5 != 4, 1700000000u + i * 60);
   powerOn(); runFor(60);
@@ -335,19 +335,16 @@ int main(int argc, char** argv) {
   CHECK(truth(kBob).text == 48, "a sent message selected read something");
   rot(-1);  // newest received message
   runFor(30);
-  CHECK(truth(kBob).text == 0 && truth(kBob).files == 60, "after selecting the newest: unread %d files %d", truth(kBob).text,
+  CHECK(truth(kBob).text == 47 && truth(kBob).files == 60, "after selecting the newest: unread %d files %d", truth(kBob).text,
         truth(kBob).files);
-  // With no fault, the first attempt verifies its own rewrites (a second
-  // pass) and completes: no failure recorded, no retry pause.
-  CHECK(Notifications::g_readUps != nullptr && Notifications::g_readUps->count == 1 && Notifications::g_readUps->items[0].done &&
-            Notifications::g_readUps->items[0].failures == 0,
-        "a fault-free read-up was not completed by its first attempt");
+  CHECK(Notifications::g_reads == nullptr, "a fault-free read is still pending");
   back();
-  CHECK(!textBadge(), "badge still lit");
+  CHECK(textBadge() && Notifications::getUnreadCount(kG, kBob) == 47, "badge %d count %u", textBadge(), Notifications::getUnreadCount(kG, kBob));
   reboot(); runFor(60);
-  CHECK(!textBadge() && truth(kBob).text == 0, "after reboot: badge %d unread %d", textBadge(), truth(kBob).text);
+  CHECK(textBadge() && truth(kBob).text == 47 && Notifications::getUnreadCount(kG, kBob) == 47, "after reboot: badge %d unread %d count %u",
+        textBadge(), truth(kBob).text, Notifications::getUnreadCount(kG, kBob));
 
-  g_test = "ST3 read up to selection is scoped to the message type; newer messages stay unread";
+  g_test = "ST3 the messages moved onto are read, nothing older and no other type; newer messages stay unread (round 5; was: read up to the selection)";
   freshDevice(); powerOn();
   MessageRef a1 = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000100u);
   MessageRef e1 = arrive(kBob, PacketCodec::MSG_TYPE_ENIGMA, 1700000200u);
@@ -357,7 +354,7 @@ int main(int argc, char** argv) {
   openText(kBob);
   rot(-1); rot(-1);  // a3, then a2 selected
   runFor(10);
-  CHECK(!isUnread(a1) && !isUnread(a2), "older Text not read: a1 %d a2 %d", isUnread(a1), isUnread(a2));
+  CHECK(isUnread(a1) && !isUnread(a2), "a1 (older, not moved onto) %d, a2 (moved onto) %d", isUnread(a1), isUnread(a2));
   CHECK(isUnread(e1) && isUnread(g1), "other types read: enigma %d game %d", isUnread(e1), isUnread(g1));
   back();
   CHECK(textBadge() && enigmaBadge(), "badges: text %d enigma %d", textBadge(), enigmaBadge());
@@ -374,7 +371,7 @@ int main(int argc, char** argv) {
   CHECK(isUnread(e1) && isUnread(g1), "selecting a Text message read enigma %d game %d", isUnread(e1), isUnread(g1));
   back();
 
-  g_test = "ST3b stored earlier but shown below the selection (later timestamp): stays unread";
+  g_test = "ST3b two moves in one batch read both messages moved onto, the one passed over included (round 5; was: it stayed unread)";
   freshDevice(); powerOn();
   MessageRef below = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000900u);  // stored first, newest timestamp
   MessageRef sel = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000500u);    // stored second, shown above it
@@ -382,14 +379,14 @@ int main(int argc, char** argv) {
   T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
   rot(-1);  // two detents in one batch: passes over `below`, selects `sel`
   runFor(10);
-  CHECK(!isUnread(sel) && isUnread(below), "selected %d below %d", isUnread(sel), isUnread(below));
+  CHECK(!isUnread(sel) && !isUnread(below), "selected %d passed over %d", isUnread(sel), isUnread(below));
   back();
 
-  g_test = "ST3c stored after the selection but shown above it, while the read-up is still pending: stays unread";
+  g_test = "ST3c stored after the selection but shown above it, while the selection's read is still pending: stays unread";
   freshDevice(); powerOn();
   MessageRef s1 = arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000500u);
   openText(kBob);
-  rot(-1);  // selects s1; the read-up is recorded, not yet applied
+  rot(-1);  // selects s1; its read is queued, not yet applied
   MessageRef late = storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000100u);  // older timestamp, stored later
   runFor(10);
   CHECK(!isUnread(s1) && isUnread(late), "selected %d later-stored %d", isUnread(s1), isUnread(late));
@@ -403,17 +400,17 @@ int main(int argc, char** argv) {
   openText(kCarol); runFor(10); back(); runFor(10);
   CHECK(truth(kCarol).enigma == 20 && enigmaBadge(), "entering cleared: unread %d badge %d", truth(kCarol).enigma, enigmaBadge());
 
-  g_test = "ST5 reboot while the read is still being applied: it resumes after reboot";
+  g_test = "ST5 reboot after a move: the one message read stays read; nothing else is read, nothing resumed (round 5; was: a read-up resumed)";
   freshDevice();
-  for (int i = 0; i < 150; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+  for (int i = 0; i < 90; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
   powerOn(); runFor(5);
   openText(kBob);
   rot(-1);
-  loopPass(150);  // 3 s: saved, not finished
-  int midway = truth(kBob).text;
-  CHECK(midway > 0, "precondition: already finished (%d left)", midway);
+  loopPass(150);  // 3 s: applied
+  CHECK(truth(kBob).text == 89, "precondition: %d unread (expected 149)", truth(kBob).text);
   reboot(); runFor(120);
-  CHECK(truth(kBob).text == 0 && !textBadge(), "after reboot: unread %d badge %d", truth(kBob).text, textBadge());
+  CHECK(truth(kBob).text == 89 && textBadge() && Notifications::getUnreadCount(kG, kBob) == 89, "after reboot: unread %d badge %d count %u",
+        truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
 
   g_test = "ST6 UI work per rotation is bounded: no file rewrite or NVS write during the encoder pass";
   freshDevice();
@@ -455,12 +452,13 @@ int main(int argc, char** argv) {
   powerOn(); runFor(10);
   g_notifyPrefs.failWrite = [](const char*) { return true; };
   openText(kBob); rot(-1); runFor(60);
-  CHECK(truth(kBob).text == 0, "with NVS failing: unread %d", truth(kBob).text);
+  CHECK(truth(kBob).text == 39, "with NVS failing: unread %d (expected 39)", truth(kBob).text);
   back();
   reboot(); runFor(60);
   g_notifyPrefs.failWrite = nullptr;
   runFor(30);
-  CHECK(truth(kBob).text == 0 && !textBadge(), "after reboot: unread %d badge %d", truth(kBob).text, textBadge());
+  CHECK(truth(kBob).text == 39 && textBadge() && Notifications::getUnreadCount(kG, kBob) == 39, "after reboot: unread %d badge %d count %u",
+        truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
 
   g_test = "ST9 unreliable directory: background recount retries, then converges";
   freshDevice();
@@ -482,7 +480,7 @@ int main(int argc, char** argv) {
   CHECK(Notifications::getUnreadCount(kG, kBob) == truth(kBob).text && truth(kBob).text == 91,
         "count %u flash %d", Notifications::getUnreadCount(kG, kBob), truth(kBob).text);
 
-  g_test = "ST11 a record rewrite fails during a read-up: the next pass retries it, nothing is left unread";
+  g_test = "ST11 a read's record rewrite fails five times: retried with backoff until written; only that message read (round 5; was: a read-up's passes)";
   freshDevice();
   for (int i = 0; i < 20; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
   powerOn(); runFor(30);
@@ -492,19 +490,20 @@ int main(int argc, char** argv) {
     LittleFS.failOpen = [](const std::string& p) {  // the first 5 temp-file writes fail
       return p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0 && tmpFailures++ < 5;
     };
-    openText(kBob); rot(-1); runFor(60);
+    openText(kBob); rot(-1); runFor(90);  // retries after 2, 4, 8, 16 and 32 s
     LittleFS.failOpen = nullptr;
-    CHECK(tmpFailures >= 5 && truth(kBob).text == 0, "left unread %d (write failures %d)", truth(kBob).text, tmpFailures);
+    CHECK(tmpFailures >= 5 && truth(kBob).text == 19 && Notifications::getUnreadCount(kG, kBob) == 19,
+          "left unread %d, count %u (write failures %d)", truth(kBob).text, Notifications::getUnreadCount(kG, kBob), tmpFailures);
     back();
   }
 
-  g_test = "ST12 a recount already under way when a read-up is selected does not light the badge again";
+  g_test = "ST12 a recount already under way when the last unread message is read does not light the badge again";
   freshDevice();
-  for (int i = 0; i < 300; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
+  for (int i = 0; i < 300; i++) storeText(kBob, kBob, true, i == 299, 1700000000u + i * 60, "E");  // the newest unread
   powerOn();
   {
     Notifications::Summary* b = nullptr;
-    runFor(60);  // counted: 300
+    runFor(60);  // counted: 1
     // the stored summary is now exact; a reboot makes it UNRESOLVED and queues its recount
     reboot();
     loopPass(3);  // that recount has started
@@ -512,10 +511,14 @@ int main(int argc, char** argv) {
     CHECK(Notifications::g_job != nullptr && Notifications::g_job->kind == Notifications::JOB_RECOUNT, "precondition: recount running");
 #endif
     openText(kBob); rot(-1);
-    bool relit = false;
-    for (int i = 0; i < 4000 && truth(kBob).text > 0; i++) {
+    for (int i = 0; i < 4000 && truth(kBob).text > 0; i++) loopPass();
+    // Lit while the summary is UNRESOLVED (the read was applied while it was
+    // being recounted); once dark it must never light again.
+    bool dark = false, relit = false;
+    for (int i = 0; i < 4000; i++) {
       loopPass();
-      if (textBadge()) relit = true;
+      if (!textBadge()) dark = true;
+      else if (dark) relit = true;
     }
     b = Notifications::findSummary(kG, kBob);
     CHECK(!relit && !textBadge() && truth(kBob).text == 0, "badge relit %d now %d unread %d state %d", relit, textBadge(),
@@ -652,7 +655,7 @@ int main(int argc, char** argv) {
           Notifications::getUnreadCount(kG, kDave));
   }
 
-  g_test = "ST19 read-up rewrites failing far beyond three passes (and across a reboot): never marked done, completes once writes work";
+  g_test = "ST19 a read whose rewrite keeps failing stays pending (retried with backoff, not dropped) without stalling other work; a reboot loses it and the message stays unread (round 5; was: a persisted read-up resumed)";
   freshDevice();
   for (int i = 0; i < 30; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
   for (int i = 0; i < 5; i++) storeOnly(kCarol, PacketCodec::MSG_TYPE_ENIGMA, true, 1700000000u + i * 60);
@@ -662,36 +665,37 @@ int main(int argc, char** argv) {
     failing = true;
     LittleFS.failOpen = [](const std::string& p) { return failing && p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };
     openText(kBob); rot(-1); back();
+    storeOnly(kCarol, PacketCodec::MSG_TYPE_ENIGMA, true, 1800000000u);  // found by a recount only
+    coldIndex();                                                         // (an outside change: everything recounted)
+    reboot();                                                            // ... by the boot sweep; the read is lost with it
+    openText(kBob); rot(-1); back();                                     // so it is made again, writes still failing
     runFor(300);
-    CHECK(truth(kBob).text == 30, "precondition: writes failing, nothing cleared (%d left)", truth(kBob).text);
-    CHECK(Notifications::g_readUps != nullptr && Notifications::g_readUps->count == 1 && !Notifications::g_readUps->items[0].done &&
-              Notifications::g_readUps->items[0].failures >= 2,
-          "the failing read-up was dropped or marked done (or never retried)");
-    storeOnly(kCarol, PacketCodec::MSG_TYPE_ENIGMA, true, 1800000000u);  // power-loss arrival: only the boot sweep finds it
-    reboot();
-    runFor(300);
-    CHECK(truth(kBob).text == 30, "precondition after reboot: still failing (%d left)", truth(kBob).text);
-    // The read-up is first in line after boot; the sweep must still get its turns.
-    CHECK(Notifications::getUnreadCount(kG, kCarol) == 6, "other work stalled behind the failing read-up: Carol %u",
+    CHECK(truth(kBob).text == 30 && Notifications::getUnreadCount(kG, kBob) == 30, "precondition: writes failing, nothing cleared (%d left)",
+          truth(kBob).text);
+    CHECK(Notifications::g_reads != nullptr && Notifications::g_reads->count == 1 && Notifications::g_reads->items[0].failures >= 4 &&
+              Notifications::g_reads->items[0].failures <= 12,
+          "the failing read was dropped, never retried, or retried without backoff (%u failures in 300 s)",
+          Notifications::g_reads != nullptr && Notifications::g_reads->count > 0 ? Notifications::g_reads->items[0].failures : 0);
+    CHECK(Notifications::getUnreadCount(kG, kCarol) == 6, "other work stalled behind the failing read: Carol %u",
           Notifications::getUnreadCount(kG, kCarol));
+    reboot();
     failing = false;
-    runFor(600);
-    CHECK(truth(kBob).text == 0 && Notifications::getUnreadCount(kG, kBob) == 0, "after writes work again: %d left, count %u",
-          truth(kBob).text, Notifications::getUnreadCount(kG, kBob));
+    runFor(300);
+    CHECK(truth(kBob).text == 30 && Notifications::getUnreadCount(kG, kBob) == 30, "after reboot: Bob %d unread (count %u)", truth(kBob).text,
+          Notifications::getUnreadCount(kG, kBob));
     LittleFS.failOpen = nullptr;
   }
 
-  g_test = "ST20 power lost before the deferred read-up save: the selection is lost, nothing is wrongly read, counts follow flash";
+  g_test = "ST20 power lost right after a move, before its rewrite: the read is lost, nothing is wrongly read, counts follow flash";
   freshDevice();
   for (int i = 0; i < 40; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
   powerOn(); runFor(30);
   openText(kBob); rot(-1);
-  loopPass(10);  // 200 ms: before the ~1 s deferred save
-  CHECK(!g_notifyPrefs.isKey("readup") || g_notifyPrefs.kv["readup"][0] == 0, "precondition: the read-up was already saved");
-  reboot();
+  CHECK(Notifications::g_reads != nullptr && Notifications::g_reads->count == 1, "precondition: the read is not pending");
+  reboot(); TextMessage::clearOpenConversation();
   runFor(120);
-  CHECK(truth(kBob).text > 0 && textBadge() && Notifications::getUnreadCount(kG, kBob) == static_cast<uint16_t>(truth(kBob).text),
-        "flash %d badge %d count %u", truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
+  CHECK(truth(kBob).text == 40 && textBadge() && Notifications::getUnreadCount(kG, kBob) == 40, "flash %d badge %d count %u",
+        truth(kBob).text, textBadge(), Notifications::getUnreadCount(kG, kBob));
 
   g_test = "ST21 400 conversations in 4 groups (and 200 empty group directories): the walk reads a bounded number of directory entries per pass and skips none";
   freshDevice();
@@ -2231,6 +2235,8 @@ int main(int argc, char** argv) {
     CHECK(pubsFor("msg/" + std::string(kCarol)) == 0 && s_watchOpens <= 1, "published %d, %d read attempts",
           pubsFor("msg/" + std::string(kCarol)), s_watchOpens);
   }
+
+#include "pm_tests.inc"
 
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

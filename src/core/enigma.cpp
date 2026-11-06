@@ -7,6 +7,7 @@
 #include "core/enigma_crypto.h"
 #include "core/enigma_keys.h"
 #include "core/held_input.h"
+#include "core/history_dates.h"
 #include "core/hooks.h"
 #include "core/identity.h"
 #include "core/identity_color.h"
@@ -939,6 +940,10 @@ HeldInput g_heldInput;
 bool g_chatLoadingShown = false;  // "Loading messages..." is on screen
 bool g_chatDrawnThisVisit = false;
 uint32_t g_chatIndexGeneration = 0;  // as in text_message.cpp: a stale index is reloaded once per change
+// As in text_message.cpp: what the shown history was drawn from (order, days,
+// unread markers); a change kept current in the index redraws the rows.
+uint32_t g_drawnIndexSignature = 0;
+bool g_historyStale = false;
 
 void refreshIndexIfNeeded() {
   if (!g_indexDirty) return;
@@ -987,6 +992,7 @@ bool syncIndexWithStore() {
   g_chatIndexGeneration = now;
   g_indexTotal = MessageStore::getIndexCount();
   followCursorMessage();
+  if (HistoryDates::indexSignature(g_indexTotal) != g_drawnIndexSignature) g_historyStale = true;
   return true;
 }
 
@@ -1135,12 +1141,22 @@ struct HistoryRowInfo {
   // colors and message-body WHITE are entirely unaffected. Hardware Fix
   // #4.8b: also the color the sender-divider bar itself is drawn in.
   uint16_t senderColor565;
+  // Presentation only, from the index (no record read): a date heading row
+  // before this message (the first of its day), and its unread marker.
+  uint8_t headerRows;
+  bool unread;
 };
 
 // Loads history entry `index` and computes where its body text wraps.
 // `labelX` is the fixed compact-cursor-cell-relative icon-cell X already
-// used by every history row's TRUE first row (2 + Display::kCursorCellWidth).
+// used by every history row's TRUE first row (kHistoryLabelX: after the
+// cursor cell and the unread-marker cell).
 void loadHistoryRow(uint16_t index, int16_t labelX, HistoryRowInfo* out) {
+  {
+    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(index);
+    out->headerRows = HistoryDates::startsDay(index) ? 1 : 0;
+    out->unread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD);
+  }
   out->lineBuf[0] = '?';
   out->lineBuf[1] = '\0';
   out->senderPrefix[0] = '\0';
@@ -1211,6 +1227,31 @@ uint16_t countHistoryRowsFor(uint16_t index, int16_t labelX) {
   return countHistoryRows(info);
 }
 
+// As in text_message.cpp: the rows a message occupies on screen (its date
+// heading, if any, and its body rows). The cursor (g_historyRowOffset)
+// moves over body rows only, never onto a heading.
+uint16_t countVisualRows(const HistoryRowInfo& info) { return static_cast<uint16_t>(info.headerRows + countHistoryRows(info)); }
+uint16_t countVisualRowsFor(uint16_t index, int16_t labelX) {
+  HistoryRowInfo info;
+  loadHistoryRow(index, labelX, &info);
+  return countVisualRows(info);
+}
+uint16_t cursorVisualRow() {
+  return static_cast<uint16_t>((HistoryDates::startsDay(g_historyCursor) ? 1 : 0) + g_historyRowOffset);
+}
+uint16_t cursorVisualTop() { return g_historyRowOffset == 0 ? 0 : cursorVisualRow(); }
+
+constexpr int16_t kUnreadMarkerX = 2 + Display::kCursorCellWidth;
+constexpr int16_t kHistoryLabelX = kUnreadMarkerX + Display::kUnreadMarkerCellWidth;
+
+void drawDateHeading(uint16_t index, int16_t y) {
+  char text[HistoryDates::kTextCap];
+  HistoryDates::headingFor(index, text, sizeof(text));
+  int16_t w = Display::textWidth(text);
+  int16_t x = static_cast<int16_t>(w < Display::kScreenWidth ? (Display::kScreenWidth - w) / 2 : 0);
+  Display::printLineColored(x, y, text, 0x8410);  // grey
+}
+
 // Picks the history viewport's starting position as a (message index,
 // rows-already-scrolled-past-within-that-message) pair instead of a plain
 // message index (Hardware Fix #4.3a issue 1), so a single logical message
@@ -1240,7 +1281,7 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
   bool placedAny = false;
   while (idx > 0) {
     idx--;
-    uint16_t rows = countHistoryRowsFor(idx, labelX);
+    uint16_t rows = countVisualRowsFor(idx, labelX);
     if (static_cast<int32_t>(rows) <= budget) {
       budget -= rows;
       defIdx = idx;
@@ -1268,11 +1309,12 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
     return;
   }
 
-  if (g_historyCursor < defIdx || (g_historyCursor == defIdx && g_historyRowOffset < defSkip)) {
+  if (g_historyCursor < defIdx || (g_historyCursor == defIdx && cursorVisualTop() < defSkip)) {
     // Focus is above (older than) the default window -- scroll up so the
-    // focused row becomes the viewport's first row.
+    // focused row (with its heading, on a message's first row) becomes the
+    // viewport's first row.
     *outStartIdx = g_historyCursor;
-    *outStartRowSkip = g_historyRowOffset;
+    *outStartRowSkip = cursorVisualTop();
     return;
   }
 
@@ -1283,13 +1325,13 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
     HistoryRowInfo first;
     loadHistoryRow(defIdx, labelX, &first);
     if (defIdx == g_historyCursor) {
-      rowsBefore = static_cast<int32_t>(g_historyRowOffset) - static_cast<int32_t>(defSkip);
+      rowsBefore = static_cast<int32_t>(cursorVisualRow()) - static_cast<int32_t>(defSkip);
     } else {
-      rowsBefore = static_cast<int32_t>(countHistoryRows(first)) - static_cast<int32_t>(defSkip);
+      rowsBefore = static_cast<int32_t>(countVisualRows(first)) - static_cast<int32_t>(defSkip);
       for (uint16_t i = static_cast<uint16_t>(defIdx + 1); i < g_historyCursor; i++) {
-        rowsBefore += countHistoryRowsFor(i, labelX);
+        rowsBefore += countVisualRowsFor(i, labelX);
       }
-      rowsBefore += g_historyRowOffset;
+      rowsBefore += cursorVisualRow();
     }
   }
 
@@ -1306,7 +1348,7 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
   uint16_t curIdx = defIdx;
   uint16_t curSkip = defSkip;
   while (rowsBefore >= static_cast<int32_t>(viewportLines)) {
-    uint16_t rows = countHistoryRowsFor(curIdx, labelX);
+    uint16_t rows = countVisualRowsFor(curIdx, labelX);
     if (static_cast<uint16_t>(curSkip + 1) < rows) {
       curSkip++;
     } else {
@@ -1319,8 +1361,9 @@ void computeHistoryViewport(uint16_t viewportLines, int16_t labelX, uint16_t* ou
   *outStartRowSkip = curSkip;
 }
 
-// Y of visual row `targetRowIdx` of history index `targetIdx`, given the
-// viewport currently starts at (startIdx, startRowSkip).
+// Y of body row `targetRowIdx` of history index `targetIdx`, given the
+// viewport currently starts at (startIdx, startRowSkip) -- visual rows,
+// date headings included.
 int16_t historyRowY(uint16_t startIdx, uint16_t startRowSkip, uint16_t targetIdx, uint16_t targetRowIdx,
                     int16_t labelX, int16_t contentTop, int16_t lh) {
   int32_t rows = 0;
@@ -1328,7 +1371,7 @@ int16_t historyRowY(uint16_t startIdx, uint16_t startRowSkip, uint16_t targetIdx
     HistoryRowInfo info;
     loadHistoryRow(i, labelX, &info);
     uint16_t skip = (i == startIdx) ? startRowSkip : 0;
-    uint16_t limit = (i == targetIdx) ? targetRowIdx : countHistoryRows(info);
+    uint16_t limit = (i == targetIdx) ? static_cast<uint16_t>(info.headerRows + targetRowIdx) : countVisualRows(info);
     if (limit > skip) rows += static_cast<int32_t>(limit - skip);
   }
   return static_cast<int16_t>(contentTop + rows * lh);
@@ -1761,20 +1804,17 @@ void handleHistoryFocusEvent(const InputEvent& e) {
   }
 }
 
-// Selecting a history item (rotating onto it) reads it and every older
-// received message of the same type in this conversation
-// (Notifications::readUpTo; same rule as Text's chat). Being in view, or
-// entering the chat, reads nothing. Checked once per newly selected message.
-bool g_readCheckDone = false;
-uint32_t g_readCheckSequence = 0;
-
-void markSelectedHistoryRead() {
+// As in text_message.cpp: a user move (a rotation, live or held and
+// replayed) put the cursor onto another message: that one message is read
+// if its index entry is unread (Notifications::readMovedOnto()). Entering,
+// drawing, a restored or followed selection and moving within one message's
+// rows read nothing.
+void readMessageMovedOnto(bool hadMessage, uint32_t previousSeq) {
   if (g_historyCursor == kNoHistoryCursor) return;
-  const MessageStore::ConversationIndexEntry* entry = MessageStore::getIndexEntry(g_historyCursor);
-  if (entry == nullptr || (g_readCheckDone && entry->sequence == g_readCheckSequence)) return;
-  g_readCheckDone = true;
-  g_readCheckSequence = entry->sequence;
-  Notifications::readUpTo(g_selectedGroupCode, g_selectedContactKey, g_historyCursor, g_indexTotal);
+  const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(g_historyCursor);
+  if (e == nullptr || (hadMessage && e->sequence == previousSeq)) return;
+  if (!(e->flags & MessageStore::FLAG_UNREAD)) return;
+  Notifications::readMovedOnto(g_selectedGroupCode, g_selectedContactKey, e->sequence, e->message_id);
 }
 
 bool g_enigmaChatDirty = true;
@@ -1865,7 +1905,7 @@ void screenEnigmaChatTick() {
   if (Menu::consumeJustEntered()) {
     resetSendFeedback();  // Phase 2B-2: nothing from a previous visit survives
     clearDraft();
-    g_readCheckDone = false;  // a selection after (re)entry is checked afresh
+    g_historyStale = false;
     g_historyCursor = kNoHistoryCursor;
     g_historyRowOffset = 0;
     TextMessage::setOpenConversation(g_selectedGroupCode, g_selectedContactKey);
@@ -1980,7 +2020,11 @@ void screenEnigmaChatTick() {
       // message the whole time a multi-row message is being read, and
       // every one of its rows becomes reachable this way, never just the
       // first few.
-      int16_t rotLabelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);
+      int16_t rotLabelX = kHistoryLabelX;
+      const MessageStore::ConversationIndexEntry* fromEntry =
+          g_historyCursor != kNoHistoryCursor ? MessageStore::getIndexEntry(g_historyCursor) : nullptr;
+      bool fromMessage = fromEntry != nullptr;
+      uint32_t fromSeq = fromMessage ? fromEntry->sequence : 0;
       if (g_historyCursor == kNoHistoryCursor) {
         if (e.value < 0 && g_indexTotal > 0) {
           g_historyCursor = static_cast<uint16_t>(g_indexTotal - 1);
@@ -2007,6 +2051,7 @@ void screenEnigmaChatTick() {
           g_historyRowOffset = 0;
         }
       }
+      readMessageMovedOnto(fromMessage, fromSeq);
     } else if (g_historyCursor != kNoHistoryCursor) {
       handleHistoryFocusEvent(e);
     } else {
@@ -2049,7 +2094,6 @@ void screenEnigmaChatTick() {
     return;
   }
   if (wasIndexDirty) g_enigmaChatDirty = true;
-  markSelectedHistoryRead();  // against the complete index
   if (g_inputLost && !g_sendRanThisTick) {
     g_inputLost = false;
     setSendStatus({"Input lost while loading", true});
@@ -2085,8 +2129,8 @@ void screenEnigmaChatTick() {
   // instead of the old PRIMARY-font ">" glyph + padding, on both history
   // and compose -- compose has no sender prefix, so its text starts right
   // after this same cell (Part G).
-  int16_t labelX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // history icon-cell X
-  int16_t composePrefixX = labelX;                                       // compose shares the same left margin
+  int16_t labelX = kHistoryLabelX;  // history icon-cell X (after the cursor and unread-marker cells)
+  int16_t composePrefixX = static_cast<int16_t>(2 + Display::kCursorCellWidth);  // compose: right after the cursor cell
   int16_t composeWidth = static_cast<int16_t>(Display::kScreenWidth - composePrefixX);
 
   // Compose text (Hardware Fix #4.3 issue E): word-wrapped by real pixel
@@ -2124,7 +2168,7 @@ void screenEnigmaChatTick() {
   // coordinate below the status bar shifted, so history, error, and
   // compose all need a full repaint together (Hardware Fix #4.3 issue E).
   bool historyLayoutChanged = firstDraw || (viewportLines != g_enigmaChatLastViewportLines);
-  bool contentChanged = !historyLayoutChanged && wasIndexDirty;
+  bool contentChanged = !historyLayoutChanged && (wasIndexDirty || g_historyStale);
   bool scrolled = !historyLayoutChanged && !contentChanged &&
                   (static_cast<int16_t>(startIdx) != g_enigmaChatLastStartIdx ||
                    static_cast<int16_t>(startRowSkip) != g_enigmaChatLastStartRowSkip);
@@ -2153,7 +2197,16 @@ void screenEnigmaChatTick() {
     for (uint16_t i = startIdx; i < g_indexTotal && rowsDrawn < viewportLines; i++) {
       HistoryRowInfo info;
       loadHistoryRow(i, labelX, &info);
-      uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;
+      uint16_t rowSkip = (i == startIdx) ? startRowSkip : 0;  // visual rows, its heading first
+      if (info.headerRows > 0) {
+        if (rowSkip == 0) {
+          drawDateHeading(i, y);
+          y = static_cast<int16_t>(y + lh);
+          rowsDrawn++;
+        } else {
+          rowSkip--;
+        }
+      }
       size_t len = strlen(info.lineBuf);
       size_t pos = 0;
       uint16_t rowIdx = 0;
@@ -2172,6 +2225,7 @@ void screenEnigmaChatTick() {
             // rows start at that same sender X (Hardware Fix #4 issues
             // 2/5, extended for issue E/4.3a, Hardware Fix #4.7 Part E,
             // #4.7b Part C).
+            if (info.unread) Display::printLineColored(kUnreadMarkerX, y, "*", ST77XX_YELLOW);
             drawRowIcon(labelX, y, info.icon);
             int16_t iconWidth = (info.icon == MessageIconKind::NONE) ? 0 : Display::kLockIconCellWidth;
             int16_t textX = static_cast<int16_t>(labelX + iconWidth);
@@ -2208,6 +2262,8 @@ void screenEnigmaChatTick() {
     }
     g_enigmaChatNeedsFullRedraw = false;
     g_chatDrawnThisVisit = true;  // a later reload keeps this on screen instead of "Loading messages..."
+    g_drawnIndexSignature = HistoryDates::indexSignature(g_indexTotal);
+    g_historyStale = false;
   } else if (selectionOnlyChanged && viewportLines > 0) {
     // Hardware Fix #4.3a issue 1 audit: guarded on viewportLines > 0 so a
     // focused message never gets its cursor marker drawn into the
@@ -2429,7 +2485,7 @@ void handleEnigmaArrival(const char* group_code, const char* contact_key, const 
 
   bool conversationOpen = TextMessage::isConversationOpen(group_code, contact_key);
   if (conversationOpen) markIndexDirty();
-  Notifications::onMessageArrived(group_code, contact_key, ref, Notifications::BADGE_ENIGMA, conversationOpen);
+  Notifications::onMessageArrived(group_code, contact_key, ref, Notifications::BADGE_ENIGMA, conversationOpen, false);
 }
 
 // =============================================================================

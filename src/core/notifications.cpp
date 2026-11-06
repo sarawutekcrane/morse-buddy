@@ -56,56 +56,54 @@ struct LegacySummary {
 
 constexpr const char* kSummaryKey = "summary2";
 constexpr const char* kLegacyKey = "summary";
-constexpr const char* kReadUpKey = "readup";
+// The earlier firmware's "read up to a selection" record (511d13e and
+// before). Never read or applied by this firmware: erased once at boot
+// (discardOldReadUpRecord()).
+constexpr const char* kOldReadUpKey = "readup";
 
-// ---- reading up to a selection (hardware findings 1 and 3 on 23293c5) -----
+// ---- per-message read (Text and Enigma chats) --------------------------
 //
-// Selecting a received message in a chat reads it AND every older received
-// message of the same type in that conversation: older means at or above it
-// in the history (sort key (effective_sort_timestamp, message_id) <= the
-// selected one's) and stored no later than it (sequence <= its sequence), so
-// a message shown below it, or one that arrived after it (even with an older
-// timestamp), stays unread. Text, Enigma and Friend-game records are separate
-// types: reading one never reads another. Older firmware never cleared a
-// stored record's unread flag on viewing, so long-used devices hold many such
-// flags; this is how they get cleared without selecting each one.
+// Moving a chat's cursor onto a received message reads exactly that message
+// (readMovedOnto()): nothing older, nothing else on screen, no other type,
+// conversation or category. Entering a chat, drawing it, its initial or a
+// restored selection, a load completing and an arrival read nothing.
 //
-// The selection itself only records the request: in RAM at once, and in the
-// "readup" NVS record about kReadUpSaveDelayMs later (coalesced). A power
-// loss before that write loses the selection: its messages stay unread
-// (never wrongly read) and are counted as such after the reboot; flags
-// already cleared on flash stay cleared. Once written, a reboot resumes it.
-// Clearing the flags on flash is background work done a few records per
-// step (below); until then counts and recounts treat a covered message as
-// read. A read-up is marked done only after a pass finds nothing left to
-// clear and nothing it could not read; until then it is retried, with a
-// growing pause between attempts so the other background work goes on.
-constexpr uint8_t kMaxReadUps = 8;
-struct ReadUp {
+// The request is kept in RAM only, by exact identity (group, contact,
+// sequence and message id), and applied by the background work: one record
+// rewrite per step (serviceTick()), before any other job. The count is
+// decremented only once the rewrite clearing FLAG_UNREAD succeeded, so counts
+// and badges always describe what is on flash. A rewrite that fails is
+// retried (kBackoffMinMs doubling, at most kBackoffMaxMs) and moved behind
+// the others; a record found gone (confirmed by a reliable listing), now
+// holding another message, or no longer unread is dropped. Nothing is
+// persisted: a power loss between the move and the rewrite's rename loses
+// the read -- the message stays unread on flash (marker shown, counted after
+// the reboot); never wrongly read. When the list is full, or cannot be
+// allocated, the read is applied at once (a synchronous rewrite); if that
+// fails the message stays unread and is not retried.
+constexpr uint8_t kMaxPendingReads = 32;
+struct PendingRead {
   char group_code[33];
   char contact_key[MessageStore::kContactKeyLen];
-  uint8_t type;
-  uint8_t done;  // applied and verified on flash; kept only so a covered selection adds nothing
-  uint32_t sortTs;
   char messageId[PacketCodec::kMessageIdLen];
   uint32_t sequence;
-  uint8_t failures;    // attempts that ended with something left (RAM; reset at load)
-  uint32_t retryAtMs;  // no attempt before this (RAM; reset at load)
+  uint32_t retryAtMs;  // 0: due now
+  uint8_t failures;    // rewrites (or reads) that failed so far
 };
-struct ReadUpRecord {
+struct PendingReads {
   uint8_t count;
-  ReadUp items[kMaxReadUps];
+  PendingRead items[kMaxPendingReads];  // oldest first
 };
 
 // ---- background work: bounded per main-loop pass -------------------------
 //
-// Recounts (UNRESOLVED conversations, the sweep below) and read-ups are jobs
+// Recounts (UNRESOLVED conversations, the sweep below) and trims are jobs
 // over one conversation, run one step at a time from serviceTick(), at most
 // one step per kStepMs. A step is ONE of: one conversation directory listing
 // (names only, at most 300 entries), up to kLoadsPerStep record reads, one
-// record rewrite (plus the reads before it in that step), one NVS write, or
-// one retry of an unreadable summary record. Nothing on the arrival, read or
-// eviction paths scans a whole conversation.
+// record deletion, one per-message read (a record rewrite), one NVS write,
+// or one retry of an unreadable summary record. Nothing on the arrival, read
+// or eviction paths scans a whole conversation.
 //
 // After every successful load (at boot, or when an unreadable record becomes
 // readable) every stored conversation is visited once (the sweep): first
@@ -132,10 +130,7 @@ constexpr uint8_t kLoadsPerStep = 4;
 // A step also ends once this much time went into it (device A on 2ed04b6:
 // about 63 ms per record open, so 4 reads were 250-480 ms passes).
 constexpr uint32_t kStepBudgetMs = 20;
-constexpr uint8_t kCountLoads = 4;       // record reads a selection may spend to count what stays unread
 constexpr uint32_t kSaveDelayMs = 2000;  // summary writes are coalesced
-constexpr uint32_t kReadUpSaveDelayMs = 1000;
-constexpr uint8_t kReadUpPasses = 3;     // passes per attempt; a pass that rewrote anything is checked by the next
 constexpr uint8_t kWalkEntriesPerStep = 16;
 constexpr uint8_t kJobAttempts = 5;      // unreliable listings or passes before a job gives way (and backs off)
 constexpr uint32_t kBackoffMinMs = 2000;
@@ -154,22 +149,19 @@ struct Sweep {
   uint32_t backoffMs;
 };
 
-enum JobKind : uint8_t { JOB_RECOUNT = 1, JOB_READUP = 2, JOB_TRIM = 3 };
+enum JobKind : uint8_t { JOB_RECOUNT = 1, JOB_TRIM = 3 };
 struct Job {
   JobKind kind;
   bool fromSweep;
   bool listed;      // seqs[] holds the conversation's records
   bool restart;     // the conversation changed under a recount: list and count again
   bool unreliable;  // a record could not be read in this pass
-  uint8_t pass;     // read-up: passes made
   uint8_t attempts; // unreliable listings or passes so far
-  uint16_t rewrites;
   uint16_t excess;  // trim: records still to delete
   uint16_t n, pos;
   uint16_t tally[kTypeSlots];
   char group_code[33];
   char contact_key[MessageStore::kContactKeyLen];
-  ReadUp readUp;
   uint32_t seqs[MessageStore::kMaxMessagesPerThread];
 };
 
@@ -193,9 +185,7 @@ uint8_t g_reconcileCursor = 0;
 Sweep* g_sweep = nullptr;          // non-null while a sweep runs (or waits for its next pass)
 uint32_t g_recountRetryMs = 0;     // a recount that gave way: UNRESOLVED ones wait until then
 Job* g_job = nullptr;              // non-null while a job runs
-ReadUpRecord* g_readUps = nullptr;  // non-null while any read-up is kept
-bool g_readUpsDirty = false;
-uint32_t g_readUpsDueMs = 0;
+PendingReads* g_reads = nullptr;    // non-null while a per-message read is pending
 
 int slotForType(uint8_t messageType) {
   switch (messageType) {
@@ -247,132 +237,6 @@ void writeSummaries() {
   }
   Serial.println("[NOTIFY] unread summary not saved; retrying");
   g_saveDueMs = millis() + kRetryMs;
-}
-
-// ---- read-up records ------------------------------------------------------
-
-// a covers b: same conversation and type, and b is at or above a in the
-// history and stored no later than it.
-bool readUpCovers(const ReadUp& a, const char* group_code, const char* contact_key, uint8_t type, uint32_t sortTs,
-                  const char* messageId, uint32_t sequence) {
-  if (a.type != type || !sameConversation(a.group_code, a.contact_key, group_code, contact_key)) return false;
-  if (sequence > a.sequence) return false;
-  if (sortTs != a.sortTs) return sortTs < a.sortTs;
-  return strncmp(messageId, a.messageId, PacketCodec::kMessageIdLen) <= 0;
-}
-
-// True if a pending (not yet applied) read-up covers this received record.
-bool coveredByPendingReadUp(const char* group_code, const char* contact_key, const MessageStore::StoredHeader& header,
-                            const PacketCodec::MessageEnvelope& envelope, uint32_t sequence) {
-  if (g_readUps == nullptr || header.direction != MessageStore::Direction::RECEIVED) return false;
-  for (uint8_t i = 0; i < g_readUps->count; i++) {
-    const ReadUp& r = g_readUps->items[i];
-    if (!r.done && readUpCovers(r, group_code, contact_key, envelope.message_type, header.effective_sort_timestamp,
-                                envelope.message_id, sequence))
-      return true;
-  }
-  return false;
-}
-
-void readUpsChanged() {
-  if (!g_readUpsDirty) g_readUpsDueMs = millis() + kReadUpSaveDelayMs;
-  g_readUpsDirty = true;
-}
-
-void writeReadUps() {
-  ReadUpRecord empty;
-  memset(&empty, 0, sizeof(empty));
-  const ReadUpRecord* r = g_readUps != nullptr ? g_readUps : &empty;
-  if (Storage::notify().putBytes(kReadUpKey, r, sizeof(*r)) == sizeof(*r)) {
-    g_readUpsDirty = false;
-    return;
-  }
-  Serial.println("[NOTIFY] read-up record not saved; retrying (the flags are still cleared meanwhile)");
-  g_readUpsDueMs = millis() + kRetryMs;
-}
-
-void loadReadUps() {
-  Preferences& p = Storage::notify();
-  if (!p.isKey(kReadUpKey)) return;
-  ReadUpRecord* r = new (std::nothrow) ReadUpRecord;
-  if (r == nullptr) return;
-  if (p.getBytes(kReadUpKey, r, sizeof(*r)) != sizeof(*r) || r->count > kMaxReadUps) {
-    // Unreadable: its selections are lost and those messages stay unread
-    // (never wrongly read); the record is replaced at the next selection.
-    Serial.println("[NOTIFY] read-up record unreadable; ignored");
-    delete r;
-    return;
-  }
-  for (uint8_t i = 0; i < r->count; i++) {
-    r->items[i].group_code[sizeof(r->items[i].group_code) - 1] = '\0';
-    r->items[i].contact_key[sizeof(r->items[i].contact_key) - 1] = '\0';
-    r->items[i].failures = 0;  // a new boot retries at once
-    r->items[i].retryAtMs = 0;
-  }
-  if (r->count == 0) {
-    delete r;
-    return;
-  }
-  g_readUps = r;
-}
-
-// Adds a read-up for the selected record. False if an existing one already
-// covers it (nothing new to read).
-bool addReadUp(const ReadUp& add) {
-  if (g_readUps == nullptr) {
-    g_readUps = new (std::nothrow) ReadUpRecord;
-    if (g_readUps == nullptr) return false;
-    memset(g_readUps, 0, sizeof(*g_readUps));
-  }
-  ReadUpRecord& r = *g_readUps;
-  for (uint8_t i = 0; i < r.count; i++) {
-    if (readUpCovers(r.items[i], add.group_code, add.contact_key, add.type, add.sortTs, add.messageId, add.sequence))
-      return false;
-  }
-  // Drop what the new one covers, then make room: a finished one first, else
-  // the oldest pending one (its messages stay unread -- never wrongly read).
-  uint8_t out = 0;
-  for (uint8_t i = 0; i < r.count; i++) {
-    const ReadUp& x = r.items[i];
-    if (!readUpCovers(add, x.group_code, x.contact_key, x.type, x.sortTs, x.messageId, x.sequence)) r.items[out++] = x;
-  }
-  r.count = out;
-  if (r.count == kMaxReadUps) {
-    uint8_t victim = 0;
-    for (uint8_t i = 0; i < r.count; i++) {
-      if (r.items[i].done) {
-        victim = i;
-        break;
-      }
-    }
-    if (!r.items[victim].done) Serial.println("[NOTIFY] read-up list full; oldest selection dropped");
-    for (uint8_t i = victim; i + 1 < r.count; i++) r.items[i] = r.items[i + 1];
-    r.count--;
-  }
-  r.items[r.count++] = add;
-  readUpsChanged();
-  return true;
-}
-
-// The same selection (the RAM-only retry fields aside).
-bool sameReadUp(const ReadUp& a, const ReadUp& b) {
-  return a.type == b.type && a.sortTs == b.sortTs && a.sequence == b.sequence &&
-         sameConversation(a.group_code, a.contact_key, b.group_code, b.contact_key) &&
-         strncmp(a.messageId, b.messageId, PacketCodec::kMessageIdLen) == 0;
-}
-
-ReadUp* findReadUp(const ReadUp& r) {
-  if (g_readUps == nullptr) return nullptr;
-  for (uint8_t i = 0; i < g_readUps->count; i++)
-    if (sameReadUp(g_readUps->items[i], r)) return &g_readUps->items[i];
-  return nullptr;
-}
-
-void markReadUpDone(const ReadUp& finished) {
-  ReadUp* x = findReadUp(finished);
-  if (x == nullptr) return;
-  x->done = 1;
-  readUpsChanged();
 }
 
 uint32_t backoffMs(uint8_t failures) {
@@ -663,19 +527,10 @@ void sweepStep() {
 }
 
 // Starts the next job, or advances the sweep (one step's work at most).
-// Order: a pending read-up that is due (the user is waiting to see it), then
-// an UNRESOLVED conversation, then the sweep.
+// Order: an UNRESOLVED conversation, then the sweep. (Per-message reads go
+// before any job: serviceTick().)
 void startNextJob() {
   uint32_t now = millis();
-  if (g_readUps != nullptr) {
-    for (uint8_t i = 0; i < g_readUps->count; i++) {
-      const ReadUp& r = g_readUps->items[i];
-      if (r.done || (r.retryAtMs != 0 && static_cast<int32_t>(now - r.retryAtMs) < 0)) continue;
-      g_job = newJob(JOB_READUP, r.group_code, r.contact_key);
-      if (g_job != nullptr) g_job->readUp = r;
-      return;
-    }
-  }
   if (g_loadState != LOAD_OK) return;  // recounts need the stored summary
   if (g_recountFailures == 0 || static_cast<int32_t>(now - g_recountRetryMs) >= 0) {
     for (uint8_t k = 0; k < kMaxSummaries; k++) {
@@ -715,40 +570,131 @@ void finishRecount() {
   endJob();
 }
 
-// A read-up pass is complete. A pass that rewrote anything is checked by
-// another (a rewrite can fail and leave the flag set); one that rewrote
-// nothing and read everything finishes it, and the conversation is
-// recounted. An attempt that still leaves something after kReadUpPasses
-// passes keeps the read-up pending (never marked done) and retries it after
-// a growing pause, while the other work goes on.
-void finishReadUp() {
-  Job& j = *g_job;
-  bool left = j.rewrites > 0 || j.unreliable;
-  if (left && j.pass + 1 < kReadUpPasses) {
-    j.pass++;
-    j.rewrites = 0;
-    j.unreliable = false;
-    j.listed = false;
-    return;
+// ---- per-message read (see PendingRead above) -----------------------------
+
+void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence);
+
+// Whether a reliable listing of the conversation shows the record gone. A
+// failed listing, or no memory for it, is not a confirmation.
+bool recordConfirmedGone(const MessageRef& ref) {
+  uint32_t* seqs = new (std::nothrow) uint32_t[MessageStore::kMaxMessagesPerThread];
+  if (seqs == nullptr) return false;
+  bool reliable = false, truncated = false;
+  uint16_t n = MessageStore::listMessageSequences(ref.group_code, ref.contact_key, seqs, MessageStore::kMaxMessagesPerThread,
+                                                  &reliable, &truncated);
+  bool listed = false;
+  for (uint16_t i = 0; i < n && !listed; i++) listed = seqs[i] == ref.sequence;
+  delete[] seqs;
+  return reliable && !listed;
+}
+
+enum class ReadOutcome : uint8_t { DONE, RETRY };
+
+// After a failed attempt, the record may have changed without its count
+// following: a rewrite reported failed after its rename (flag cleared), or
+// one whose rename failed after the old file was removed (record gone, see
+// atomicRewrite()). Recount rather than guess.
+void recountAfterFailedAttempt(const PendingRead& p) {
+  if (p.failures == 0) return;
+  Summary* s = findSummary(p.group_code, p.contact_key);
+  if (s == nullptr || s->state != SUMMARY_COUNTED) return;
+  markUnresolved(s, 0);
+  saveSummaries();
+}
+
+// Clears this one message's FLAG_UNREAD on flash and, only once that
+// succeeded, its count. DONE also when there is nothing (left) to do.
+ReadOutcome applyRead(const PendingRead& p) {
+  MessageRef ref;
+  memset(&ref, 0, sizeof(ref));
+  strncpy(ref.group_code, p.group_code, sizeof(ref.group_code) - 1);
+  strncpy(ref.contact_key, p.contact_key, sizeof(ref.contact_key) - 1);
+  ref.sequence = p.sequence;
+  StoredMessageView view;
+  if (!MessageStore::loadMessage(ref, &view)) {
+    if (!recordConfirmedGone(ref)) return ReadOutcome::RETRY;  // unreadable for now: never assumed gone
+    recountAfterFailedAttempt(p);                              // deleted or evicted: nothing to read
+    return ReadOutcome::DONE;
   }
-  if (left) {
-    ReadUp* x = findReadUp(j.readUp);
-    if (x != nullptr) {
-      if (x->failures < 255) x->failures++;
-      x->retryAtMs = millis() + backoffMs(x->failures);
-      if (x->retryAtMs == 0) x->retryAtMs = 1;
-    }
-    Serial.println("[NOTIFY] read-up not complete; retried later");
-    endJob();
-    return;
+  if (strncmp(view.envelope.message_id, p.messageId, PacketCodec::kMessageIdLen) != 0) {
+    recountAfterFailedAttempt(p);  // another message holds the sequence now: it is not read
+    return ReadOutcome::DONE;
   }
-  markReadUpDone(j.readUp);
-  Summary* s = findSummary(j.group_code, j.contact_key);
-  if (s != nullptr && s->state == SUMMARY_COUNTED) {
-    markUnresolved(s, 0);  // recounted next, from the flags just written
+  if (view.header.direction != MessageStore::Direction::RECEIVED || !(view.header.flags & MessageStore::FLAG_UNREAD)) {
+    recountAfterFailedAttempt(p);  // already read
+    return ReadOutcome::DONE;
+  }
+  Summary* s = findSummary(p.group_code, p.contact_key);
+  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return ReadOutcome::RETRY;
+  conversationChanged(p.group_code, p.contact_key);  // a recount under way may have counted it unread
+  int slot = slotForType(view.envelope.message_type);
+  if (s != nullptr && s->state == SUMMARY_COUNTED && slot >= 0 && s->unread[slot] > 0) {
+    s->unread[slot]--;
     saveSummaries();
   }
-  endJob();
+  return ReadOutcome::DONE;  // (an UNRESOLVED summary is recounted from the flags)
+}
+
+void removePendingRead(uint8_t i) {
+  for (uint8_t k = i; k + 1 < g_reads->count; k++) g_reads->items[k] = g_reads->items[k + 1];
+  g_reads->count--;
+  if (g_reads->count == 0) {
+    delete g_reads;
+    g_reads = nullptr;
+  }
+}
+
+// Applies the oldest due per-message read (one record rewrite). False if
+// none is due.
+bool stepPendingRead() {
+  if (g_reads == nullptr) return false;
+  uint32_t now = millis();
+  for (uint8_t i = 0; i < g_reads->count; i++) {
+    PendingRead& p = g_reads->items[i];
+    if (p.retryAtMs != 0 && static_cast<int32_t>(now - p.retryAtMs) < 0) continue;
+    if (applyRead(p) == ReadOutcome::DONE) {
+      removePendingRead(i);
+      return true;
+    }
+    // Retried later, behind the others (it never blocks them).
+    PendingRead again = p;
+    if (again.failures < 255) again.failures++;
+    again.retryAtMs = now + backoffMs(again.failures);
+    if (again.retryAtMs == 0) again.retryAtMs = 1;
+    Serial.printf("[NOTIFY] read of %s/%s #%lu not written; retried in %lu ms\n", again.group_code, again.contact_key,
+                  static_cast<unsigned long>(again.sequence), static_cast<unsigned long>(again.retryAtMs - now));
+    for (uint8_t k = i; k + 1 < g_reads->count; k++) g_reads->items[k] = g_reads->items[k + 1];
+    g_reads->items[g_reads->count - 1] = again;
+    return true;
+  }
+  return false;
+}
+
+// Pending reads of a record that is gone (sequence given), of a whole
+// conversation (contact given, no sequence) or of a whole group.
+void forgetPendingReads(const char* group_code, const char* contact_key, const uint32_t* sequence) {
+  if (g_reads == nullptr) return;
+  for (uint8_t i = g_reads->count; i-- > 0;) {
+    const PendingRead& p = g_reads->items[i];
+    if (strcmp(p.group_code, group_code) != 0) continue;
+    if (contact_key != nullptr && strcmp(p.contact_key, contact_key) != 0) continue;
+    if (sequence != nullptr && p.sequence != *sequence) continue;
+    removePendingRead(i);
+    if (g_reads == nullptr) return;
+  }
+}
+
+// The earlier firmware kept a "read up to this selection" request in NVS
+// until it was applied. Its ranges are never applied or turned into
+// per-message reads: the record is erased (once; if erasing fails it is
+// ignored again at the next boot). Messages it had already cleared on flash
+// stay read; those it had not reached keep their (truthful) unread flag, and
+// the boot sweep recounts every conversation from the flags.
+void discardOldReadUpRecord() {
+  Preferences& p = Storage::notify();
+  if (!p.isKey(kOldReadUpKey)) return;
+  if (p.remove(kOldReadUpKey)) Serial.println("[NOTIFY] earlier read-up record discarded, not applied");
+  else Serial.println("[NOTIFY] earlier read-up record not erased; ignored (erased at a later boot)");
 }
 
 // One trim step: at most kLoadsPerStep record reads (pending-outbox records
@@ -790,8 +736,7 @@ void stepTrim(Job& j) {
     }
     int slot = slotForType(view.envelope.message_type);
     bool counted = view.header.direction == MessageStore::Direction::RECEIVED &&
-                   (view.header.flags & MessageStore::FLAG_UNREAD) && slot >= 0 &&
-                   !coveredByPendingReadUp(j.group_code, j.contact_key, view.header, view.envelope, ref.sequence);
+                   (view.header.flags & MessageStore::FLAG_UNREAD) && slot >= 0;
     if (!MessageStore::deleteMessage(ref)) {
       Serial.println("[NOTIFY] trim: a record could not be deleted; retried later");
       giveWay(j);
@@ -800,6 +745,7 @@ void stepTrim(Job& j) {
     }
     j.pos++;
     j.excess--;
+    forgetPendingReads(ref.group_code, ref.contact_key, &ref.sequence);
     if (counted) {  // uncounted only now that it is gone
       Summary* s = findSummary(j.group_code, j.contact_key);
       if (s != nullptr && s->state == SUMMARY_COUNTED && s->unread[slot] > 0) {
@@ -840,12 +786,6 @@ void stepJob() {
     j.listed = reliable;
     if (!reliable) {
       if (++j.attempts >= kJobAttempts) {  // the listing keeps failing: give way, retried later
-        if (j.kind == JOB_READUP) {
-          j.unreliable = true;
-          j.pass = kReadUpPasses;  // this attempt ends with something left
-          finishReadUp();
-          return;
-        }
         giveWay(j);
         if (j.kind == JOB_TRIM) continueWithRecount(j);
         else endJob();
@@ -888,31 +828,17 @@ void stepJob() {
     if (j.kind == JOB_RECOUNT)
       MessageStore::feedIndexRecord(ref.group_code, ref.contact_key, ref.sequence, &view.header, view.envelope.message_id);
     if (view.header.direction != MessageStore::Direction::RECEIVED || !(view.header.flags & MessageStore::FLAG_UNREAD)) continue;
-    if (j.kind == JOB_RECOUNT) {
-      int slot = slotForType(view.envelope.message_type);
-      if (slot >= 0 && !coveredByPendingReadUp(j.group_code, j.contact_key, view.header, view.envelope, ref.sequence))
-        j.tally[slot]++;
-      continue;
-    }
-    if (readUpCovers(j.readUp, j.group_code, j.contact_key, view.envelope.message_type, view.header.effective_sort_timestamp,
-                     view.envelope.message_id, ref.sequence)) {
-      MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
-      j.rewrites++;
-      return;  // at most one rewrite per step
-    }
+    int slot = slotForType(view.envelope.message_type);
+    if (slot >= 0) j.tally[slot]++;
   }
   if (j.pos < j.n) return;
-  if (j.kind == JOB_RECOUNT) {
-    if (j.restart) return;  // relisted at the next step
-    finishRecount();
-  } else {
-    finishReadUp();
-  }
+  if (j.restart) return;  // relisted at the next step
+  finishRecount();
 }
 
 // One bounded step of background work per kStepMs, in priority order: retry
-// an unreadable stored summary (every kRetryMs), write a due summary or
-// read-up record, then advance (or start) a job. A summary write that keeps
+// an unreadable stored summary (every kRetryMs), write a due summary, apply
+// a due per-message read, then advance (or start) a job. A summary write that keeps
 // failing is retried every kRetryMs without stopping the other work.
 void serviceTick() {
   uint32_t now = millis();
@@ -930,15 +856,12 @@ void serviceTick() {
     writeSummaries();
     return;
   }
-  if (g_readUpsDirty && static_cast<int32_t>(now - g_readUpsDueMs) >= 0) {
-    writeReadUps();
-    return;
-  }
   // One background storage step per main-loop pass, shared with the Outbox.
   if (!claimBackgroundStorageStep(BG_NOTIFICATIONS)) {
     g_nextStepMs = now;  // not this pass: the next one
     return;
   }
+  if (stepPendingRead()) return;  // the user is looking at it: before any job
   if (g_job != nullptr) {
     stepJob();
     return;
@@ -963,6 +886,7 @@ bool hasBadge(uint8_t mask) {
 // runs inside an append, on the arrival path.
 void onMessageEvicted(const MessageRef& ref, uint16_t flags) {
   conversationChanged(ref.group_code, ref.contact_key);
+  forgetPendingReads(ref.group_code, ref.contact_key, &ref.sequence);
   if (!(flags & MessageStore::FLAG_UNREAD)) return;
   Summary* s = findSummary(ref.group_code, ref.contact_key);
   if (s == nullptr) return;  // not listed: nothing to correct (the sweep covers the rest)
@@ -982,10 +906,11 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
     }
   }
   if (changed) saveSummaries();
+  forgetPendingReads(info.group_code, nullptr, nullptr);
 }
 
 void serviceInit() {
-  loadReadUps();
+  discardOldReadUpRecord();
   loadSummaries();
   registerSettingsChangeHook(onSettingsChanged);
   MessageStore::setOnEvictedCallback(onMessageEvicted);
@@ -1007,11 +932,11 @@ Registrar g_registrar;
 }  // namespace
 
 void onMessageArrived(const char* group_code, const char* contact_key, const MessageRef& ref,
-                      uint8_t badgeMask, bool conversationCurrentlyOpen) {
+                      uint8_t badgeMask, bool conversationCurrentlyOpen, bool readIfOpen) {
   conversationChanged(group_code, contact_key);
   StoredMessageView view;
   bool loaded = MessageStore::loadMessage(ref, &view);
-  if (conversationCurrentlyOpen) {
+  if (conversationCurrentlyOpen && readIfOpen) {
     if (!loaded || (view.header.flags & MessageStore::FLAG_UNREAD))
       MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
     return;
@@ -1035,6 +960,7 @@ void onMessageArrived(const char* group_code, const char* contact_key, const Mes
     saveSummaries();
   }
 
+  if (conversationCurrentlyOpen) return;  // on screen already (and still unread: readIfOpen false)
   playTone(1000, 150, SOUND_NOTIFICATION);
   Sleep::notifyActivity();
 }
@@ -1044,11 +970,10 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
   if (!MessageStore::loadMessage(ref, &view)) return;
   if (!(view.header.flags & MessageStore::FLAG_UNREAD)) return;
 
-  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD);
+  if (!MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_UNREAD)) return;  // still unread: still counted
   conversationChanged(group_code, contact_key);
   Summary* s = findSummary(group_code, contact_key);
   if (s == nullptr || s->state == SUMMARY_UNRESOLVED) return;  // an UNRESOLVED one is recounted in the background
-  if (coveredByPendingReadUp(group_code, contact_key, view.header, view.envelope, ref.sequence)) return;  // counted as read already
   int slot = slotForType(view.envelope.message_type);
   if (slot >= 0 && s->unread[slot] > 0) {
     s->unread[slot]--;
@@ -1056,69 +981,34 @@ void clearUnread(const char* group_code, const char* contact_key, const MessageR
   }
 }
 
-void readUpTo(const char* group_code, const char* contact_key, uint16_t selectedIndex, uint16_t indexTotal) {
-  const MessageStore::ConversationIndexEntry* sel = MessageStore::getIndexEntry(selectedIndex);
-  if (sel == nullptr || selectedIndex >= indexTotal) return;
-  // Nothing at or above it that may be unread: nothing to read (the index's
-  // flags can only over-report: a cleared flag shows as unread until the
-  // chat reloads its index).
-  bool anyUnread = false;
-  for (uint16_t i = 0; i <= selectedIndex && !anyUnread; i++) {
-    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
-    anyUnread = e != nullptr && (e->flags & MessageStore::FLAG_UNREAD) && e->sequence <= sel->sequence;
-  }
-  if (!anyUnread) return;
-
-  MessageRef ref;
-  strncpy(ref.group_code, group_code, sizeof(ref.group_code) - 1);
-  ref.group_code[sizeof(ref.group_code) - 1] = '\0';
-  strncpy(ref.contact_key, contact_key, sizeof(ref.contact_key) - 1);
-  ref.contact_key[sizeof(ref.contact_key) - 1] = '\0';
-  ref.sequence = sel->sequence;
-  StoredMessageView view;
-  if (!MessageStore::loadMessage(ref, &view)) return;
-  if (view.header.direction != MessageStore::Direction::RECEIVED) return;
-  int slot = slotForType(view.envelope.message_type);
-  if (slot < 0) return;
-
-  ReadUp r;
+void readMovedOnto(const char* group_code, const char* contact_key, uint32_t sequence, const char* message_id) {
+  if (group_code == nullptr || contact_key == nullptr || message_id == nullptr) return;
+  PendingRead r;
   memset(&r, 0, sizeof(r));
   strncpy(r.group_code, group_code, sizeof(r.group_code) - 1);
   strncpy(r.contact_key, contact_key, sizeof(r.contact_key) - 1);
-  r.type = view.envelope.message_type;
-  r.sortTs = view.header.effective_sort_timestamp;
-  memcpy(r.messageId, view.envelope.message_id, sizeof(r.messageId));
-  r.sequence = sel->sequence;
-  if (!addReadUp(r)) return;  // covered by an earlier selection
-  conversationChanged(group_code, contact_key);  // a recount under way may have counted what is now read
-
-  // The badge follows at once when what stays unread of this type can be
-  // counted with a few reads: records below the selection, or stored after
-  // it, whose index flag shows unread. Otherwise the recount after the
-  // read-up sets it (the categories stay lit meanwhile).
-  Summary* s = findSummary(group_code, contact_key);
-  if (s == nullptr) return;
-  uint16_t remaining = 0;
-  uint8_t loads = 0;
-  for (uint16_t i = 0; i < indexTotal; i++) {
-    const MessageStore::ConversationIndexEntry* e = MessageStore::getIndexEntry(i);
-    if (e == nullptr || !(e->flags & MessageStore::FLAG_UNREAD)) continue;
-    if (i <= selectedIndex && e->sequence <= r.sequence) continue;  // at or above it: read now (if this type)
-    if (loads++ == kCountLoads) return;
-    ref.sequence = e->sequence;
-    StoredMessageView v;
-    if (!MessageStore::loadMessage(ref, &v)) return;
-    if (v.header.direction == MessageStore::Direction::RECEIVED && (v.header.flags & MessageStore::FLAG_UNREAD) &&
-        v.envelope.message_type == r.type && !coveredByPendingReadUp(group_code, contact_key, v.header, v.envelope, e->sequence))
-      remaining++;
-  }
-  if (s->state == SUMMARY_COUNTED) {
-    if (s->unread[slot] == remaining) return;
-    s->unread[slot] = remaining;
+  memcpy(r.messageId, message_id, sizeof(r.messageId));
+  r.sequence = sequence;
+  if (g_reads != nullptr) {
+    for (uint8_t i = 0; i < g_reads->count; i++) {
+      const PendingRead& p = g_reads->items[i];
+      if (p.sequence == sequence && sameConversation(p.group_code, p.contact_key, group_code, contact_key) &&
+          strncmp(p.messageId, r.messageId, sizeof(r.messageId)) == 0)
+        return;  // already pending
+    }
   } else {
-    s->unread[slot] = remaining > 0 ? 1 : 0;
+    g_reads = new (std::nothrow) PendingReads;
+    if (g_reads != nullptr) g_reads->count = 0;
   }
-  saveSummaries();
+  if (g_reads != nullptr && g_reads->count < kMaxPendingReads) {
+    g_reads->items[g_reads->count++] = r;
+    return;
+  }
+  // No room (or no memory) to keep it: applied now; if that fails, the
+  // message stays unread (shown so) and nothing claims otherwise.
+  if (applyRead(r) != ReadOutcome::DONE)
+    Serial.printf("[NOTIFY] read of %s/%s #%lu not written (no room to retry); left unread\n", group_code, contact_key,
+                  static_cast<unsigned long>(sequence));
 }
 
 uint16_t getUnreadCount(const char* group_code, const char* contact_key) {

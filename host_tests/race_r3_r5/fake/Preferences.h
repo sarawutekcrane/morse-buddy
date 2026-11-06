@@ -33,6 +33,13 @@ class Preferences {
     return it->second.size();
   }
   bool isKey(const char* key) { return kv.count(key) != 0; }
+  std::function<bool(const char*)> failRemove;  // true -> this remove fails (the key stays)
+  int removes = 0;
+  bool remove(const char* key) {  // nvs_erase_key: false if absent or on error
+    removes++;
+    if (failRemove && failRemove(key)) return false;
+    return kv.erase(key) != 0;
+  }
   bool begin(const char*, bool) { return true; }
   uint32_t getULong(const char* key, uint32_t def) {
     uint32_t v = def;

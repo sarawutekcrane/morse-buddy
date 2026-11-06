@@ -48,6 +48,9 @@ extern uint32_t unixTime;  // WifiManager::getUnixTime()
 // (font_metrics.h) with Adafruit getTextBounds() semantics, and printLine()
 // clipping exactly as display.cpp does. Reset by reset().
 extern bool realGlyphs;
+// Display fake wrapping: false (default) = wrapLineAt() returns the rest of
+// the text as one row; true = a greedy word wrap at the row width. Reset by reset().
+extern bool realWrap;
 // REAL_NOTIFICATIONS builds only: MessageStore::findMessagesByPredicate()
 // scans the fake store; true makes it report the scan as unreliable.
 extern bool scanUnreliable;
