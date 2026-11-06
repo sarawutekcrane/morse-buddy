@@ -123,7 +123,7 @@ Host model only (63 ms per file open). This is not device timing. The tests and 
 - **`notify_test`:** 119 passed.
 - **Full `run_all.sh` suites** (mutation step run separately): all passed (`evidence/run_all_suites_1609f06.txt`).
 - **Mutations**, each script run alone:
-  - **`mutate_notify.py`** (178 mutants: 40 new for this round, 17 obsolete read-up mutants removed, one anchor updated for the new signature): see `evidence/mutate_notify.txt`. The first full run (`evidence/mutate_notify_first_run_4fe335b.txt`) left 7 unexplained survivors. Each was an observed test gap, now closed by a test:
+  - **`mutate_notify.py`** (178 mutants: 40 new for this round, 17 obsolete read-up mutants removed, one anchor updated for the new signature): **176/178 caught, 0 unexplained**; the 2 survivors are the equivalents assessed in earlier rounds, with reasons in the script (`evidence/mutate_notify.txt`). The first full run (`evidence/mutate_notify_first_run_4fe335b.txt`) left 7 unexplained survivors. Each was an observed test gap, now closed by a test:
     - an Enigma arrival in the open chat read: the arrival helper bypassed the chats' handlers (now PM7 and DS3 go through the dispatcher);
     - a read waiting behind long background work (PM11);
     - a read not restarting a recount under way (ST12: the count is exact whenever no recount of it runs);
