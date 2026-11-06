@@ -61,6 +61,39 @@ static const char* kBob = "B0B000000001";
 static const char* kCarol = "CA201000000001";
 static uint32_t g_msgNo = 0;
 
+// ---- pending reads (RAM only) ---------------------------------------------
+// -DNOTIFY_READUP builds these tests against the read-up firmware (511d13e)
+// for before/after evidence: its pending state was the read-up list.
+#ifdef NOTIFY_READUP
+static int pendingReads() {
+  int n = 0;
+  if (Notifications::g_readUps != nullptr)
+    for (uint8_t i = 0; i < Notifications::g_readUps->count; i++) n += !Notifications::g_readUps->items[i].done;
+  return n;
+}
+static int pendingFailures() {
+  if (Notifications::g_readUps != nullptr)
+    for (uint8_t i = 0; i < Notifications::g_readUps->count; i++)
+      if (!Notifications::g_readUps->items[i].done) return Notifications::g_readUps->items[i].failures;
+  return 0;
+}
+static void dropPendingReads() {
+  delete Notifications::g_readUps;
+  Notifications::g_readUps = nullptr;
+  Notifications::g_readUpsDirty = false;
+  Notifications::g_readUpsDueMs = 0;
+}
+#else
+static int pendingReads() { return Notifications::g_reads != nullptr ? Notifications::g_reads->count : 0; }
+static int pendingFailures() {
+  return Notifications::g_reads != nullptr && Notifications::g_reads->count > 0 ? Notifications::g_reads->items[0].failures : 0;
+}
+static void dropPendingReads() {
+  delete Notifications::g_reads;
+  Notifications::g_reads = nullptr;
+}
+#endif
+
 // ---- volatile state of the notification service (a reboot loses it) -------
 static void resetNotifyVolatile() {
 #ifdef NOTIFY_HEAD  // 23293c5's notifications.cpp
@@ -75,8 +108,7 @@ static void resetNotifyVolatile() {
   Notifications::g_recountFailures = 0;
   delete Notifications::g_job;
   Notifications::g_job = nullptr;
-  delete Notifications::g_reads;  // pending per-message reads: RAM only
-  Notifications::g_reads = nullptr;
+  dropPendingReads();  // RAM only
   Notifications::g_reconcileCursor = 0;
   Notifications::g_nextStepMs = T::now;
   Notifications::g_saveDueMs = 0;
@@ -337,7 +369,7 @@ int main(int argc, char** argv) {
   runFor(30);
   CHECK(truth(kBob).text == 47 && truth(kBob).files == 60, "after selecting the newest: unread %d files %d", truth(kBob).text,
         truth(kBob).files);
-  CHECK(Notifications::g_reads == nullptr, "a fault-free read is still pending");
+  CHECK(pendingReads() == 0, "a fault-free read is still pending");
   back();
   CHECK(textBadge() && Notifications::getUnreadCount(kG, kBob) == 47, "badge %d count %u", textBadge(), Notifications::getUnreadCount(kG, kBob));
   reboot(); runFor(60);
@@ -499,14 +531,18 @@ int main(int argc, char** argv) {
 
   g_test = "ST12 a recount already under way when the last unread message is read does not light the badge again";
   freshDevice();
-  for (int i = 0; i < 300; i++) storeText(kBob, kBob, true, i == 299, 1700000000u + i * 60, "E");  // the newest unread
+  // The unread one is stored first (listed, and recounted, first) but shown
+  // newest: the recount under way has counted it before it is read.
+  // (100 records: none trimmed away by the sweep)
+  storeText(kBob, kBob, true, true, 1700000000u + 400 * 60, "E");
+  for (int i = 0; i < 99; i++) storeText(kBob, kBob, true, false, 1700000000u + i * 60, "E");
   powerOn();
   {
     Notifications::Summary* b = nullptr;
-    runFor(60);  // counted: 1
+    runFor(60);  // counted: 1 (sweep done)
     // the stored summary is now exact; a reboot makes it UNRESOLVED and queues its recount
     reboot();
-    loopPass(3);  // that recount has started
+    loopPass(10);  // that recount has started, and counted the unread one
 #ifndef NOTIFY_HEAD
     CHECK(Notifications::g_job != nullptr && Notifications::g_job->kind == Notifications::JOB_RECOUNT, "precondition: recount running");
 #endif
@@ -514,12 +550,19 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 4000 && truth(kBob).text > 0; i++) loopPass();
     // Lit while the summary is UNRESOLVED (the read was applied while it was
     // being recounted); once dark it must never light again.
-    bool dark = false, relit = false;
+    // Whenever no recount of it is under way, a COUNTED summary is exact (a
+    // recount that had counted the message before it was read starts over).
+    bool dark = false, relit = false, stale = false;
     for (int i = 0; i < 4000; i++) {
       loopPass();
       if (!textBadge()) dark = true;
       else if (dark) relit = true;
+      Notifications::Summary* cur = Notifications::findSummary(kG, kBob);
+      bool bobJob = Notifications::g_job != nullptr && strcmp(Notifications::g_job->contact_key, kBob) == 0;
+      if (cur != nullptr && cur->state == Notifications::SUMMARY_COUNTED && !bobJob && Notifications::getUnreadCount(kG, kBob) != truth(kBob).text)
+        stale = true;
     }
+    CHECK(!stale, "a recount finished with a stale count (counted the message before it was read)");
     b = Notifications::findSummary(kG, kBob);
     CHECK(!relit && !textBadge() && truth(kBob).text == 0, "badge relit %d now %d unread %d state %d", relit, textBadge(),
           truth(kBob).text, b ? b->state : -1);
@@ -672,10 +715,9 @@ int main(int argc, char** argv) {
     runFor(300);
     CHECK(truth(kBob).text == 30 && Notifications::getUnreadCount(kG, kBob) == 30, "precondition: writes failing, nothing cleared (%d left)",
           truth(kBob).text);
-    CHECK(Notifications::g_reads != nullptr && Notifications::g_reads->count == 1 && Notifications::g_reads->items[0].failures >= 4 &&
-              Notifications::g_reads->items[0].failures <= 12,
-          "the failing read was dropped, never retried, or retried without backoff (%u failures in 300 s)",
-          Notifications::g_reads != nullptr && Notifications::g_reads->count > 0 ? Notifications::g_reads->items[0].failures : 0);
+    CHECK(pendingReads() == 1 && pendingFailures() >= 4 && pendingFailures() <= 12,
+          "the failing read was dropped, never retried, or retried without backoff (%d pending, %d failures in 300 s)", pendingReads(),
+          pendingFailures());
     CHECK(Notifications::getUnreadCount(kG, kCarol) == 6, "other work stalled behind the failing read: Carol %u",
           Notifications::getUnreadCount(kG, kCarol));
     reboot();
@@ -691,7 +733,7 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 40; i++) storeOnly(kBob, PacketCodec::MSG_TYPE_TEXT, true, 1700000000u + i * 60);
   powerOn(); runFor(30);
   openText(kBob); rot(-1);
-  CHECK(Notifications::g_reads != nullptr && Notifications::g_reads->count == 1, "precondition: the read is not pending");
+  CHECK(pendingReads() == 1, "precondition: the read is not pending");
   reboot(); TextMessage::clearOpenConversation();
   runFor(120);
   CHECK(truth(kBob).text == 40 && textBadge() && Notifications::getUnreadCount(kG, kBob) == 40, "flash %d badge %d count %u",

@@ -60,6 +60,27 @@
     return refs;
   };
   const char* kChatName[2] = {"Text", "Enigma"};
+  // A received message as the radio delivers it: through the ACTUAL
+  // PK_MESSAGE dispatcher and the type's own arrival handler (Text's or
+  // Enigma's), which tell Notifications whether its chat is open.
+  auto arriveLive = [&](const char* contact, uint8_t type, uint32_t ts) {
+    PacketCodec::MessageEnvelope env = envOf(contact, type, ts);
+    // An id never used before in this run: the store's duplicate filter (RAM)
+    // outlives freshDevice(), which restarts envOf()'s numbering.
+    static uint32_t liveNo = 0;
+    snprintf(env.message_id, sizeof(env.message_id), "LIVE%019u", ++liveNo);
+    uint8_t payload[96];
+    size_t pn = PacketCodec::encodeTextPayload("E", payload, sizeof(payload));
+    uint8_t wire[256];
+    size_t n = PacketCodec::encodeMessagePacket(env, payload, static_cast<uint16_t>(pn), wire, sizeof(wire));
+    PacketCodec::Header h;
+    const uint8_t* body = nullptr;
+    PacketCodec::decodeHeader(wire, n, &h, &body);
+    handleIncomingMessagePacket(kG, "direct", body, h.payload_length);
+    MessageRef ref{};
+    MessageStore::findMessageById(kG, contact, env.message_id, &ref);
+    return ref;
+  };
   constexpr uint32_t kDay06 = 1793898000u;  // 06/11/2026 00:00:00 in Thailand (UTC+7) = 2026-11-05T17:00:00Z
   // First rows of received messages on screen (their sender name, "Bob ...").
   auto firstRows = []() {
@@ -219,6 +240,49 @@
     back();
   }
 
+  g_test = "PM5b a read while the conversation is UNRESOLVED keeps the badge lit while another unread message remains";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    std::vector<MessageRef> bob = unreadRun(kBob, enigma, 2, kDay06 + 600);
+    powerOn(); runFor(30);
+    auto badge = [&]() { return enigma ? enigmaBadge() : textBadge(); };
+    open(enigma, kBob);
+    // UNRESOLVED (as after an unreadable record or an eviction): its count is a
+    // category flag until recounted -- and the read is applied before that.
+    Notifications::Summary* sum = Notifications::findSummary(kG, kBob);
+    if (sum != nullptr) Notifications::markUnresolved(sum, 0);
+    bool unresolved = sum != nullptr && sum->state == Notifications::SUMMARY_UNRESOLVED;
+    rot(-1);
+    bool alwaysLit = true;
+    for (int i = 0; i < 3000; i++) {
+      loopPass();
+      alwaysLit = alwaysLit && badge();
+    }
+    CHECK(unresolved && alwaysLit && !isUnread(bob[1]) && isUnread(bob[0]) && Notifications::getUnreadCount(kG, kBob) == 1,
+          "%s: unresolved at the read %d; badge always lit %d; count %u", kChatName[enigma], unresolved, alwaysLit,
+          Notifications::getUnreadCount(kG, kBob));
+    back();
+  }
+
+  g_test = "PM11 a read is applied promptly while long background work runs (the boot sweep over 8 x 300 records)";
+  {
+    freshDevice();
+    char contact[16];
+    for (int c = 0; c < 8; c++) {
+      snprintf(contact, sizeof(contact), "C%011d", c);
+      for (int i = 0; i < 300; i++) storeOnly(contact, PacketCodec::MSG_TYPE_TEXT, false, 1700000000u + i * 60);
+    }
+    std::vector<MessageRef> bob = unreadRun(kBob, false, 3, kDay06 + 600);
+    powerOn(); runFor(5);
+    openText(kBob);
+    bool sweeping = Notifications::g_sweep != nullptr;
+    rot(-1);
+    loopPass(50);  // 1 s
+    CHECK(sweeping && Notifications::g_sweep != nullptr && !isUnread(bob[2]),
+          "sweep running %d (still %d); the read applied within 1 s %d", sweeping, Notifications::g_sweep != nullptr, !isUnread(bob[2]));
+    back();
+  }
+
   g_test = "PM6 a failing rewrite leaves the message unread (marker, count, badge) and is retried; reboot before the rewrite loses the read, after it keeps it";
   for (int enigma = 0; enigma < 2; enigma++) {
     freshDevice();
@@ -278,7 +342,7 @@
     open(enigma, kBob);
     rot(-1);  // the history is focused on the (read) message
     int m0 = markers();
-    MessageRef late = arrive(kBob, ofType(enigma), kDay06 + 900);
+    MessageRef late = arriveLive(kBob, ofType(enigma), kDay06 + 900);
     runFor(2);
     CHECK(isUnread(late) && Notifications::getUnreadCount(kG, kBob) == 1 && (enigma ? enigmaBadge() : textBadge()) && markers() == m0 + 1,
           "%s: arrival: unread %d count %u markers %d -> %d", kChatName[enigma], isUnread(late), Notifications::getUnreadCount(kG, kBob), m0,
@@ -453,6 +517,62 @@
     }
   }
 
+  g_test = "DS4 a heading per message (one per day): on entry the newest message is on the bottom row; scrolling up and down keeps the cursor on screen, on a message row";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    for (int i = 0; i < 10; i++) storeText(kBob, kBob, true, false, kDay06 + i * 86400, i % 2 ? "E" : "T");
+    powerOn(); runFor(30);
+    open(enigma, kBob);
+    int composeY = cursorY();
+    // The newest day's heading and, right below it, the newest message (the
+    // last history row: Enigma keeps a status row above its compose row).
+    char lastDay[HistoryDates::kTextCap];
+    HistoryDates::formatDay(HistoryDates::thaiDay(kDay06 + 9 * 86400), lastDay, sizeof(lastDay));
+    int headY = shownY(lastDay);
+    bool newestShown = false, belowIt = false;
+    for (auto& d : T::screen) {
+      if (headY >= 16 && d.y == headY + 23 && d.text.find('/') == std::string::npos && d.text[0] != '#') newestShown = true;
+      if (headY >= 16 && d.y > headY + 23 && d.y < composeY && !d.text.empty()) belowIt = true;
+    }
+    CHECK(newestShown && !belowIt, "%s: on entry: heading %s at y %d, the newest below it %d, history rows below that %d (compose at %d)",
+          kChatName[enigma], lastDay, headY, newestShown, belowIt, composeY);
+    bool visible = true;
+    int moves = 0;
+    auto cursorOk = [&]() {
+      int cy = cursorY();
+      bool ok = cy >= 16 && cy < composeY;
+      for (auto& d : T::screen)
+        if (d.y == cy && d.text.find('/') != std::string::npos) ok = false;  // a heading row
+      return ok;
+    };
+    for (int i = 0; i < 10; i++, moves++) { rot(-1); visible = visible && cursorOk(); }
+    for (int i = 0; i < 9; i++, moves++) { rot(1); visible = visible && cursorOk(); }
+    CHECK(visible, "%s: the cursor left the screen (or sat on a heading) during %d moves", kChatName[enigma], moves);
+    back();
+  }
+
+  g_test = "DS5 scrolling up inside a message taller than the screen (with a heading): the focused row becomes the top row; its first row shows its heading above it";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    storeText(kBob, kBob, true, false, kDay06 - 86400, "E");   // 05/11
+    std::string tall(90, 'T');                                  // 06/11: several rows
+    storeText(kBob, kBob, true, false, kDay06 + 60, tall.c_str());
+    T::realWrap = true;
+    powerOn(); runFor(30);
+    open(enigma, kBob);
+    std::vector<int> ys;
+    for (int i = 0; i < 30; i++) {
+      rot(-1);
+      ys.push_back(cursorY());
+      if (shownY("06/11/2026") >= 16 && cursorY() == shownY("06/11/2026") + 23) break;  // its first row, its heading above
+    }
+    size_t n = ys.size();
+    bool reached = shownY("06/11/2026") == 16 && n >= 3;
+    CHECK(reached && ys[n - 2] == 16, "%s: reached the first row %d after %zu moves; the cursor on its second row at y %d (expected 16, the top row)",
+          kChatName[enigma], reached, n, n >= 2 ? ys[n - 2] : -1);
+    back();
+  }
+
   g_test = "DS2b retention cut into a day: the first remaining message still gets its day's heading";
   {
     freshDevice();
@@ -477,7 +597,7 @@
     powerOn(); runFor(120);
     open(enigma, kBob);
     CHECK(shownCount("07/11/2026") == 0, "%s: precondition", kChatName[enigma]);
-    MessageRef late = arrive(kBob, ofType(enigma), kDay06 + 86400 + 30);  // 07/11, evicts the unread oldest
+    MessageRef late = arriveLive(kBob, ofType(enigma), kDay06 + 86400 + 30);  // 07/11, evicts the unread oldest
     runFor(3);
     CHECK(shownCount("07/11/2026") == 1 && isUnread(late) && onFlash(kG, kBob).size() == 100, "%s: 07/11 heading x%d; arrival unread %d; kept %zu",
           kChatName[enigma], shownCount("07/11/2026"), isUnread(late), onFlash(kG, kBob).size());
@@ -573,16 +693,19 @@
       measure("cold entry (until drawn)", [&]() { open(enigma, MessageStore::kEveryone); });
       back();
       measure("cached re-entry (until drawn)", [&]() { open(enigma, MessageStore::kEveryone); });
-      measure("scroll 20 rows over read messages", [&]() {
-        // the newest 40 hold the unread ones: first scroll over them down to the older, read part
-        for (int i = 0; i < 45; i++) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, -1, 0, 0));
-        loopPass(); runFor(10);
-        g_svcMax = PassMax(); g_uiMax = PassMax();
-        FsStats b = g_fs;
-        for (int i = 0; i < 20; i++) rot(-1);
-        printf("MEASURE   (of which the 20 single-row moves alone: opens %llu writes %llu renames %llu; ui max opens %llu per pass)\n",
-               (unsigned long long)(g_fs.fileOpens - b.fileOpens), (unsigned long long)(g_fs.writes - b.writes),
-               (unsigned long long)(g_fs.renames - b.renames), (unsigned long long)g_uiMax.opens);
+      back();
+      // scrolling: the same history with every message read
+      LittleFS.onFileOpen = nullptr;
+      freshDevice();
+      for (int i = 0; i < 90; i++) {
+        bool received = i % 3 != 0;
+        storeText(MessageStore::kEveryone, received ? kBob : "DEADBEEFAAAA", received, false, kDay06 + i * 600, "E");
+      }
+      powerOn(); runFor(120);
+      open(enigma, MessageStore::kEveryone);
+      LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
+      measure("scroll: 40 single moves, all read", [&]() {
+        for (int i = 0; i < 40; i++) rot(-1);
       });
       back();
       // reading: fresh flags again
@@ -595,7 +718,7 @@
       powerOn(); runFor(120);
       open(enigma, MessageStore::kEveryone);
       LittleFS.onFileOpen = [](const std::string&) { T::now += 63; };
-      measure("read: 20 moves over the newest (13 unread), then 10 s", [&]() {
+      measure("read: 20 moves over the newest (14 unread), then 10 s", [&]() {
         for (int i = 0; i < 20; i++) rot(-1);
         runFor(10);
       });
