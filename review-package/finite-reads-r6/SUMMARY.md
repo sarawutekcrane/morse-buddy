@@ -114,7 +114,7 @@ The 17 failures on `1609f06`:
 - `notify_test`: 119 passed.
 - Full `run_all.sh` suites: all passed (`evidence/run_all_suites_5af4695.txt`).
 - **Mutations**, each script run alone:
-  - `mutate_notify.py`: 187 mutants; 10 new in this round, and 1 removed (it targeted the deleted synchronous fallback). See `evidence/mutate_notify.txt` (final run on `5af4695`).
+  - `mutate_notify.py`: 187 mutants; 10 new in this round, and 1 removed (it targeted the deleted synchronous fallback). Final run on `5af4695`: **184/187 caught, 0 unexplained, 0 build errors** (`evidence/mutate_notify.txt`).
   - The first full run, on `5139cf3` (`evidence/mutate_notify_first_run_5139cf3.txt`), caught 181/187:
     - 1 unexplained survivor, "absence remembered across a listing that shows the record". This was a test gap, now closed by PO6(c2).
     - 2 build errors: the two "refused read is not reported" mutants did not compile. They are fixed and now caught by PO1.
