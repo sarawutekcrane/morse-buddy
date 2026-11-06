@@ -526,8 +526,7 @@
     int composeY = cursorY();
     // The newest day's heading and, right below it, the newest message (the
     // last history row: Enigma keeps a status row above its compose row).
-    char lastDay[HistoryDates::kTextCap];
-    HistoryDates::formatDay(HistoryDates::thaiDay(kDay06 + 9 * 86400), lastDay, sizeof(lastDay));
+    const char* lastDay = "15/11/2026";  // kDay06 + 9 days
     int headY = shownY(lastDay);
     bool newestShown = false, belowIt = false;
     for (auto& d : T::screen) {
