@@ -127,14 +127,17 @@ class ListMenu {
  private:
   bool tickImpl(const char* title, InputFilterFn dropFilter, bool stopOnNavigation);
 
+  // (Ordered for size: two pointers, the one int16_t, then the single
+  // bytes -- 24 bytes on the ESP32, as before round 8's badgeLayout_; every
+  // ListMenu is a static global, and static DRAM is tight.)
   const SettingItem* items_ = nullptr;
   const BadgeFn* badges_ = nullptr;
+  int16_t lastDrawnStartIdx_ = -1;  // -1: nothing drawn yet (forces firstDraw's own path anyway)
   uint8_t count_ = 0;
   uint8_t selected_ = 0;
   SelectionMode selectionMode_ = SelectionMode::PUSH_SCREEN;
   BadgeLayout badgeLayout_ = BadgeLayout::AFTER_LABEL;
   bool needsFullRedraw_ = true;
-  int16_t lastDrawnStartIdx_ = -1;  // -1: nothing drawn yet (forces firstDraw's own path anyway)
   uint8_t lastDrawnSelected_ = 0;
   bool lastBadge_[kBadgeCacheCap] = {};  // per VISIBLE row (index - lastDrawnStartIdx_)
 };
