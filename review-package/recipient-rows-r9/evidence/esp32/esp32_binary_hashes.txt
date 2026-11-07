@@ -1,0 +1,17 @@
+# ESP32 build of 0c73862cd08558cd98590f649367e2aa1ef86153 (git archive; 89 files compared, 0 differ; pio run, espressif32@6.13.0). Not flashed.
+# Static DRAM: dram0_0_seg 124580 B; used = _heap_start (0x3ffdc1c0) - 0x3ffbdb5c.
+RAM:   [====      ]  38.0% (used 124508 bytes from 327680 bytes)
+Flash: [========  ]  84.4% (used 1216765 bytes from 1441792 bytes)
+static DRAM used 124516 of 124580 B, headroom 64 B (5237d86: 64 B)
+cf2857c37911f35a3f7d7149b3f769b54091171feb4890f2965dbf707dc4021a  firmware.bin
+dc44e314a1e6140ff7d339c156b489b795e91117b8b6125d6b99f42761085182  firmware.elf
+# new code (shared, one copy each; .flash.text):
+400d70f8 00000013 W RecipientRows::setKey(char*, char const*)
+400d70c4 00000033 W RecipientRows::findKey(RecipientRows::Table const&, char const*)
+4019cb18 00000033 W RecipientRows::bindItems(RecipientRows::Table&)
+400dd51c 0000004f T Notifications::nextUnreadContactIn(char const*, unsigned char, unsigned char&)
+400d710c 00000053 W RecipientRows::appendDeviceSuffix(char*, unsigned int, char const*)
+400d7160 00000081 W RecipientRows::dropReadRow(RecipientRows::Table&, int)
+400deba8 00000166 t _ZN12_GLOBAL__N_118buildRecipientRowsEPKcPA17_cPA40_c$constprop$23
+400d73f8 000001e3 W RecipientRows::build(RecipientRows::Table&)
+400d71e4 00000214 W RecipientRows::refresh(RecipientRows::Table&, unsigned char)

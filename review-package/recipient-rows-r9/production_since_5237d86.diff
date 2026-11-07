@@ -1,0 +1,481 @@
+diff --git a/src/core/enigma.cpp b/src/core/enigma.cpp
+index 37b4785..c603d83 100644
+--- a/src/core/enigma.cpp
++++ b/src/core/enigma.cpp
+@@ -9,6 +9,7 @@
+ #include "core/held_input.h"
+ #include "core/history_dates.h"
+ #include "core/list_badges.h"
++#include "core/recipient_rows.h"
+ #include "core/hooks.h"
+ #include "core/identity.h"
+ #include "core/identity_color.h"
+@@ -145,7 +146,7 @@ void screenGroupSelect() {
+ // =============================================================================
+ constexpr uint8_t kMaxRecipientItems = 41;
+ SettingItem g_recipientItems[kMaxRecipientItems];
+-char g_recipientLabelBuf[kMaxRecipientItems][40];
++char g_recipientLabelBuf[kMaxRecipientItems][RecipientRows::kLabelLen];
+ char g_recipientContactKeys[kMaxRecipientItems][MessageStore::kContactKeyLen];
+ uint8_t g_recipientItemCount = 0;
+ ListMenu g_recipientListMenu;
+@@ -158,16 +159,6 @@ bool recipientRowUnread() {
+ const BadgeFn kRecipientRowBadges[kMaxRecipientItems] = {MB_BADGE_ROWS40(recipientRowUnread), recipientRowUnread<40>};
+ static_assert(kMaxRecipientItems == 41, "one badge function per recipient row");
+ 
+-void appendDeviceSuffix(char* label, size_t labelBufSize, const char* device_id) {
+-  size_t idLen = strlen(device_id);
+-  if (idLen < 4) return;
+-  char suffix[10];
+-  snprintf(suffix, sizeof(suffix), " [%s]", device_id + idLen - 4);
+-  size_t len = strlen(label);
+-  size_t room = (labelBufSize > len) ? (labelBufSize - len - 1) : 0;
+-  strncat(label, suffix, room);
+-}
+-
+ void recipientTrampoline() {
+   uint8_t idx = g_recipientListMenu.selectedIndex();
+   if (idx < g_recipientItemCount) {
+@@ -178,65 +169,26 @@ void recipientTrampoline() {
+   Menu::pushScreen(screenContactMenu);
+ }
+ 
++// Rows: online, recent offline, other unread conversations, Everyone (see
++// recipient_rows.h). Built from RAM on entry; while shown, a conversation
++// that becomes unread without a row gains one, keeping the selected row.
++RecipientRows::Table recipientTable() {
++  return RecipientRows::Table{g_recipientItems,   g_recipientLabelBuf,  g_recipientContactKeys,
++                              g_recipientItemCount, kMaxRecipientItems, recipientTrampoline,
++                              g_selectedGroupCode, Notifications::BADGE_ENIGMA};
++}
++
+ void screenRecipient() {
++  RecipientRows::Table rows = recipientTable();
+   if (Menu::consumeJustEntered()) {
+-    g_recipientItemCount = 0;
+-
+-    Presence::OnlineContact online[20];
+-    uint8_t onlineN = Presence::getOnlineContacts(g_selectedGroupCode, online, 20);
+-    for (uint8_t i = 0; i < onlineN && g_recipientItemCount < kMaxRecipientItems; i++) {
+-      strncpy(g_recipientContactKeys[g_recipientItemCount], online[i].device_id,
+-              sizeof(g_recipientContactKeys[0]) - 1);
+-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
+-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "%s",
+-               online[i].display_name);
+-      g_recipientItems[g_recipientItemCount] = SettingItem{g_recipientLabelBuf[g_recipientItemCount],
+-                                                            recipientTrampoline};
+-      g_recipientItemCount++;
+-    }
+-
+-    Presence::RecentContact recent[20];
+-    uint8_t recentN = Presence::getRecentContacts(g_selectedGroupCode, recent, 20);
+-    for (uint8_t i = 0; i < recentN && g_recipientItemCount < kMaxRecipientItems; i++) {
+-      bool alreadyOnline = false;
+-      for (uint8_t j = 0; j < onlineN; j++) {
+-        if (strcmp(online[j].device_id, recent[i].device_id) == 0) {
+-          alreadyOnline = true;
+-          break;
+-        }
+-      }
+-      if (alreadyOnline) continue;
+-      strncpy(g_recipientContactKeys[g_recipientItemCount], recent[i].device_id,
+-              sizeof(g_recipientContactKeys[0]) - 1);
+-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
+-      const char* name = (recent[i].last_known_name[0] != '\0') ? recent[i].last_known_name : recent[i].device_id;
+-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "%s (offline)", name);
+-      g_recipientItems[g_recipientItemCount] = SettingItem{g_recipientLabelBuf[g_recipientItemCount],
+-                                                            recipientTrampoline};
+-      g_recipientItemCount++;
+-    }
+-
+-    for (uint8_t i = 0; i < g_recipientItemCount; i++) {
+-      for (uint8_t j = static_cast<uint8_t>(i + 1); j < g_recipientItemCount; j++) {
+-        if (strcmp(g_recipientLabelBuf[i], g_recipientLabelBuf[j]) == 0) {
+-          appendDeviceSuffix(g_recipientLabelBuf[i], sizeof(g_recipientLabelBuf[i]), g_recipientContactKeys[i]);
+-          appendDeviceSuffix(g_recipientLabelBuf[j], sizeof(g_recipientLabelBuf[j]), g_recipientContactKeys[j]);
+-        }
+-      }
+-    }
+-
+-    if (g_recipientItemCount < kMaxRecipientItems) {
+-      strncpy(g_recipientContactKeys[g_recipientItemCount], MessageStore::kEveryone,
+-              sizeof(g_recipientContactKeys[0]) - 1);
+-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
+-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "Everyone");
+-      g_recipientItems[g_recipientItemCount] = SettingItem{g_recipientLabelBuf[g_recipientItemCount],
+-                                                            recipientTrampoline};
+-      g_recipientItemCount++;
+-    }
+-
++    RecipientRows::build(rows);
+     g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, 0,
+                                   ListMenu::SelectionMode::PUSH_SCREEN, ListMenu::BadgeLayout::RESERVED_COLUMN);
++  } else {
++    uint8_t selected = RecipientRows::refresh(rows, g_recipientListMenu.selectedIndex());
++    if (selected != RecipientRows::kNoChange)
++      g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, selected,
++                                    ListMenu::SelectionMode::PUSH_SCREEN, ListMenu::BadgeLayout::RESERVED_COLUMN);
+   }
+   Display::drawStatusBar();
+   g_recipientListMenu.tick("Recipient");
+diff --git a/src/core/notifications.cpp b/src/core/notifications.cpp
+index 26e21b7..4b2e724 100644
+--- a/src/core/notifications.cpp
++++ b/src/core/notifications.cpp
+@@ -1060,6 +1060,15 @@ bool hasUnreadIn(const char* group_code, const char* contact_key, uint8_t badgeM
+   return false;
+ }
+ 
++const char* nextUnreadContactIn(const char* group_code, uint8_t badgeMask, uint8_t& cursor) {
++  if (group_code == nullptr) return nullptr;
++  while (cursor < kMaxSummaries) {
++    const Summary& s = g_summaries[cursor++];
++    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;
++  }
++  return nullptr;
++}
++
+ bool hasAnyUnreadText() { return hasBadge(BADGE_TEXT); }
+ bool hasAnyUnreadEnigma() { return hasBadge(BADGE_ENIGMA); }
+ bool hasAnyUnreadTrainingGame() { return hasBadge(BADGE_TRAINING_GAME) || g_raceInvitePending; }
+diff --git a/src/core/notifications.h b/src/core/notifications.h
+index 5afe574..8965c6f 100644
+--- a/src/core/notifications.h
++++ b/src/core/notifications.h
+@@ -59,6 +59,14 @@ uint16_t getUnreadCount(const char* group_code, const char* contact_key);
+ // i.e. conservatively "possibly unread".
+ bool hasUnreadIn(const char* group_code, const char* contact_key, uint8_t badgeMask);
+ 
++// Read-only enumeration over the same in-memory summaries (no storage
++// access): the contact key of the next conversation of group_code at or
++// after summary slot `cursor` for which hasUnreadIn(group_code, key, mask)
++// is true, advancing `cursor` past it; nullptr when there is none. Start
++// with cursor 0. The pointer is valid until the summaries next change.
++// Only tracked summaries are seen (at most 24 conversations).
++const char* nextUnreadContactIn(const char* group_code, uint8_t badgeMask, uint8_t& cursor);
++
+ bool hasAnyUnreadText();
+ bool hasAnyUnreadEnigma();
+ bool hasAnyUnreadTrainingGame();
+diff --git a/src/core/recipient_rows.h b/src/core/recipient_rows.h
+new file mode 100644
+index 0000000..9978f85
+--- /dev/null
++++ b/src/core/recipient_rows.h
+@@ -0,0 +1,195 @@
++#pragma once
++// Recipient rows of the Text and Enigma chats (shared by both): online
++// contacts, then recent offline contacts, then every other conversation of
++// the group that may hold unread messages of the list's category, then
++// Everyone. Rows are keyed by contact identity within the selected group.
++//
++// The unread conversations come from Notifications::nextUnreadContactIn(),
++// the in-memory summaries behind the Main Menu and list badges (tracked
++// summaries only, at most 24): building, refreshing and drawing these rows
++// opens no file, lists no directory and touches no NVS. Names come from
++// Presence's RAM tables (Presence::resolveDisplayName()); with no name known
++// the row shows the contact id.
++//
++// Capacity: the row arrays hold `cap` rows (41: Everyone + 20 + 20). When the
++// ordinary (online/recent) rows and the unread ones do not all fit, each
++// unread row added replaces the last row that is neither unread, selected nor
++// Everyone, so every unread conversation and Everyone stay reachable. At most
++// 24 conversations are tracked, so the unread rows always fit.
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "core/menu.h"
++#include "core/notifications.h"
++#include "core/presence.h"
++#include "core/storage_messages.h"
++
++namespace RecipientRows {
++
++constexpr size_t kLabelLen = 40;
++constexpr uint8_t kNoChange = 0xFF;
++
++struct Table {
++  SettingItem* items;
++  char (*labels)[kLabelLen];
++  char (*keys)[MessageStore::kContactKeyLen];
++  uint8_t& count;
++  uint8_t cap;
++  ScreenHandlerFn onSelect;
++  const char* group;
++  uint8_t badgeMask;  // Notifications::BADGE_TEXT or BADGE_ENIGMA
++};
++
++inline int findKey(const Table& t, const char* key) {
++  for (uint8_t i = 0; i < t.count; i++)
++    if (strcmp(t.keys[i], key) == 0) return i;
++  return -1;
++}
++
++inline void setKey(char* dst, const char* key) {
++  strncpy(dst, key, MessageStore::kContactKeyLen - 1);
++  dst[MessageStore::kContactKeyLen - 1] = '\0';
++}
++
++// Last 4 characters of the id, in brackets: tells equal names apart.
++inline void appendDeviceSuffix(char* label, size_t labelBufSize, const char* device_id) {
++  size_t idLen = strlen(device_id);
++  if (idLen < 4) return;
++  char suffix[10];
++  snprintf(suffix, sizeof(suffix), " [%s]", device_id + idLen - 4);
++  size_t len = strlen(label);
++  size_t room = (labelBufSize > len) ? (labelBufSize - len - 1) : 0;
++  strncat(label, suffix, room);
++}
++
++inline void removeRow(Table& t, uint8_t at) {
++  for (uint8_t i = at; i + 1 < t.count; i++) {
++    memcpy(t.labels[i], t.labels[i + 1], kLabelLen);
++    memcpy(t.keys[i], t.keys[i + 1], MessageStore::kContactKeyLen);
++  }
++  t.count--;
++}
++
++inline void insertRow(Table& t, uint8_t at) {
++  for (uint8_t i = t.count; i > at; i--) {
++    memcpy(t.labels[i], t.labels[i - 1], kLabelLen);
++    memcpy(t.keys[i], t.keys[i - 1], MessageStore::kContactKeyLen);
++  }
++  t.count++;
++}
++
++// Frees one row: the last one that is not Everyone, not `keep` and not
++// unread. False if there is none.
++inline bool dropReadRow(Table& t, int keep) {
++  for (int i = static_cast<int>(t.count) - 1; i >= 0; i--) {
++    if (i == keep || strcmp(t.keys[i], MessageStore::kEveryone) == 0) continue;
++    if (Notifications::hasUnreadIn(t.group, t.keys[i], t.badgeMask)) continue;
++    removeRow(t, static_cast<uint8_t>(i));
++    return true;
++  }
++  return false;
++}
++
++inline void labelUnreadRow(const Table& t, uint8_t i) {
++  char name[MessageStore::kContactKeyLen + 24];
++  Presence::resolveDisplayName(t.group, t.keys[i], name, sizeof(name));
++  snprintf(t.labels[i], kLabelLen, Presence::isContactOnline(t.group, t.keys[i]) ? "%s" : "%s (offline)", name);
++}
++
++inline void bindItems(Table& t) {
++  for (uint8_t i = 0; i < t.count; i++) t.items[i] = SettingItem{t.labels[i], t.onSelect};
++}
++
++// While the list is shown: adds a row, before Everyone, for each unread
++// conversation not yet listed (e.g. a message from a sender absent at entry).
++// Rows are never removed for being read during the visit; only when the rows
++// are full does a new unread row replace the last row that is neither
++// unread, selected nor Everyone. Returns the selected row's new index (same
++// identity) if rows changed, else kNoChange.
++inline uint8_t refresh(Table& t, uint8_t selected) {
++  char selectedKey[MessageStore::kContactKeyLen];
++  setKey(selectedKey, selected < t.count ? t.keys[selected] : "");
++  bool changed = false;
++  uint8_t cursor = 0;
++  const char* summaryKey;
++  while ((summaryKey = Notifications::nextUnreadContactIn(t.group, t.badgeMask, cursor)) != nullptr) {
++    if (findKey(t, summaryKey) >= 0) continue;  // (Everyone included: it always has its row)
++    char key[MessageStore::kContactKeyLen];
++    setKey(key, summaryKey);
++    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;
++    int at = findKey(t, MessageStore::kEveryone);
++    if (at < 0) at = t.count;
++    insertRow(t, static_cast<uint8_t>(at));
++    setKey(t.keys[at], key);
++    labelUnreadRow(t, static_cast<uint8_t>(at));
++    // A name already shown: tell the rows apart by id.
++    size_t len = strlen(t.labels[at]);
++    bool suffixNew = false;
++    for (uint8_t j = 0; j < t.count; j++) {
++      if (j == at || strncmp(t.labels[j], t.labels[at], len) != 0) continue;
++      if (t.labels[j][len] == '\0') {
++        appendDeviceSuffix(t.labels[j], kLabelLen, t.keys[j]);
++        suffixNew = true;
++      } else if (strncmp(t.labels[j] + len, " [", 2) == 0) {
++        suffixNew = true;
++      }
++    }
++    if (suffixNew) appendDeviceSuffix(t.labels[at], kLabelLen, t.keys[at]);
++    changed = true;
++  }
++  if (!changed) return kNoChange;
++  bindItems(t);
++  int sel = findKey(t, selectedKey);
++  return static_cast<uint8_t>(sel >= 0 ? sel : 0);
++}
++
++// Entry: builds every row afresh.
++inline void build(Table& t) {
++  t.count = 0;
++  Presence::OnlineContact online[20];
++  uint8_t onlineN = Presence::getOnlineContacts(t.group, online, 20);
++  for (uint8_t i = 0; i < onlineN && t.count < t.cap; i++) {
++    setKey(t.keys[t.count], online[i].device_id);
++    snprintf(t.labels[t.count], kLabelLen, "%s", online[i].display_name);
++    t.count++;
++  }
++
++  Presence::RecentContact recent[20];
++  uint8_t recentN = Presence::getRecentContacts(t.group, recent, 20);
++  for (uint8_t i = 0; i < recentN && t.count < t.cap; i++) {
++    bool alreadyOnline = false;
++    for (uint8_t j = 0; j < onlineN; j++) {
++      if (strcmp(online[j].device_id, recent[i].device_id) == 0) {
++        alreadyOnline = true;
++        break;
++      }
++    }
++    if (alreadyOnline) continue;
++    setKey(t.keys[t.count], recent[i].device_id);
++    const char* name = (recent[i].last_known_name[0] != '\0') ? recent[i].last_known_name : recent[i].device_id;
++    snprintf(t.labels[t.count], kLabelLen, "%s (offline)", name);
++    t.count++;
++  }
++
++  // Disambiguate duplicate display names with the last 4 hex of device_id.
++  for (uint8_t i = 0; i < t.count; i++) {
++    for (uint8_t j = static_cast<uint8_t>(i + 1); j < t.count; j++) {
++      if (strcmp(t.labels[i], t.labels[j]) == 0) {
++        appendDeviceSuffix(t.labels[i], kLabelLen, t.keys[i]);
++        appendDeviceSuffix(t.labels[j], kLabelLen, t.keys[j]);
++      }
++    }
++  }
++
++  if (t.count >= t.cap) dropReadRow(t, -1);
++  if (t.count < t.cap) {
++    setKey(t.keys[t.count], MessageStore::kEveryone);
++    snprintf(t.labels[t.count], kLabelLen, "Everyone");
++    t.count++;
++  }
++  bindItems(t);
++  refresh(t, 0);  // then the unread conversations not listed above
++}
++
++}  // namespace RecipientRows
+diff --git a/src/core/text_message.cpp b/src/core/text_message.cpp
+index 4024643..7967fe3 100644
+--- a/src/core/text_message.cpp
++++ b/src/core/text_message.cpp
+@@ -7,6 +7,7 @@
+ #include "core/held_input.h"
+ #include "core/history_dates.h"
+ #include "core/list_badges.h"
++#include "core/recipient_rows.h"
+ #include "core/hooks.h"
+ #include "core/identity.h"
+ #include "core/identity_color.h"
+@@ -264,7 +265,7 @@ void screenGroupSelect() {
+ // =============================================================================
+ constexpr uint8_t kMaxRecipientItems = 41;  // Everyone + up to 20 online + up to 20 recent-offline
+ SettingItem g_recipientItems[kMaxRecipientItems];
+-char g_recipientLabelBuf[kMaxRecipientItems][40];
++char g_recipientLabelBuf[kMaxRecipientItems][RecipientRows::kLabelLen];
+ char g_recipientContactKeys[kMaxRecipientItems][MessageStore::kContactKeyLen];
+ uint8_t g_recipientItemCount = 0;
+ ListMenu g_recipientListMenu;
+@@ -277,16 +278,6 @@ bool recipientRowUnread() {
+ const BadgeFn kRecipientRowBadges[kMaxRecipientItems] = {MB_BADGE_ROWS40(recipientRowUnread), recipientRowUnread<40>};
+ static_assert(kMaxRecipientItems == 41, "one badge function per recipient row");
+ 
+-void appendDeviceSuffix(char* label, size_t labelBufSize, const char* device_id) {
+-  size_t idLen = strlen(device_id);
+-  if (idLen < 4) return;
+-  char suffix[10];
+-  snprintf(suffix, sizeof(suffix), " [%s]", device_id + idLen - 4);
+-  size_t len = strlen(label);
+-  size_t room = (labelBufSize > len) ? (labelBufSize - len - 1) : 0;
+-  strncat(label, suffix, room);
+-}
+-
+ void recipientTrampoline() {
+   uint8_t idx = g_recipientListMenu.selectedIndex();
+   if (idx < g_recipientItemCount) {
+@@ -297,66 +288,26 @@ void recipientTrampoline() {
+   Menu::pushScreen(screenChat);
+ }
+ 
++// Rows: online, recent offline, other unread conversations, Everyone (see
++// recipient_rows.h). Built from RAM on entry; while shown, a conversation
++// that becomes unread without a row gains one, keeping the selected row.
++RecipientRows::Table recipientTable() {
++  return RecipientRows::Table{g_recipientItems,   g_recipientLabelBuf,  g_recipientContactKeys,
++                              g_recipientItemCount, kMaxRecipientItems, recipientTrampoline,
++                              g_selectedGroupCode, Notifications::BADGE_TEXT};
++}
++
+ void screenRecipient() {
++  RecipientRows::Table rows = recipientTable();
+   if (Menu::consumeJustEntered()) {
+-    g_recipientItemCount = 0;
+-
+-    Presence::OnlineContact online[20];
+-    uint8_t onlineN = Presence::getOnlineContacts(g_selectedGroupCode, online, 20);
+-    for (uint8_t i = 0; i < onlineN && g_recipientItemCount < kMaxRecipientItems; i++) {
+-      strncpy(g_recipientContactKeys[g_recipientItemCount], online[i].device_id,
+-              sizeof(g_recipientContactKeys[0]) - 1);
+-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
+-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "%s",
+-               online[i].display_name);
+-      g_recipientItems[g_recipientItemCount] = SettingItem{g_recipientLabelBuf[g_recipientItemCount],
+-                                                            recipientTrampoline};
+-      g_recipientItemCount++;
+-    }
+-
+-    Presence::RecentContact recent[20];
+-    uint8_t recentN = Presence::getRecentContacts(g_selectedGroupCode, recent, 20);
+-    for (uint8_t i = 0; i < recentN && g_recipientItemCount < kMaxRecipientItems; i++) {
+-      bool alreadyOnline = false;
+-      for (uint8_t j = 0; j < onlineN; j++) {
+-        if (strcmp(online[j].device_id, recent[i].device_id) == 0) {
+-          alreadyOnline = true;
+-          break;
+-        }
+-      }
+-      if (alreadyOnline) continue;
+-      strncpy(g_recipientContactKeys[g_recipientItemCount], recent[i].device_id,
+-              sizeof(g_recipientContactKeys[0]) - 1);
+-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
+-      const char* name = (recent[i].last_known_name[0] != '\0') ? recent[i].last_known_name : recent[i].device_id;
+-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "%s (offline)", name);
+-      g_recipientItems[g_recipientItemCount] = SettingItem{g_recipientLabelBuf[g_recipientItemCount],
+-                                                            recipientTrampoline};
+-      g_recipientItemCount++;
+-    }
+-
+-    // Disambiguate duplicate display names with the last 4 hex of device_id.
+-    for (uint8_t i = 0; i < g_recipientItemCount; i++) {
+-      for (uint8_t j = static_cast<uint8_t>(i + 1); j < g_recipientItemCount; j++) {
+-        if (strcmp(g_recipientLabelBuf[i], g_recipientLabelBuf[j]) == 0) {
+-          appendDeviceSuffix(g_recipientLabelBuf[i], sizeof(g_recipientLabelBuf[i]), g_recipientContactKeys[i]);
+-          appendDeviceSuffix(g_recipientLabelBuf[j], sizeof(g_recipientLabelBuf[j]), g_recipientContactKeys[j]);
+-        }
+-      }
+-    }
+-
+-    if (g_recipientItemCount < kMaxRecipientItems) {
+-      strncpy(g_recipientContactKeys[g_recipientItemCount], MessageStore::kEveryone,
+-              sizeof(g_recipientContactKeys[0]) - 1);
+-      g_recipientContactKeys[g_recipientItemCount][sizeof(g_recipientContactKeys[0]) - 1] = '\0';
+-      snprintf(g_recipientLabelBuf[g_recipientItemCount], sizeof(g_recipientLabelBuf[0]), "Everyone");
+-      g_recipientItems[g_recipientItemCount] = SettingItem{g_recipientLabelBuf[g_recipientItemCount],
+-                                                            recipientTrampoline};
+-      g_recipientItemCount++;
+-    }
+-
++    RecipientRows::build(rows);
+     g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, 0,
+                                   ListMenu::SelectionMode::PUSH_SCREEN, ListMenu::BadgeLayout::RESERVED_COLUMN);
++  } else {
++    uint8_t selected = RecipientRows::refresh(rows, g_recipientListMenu.selectedIndex());
++    if (selected != RecipientRows::kNoChange)
++      g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, selected,
++                                    ListMenu::SelectionMode::PUSH_SCREEN, ListMenu::BadgeLayout::RESERVED_COLUMN);
+   }
+   Display::drawStatusBar();
+   g_recipientListMenu.tick("Recipient");

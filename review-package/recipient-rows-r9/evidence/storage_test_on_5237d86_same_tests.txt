@@ -1,0 +1,58 @@
+   CE1 measured: max 4 opens/pass, 4 opens total, content after 1 passes
+   CE1b measured: max 6 opens/pass, 94 opens total, content after 23 passes
+   CE2 measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE2b measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE3 measured: 4 opens to store an arrival (with its eviction) and show it in the open chat
+   CE17 measured: 80 file opens for the boot sweep of 80 records
+   CE21 variant 0 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 1 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 2 measured: 3 opens on entry, content after 1 passes
+   CE11 measured: 95 opens to load 90 records with an arrival during the load
+   DM1 1 s after boot: chat drawn after 68 passes, 5959 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   DM2 after boot work settled: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 1)
+   DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 335 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   IN6 measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   IN6c measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   OB7b measured: in 300 s, 25 reads of the unreadable record offline (sweep), 26 online: 1 Outbox passes
+   PO1 Text measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+   PO1 Enigma measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+   PO2 Text measured: UI passes while writes fail: max opens 16, dirEntries 45 (the chat's own reload), writes 0
+   PO2 Text measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+   PO2 Enigma measured: UI passes while writes fail: max opens 15, dirEntries 45 (the chat's own reload), writes 0
+   PO2 Enigma measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+   PO9 measured (300 s, one uncertain request): 8 attempts; background max per pass opens 4 writes 0 dirEntries 13
+FAIL [LR1 an unread conversation with a contact neither online nor recent has a row (starred) in its group's list; opening it opens that history and reads nothing] line 404: Text: listed 0, starred 0, opened its history 0, unread 1 -> 1, Everyone rows 1, rows for the other category's contact 0
+FAIL [LR1 an unread conversation with a contact neither online nor recent has a row (starred) in its group's list; opening it opens that history and reads nothing] line 404: Enigma: listed 0, starred 0, opened its history 0, unread 1 -> 1, Everyone rows 1, rows for the other category's contact 0
+FAIL [LR2 rows are keyed by group and contact: the same contact in two groups, and two contacts with the same name, each open their own history] line 442: Text: Fam rows: Sam 1 (starred 0), 5A0000000001 0; Work rows: Sam 1, 5A0000000001 0; Work's 5A0000000001 opened (starred) 0
+FAIL [LR2 rows are keyed by group and contact: the same contact in two groups, and two contacts with the same name, each open their own history] line 447: Text: a contact unread only in Work: rows in Fam 0, in Work 0
+FAIL [LR2 rows are keyed by group and contact: the same contact in two groups, and two contacts with the same name, each open their own history] line 442: Enigma: Fam rows: Sam 1 (starred 0), 5A0000000001 0; Work rows: Sam 1, 5A0000000001 0; Work's 5A0000000001 opened (starred) 0
+FAIL [LR2 rows are keyed by group and contact: the same contact in two groups, and two contacts with the same name, each open their own history] line 447: Enigma: a contact unread only in Work: rows in Fam 0, in Work 0
+FAIL [LR3 an unread contact that becomes online (or recent) is listed once, by identity: no duplicate row] line 471: Text: rows for the contact: absent 0, after it came online (same visit) 0, next entry 1
+FAIL [LR3 an unread contact that becomes online (or recent) is listed once, by identity: no duplicate row] line 471: Enigma: rows for the contact: absent 0, after it came online (same visit) 0, next entry 1
+FAIL [LR4 an arrival from an absent sender adds its row on the open list; the selection stays on its row (Everyone included)] line 498: Text, Bob selected: the new row listed 0; selection 'Bob' -> 'Bob' (after the stepping 'Bob'); confirm opened the selected one 1
+FAIL [LR4 an arrival from an absent sender adds its row on the open list; the selection stays on its row (Everyone included)] line 498: Text, Everyone selected: the new row listed 0; selection 'Everyone' -> 'Everyone' (after the stepping 'Everyone'); confirm opened the selected one 1
+FAIL [LR4 an arrival from an absent sender adds its row on the open list; the selection stays on its row (Everyone included)] line 498: Enigma, Bob selected: the new row listed 0; selection 'Bob' -> 'Bob' (after the stepping 'Bob'); confirm opened the selected one 1
+FAIL [LR4 an arrival from an absent sender adds its row on the open list; the selection stays on its row (Everyone included)] line 498: Enigma, Everyone selected: the new row listed 0; selection 'Everyone' -> 'Everyone' (after the stepping 'Everyone'); confirm opened the selected one 1
+FAIL [LR5 the last read saved clears the star but keeps the row for that visit (a failed write keeps the star); the next entry omits it] line 534: Text: while the write fails: row 0 star 0 0; after it succeeds: star cleared, row kept 0 0; next entry lists it 0
+FAIL [LR5 the last read saved clears the star but keeps the row for that visit (a failed write keeps the star); the next entry omits it] line 534: Enigma: while the write fails: row 0 star 0 0; after it succeeds: star cleared, row kept 0 0; next entry lists it 0
+FAIL [LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows] line 587: Text: arrival with the replaceable row 'Rec19 (offline)' selected: still selected 1, listed 1; new row 0; 40 rows
+FAIL [LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows] line 592: Text: presence online 20 recent 20; 40 rows (expected 41): Everyone 1, unread 0 0 (starred 0 0), ordinary 39 (expected 38: one dropped)
+FAIL [LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows] line 597: Text: after an arrival on the full list: 40 rows; the new one 0, Everyone 1 (still selected 1)
+FAIL [LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows] line 587: Enigma: arrival with the replaceable row 'Rec19 (offline)' selected: still selected 1, listed 1; new row 0; 40 rows
+FAIL [LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows] line 592: Enigma: presence online 20 recent 20; 40 rows (expected 41): Everyone 1, unread 0 0 (starred 0 0), ordinary 39 (expected 38: one dropped)
+FAIL [LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows] line 597: Enigma: after an arrival on the full list: 40 rows; the new one 0, Everyone 1 (still selected 1)
+FAIL [LR8 building, refreshing (after an arrival) and drawing the lists' rows do no storage work: no file opens, listings, NVS reads or writes] line 659: Text: the arrival's row added 0; list UI: 0 opens, 0 directory entries, 0 NVS reads, 0 NVS writes
+FAIL [LR8 building, refreshing (after an arrival) and drawing the lists' rows do no storage work: no file opens, listings, NVS reads or writes] line 659: Enigma: the arrival's row added 0; list UI: 0 opens, 0 directory entries, 0 NVS reads, 0 NVS writes
+MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   36 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3068 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   30 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12290 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+MEASURE -- Enigma chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   93 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 4 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7679 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   31 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12353 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+355 checks passed, 22 failed
