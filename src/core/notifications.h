@@ -59,6 +59,14 @@ uint16_t getUnreadCount(const char* group_code, const char* contact_key);
 // i.e. conservatively "possibly unread".
 bool hasUnreadIn(const char* group_code, const char* contact_key, uint8_t badgeMask);
 
+// Read-only enumeration over the same in-memory summaries (no storage
+// access): the contact key of the next conversation of group_code at or
+// after summary slot `cursor` for which hasUnreadIn(group_code, key, mask)
+// is true, advancing `cursor` past it; nullptr when there is none. Start
+// with cursor 0. The pointer is valid until the summaries next change.
+// Only tracked summaries are seen (at most 24 conversations).
+const char* nextUnreadContactIn(const char* group_code, uint8_t badgeMask, uint8_t& cursor);
+
 bool hasAnyUnreadText();
 bool hasAnyUnreadEnigma();
 bool hasAnyUnreadTrainingGame();

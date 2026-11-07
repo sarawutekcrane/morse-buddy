@@ -1060,6 +1060,15 @@ bool hasUnreadIn(const char* group_code, const char* contact_key, uint8_t badgeM
   return false;
 }
 
+const char* nextUnreadContactIn(const char* group_code, uint8_t badgeMask, uint8_t& cursor) {
+  if (group_code == nullptr) return nullptr;
+  while (cursor < kMaxSummaries) {
+    const Summary& s = g_summaries[cursor++];
+    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;
+  }
+  return nullptr;
+}
+
 bool hasAnyUnreadText() { return hasBadge(BADGE_TEXT); }
 bool hasAnyUnreadEnigma() { return hasBadge(BADGE_ENIGMA); }
 bool hasAnyUnreadTrainingGame() { return hasBadge(BADGE_TRAINING_GAME) || g_raceInvitePending; }

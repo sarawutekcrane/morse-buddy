@@ -443,20 +443,24 @@
 
   g_test = "LR3 an unread contact that becomes online (or recent) is listed once, by identity: no duplicate row";
   for (int enigma = 0; enigma < 2; enigma++) {
+    // Its own id per mode: presence state outlives freshDevice(), and this
+    // test makes the contact online.
+    const char* kNew = enigma ? "AB5E000000E3" : "AB5E000000T3";
     freshDevice();
-    storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+    storeIn(enigma, kG, kNew, true, kDay06 + 60);
     powerOn(); runFor(30);
     openMode(enigma);
     std::vector<std::string> r1 = listRows();
-    presence(kG, kAbsent, "Abe");  // now online (and recent), still unread
+    const char* kName = enigma ? "Ann" : "Abe";  // (the Text pass's contact stays online)
+    presence(kG, kNew, kName);  // now online (and recent), still unread
     loopPass(3);
     std::vector<std::string> r1b = listRows();  // same visit: unchanged
     toMain();
     openMode(enigma);
     std::vector<std::string> r2 = listRows();
     toMain();
-    int n1 = countPrefix(r1, kAbsent), n1b = countPrefix(r1b, kAbsent) + countPrefix(r1b, "Abe"), n2 = countPrefix(r2, kAbsent) + countPrefix(r2, "Abe");
-    CHECK(n1 == 1 && n1b == 1 && n2 == 1 && countPrefix(r2, "Abe") == 1, "%s: rows for the contact: absent %d, after it came online (same visit) %d, next entry %d",
+    int n1 = countPrefix(r1, kNew), n1b = countPrefix(r1b, kNew) + countPrefix(r1b, kName), n2 = countPrefix(r2, kNew) + countPrefix(r2, kName);
+    CHECK(n1 == 1 && n1b == 1 && n2 == 1 && countPrefix(r2, kName) == 1, "%s: rows for the contact: absent %d, after it came online (same visit) %d, next entry %d",
           kChatName[enigma], n1, n1b, n2);
   }
 
@@ -500,7 +504,8 @@
     rot(-1);  // the one unread message: its write fails
     loopPass(2);
     backToList(enigma);
-    bool rowWhileFailing = rowY(kAbsent) >= 0, starWhileFailing = starred(kAbsent);
+    bool rowWhileFailing = selectRow(kAbsent);  // (scrolled into view: other contacts may be listed)
+    bool starWhileFailing = starred(kAbsent);
     runFor(5);
     bool starStill = starred(kAbsent);
     failing = false;

@@ -368,6 +368,7 @@ void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool
 void clearUnread(const char*, const char*, const MessageRef&) {}
 bool readMovedOnto(const char*, const char*, uint32_t, const char*) { return true; }
 bool hasUnreadIn(const char*, const char*, uint8_t) { return false; }
+const char* nextUnreadContactIn(const char*, uint8_t, uint8_t&) { return nullptr; }
 }
 #endif
 namespace Settings {

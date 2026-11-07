@@ -274,7 +274,7 @@ def one(k, mut):
     target, name, old, new = mut
     out = os.path.join(H, "out", "mutn%d" % k)
     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
-    for x in (NT, TX, EN, SM, OB, IQ, HD, MN, "menu.h", "list_badges.h", "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+    for x in (NT, TX, EN, SM, OB, IQ, HD, MN, "menu.h", "list_badges.h", "recipient_rows.h", "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
     p = out + "/core/" + target; src = open(p).read()
     open(p, "w").write(src.replace(old, new))
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])
