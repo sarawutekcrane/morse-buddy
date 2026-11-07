@@ -3,7 +3,8 @@
 | | Git ID |
 |---|---|
 | Pre-change source (on devices A and B) | `0f2e76ba34b6f259a756811f438a76ea4415c275` |
-| This candidate (source, tests and ESP32 build: the same commit) | `277daa2b5d646b31fcd8a43161c74f25758fba46` |
+| This candidate (source and tests) | `5237d869ec1d47e8cfdd43479adb795abe7d69c1` |
+| ESP32 build source: `src` identical to `5237d86` (only a test stub changed after it) | `277daa2b5d646b31fcd8a43161c74f25758fba46` |
 
 **Preflight:**
 - HEAD was `92bc2fc`, equal to origin, with a clean tree.
@@ -13,11 +14,12 @@
 **Commits on top of it:**
 - `90843f8`: the feature and its tests.
 - `277daa2`: a field reorder in `ListMenu`. The first ESP32 link overflowed DRAM by 48 B; see 5.
+- `5237d86`: the test stub gains `hasUnreadIn()`. The first full suite run failed to link the Friend suite without it.
 
 **Diffs:**
 - `production_since_0f2e76b.diff`: 7 files, 1 new (`core/list_badges.h`).
 - `host_tests_since_0f2e76b.diff`: including the new `list_marker_tests.inc`.
-- `test_sources/`: every test, fake and script, as at `277daa2`.
+- `test_sources/`: every test, fake and script, as at `5237d86`.
 
 **Not done:** nothing flashed, erased, uploaded or merged. No OTA or release change. `test/hw-functional-ui-fix4` was not touched. The devices are unchanged. No change to storage format, migration, retention, read queues, date headings, Friend game, Race, Outbox or networking.
 
@@ -64,7 +66,7 @@
 | `storage_test`, the same final tests | Result |
 |---|---|
 | on `0f2e76b` | 337 passed, **17 failed**: every LM check of a star (`evidence/storage_test_on_0f2e76b_same_tests.txt`). LM7 (no storage work) passes on both. |
-| on `277daa2` | **354 passed, 0 failed** (`evidence/storage_test_on_277daa2.txt`) |
+| on `5237d86` | **354 passed, 0 failed** (`evidence/storage_test_on_5237d86.txt`) |
 
 **New tests** (`list_marker_tests.inc`; Text and Enigma; real Menu, ListMenu, chats, Notifications, Presence and store):
 
@@ -82,19 +84,20 @@
 **Test infrastructure:** the Settings stub gets an opt-in second group (`T::groupCount`).
 
 **Other results:**
-- `notify_test`: `evidence/notify_test_on_277daa2.txt`.
-- Full `run_all.sh` suites: `evidence/run_all_suites_277daa2.txt`.
+- `notify_test`: **119 passed** (`evidence/notify_test_on_5237d86.txt`).
+- Full `run_all.sh` suites: **all passed** (`evidence/run_all_suites_5237d86.txt`).
+- The first full run, on `277daa2`, failed one step: the Friend suite did not link, because the stub lacked `hasUnreadIn()`. Fixed in `5237d86`.
 - **Mutations:**
-  - `mutate_notify.py`: 206 mutants, 15 new (`evidence/mutate_notify.txt`).
+  - `mutate_notify.py`: 206 mutants, 15 new. Final run on `5237d86`: **204/206 caught, 0 unexplained, 0 build errors**; the 2 survivors are the equivalents assessed in earlier rounds (`evidence/mutate_notify.txt`).
   - Targeted runs, before the full run, caught all 15 plus 2 re-anchored older mutants (the badge rule moved into `summaryShows()`).
   - Four survivors on the way were test gaps, now closed:
     - the Enigma group list was untested (LM2 now runs for both chats);
     - LM6's long name was never scrolled into view, and 16 ordinary characters still fit, so it now uses wide glyphs and scrolls the whole list.
-  - `mutate_room.py`: `evidence/mutate_room.txt`. The shared stub and ListMenu changed, so it was re-run.
+  - `mutate_room.py`: **104/107**, with its 3 existing equivalents (`evidence/mutate_room.txt`). The shared stub and ListMenu changed, so it was re-run.
 
 ## 5. ESP32 (`evidence/esp32/`)
 
-- Built from a `git archive` of `277daa2`: 88 files compared with the commit, 0 differ. `pio run`, espressif32@6.13.0. Not flashed.
+- Built from a `git archive` of `277daa2`: 88 files compared with the commit, 0 differ. Its `src`, `platformio.ini` and `partitions.csv` equal `5237d86`. `pio run`, espressif32@6.13.0. Not flashed.
 - **The first build, of `90843f8`, did not link:** `dram0_0_seg` overflowed by 48 B. The new `badgeLayout_` byte had grown every global `ListMenu` from 24 to 28 B through alignment. `277daa2` reorders the fields, and `sizeof(ListMenu)` is 24 again with the ESP32 compiler.
 - RAM 124,508 B; flash 1,216,105 B (84.3%, +7,152 B over `0f2e76b`); 0 warnings.
 - **Static DRAM headroom: exactly 64 B** (used 124,516 of 124,580 B), unchanged.

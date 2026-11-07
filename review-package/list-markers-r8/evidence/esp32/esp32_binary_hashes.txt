@@ -1,0 +1,13 @@
+# ESP32 build of 277daa2b5d646b31fcd8a43161c74f25758fba46 (git archive; 88 files compared, 0 differ; pio run, espressif32@6.13.0). Not flashed.
+# src/ of 5237d869ec1d47e8cfdd43479adb795abe7d69c1 is identical to 277daa2b5d646b31fcd8a43161c74f25758fba46 (only a test stub changed after it).
+# Static DRAM: dram0_0_seg 124580 B; used = .dram0.heap_start - 0x3ffbdb5c.
+RAM:   [====      ]  38.0% (used 124508 bytes from 327680 bytes)
+Flash: [========  ]  84.3% (used 1216105 bytes from 1441792 bytes)
+static DRAM used 124516 of 124580 B, headroom 64 B (0f2e76b: 64 B)
+ec30d2ebf2b7ae37940ffaa4027ccccb44055df39e8bd4511a6c3f86e82e7a87  firmware.bin
+93eaa49dd2b0d957ca102d16b6afb32d46821c88115bd61ec2feadf48b2beca2  firmware.elf
+# badge tables in .flash.rodata:
+3f401e64 l     O .flash.rodata	00000014 _ZN12_GLOBAL__N_1L15kGroupRowBadgesE
+3f401dc0 l     O .flash.rodata	000000a4 _ZN12_GLOBAL__N_1L19kRecipientRowBadgesE
+3f4046ac l     O .flash.rodata	00000014 _ZN12_GLOBAL__N_1L15kGroupRowBadgesE
+3f404608 l     O .flash.rodata	000000a4 _ZN12_GLOBAL__N_1L19kRecipientRowBadgesE

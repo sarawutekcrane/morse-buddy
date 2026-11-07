@@ -1,0 +1,53 @@
+   CE1 measured: max 4 opens/pass, 4 opens total, content after 1 passes
+   CE1b measured: max 6 opens/pass, 94 opens total, content after 23 passes
+   CE2 measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE2b measured: max 0 opens/pass, 0 opens total, content after 1 passes
+   CE3 measured: 4 opens to store an arrival (with its eviction) and show it in the open chat
+   CE17 measured: 80 file opens for the boot sweep of 80 records
+   CE21 variant 0 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 1 measured: 4 opens on entry, content after 1 passes
+   CE21 variant 2 measured: 3 opens on entry, content after 1 passes
+   CE11 measured: 95 opens to load 90 records with an arrival during the load
+   DM1 1 s after boot: chat drawn after 68 passes, 5959 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   DM2 after boot work settled: chat drawn after 1 passes, 272 ms simulated, max 4 opens per pass (boot passes before: max 1)
+   DM3 14 s after boot, 3 x 99 others: chat drawn after 1 passes, 335 ms simulated, max 5 opens per pass (boot passes before: max 1)
+   IN6 measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   IN6c measured: left after one pass of 20 ms simulated, 0 opens (20 rotations, then Back)
+   OB7b measured: in 300 s, 25 reads of the unreadable record offline (sweep), 26 online: 1 Outbox passes
+   PO1 Text measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+   PO1 Enigma measured: UI passes max opens 44 writes 0 dirEntries 0; background max per pass opens 4 rewrites 1 dirEntries 45 nvs 1
+   PO2 Text measured: UI passes while writes fail: max opens 16, dirEntries 45 (the chat's own reload), writes 0
+   PO2 Text measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+   PO2 Enigma measured: UI passes while writes fail: max opens 15, dirEntries 45 (the chat's own reload), writes 0
+   PO2 Enigma measured (60 s, writes failing, 32 pending): background max per pass opens 4 writes 0 dirEntries 5 nvs 1
+   PO9 measured (300 s, one uncertain request): 8 attempts; background max per pass opens 4 writes 0 dirEntries 13
+FAIL [LM1 recipient rows: a star on each friend (and Everyone) with unread messages of the list's category; none on others; entering, highlighting and opening read nothing] line 72: Text list: Bob 0 Carol 0 Dave 0 Everyone 0 (expected 1 0 0 0)
+FAIL [LM1 recipient rows: a star on each friend (and Everyone) with unread messages of the list's category; none on others; entering, highlighting and opening read nothing] line 80: Enigma list: Bob 0 Everyone 0 (expected 0 1)
+FAIL [LM1 recipient rows: a star on each friend (and Everyone) with unread messages of the list's category; none on others; entering, highlighting and opening read nothing] line 86: Main Menu badges (text 1 enigma 1) disagree with the rows
+FAIL [LM2 group rows aggregate exactly their own group's conversations (Everyone included); the same contact in two groups stays apart] line 108: Text: group list: Fam 0 (its Everyone) Work 0 (its Bob)
+FAIL [LM2 group rows aggregate exactly their own group's conversations (Everyone included); the same contact in two groups stays apart] line 117: Text: Fam: Bob 0 Everyone 0; Work: Bob 0 Everyone 0 (expected 0 1 1 0)
+FAIL [LM2 group rows aggregate exactly their own group's conversations (Everyone included); the same contact in two groups stays apart] line 129: Text: after reading Fam's Everyone: Fam 0 Work 0 (expected 0 1)
+FAIL [LM2 group rows aggregate exactly their own group's conversations (Everyone included); the same contact in two groups stays apart] line 108: Enigma: group list: Fam 0 (its Everyone) Work 0 (its Bob)
+FAIL [LM2 group rows aggregate exactly their own group's conversations (Everyone included); the same contact in two groups stays apart] line 117: Enigma: Fam: Bob 0 Everyone 0; Work: Bob 0 Everyone 0 (expected 0 1 1 0)
+FAIL [LM2 group rows aggregate exactly their own group's conversations (Everyone included); the same contact in two groups stays apart] line 129: Enigma: after reading Fam's Everyone: Fam 0 Work 0 (expected 0 1)
+FAIL [LM3 a friend's star stays while any of its unread messages is unread; after the last read it clears only once the write succeeded, on the list already shown] line 173: Text: star at entry 0, after reading 1 of 2 0; on the shown list while the last write fails 0 0; cleared there after it succeeded 1
+FAIL [LM3 a friend's star stays while any of its unread messages is unread; after the last read it clears only once the write succeeded, on the list already shown] line 173: Enigma: star at entry 0, after reading 1 of 2 0; on the shown list while the last write fails 0 0; cleared there after it succeeded 1
+FAIL [LM4 a new arrival lights the star of its friend on the list already shown (and only that one)] line 194: Text: before 0; after Carol's arrival Carol 0 Bob 0; after Bob's arrival of the other type Bob 0
+FAIL [LM4 a new arrival lights the star of its friend on the list already shown (and only that one)] line 194: Enigma: before 0; after Carol's arrival Carol 0 Bob 0; after Bob's arrival of the other type Bob 0
+FAIL [LM5 an UNRESOLVED conversation (counts unknown) keeps its category's star lit, conservatively; the other category stays dark] line 213: UNRESOLVED (Text flagged): Text list 0, Enigma list 0 (expected 1 0)
+FAIL [LM6 long names keep their star visible in a reserved column; the selected row and scrolling redraw stars exactly] line 259: scrolling through 8 friends: stars exact 0, in their own column 1, the long name's row checked 1 (64 rows checked)
+FAIL [LM8 an idle recipient list longer than 8 rows draws nothing tick after tick; a star change redraws only that badge cell] line 326: Text: 0 draws in 30 idle ticks (expected 0); the star change drew 0 items (lit 0)
+FAIL [LM8 an idle recipient list longer than 8 rows draws nothing tick after tick; a star change redraws only that badge cell] line 326: Enigma: 0 draws in 30 idle ticks (expected 0); the star change drew 0 items (lit 0)
+MEASURE -- Text chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   94 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 5 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7742 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   36 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3068 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   30 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12290 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+MEASURE -- Enigma chat, Everyone: 90 messages (27 received unread among the newest 40), several days
+MEASURE cold entry (until drawn)           opens   93 writes   0 renames   0 removes   0 dirEntries   90 nvs   0 | per pass max: ui opens 4 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 7679 ms
+MEASURE cached re-entry (until drawn)      opens    2 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 0 writes 0 renames 0; services opens 1 writes 0 renames 0 nvs 0 | model 206 ms
+MEASURE scroll: 40 single moves, all read  opens   37 writes   0 renames   0 removes   0 dirEntries    0 nvs   0 | per pass max: ui opens 1 writes 0 renames 0; services opens 0 writes 0 renames 0 nvs 0 | model 3131 ms
+MEASURE read: 20 moves over the newest (14 unread), then 10 s opens   31 writes  14 renames  14 removes  14 dirEntries    0 nvs   2 | per pass max: ui opens 1 writes 0 renames 0; services opens 1 writes 1 renames 1 nvs 1 | model 12353 ms
+MEASURE   flash: 13 unread left of 27 (count 13)
+337 checks passed, 17 failed
