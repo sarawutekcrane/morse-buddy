@@ -6,6 +6,7 @@
 # mutation must fail at least one of them.
 import os, subprocess, sys, shutil, tempfile
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
+RR = "recipient_rows.h"
 NT, TX, EN, SM, OB, IQ, HD, MN = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h", "history_dates.h", "menu.cpp"
 muts = [
  # ---- categories ----
@@ -53,6 +54,22 @@ muts = [
  (NT, "ending a request ignores its sequence (another message's request ends too)", "strcmp(p.contact_key, contact_key) != 0 || p.sequence != *sequence) continue;", "strcmp(p.contact_key, contact_key) != 0) continue;"),
  (SM, "an evicted record whose header could not be read is not reported", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (removed && notifyIfUnread && haveHdr && (hdr.flags & FLAG_UNREAD) && g_onEvicted != nullptr) {"),
  (SM, "a failed removal is reported as an eviction", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {"),
+ # ---- round 9: every unread conversation has a recipient row ----
+ (NT, "the unread-contact walk ignores the group", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;", "    if (summaryShows(s, badgeMask)) return s.contact_key;"),
+ (NT, "the unread-contact walk ignores the category", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, 0xFF)) return s.contact_key;"),
+ (RR, "entry: the unread rows wait for the next pass", "  refresh(t, 0);  // then", "  // then"),
+ (RR, "an unread listed contact gets a second row", "    if (findKey(t, summaryKey) >= 0) continue;", "    if (false) continue;"),
+ (RR, "a full list may drop an unread row", "    if (Notifications::hasUnreadIn(t.group, t.keys[i], t.badgeMask)) continue;\n    removeRow", "    removeRow"),
+ (RR, "a full list may drop Everyone", "    if (i == keep || strcmp(t.keys[i], MessageStore::kEveryone) == 0) continue;", "    if (i == keep) continue;"),
+ (RR, "while shown: no row added for a new unread conversation", "  if (!changed) return kNoChange;", "  return kNoChange;"),
+ (RR, "while shown: the selection keeps its index, not its identity", "  int sel = findKey(t, selectedKey);", "  int sel = selected;"),
+ (RR, "while shown: the new row goes after Everyone", "    int at = findKey(t, MessageStore::kEveryone);\n    if (at < 0)", "    int at = -1;\n    if (at < 0)"),
+ (RR, "while shown: a full list may replace the selected row", "    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;", "    if (t.count >= t.cap && !dropReadRow(t, -1)) break;"),
+ (RR, "while shown: a full list adds nothing", "    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;", "    if (t.count >= t.cap) break;"),
+ (TX, "Text: rows added while shown are not shown (no reconfigure)", "    if (selected != RecipientRows::kNoChange)", "    if (false)"),
+ (EN, "Enigma: rows added while shown are not shown (no reconfigure)", "    if (selected != RecipientRows::kNoChange)", "    if (false)"),
+ (TX, "Text: unread rows for either category", "                              g_selectedGroupCode, Notifications::BADGE_TEXT};", "                              g_selectedGroupCode, Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA};"),
+ (EN, "Enigma: unread rows for either category", "                              g_selectedGroupCode, Notifications::BADGE_ENIGMA};", "                              g_selectedGroupCode, Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA};"),
  # ---- round 8: unread markers on the friend and group lists ----
  (NT, "a friend row is lit by any conversation of its group", "    if (contact_key != nullptr && strcmp(s.contact_key, contact_key) != 0) continue;\n    if (summaryShows(s, badgeMask)) return true;", "    if (summaryShows(s, badgeMask)) return true;"),
  (NT, "a row is lit by another group's conversation", "    if (strcmp(s.group_code, group_code) != 0) continue;\n    if (contact_key", "    if (contact_key"),
@@ -237,6 +254,7 @@ muts = [
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
+ "entry: the unread rows wait for the next pass": "the per-pass refresh adds exactly the same rows on the next pass (about 20 ms later), inserting them before Everyone and keeping the selected identity, so input in the entry pass reaches the same row either way; the entry call only avoids a one-frame gap",
  "the feed ignores the open chat (replaces the index it draws from)": "a current open-chat index is still protected by the cache check, and a stale one is reloaded by the chat's per-pass re-sync (CE23) anyway: the flag only saves that reload (cost, not correctness)",
  "an unreadable record is fed as read": "without the explicit nullptr feed the next fed record is out of step, which drops the feed; either way the fed index is never used and the chat loads itself",
 }

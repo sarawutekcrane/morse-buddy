@@ -12,18 +12,18 @@
 // the row shows the contact id.
 //
 // Capacity: the row arrays hold `cap` rows (41: Everyone + 20 + 20). When the
-// ordinary (online/recent) rows and the unread ones do not all fit, ordinary
-// rows that are not unread are dropped from the end, so every unread
-// conversation and Everyone stay reachable. At most 24 conversations are
-// tracked, so the unread rows always fit.
+// ordinary (online/recent) rows and the unread ones do not all fit, each
+// unread row added replaces the last row that is neither unread, selected nor
+// Everyone, so every unread conversation and Everyone stay reachable. At most
+// 24 conversations are tracked, so the unread rows always fit.
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "menu.h"
-#include "notifications.h"
-#include "presence.h"
-#include "storage_messages.h"
+#include "core/menu.h"
+#include "core/notifications.h"
+#include "core/presence.h"
+#include "core/storage_messages.h"
 
 namespace RecipientRows {
 
@@ -101,6 +101,49 @@ inline void bindItems(Table& t) {
   for (uint8_t i = 0; i < t.count; i++) t.items[i] = SettingItem{t.labels[i], t.onSelect};
 }
 
+// While the list is shown: adds a row, before Everyone, for each unread
+// conversation not yet listed (e.g. a message from a sender absent at entry).
+// Rows are never removed for being read during the visit; only when the rows
+// are full does a new unread row replace the last row that is neither
+// unread, selected nor Everyone. Returns the selected row's new index (same
+// identity) if rows changed, else kNoChange.
+inline uint8_t refresh(Table& t, uint8_t selected) {
+  char selectedKey[MessageStore::kContactKeyLen];
+  setKey(selectedKey, selected < t.count ? t.keys[selected] : "");
+  bool changed = false;
+  uint8_t cursor = 0;
+  const char* summaryKey;
+  while ((summaryKey = Notifications::nextUnreadContactIn(t.group, t.badgeMask, cursor)) != nullptr) {
+    if (findKey(t, summaryKey) >= 0) continue;  // (Everyone included: it always has its row)
+    char key[MessageStore::kContactKeyLen];
+    setKey(key, summaryKey);
+    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;
+    int at = findKey(t, MessageStore::kEveryone);
+    if (at < 0) at = t.count;
+    insertRow(t, static_cast<uint8_t>(at));
+    setKey(t.keys[at], key);
+    labelUnreadRow(t, static_cast<uint8_t>(at));
+    // A name already shown: tell the rows apart by id.
+    size_t len = strlen(t.labels[at]);
+    bool suffixNew = false;
+    for (uint8_t j = 0; j < t.count; j++) {
+      if (j == at || strncmp(t.labels[j], t.labels[at], len) != 0) continue;
+      if (t.labels[j][len] == '\0') {
+        appendDeviceSuffix(t.labels[j], kLabelLen, t.keys[j]);
+        suffixNew = true;
+      } else if (strncmp(t.labels[j] + len, " [", 2) == 0) {
+        suffixNew = true;
+      }
+    }
+    if (suffixNew) appendDeviceSuffix(t.labels[at], kLabelLen, t.keys[at]);
+    changed = true;
+  }
+  if (!changed) return kNoChange;
+  bindItems(t);
+  int sel = findKey(t, selectedKey);
+  return static_cast<uint8_t>(sel >= 0 ? sel : 0);
+}
+
 // Entry: builds every row afresh.
 inline void build(Table& t) {
   t.count = 0;
@@ -129,18 +172,6 @@ inline void build(Table& t) {
     t.count++;
   }
 
-  // Unread conversations not listed above (Everyone has its own row). One
-  // row stays free for Everyone.
-  uint8_t cursor = 0;
-  const char* key;
-  while ((key = Notifications::nextUnreadContactIn(t.group, t.badgeMask, cursor)) != nullptr) {
-    if (strcmp(key, MessageStore::kEveryone) == 0 || findKey(t, key) >= 0) continue;
-    if (t.count + 1 >= t.cap && !dropReadRow(t, -1)) break;
-    setKey(t.keys[t.count], key);
-    labelUnreadRow(t, t.count);
-    t.count++;
-  }
-
   // Disambiguate duplicate display names with the last 4 hex of device_id.
   for (uint8_t i = 0; i < t.count; i++) {
     for (uint8_t j = static_cast<uint8_t>(i + 1); j < t.count; j++) {
@@ -158,49 +189,7 @@ inline void build(Table& t) {
     t.count++;
   }
   bindItems(t);
-}
-
-// While the list is shown: adds a row, before Everyone, for each unread
-// conversation not yet listed (e.g. a message from a sender absent at entry).
-// Rows are never removed for being read during the visit; only when the rows
-// are full does a new unread row replace the last row that is neither
-// unread, selected nor Everyone. Returns the selected row's new index (same
-// identity) if rows changed, else kNoChange.
-inline uint8_t refresh(Table& t, uint8_t selected) {
-  char selectedKey[MessageStore::kContactKeyLen];
-  setKey(selectedKey, selected < t.count ? t.keys[selected] : "");
-  bool changed = false;
-  uint8_t cursor = 0;
-  const char* summaryKey;
-  while ((summaryKey = Notifications::nextUnreadContactIn(t.group, t.badgeMask, cursor)) != nullptr) {
-    if (strcmp(summaryKey, MessageStore::kEveryone) == 0 || findKey(t, summaryKey) >= 0) continue;
-    char key[MessageStore::kContactKeyLen];
-    setKey(key, summaryKey);
-    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;
-    int at = findKey(t, MessageStore::kEveryone);
-    if (at < 0) at = t.count;
-    insertRow(t, static_cast<uint8_t>(at));
-    setKey(t.keys[at], key);
-    labelUnreadRow(t, static_cast<uint8_t>(at));
-    // A name already shown: tell the rows apart by id.
-    size_t len = strlen(t.labels[at]);
-    bool suffixNew = false;
-    for (uint8_t j = 0; j < t.count; j++) {
-      if (j == at || strncmp(t.labels[j], t.labels[at], len) != 0) continue;
-      if (t.labels[j][len] == '\0') {
-        appendDeviceSuffix(t.labels[j], kLabelLen, t.keys[j]);
-        suffixNew = true;
-      } else if (strncmp(t.labels[j] + len, " [", 2) == 0) {
-        suffixNew = true;
-      }
-    }
-    if (suffixNew) appendDeviceSuffix(t.labels[at], kLabelLen, t.keys[at]);
-    changed = true;
-  }
-  if (!changed) return kNoChange;
-  bindItems(t);
-  int sel = findKey(t, selectedKey);
-  return static_cast<uint8_t>(sel >= 0 ? sel : 0);
+  refresh(t, 0);  // then the unread conversations not listed above
 }
 
 }  // namespace RecipientRows

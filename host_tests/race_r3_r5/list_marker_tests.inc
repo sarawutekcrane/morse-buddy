@@ -385,6 +385,9 @@
   for (int enigma = 0; enigma < 2; enigma++) {
     freshDevice();
     storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+    storeIn(!enigma, kG, kAbsent2, true, kDay06 + 60);  // the other category only: no row in this mode
+    if (enigma) storeEnigmaIn(kG, MessageStore::kEveryone, true, kDay06 + 60);  // unread Everyone: still one Everyone row
+    else storeTextIn(kG, MessageStore::kEveryone, kBob, true, true, kDay06 + 60);
     storeTextIn(kG, kBob, kBob, true, false, kDay06 + 60);
     powerOn(); runFor(30);
     presence(kG, kBob, "Bob");
@@ -399,9 +402,10 @@
     }
     TypeCount after = truth(kAbsent);
     CHECK(listed && star && opened && after.text + after.enigma == before.text + before.enigma && before.text + before.enigma == 1 &&
-              countPrefix(rows, "Everyone") == 1 && (enigma ? enigmaBadge() : textBadge()),
-          "%s: listed %d, starred %d, opened its history %d, unread %d -> %d, Everyone rows %d", kChatName[enigma], listed, star, opened,
-          before.text + before.enigma, after.text + after.enigma, countPrefix(rows, "Everyone"));
+              countPrefix(rows, "Everyone") == 1 && countPrefix(rows, kAbsent2) == 0 && (enigma ? enigmaBadge() : textBadge()),
+          "%s: listed %d, starred %d, opened its history %d, unread %d -> %d, Everyone rows %d, rows for the other category's contact %d",
+          kChatName[enigma], listed, star, opened, before.text + before.enigma, after.text + after.enigma, countPrefix(rows, "Everyone"),
+          countPrefix(rows, kAbsent2));
     toMain();
   }
 
@@ -414,6 +418,8 @@
     storeIn(enigma, kG, kSam1, false, kDay06 + 60);         // Fam: Sam1 read (a recent contact there)
     storeIn(enigma, "GROUP2", kSam1, true, kDay06 + 60);    // Work: Sam1 unread, unknown to Work's presence
     storeIn(enigma, "GROUP2", kSam2, false, kDay06 + 60);   // Work: Sam2 online, named "Sam"
+    const char* kWorkOnly = "5A0000000003";
+    storeIn(enigma, "GROUP2", kWorkOnly, true, kDay06 + 60);  // Work: unread, unknown to both groups' presence
     powerOn(); runFor(60);
     presence(kG, kSam1, "Sam");
     presence("GROUP2", kSam2, "Sam");
@@ -434,10 +440,12 @@
     }
     toMain();
     CHECK(countPrefix(fam, kSam1) == 0 && countPrefix(fam, "Sam") == 1 && !famSam1Star && countPrefix(work, "Sam") == 1 &&
-              countPrefix(work, kSam1) == 1 && opened,
+              countPrefix(work, kSam1) == 1 && opened && countPrefix(fam, kWorkOnly) == 0 && countPrefix(work, kWorkOnly) == 1,
           "%s: Fam rows: Sam %d (starred %d), %s %d; Work rows: Sam %d, %s %d; Work's %s opened (starred) %d", kChatName[enigma],
           countPrefix(fam, "Sam"), famSam1Star, kSam1, countPrefix(fam, kSam1), countPrefix(work, "Sam"), kSam1, countPrefix(work, kSam1), kSam1,
           opened);
+    CHECK(countPrefix(fam, kWorkOnly) == 0 && countPrefix(work, kWorkOnly) == 1, "%s: a contact unread only in Work: rows in Fam %d, in Work %d",
+          kChatName[enigma], countPrefix(fam, kWorkOnly), countPrefix(work, kWorkOnly));
     T::groupCount = 1;
   }
 
@@ -481,6 +489,9 @@
       std::vector<std::string> rows = listRows();  // (returns to the same selection)
       std::string sel2 = selectedLabel();
       bool listed = countPrefix(rows, onEveryone ? kAbsent : kAbsent2) == 1 && countPrefix(rows, "Everyone") == 1;
+      // Inserted just before Everyone (rows run cyclically from the selection).
+      for (size_t i = 0; i < rows.size(); i++)
+        if (rows[i].rfind(onEveryone ? kAbsent : kAbsent2, 0) == 0) listed = listed && rows[(i + 1) % rows.size()] == "Everyone";
       openSelected(enigma);
       bool rightChat = TextMessage::isConversationOpen(kG, onEveryone ? MessageStore::kEveryone : kBob);
       toMain();
@@ -562,7 +573,21 @@
     loopPass(3);
     bool stillEveryone = selectedLabel() == "Everyone";
     std::vector<std::string> rows2 = listRows();
+    // A fourth arrives while the row it would replace (the last read one) is
+    // selected: that row stays, selected; another read row makes room.
+    std::string victim;
+    for (auto& r : rows2)
+      if (r.rfind("On", 0) == 0 || r.rfind("Rec", 0) == 0) victim = r;
+    selectRow(victim);
+    arrive("AB5E00000004", ofType(enigma), kDay06 + 960);
+    loopPass(3);
+    bool victimKept = selectedLabel() == victim;
+    std::vector<std::string> rows3 = listRows();
     toMain();
+    CHECK(victimKept && rows3.size() == 41 && countPrefix(rows3, victim) == 1 && countPrefix(rows3, "AB5E00000004") == 1 &&
+              countPrefix(rows3, "Everyone") == 1 && countPrefix(rows3, kAbsent3) == 1,
+          "%s: arrival with the replaceable row '%s' selected: still selected %d, listed %d; new row %d; %zu rows", kChatName[enigma], victim.c_str(),
+          victimKept, countPrefix(rows3, victim), countPrefix(rows3, "AB5E00000004"), rows3.size());
     int ordinary = countPrefix(rows, "On") + countPrefix(rows, "Rec");
     CHECK(on == 20 && rec >= 19 && rows.size() == 41 && countPrefix(rows, "Everyone") == 1 && countPrefix(rows, kAbsent) == 1 &&
               countPrefix(rows, kAbsent2) == 1 && aStar && bStar && ordinary == 38,
