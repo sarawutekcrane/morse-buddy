@@ -19,6 +19,7 @@ namespace Notifications {
 namespace {
 
 constexpr uint8_t kMaxSummaries = 24;
+static_assert(kMaxSummaries == kMaxTrackedConversations, "the recipient rows are sized from this");
 
 // Unread received messages per conversation, counted separately for each
 // stored message type (hardware finding 3 on 30ed514: one shared count and a

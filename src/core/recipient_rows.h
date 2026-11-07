@@ -11,11 +11,25 @@
 // Presence's RAM tables (Presence::resolveDisplayName()); with no name known
 // the row shows the contact id.
 //
-// Capacity: the row arrays hold `cap` rows (41: Everyone + 20 + 20). When the
-// ordinary (online/recent) rows and the unread ones do not all fit, each
-// unread row added replaces the last row that is neither unread, selected nor
-// Everyone, so every unread conversation and Everyone stay reachable. At most
-// 24 conversations are tracked, so the unread rows always fit.
+// Capacity (round 10): no row gives way to another. The rows hold every
+// recipient that can exist at once -- 20 online + 20 recent offline + one per
+// tracked conversation + Everyone -- plus one spare (kMaxRows = 66). ListMenu
+// scrolls them. The two chats share this one row store: a chat's list is only
+// ever the top screen (choosing a row replaces it with the chat or contact
+// menu, and every return to it rebuilds it), so the Text and Enigma lists are
+// never live together. Sharing keeps static RAM below the two former 41-row
+// stores.
+//
+// During one visit rows are never removed, with one bounded exception: if new
+// unread conversations keep appearing while the list stays open (a summary
+// whose last read completed is reused by a new sender) until all kMaxRows
+// rows are used, a new unread row reuses an added row whose conversation is
+// no longer unread and is not selected. Ordinary (online/recent) rows and
+// Everyone are never reused. Why one always exists: when all rows are used
+// there are 25 added rows, while at most 24 conversations are tracked and the
+// new one is one of them, so at most 23 added rows are unread -- at least two
+// are not, and at most one of those is selected.
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,22 +42,38 @@
 namespace RecipientRows {
 
 constexpr size_t kLabelLen = 40;
+constexpr uint8_t kMaxOnline = 20;
+constexpr uint8_t kMaxRecent = 20;
+// Ordinary rows, one added row per tracked conversation plus one spare, and
+// Everyone (see the reuse rule above for why the spare).
+constexpr uint8_t kMaxRows = kMaxOnline + kMaxRecent + Notifications::kMaxTrackedConversations + 1 + 1;
 constexpr uint8_t kNoChange = 0xFF;
 
-struct Table {
-  SettingItem* items;
-  char (*labels)[kLabelLen];
-  char (*keys)[MessageStore::kContactKeyLen];
-  uint8_t& count;
-  uint8_t cap;
-  ScreenHandlerFn onSelect;
-  const char* group;
-  uint8_t badgeMask;  // Notifications::BADGE_TEXT or BADGE_ENIGMA
+struct Storage {
+  SettingItem items[kMaxRows];
+  char labels[kMaxRows][kLabelLen];
+  char keys[kMaxRows][MessageStore::kContactKeyLen];
+  uint8_t count;
+  uint8_t ordinaryEnd;  // rows [0, ordinaryEnd) are the online and recent ones
 };
 
-inline int findKey(const Table& t, const char* key) {
-  for (uint8_t i = 0; i < t.count; i++)
-    if (strcmp(t.keys[i], key) == 0) return i;
+// The one row store (zero-initialized, no constructor: no guard, no heap).
+inline Storage& rows() {
+  static Storage s;
+  return s;
+}
+
+// What differs between the chats.
+struct Mode {
+  const char* group;
+  uint8_t badgeMask;  // Notifications::BADGE_TEXT or BADGE_ENIGMA
+  ScreenHandlerFn onSelect;
+};
+
+inline int findKey(const char* key) {
+  Storage& r = rows();
+  for (uint8_t i = 0; i < r.count; i++)
+    if (strcmp(r.keys[i], key) == 0) return i;
   return -1;
 }
 
@@ -63,101 +93,106 @@ inline void appendDeviceSuffix(char* label, size_t labelBufSize, const char* dev
   strncat(label, suffix, room);
 }
 
-inline void removeRow(Table& t, uint8_t at) {
-  for (uint8_t i = at; i + 1 < t.count; i++) {
-    memcpy(t.labels[i], t.labels[i + 1], kLabelLen);
-    memcpy(t.keys[i], t.keys[i + 1], MessageStore::kContactKeyLen);
+inline void removeRow(uint8_t at) {
+  Storage& r = rows();
+  for (uint8_t i = at; i + 1 < r.count; i++) {
+    memcpy(r.labels[i], r.labels[i + 1], kLabelLen);
+    memcpy(r.keys[i], r.keys[i + 1], MessageStore::kContactKeyLen);
   }
-  t.count--;
+  r.count--;
 }
 
-inline void insertRow(Table& t, uint8_t at) {
-  for (uint8_t i = t.count; i > at; i--) {
-    memcpy(t.labels[i], t.labels[i - 1], kLabelLen);
-    memcpy(t.keys[i], t.keys[i - 1], MessageStore::kContactKeyLen);
+inline void insertRow(uint8_t at) {
+  Storage& r = rows();
+  for (uint8_t i = r.count; i > at; i--) {
+    memcpy(r.labels[i], r.labels[i - 1], kLabelLen);
+    memcpy(r.keys[i], r.keys[i - 1], MessageStore::kContactKeyLen);
   }
-  t.count++;
+  r.count++;
 }
 
-// Frees one row: the last one that is not Everyone, not `keep` and not
-// unread. False if there is none.
-inline bool dropReadRow(Table& t, int keep) {
-  for (int i = static_cast<int>(t.count) - 1; i >= 0; i--) {
-    if (i == keep || strcmp(t.keys[i], MessageStore::kEveryone) == 0) continue;
-    if (Notifications::hasUnreadIn(t.group, t.keys[i], t.badgeMask)) continue;
-    removeRow(t, static_cast<uint8_t>(i));
+// Rows full: frees an added row (not ordinary, not Everyone) whose
+// conversation is no longer unread and that is not `keep`. False if none.
+inline bool reuseAddedRow(const Mode& m, int keep) {
+  Storage& r = rows();
+  for (int i = static_cast<int>(r.count) - 1; i >= r.ordinaryEnd; i--) {
+    if (i == keep || strcmp(r.keys[i], MessageStore::kEveryone) == 0) continue;
+    if (Notifications::hasUnreadIn(m.group, r.keys[i], m.badgeMask)) continue;
+    removeRow(static_cast<uint8_t>(i));
     return true;
   }
   return false;
 }
 
-inline void labelUnreadRow(const Table& t, uint8_t i) {
+inline void labelUnreadRow(const Mode& m, uint8_t i) {
+  Storage& r = rows();
   char name[MessageStore::kContactKeyLen + 24];
-  Presence::resolveDisplayName(t.group, t.keys[i], name, sizeof(name));
-  snprintf(t.labels[i], kLabelLen, Presence::isContactOnline(t.group, t.keys[i]) ? "%s" : "%s (offline)", name);
+  Presence::resolveDisplayName(m.group, r.keys[i], name, sizeof(name));
+  snprintf(r.labels[i], kLabelLen, Presence::isContactOnline(m.group, r.keys[i]) ? "%s" : "%s (offline)", name);
 }
 
-inline void bindItems(Table& t) {
-  for (uint8_t i = 0; i < t.count; i++) t.items[i] = SettingItem{t.labels[i], t.onSelect};
+inline void bindItems(const Mode& m) {
+  Storage& r = rows();
+  for (uint8_t i = 0; i < r.count; i++) r.items[i] = SettingItem{r.labels[i], m.onSelect};
 }
 
 // While the list is shown: adds a row, before Everyone, for each unread
 // conversation not yet listed (e.g. a message from a sender absent at entry).
-// Rows are never removed for being read during the visit; only when the rows
-// are full does a new unread row replace the last row that is neither
-// unread, selected nor Everyone. Returns the selected row's new index (same
-// identity) if rows changed, else kNoChange.
-inline uint8_t refresh(Table& t, uint8_t selected) {
+// Returns the selected row's new index (same identity) if rows changed, else
+// kNoChange.
+inline uint8_t refresh(const Mode& m, uint8_t selected) {
+  Storage& r = rows();
   char selectedKey[MessageStore::kContactKeyLen];
-  setKey(selectedKey, selected < t.count ? t.keys[selected] : "");
+  setKey(selectedKey, selected < r.count ? r.keys[selected] : "");
   bool changed = false;
   uint8_t cursor = 0;
   const char* summaryKey;
-  while ((summaryKey = Notifications::nextUnreadContactIn(t.group, t.badgeMask, cursor)) != nullptr) {
-    if (findKey(t, summaryKey) >= 0) continue;  // (Everyone included: it always has its row)
+  while ((summaryKey = Notifications::nextUnreadContactIn(m.group, m.badgeMask, cursor)) != nullptr) {
+    if (findKey(summaryKey) >= 0) continue;  // (Everyone included: it always has its row)
     char key[MessageStore::kContactKeyLen];
     setKey(key, summaryKey);
-    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;
-    int at = findKey(t, MessageStore::kEveryone);
-    if (at < 0) at = t.count;
-    insertRow(t, static_cast<uint8_t>(at));
-    setKey(t.keys[at], key);
-    labelUnreadRow(t, static_cast<uint8_t>(at));
+    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;
+    int at = findKey(MessageStore::kEveryone);
+    if (at < 0) at = r.count;
+    insertRow(static_cast<uint8_t>(at));
+    setKey(r.keys[at], key);
+    labelUnreadRow(m, static_cast<uint8_t>(at));
     // A name already shown: tell the rows apart by id.
-    size_t len = strlen(t.labels[at]);
+    size_t len = strlen(r.labels[at]);
     bool suffixNew = false;
-    for (uint8_t j = 0; j < t.count; j++) {
-      if (j == at || strncmp(t.labels[j], t.labels[at], len) != 0) continue;
-      if (t.labels[j][len] == '\0') {
-        appendDeviceSuffix(t.labels[j], kLabelLen, t.keys[j]);
+    for (uint8_t j = 0; j < r.count; j++) {
+      if (j == at || strncmp(r.labels[j], r.labels[at], len) != 0) continue;
+      if (r.labels[j][len] == '\0') {
+        appendDeviceSuffix(r.labels[j], kLabelLen, r.keys[j]);
         suffixNew = true;
-      } else if (strncmp(t.labels[j] + len, " [", 2) == 0) {
+      } else if (strncmp(r.labels[j] + len, " [", 2) == 0) {
         suffixNew = true;
       }
     }
-    if (suffixNew) appendDeviceSuffix(t.labels[at], kLabelLen, t.keys[at]);
+    if (suffixNew) appendDeviceSuffix(r.labels[at], kLabelLen, r.keys[at]);
     changed = true;
   }
   if (!changed) return kNoChange;
-  bindItems(t);
-  int sel = findKey(t, selectedKey);
+  bindItems(m);
+  int sel = findKey(selectedKey);
   return static_cast<uint8_t>(sel >= 0 ? sel : 0);
 }
 
 // Entry: builds every row afresh.
-inline void build(Table& t) {
-  t.count = 0;
-  Presence::OnlineContact online[20];
-  uint8_t onlineN = Presence::getOnlineContacts(t.group, online, 20);
-  for (uint8_t i = 0; i < onlineN && t.count < t.cap; i++) {
-    setKey(t.keys[t.count], online[i].device_id);
-    snprintf(t.labels[t.count], kLabelLen, "%s", online[i].display_name);
-    t.count++;
+inline void build(const Mode& m) {
+  Storage& r = rows();
+  r.count = 0;
+  Presence::OnlineContact online[kMaxOnline];
+  uint8_t onlineN = Presence::getOnlineContacts(m.group, online, kMaxOnline);
+  for (uint8_t i = 0; i < onlineN; i++) {
+    setKey(r.keys[r.count], online[i].device_id);
+    snprintf(r.labels[r.count], kLabelLen, "%s", online[i].display_name);
+    r.count++;
   }
 
-  Presence::RecentContact recent[20];
-  uint8_t recentN = Presence::getRecentContacts(t.group, recent, 20);
-  for (uint8_t i = 0; i < recentN && t.count < t.cap; i++) {
+  Presence::RecentContact recent[kMaxRecent];
+  uint8_t recentN = Presence::getRecentContacts(m.group, recent, kMaxRecent);
+  for (uint8_t i = 0; i < recentN; i++) {
     bool alreadyOnline = false;
     for (uint8_t j = 0; j < onlineN; j++) {
       if (strcmp(online[j].device_id, recent[i].device_id) == 0) {
@@ -166,30 +201,28 @@ inline void build(Table& t) {
       }
     }
     if (alreadyOnline) continue;
-    setKey(t.keys[t.count], recent[i].device_id);
+    setKey(r.keys[r.count], recent[i].device_id);
     const char* name = (recent[i].last_known_name[0] != '\0') ? recent[i].last_known_name : recent[i].device_id;
-    snprintf(t.labels[t.count], kLabelLen, "%s (offline)", name);
-    t.count++;
+    snprintf(r.labels[r.count], kLabelLen, "%s (offline)", name);
+    r.count++;
   }
 
   // Disambiguate duplicate display names with the last 4 hex of device_id.
-  for (uint8_t i = 0; i < t.count; i++) {
-    for (uint8_t j = static_cast<uint8_t>(i + 1); j < t.count; j++) {
-      if (strcmp(t.labels[i], t.labels[j]) == 0) {
-        appendDeviceSuffix(t.labels[i], kLabelLen, t.keys[i]);
-        appendDeviceSuffix(t.labels[j], kLabelLen, t.keys[j]);
+  for (uint8_t i = 0; i < r.count; i++) {
+    for (uint8_t j = static_cast<uint8_t>(i + 1); j < r.count; j++) {
+      if (strcmp(r.labels[i], r.labels[j]) == 0) {
+        appendDeviceSuffix(r.labels[i], kLabelLen, r.keys[i]);
+        appendDeviceSuffix(r.labels[j], kLabelLen, r.keys[j]);
       }
     }
   }
+  r.ordinaryEnd = r.count;  // at most kMaxOnline + kMaxRecent: Everyone always fits
 
-  if (t.count >= t.cap) dropReadRow(t, -1);
-  if (t.count < t.cap) {
-    setKey(t.keys[t.count], MessageStore::kEveryone);
-    snprintf(t.labels[t.count], kLabelLen, "Everyone");
-    t.count++;
-  }
-  bindItems(t);
-  refresh(t, 0);  // then the unread conversations not listed above
+  setKey(r.keys[r.count], MessageStore::kEveryone);
+  snprintf(r.labels[r.count], kLabelLen, "Everyone");
+  r.count++;
+  bindItems(m);
+  refresh(m, 0);  // then the unread conversations not listed above
 }
 
 }  // namespace RecipientRows

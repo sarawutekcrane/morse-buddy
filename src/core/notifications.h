@@ -11,6 +11,9 @@
 
 namespace Notifications {
 
+// The in-memory summaries track at most this many conversations (all groups).
+constexpr uint8_t kMaxTrackedConversations = 24;
+
 enum BadgeCategory : uint8_t {
   BADGE_TEXT = 1u << 0,
   BADGE_ENIGMA = 1u << 1,

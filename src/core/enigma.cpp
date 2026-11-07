@@ -144,51 +144,44 @@ void screenGroupSelect() {
 // =============================================================================
 // Recipient (Online / Recent Offline / Everyone — Everyone is allowed here)
 // =============================================================================
-constexpr uint8_t kMaxRecipientItems = 41;
-SettingItem g_recipientItems[kMaxRecipientItems];
-char g_recipientLabelBuf[kMaxRecipientItems][RecipientRows::kLabelLen];
-char g_recipientContactKeys[kMaxRecipientItems][MessageStore::kContactKeyLen];
-uint8_t g_recipientItemCount = 0;
+// Rows (shared with the other chat; see recipient_rows.h): online, recent
+// offline, other unread conversations, Everyone. Up to RecipientRows::kMaxRows,
+// scrolled by the ListMenu. Built from RAM on entry; while shown, a
+// conversation that becomes unread without a row gains one, keeping the
+// selected row, and no row gives way to it.
 ListMenu g_recipientListMenu;
 
 template <uint8_t I>
 bool recipientRowUnread() {
-  return I < g_recipientItemCount &&
-         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_ENIGMA);
+  RecipientRows::Storage& r = RecipientRows::rows();
+  return I < r.count && Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[I], Notifications::BADGE_ENIGMA);
 }
-const BadgeFn kRecipientRowBadges[kMaxRecipientItems] = {MB_BADGE_ROWS40(recipientRowUnread), recipientRowUnread<40>};
-static_assert(kMaxRecipientItems == 41, "one badge function per recipient row");
+const BadgeFn kRecipientRowBadges[RecipientRows::kMaxRows] = {MB_BADGE_ROWS66(recipientRowUnread)};
+static_assert(RecipientRows::kMaxRows == 66, "one badge function per recipient row");
 
 void recipientTrampoline() {
+  RecipientRows::Storage& r = RecipientRows::rows();
   uint8_t idx = g_recipientListMenu.selectedIndex();
-  if (idx < g_recipientItemCount) {
-    strncpy(g_selectedContactKey, g_recipientContactKeys[idx], sizeof(g_selectedContactKey) - 1);
+  if (idx < r.count) {
+    strncpy(g_selectedContactKey, r.keys[idx], sizeof(g_selectedContactKey) - 1);
     g_selectedContactKey[sizeof(g_selectedContactKey) - 1] = '\0';
   }
   Menu::goBack();
   Menu::pushScreen(screenContactMenu);
 }
 
-// Rows: online, recent offline, other unread conversations, Everyone (see
-// recipient_rows.h). Built from RAM on entry; while shown, a conversation
-// that becomes unread without a row gains one, keeping the selected row.
-RecipientRows::Table recipientTable() {
-  return RecipientRows::Table{g_recipientItems,   g_recipientLabelBuf,  g_recipientContactKeys,
-                              g_recipientItemCount, kMaxRecipientItems, recipientTrampoline,
-                              g_selectedGroupCode, Notifications::BADGE_ENIGMA};
-}
-
 void screenRecipient() {
-  RecipientRows::Table rows = recipientTable();
+  const RecipientRows::Mode mode{g_selectedGroupCode, Notifications::BADGE_ENIGMA, recipientTrampoline};
+  RecipientRows::Storage& r = RecipientRows::rows();
   if (Menu::consumeJustEntered()) {
-    RecipientRows::build(rows);
-    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, 0,
-                                  ListMenu::SelectionMode::PUSH_SCREEN, ListMenu::BadgeLayout::RESERVED_COLUMN);
+    RecipientRows::build(mode);
+    g_recipientListMenu.configure(r.items, r.count, kRecipientRowBadges, 0, ListMenu::SelectionMode::PUSH_SCREEN,
+                                  ListMenu::BadgeLayout::RESERVED_COLUMN);
   } else {
-    uint8_t selected = RecipientRows::refresh(rows, g_recipientListMenu.selectedIndex());
+    uint8_t selected = RecipientRows::refresh(mode, g_recipientListMenu.selectedIndex());
     if (selected != RecipientRows::kNoChange)
-      g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, selected,
-                                    ListMenu::SelectionMode::PUSH_SCREEN, ListMenu::BadgeLayout::RESERVED_COLUMN);
+      g_recipientListMenu.configure(r.items, r.count, kRecipientRowBadges, selected, ListMenu::SelectionMode::PUSH_SCREEN,
+                                    ListMenu::BadgeLayout::RESERVED_COLUMN);
   }
   Display::drawStatusBar();
   g_recipientListMenu.tick("Recipient");

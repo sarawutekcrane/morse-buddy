@@ -342,7 +342,7 @@
     std::vector<std::string> rows;
     std::string first = selectedLabel();
     rows.push_back(first);
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 100; i++) {  // (more than the 66 rows)
       rot(1);
       std::string l = selectedLabel();
       if (l == first) break;
@@ -357,7 +357,7 @@
   };
   // Moves the selection onto the row starting with `prefix` (false: not listed).
   auto selectRow = [&](const std::string& prefix) {
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 100; i++) {  // (more than the 66 rows)
       if (selectedLabel().rfind(prefix, 0) == 0) return true;
       rot(1);
     }
@@ -754,6 +754,77 @@
               kChatName[enigma], (unsigned long long)opens, (unsigned long long)entries, nvs);
       }
     }
+  }
+
+  g_test = "LR10 rows all used while the list stays open (40 ordinary, 25 added, Everyone): a later new sender reuses only an added row whose conversation is no longer unread and is not selected; ordinary rows, Everyone, unread rows and the selected row stay";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    powerOn(); runFor(30);
+    char id[16], name[16], p[120];
+    T::unixTime = 1950000000u;
+    for (int i = 0; i < 20; i++) {
+      snprintf(id, sizeof(id), "C0000000%04d", i);
+      snprintf(name, sizeof(name), "Onl%02d", i);
+      presence(kG, id, name);
+    }
+    T::unixTime = 1990000000u;
+    for (int i = 0; i < 20; i++) {
+      snprintf(id, sizeof(id), "D0000000%04d", i);
+      snprintf(p, sizeof(p), "MBP1|%s|Gone|OFFLINE|0|%lu|255", id, (unsigned long)T::unixTime);
+      Presence::handleIncoming(kG, p, static_cast<uint16_t>(strlen(p)));
+    }
+    T::unixTime = 1700000000u;
+    openMode(enigma);
+    std::vector<std::string> orig = listRows();
+    selectRow("Everyone");
+    // 24 new senders: every tracked summary in use, 65 rows.
+    char xs[26][13];
+    MessageRef xref[26];
+    for (int k = 0; k < 26; k++) snprintf(xs[k], sizeof(xs[k]), "F00000000%03d", k);
+    for (int k = 0; k < 24; k++) {
+      xref[k] = arrive(xs[k], ofType(enigma), kDay06 + 900 + k);
+      loopPass(2);
+    }
+    size_t n24 = listRows().size();
+    // X0's read completes while the list is shown: its star clears, its row stays.
+    Notifications::clearUnread(kG, xs[0], xref[0]);
+    loopPass(3);
+    bool x0Kept = selectRow(xs[0]) && !starred(xs[0]);
+    selectRow("Everyone");
+    // X24 reuses X0's summary; the spare row takes it: nothing given up.
+    xref[24] = arrive(xs[24], ofType(enigma), kDay06 + 990);
+    loopPass(3);
+    std::vector<std::string> r66 = listRows();
+    // X1's read completes and X1 is selected; X25 arrives with all 66 rows used:
+    // X0 (read, not selected) is the only row that may give way.
+    Notifications::clearUnread(kG, xs[1], xref[1]);
+    loopPass(3);
+    selectRow(xs[1]);
+    xref[25] = arrive(xs[25], ofType(enigma), kDay06 + 991);
+    loopPass(3);
+    bool x1Selected = selectedLabel().rfind(xs[1], 0) == 0;
+    std::vector<std::string> fin = listRows();
+    bool opened = false;
+    if (selectRow(xs[25])) {
+      openSelected(enigma);
+      opened = TextMessage::isConversationOpen(kG, xs[25]);
+    }
+    toMain();
+    int origMissing = 0, xMissing = 0;
+    for (auto& o : orig) {
+      int n = 0;
+      for (auto& f : fin) n += f == o;
+      origMissing += n != 1;
+    }
+    for (int k = 1; k < 26; k++) xMissing += countPrefix(fin, xs[k]) != 1;
+    CHECK(orig.size() == 41 && n24 == 65 && x0Kept && r66.size() == 66 && countPrefix(r66, xs[0]) == 1 && countPrefix(r66, xs[24]) == 1,
+          "%s: %zu rows at entry, %zu after 24 senders; X0 read: row kept, star off %d; after X24: %zu rows, X0 %d, X24 %d", kChatName[enigma],
+          orig.size(), n24, x0Kept, r66.size(), countPrefix(r66, xs[0]), countPrefix(r66, xs[24]));
+    CHECK(fin.size() == 66 && origMissing == 0 && xMissing == 0 && countPrefix(fin, xs[0]) == 0 && x1Selected && opened &&
+              countPrefix(fin, "Everyone") == 1,
+          "%s: all rows used, X25 arrives with read X1 selected: %zu rows; originals missing %d, X1..X25 missing %d, X0 (read, not selected) "
+          "reused %d; X1 still selected %d; X25 opens its history %d",
+          kChatName[enigma], fin.size(), origMissing, xMissing, countPrefix(fin, xs[0]) == 0, x1Selected, opened);
   }
 
   (void)none;
