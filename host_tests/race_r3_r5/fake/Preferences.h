@@ -11,6 +11,11 @@
 #include <functional>
 #include <map>
 #include <string>
+// Every instance's operations, counted together (reads include isKey()).
+struct PrefsOps {
+  static int& reads() { static int n = 0; return n; }
+  static int& writes() { static int n = 0; return n; }
+};
 struct PrefsCapture { static std::map<std::string, std::string>& last() { static std::map<std::string, std::string> m; return m; } };
 class Preferences {
  public:
@@ -20,28 +25,32 @@ class Preferences {
   int writes = 0;
   size_t putBytes(const char* key, const void* v, size_t len) {
     writes++;
+    PrefsOps::writes()++;
     if (failWrite && failWrite(key)) return 0;
     PrefsCapture::last()[key].assign(static_cast<const char*>(v), len);
     kv[key].assign(static_cast<const char*>(v), len);
     return len;
   }
   size_t getBytes(const char* key, void* buf, size_t maxLen) {
+    PrefsOps::reads()++;
     if (failRead && failRead(key)) return 0;  // nvs_get_blob error: getBytes reports 0
     auto it = kv.find(key);
     if (it == kv.end() || it->second.size() > maxLen) return 0;
     memcpy(buf, it->second.data(), it->second.size());
     return it->second.size();
   }
-  bool isKey(const char* key) { return kv.count(key) != 0; }
+  bool isKey(const char* key) { PrefsOps::reads()++; return kv.count(key) != 0; }
   std::function<bool(const char*)> failRemove;  // true -> this remove fails (the key stays)
   int removes = 0;
   bool remove(const char* key) {  // nvs_erase_key: false if absent or on error
     removes++;
+    PrefsOps::writes()++;
     if (failRemove && failRemove(key)) return false;
     return kv.erase(key) != 0;
   }
   bool begin(const char*, bool) { return true; }
   uint32_t getULong(const char* key, uint32_t def) {
+    PrefsOps::reads()++;
     uint32_t v = def;
     if (failRead && failRead(key)) return def;
     if (kv.count(key) && kv[key].size() == 4) memcpy(&v, kv[key].data(), 4);

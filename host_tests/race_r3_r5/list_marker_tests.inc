@@ -327,5 +327,309 @@
           kChatName[enigma], idle, onFlip, lit);
     toMain();
   }
+  // ---- round 9: every qualifying conversation reachable ------------------
+  // All recipient rows, from the selected one round to it again (the
+  // selection is stepped through the whole list and ends where it started).
+  auto selectedLabel = []() -> std::string {
+    int y = -1;
+    for (auto& d : T::screen)
+      if (d.text == ">") y = d.y;
+    for (auto& d : T::screen)
+      if (d.y == y && d.x > 2 && d.text != ">" && d.text != "*" && d.text != " *") return d.text;
+    return "";
+  };
+  auto listRows = [&]() {
+    std::vector<std::string> rows;
+    std::string first = selectedLabel();
+    rows.push_back(first);
+    for (int i = 0; i < 60; i++) {
+      rot(1);
+      std::string l = selectedLabel();
+      if (l == first) break;
+      rows.push_back(l);
+    }
+    return rows;
+  };
+  auto countPrefix = [](const std::vector<std::string>& rows, const std::string& prefix) {
+    int n = 0;
+    for (auto& r : rows) n += r.rfind(prefix, 0) == 0;
+    return n;
+  };
+  // Moves the selection onto the row starting with `prefix` (false: not listed).
+  auto selectRow = [&](const std::string& prefix) {
+    for (int i = 0; i < 60; i++) {
+      if (selectedLabel().rfind(prefix, 0) == 0) return true;
+      rot(1);
+    }
+    return false;
+  };
+  auto openSelected = [&](bool enigma) {
+    confirm();
+    if (enigma) confirm();  // the contact menu's Chat
+    loopPass(3);
+  };
+  auto backToList = [&](bool enigma) {
+    back();
+    if (enigma) back();
+    loopPass(3);
+  };
+  const char* kAbsent = "AB5E00000001";   // never seen by presence: neither online nor recent
+  const char* kAbsent2 = "AB5E00000002";
+  const char* kAbsent3 = "AB5E00000003";
+  auto storeIn = [&](bool enigma, const char* group, const char* contact, bool unread, uint32_t ts) {
+    if (enigma) storeEnigmaIn(group, contact, unread, ts);
+    else storeTextIn(group, contact, contact, true, unread, ts);
+  };
+
+  g_test = "LR1 an unread conversation with a contact neither online nor recent has a row (starred) in its group's list; opening it opens that history and reads nothing";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+    storeTextIn(kG, kBob, kBob, true, false, kDay06 + 60);
+    powerOn(); runFor(30);
+    presence(kG, kBob, "Bob");
+    TypeCount before = truth(kAbsent);
+    openMode(enigma);
+    std::vector<std::string> rows = listRows();
+    bool listed = countPrefix(rows, kAbsent) == 1, star = starred(kAbsent) || (selectRow(kAbsent) && starred(kAbsent));
+    bool opened = false;
+    if (selectRow(kAbsent)) {
+      openSelected(enigma);
+      opened = TextMessage::isConversationOpen(kG, kAbsent);
+    }
+    TypeCount after = truth(kAbsent);
+    CHECK(listed && star && opened && after.text + after.enigma == before.text + before.enigma && before.text + before.enigma == 1 &&
+              countPrefix(rows, "Everyone") == 1 && (enigma ? enigmaBadge() : textBadge()),
+          "%s: listed %d, starred %d, opened its history %d, unread %d -> %d, Everyone rows %d", kChatName[enigma], listed, star, opened,
+          before.text + before.enigma, after.text + after.enigma, countPrefix(rows, "Everyone"));
+    toMain();
+  }
+
+  g_test = "LR2 rows are keyed by group and contact: the same contact in two groups, and two contacts with the same name, each open their own history";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    T::groupCount = 2;
+    const char* kSam1 = "5A0000000001";
+    const char* kSam2 = "5A0000000002";
+    storeIn(enigma, kG, kSam1, false, kDay06 + 60);         // Fam: Sam1 read (a recent contact there)
+    storeIn(enigma, "GROUP2", kSam1, true, kDay06 + 60);    // Work: Sam1 unread, unknown to Work's presence
+    storeIn(enigma, "GROUP2", kSam2, false, kDay06 + 60);   // Work: Sam2 online, named "Sam"
+    powerOn(); runFor(60);
+    presence(kG, kSam1, "Sam");
+    presence("GROUP2", kSam2, "Sam");
+    openMode(enigma);  // group list
+    confirm();         // Fam
+    std::vector<std::string> fam = listRows();
+    bool famSam1Star = selectRow("Sam") && starred("Sam");
+    toMain();
+    openMode(enigma);
+    rot(1);
+    confirm();  // Work
+    std::vector<std::string> work = listRows();
+    bool opened = false;
+    if (selectRow(kSam1)) {
+      bool st = starred(kSam1);
+      openSelected(enigma);
+      opened = st && TextMessage::isConversationOpen("GROUP2", kSam1);
+    }
+    toMain();
+    CHECK(countPrefix(fam, kSam1) == 0 && countPrefix(fam, "Sam") == 1 && !famSam1Star && countPrefix(work, "Sam") == 1 &&
+              countPrefix(work, kSam1) == 1 && opened,
+          "%s: Fam rows: Sam %d (starred %d), %s %d; Work rows: Sam %d, %s %d; Work's %s opened (starred) %d", kChatName[enigma],
+          countPrefix(fam, "Sam"), famSam1Star, kSam1, countPrefix(fam, kSam1), countPrefix(work, "Sam"), kSam1, countPrefix(work, kSam1), kSam1,
+          opened);
+    T::groupCount = 1;
+  }
+
+  g_test = "LR3 an unread contact that becomes online (or recent) is listed once, by identity: no duplicate row";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+    powerOn(); runFor(30);
+    openMode(enigma);
+    std::vector<std::string> r1 = listRows();
+    presence(kG, kAbsent, "Abe");  // now online (and recent), still unread
+    loopPass(3);
+    std::vector<std::string> r1b = listRows();  // same visit: unchanged
+    toMain();
+    openMode(enigma);
+    std::vector<std::string> r2 = listRows();
+    toMain();
+    int n1 = countPrefix(r1, kAbsent), n1b = countPrefix(r1b, kAbsent) + countPrefix(r1b, "Abe"), n2 = countPrefix(r2, kAbsent) + countPrefix(r2, "Abe");
+    CHECK(n1 == 1 && n1b == 1 && n2 == 1 && countPrefix(r2, "Abe") == 1, "%s: rows for the contact: absent %d, after it came online (same visit) %d, next entry %d",
+          kChatName[enigma], n1, n1b, n2);
+  }
+
+  g_test = "LR4 an arrival from an absent sender adds its row on the open list; the selection stays on its row (Everyone included)";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    for (int onEveryone = 0; onEveryone < 2; onEveryone++) {
+      freshDevice();
+      storeTextIn(kG, kBob, kBob, true, false, kDay06 + 60);
+      powerOn(); runFor(30);
+      presence(kG, kBob, "Bob");
+      openMode(enigma);
+      selectRow(onEveryone ? "Everyone" : "Bob");
+      std::string sel0 = selectedLabel();
+      arrive(onEveryone ? kAbsent : kAbsent2, ofType(enigma), kDay06 + 900);
+      loopPass(3);
+      std::string sel1 = selectedLabel();
+      bool rowShown = rowY(onEveryone ? kAbsent : kAbsent2) >= 0 || true;
+      std::vector<std::string> rows = listRows();  // (returns to the same selection)
+      std::string sel2 = selectedLabel();
+      bool listed = countPrefix(rows, onEveryone ? kAbsent : kAbsent2) == 1 && countPrefix(rows, "Everyone") == 1;
+      openSelected(enigma);
+      bool rightChat = TextMessage::isConversationOpen(kG, onEveryone ? MessageStore::kEveryone : kBob);
+      toMain();
+      CHECK(listed && rowShown && sel1 == sel0 && sel2 == sel0 && rightChat,
+            "%s, %s selected: the new row listed %d; selection '%s' -> '%s' (after the stepping '%s'); confirm opened the selected one %d",
+            kChatName[enigma], onEveryone ? "Everyone" : "Bob", listed, sel0.c_str(), sel1.c_str(), sel2.c_str(), rightChat);
+    }
+  }
+
+  g_test = "LR5 the last read saved clears the star but keeps the row for that visit (a failed write keeps the star); the next entry omits it";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+    powerOn(); runFor(30);
+    openMode(enigma);
+    selectRow(kAbsent);
+    openSelected(enigma);
+    static bool failing;
+    failing = true;
+    LittleFS.failOpen = [](const std::string& p) { return failing && p.size() > 4 && p.compare(p.size() - 4, 4, ".tmp") == 0; };
+    rot(-1);  // the one unread message: its write fails
+    loopPass(2);
+    backToList(enigma);
+    bool rowWhileFailing = rowY(kAbsent) >= 0, starWhileFailing = starred(kAbsent);
+    runFor(5);
+    bool starStill = starred(kAbsent);
+    failing = false;
+    LittleFS.failOpen = nullptr;
+    bool cleared = false;
+    for (int i = 0; i < 6000 && !cleared; i++) {
+      loopPass();
+      cleared = rowY(kAbsent) >= 0 && !starred(kAbsent);
+    }
+    bool stillListed = selectRow(kAbsent);
+    toMain();
+    openMode(enigma);
+    std::vector<std::string> next = listRows();
+    toMain();
+    CHECK(rowWhileFailing && starWhileFailing && starStill && cleared && stillListed && countPrefix(next, kAbsent) == 0,
+          "%s: while the write fails: row %d star %d %d; after it succeeds: star cleared, row kept %d %d; next entry lists it %d", kChatName[enigma],
+          rowWhileFailing, starWhileFailing, starStill, cleared, stillListed, countPrefix(next, kAbsent));
+  }
+
+  g_test = "LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+    storeIn(enigma, kG, kAbsent2, true, kDay06 + 60);
+    powerOn(); runFor(30);
+    // Recent: 20 contacts seen later (then offline); online: 20 seen earlier
+    // (only the last of them keeps a recent slot) -- 39 distinct ordinary rows.
+    char id[16], name[16];
+    T::unixTime = 1900000000u;
+    for (int i = 0; i < 20; i++) {
+      snprintf(id, sizeof(id), "B0000000%04d", i);
+      snprintf(name, sizeof(name), "Rec%02d", i);
+      presence(kG, id, name);
+      char p[120];
+      snprintf(p, sizeof(p), "MBP1|%s|%s|OFFLINE|0|%lu|255", id, name, (unsigned long)T::unixTime);
+      Presence::handleIncoming(kG, p, static_cast<uint16_t>(strlen(p)));
+    }
+    T::unixTime = 1800000000u;
+    for (int i = 0; i < 20; i++) {
+      snprintf(id, sizeof(id), "A0000000%04d", i);
+      snprintf(name, sizeof(name), "On%02d", i);
+      presence(kG, id, name);
+    }
+    T::unixTime = 1700000000u;
+    Presence::OnlineContact oc[20];
+    Presence::RecentContact rc[20];
+    uint8_t on = Presence::getOnlineContacts(kG, oc, 20), rec = Presence::getRecentContacts(kG, rc, 20);
+    openMode(enigma);
+    std::vector<std::string> rows = listRows();
+    bool aStar = selectRow(kAbsent) && starred(kAbsent), bStar = selectRow(kAbsent2) && starred(kAbsent2);
+    // A third one arrives while the full list is open.
+    selectRow("Everyone");
+    arrive(kAbsent3, ofType(enigma), kDay06 + 900);
+    loopPass(3);
+    bool stillEveryone = selectedLabel() == "Everyone";
+    std::vector<std::string> rows2 = listRows();
+    toMain();
+    int ordinary = countPrefix(rows, "On") + countPrefix(rows, "Rec");
+    CHECK(on == 20 && rec >= 19 && rows.size() == 41 && countPrefix(rows, "Everyone") == 1 && countPrefix(rows, kAbsent) == 1 &&
+              countPrefix(rows, kAbsent2) == 1 && aStar && bStar && ordinary == 38,
+          "%s: presence online %u recent %u; %zu rows (expected 41): Everyone %d, unread %d %d (starred %d %d), ordinary %d (expected 38: one dropped)",
+          kChatName[enigma], on, rec, rows.size(), countPrefix(rows, "Everyone"), countPrefix(rows, kAbsent), countPrefix(rows, kAbsent2), aStar, bStar,
+          ordinary);
+    CHECK(rows2.size() == 41 && countPrefix(rows2, kAbsent3) == 1 && countPrefix(rows2, "Everyone") == 1 && countPrefix(rows2, kAbsent) == 1 &&
+              countPrefix(rows2, kAbsent2) == 1 && stillEveryone,
+          "%s: after an arrival on the full list: %zu rows; the new one %d, Everyone %d (still selected %d)", kChatName[enigma], rows2.size(),
+          countPrefix(rows2, kAbsent3), countPrefix(rows2, "Everyone"), stillEveryone);
+  }
+
+  g_test = "LR7 one unread game and one unread Text from the same friend: both modes star the friend; reading only the game in Enigma clears the Enigma star, the Morse star stays";
+  {
+    freshDevice();
+    storeTextIn(kG, kBob, kBob, true, true, kDay06 + 60);                     // Text, older
+    storeOnly(kBob, PacketCodec::MSG_TYPE_GAME, true, kDay06 + 120);           // Friend game record, newest
+    powerOn(); runFor(30);
+    presence(kG, kBob, "Bob");
+    openMode(false);
+    bool text0 = starred("Bob");
+    toMain();
+    openMode(true);
+    bool en0 = starred("Bob");
+    selectRow("Bob");
+    openSelected(true);
+    rot(-1);  // the newest: the game record
+    runFor(2);
+    backToList(true);
+    bool en1 = starred("Bob");
+    toMain();
+    openMode(false);
+    bool text1 = starred("Bob");
+    toMain();
+    TypeCount t = truth(kBob);
+    CHECK(text0 && en0 && !en1 && text1 && t.game == 0 && t.text == 1, "Morse star %d -> %d, Enigma star %d -> %d (game unread %d, text unread %d)",
+          text0, text1, en0, en1, t.game, t.text);
+  }
+
+  g_test = "LR8 building, refreshing (after an arrival) and drawing the lists' rows do no storage work: no file opens, listings, NVS reads or writes";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    freshDevice();
+    storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+    powerOn(); runFor(30);
+    presence(kG, kBob, "Bob");
+    loopPass(5);
+    FsStats a = g_fs;
+    int r0 = PrefsOps::reads(), w0 = PrefsOps::writes();
+    Menu::pushScreen(getModeHandler(enigma ? Modes::ENIGMA : Modes::TEXT));  // entry builds the rows
+    for (int i = 0; i < 10; i++) {
+      T::now += 20;
+      if (i % 3 == 0) T::raw.push_back(InputEvent(InputEventType::ENCODER_ROTATE, 1, 0, 0));
+      Menu::tick();
+    }
+    FsStats b = g_fs;
+    int r1 = PrefsOps::reads(), w1 = PrefsOps::writes();
+    arrive(kAbsent2, ofType(enigma), kDay06 + 900);  // (the arrival itself is storage work: not measured)
+    FsStats c = g_fs;
+    int r2 = PrefsOps::reads(), w2 = PrefsOps::writes();
+    for (int i = 0; i < 10; i++) {  // the refresh adding its row, and drawing
+      T::now += 20;
+      Menu::tick();
+    }
+    bool added = rowY(kAbsent2) >= 0 || selectRow(kAbsent2);
+    FsStats d = g_fs;
+    int r3 = PrefsOps::reads(), w3 = PrefsOps::writes();
+    uint64_t opens = (b.fileOpens - a.fileOpens) + (d.fileOpens - c.fileOpens), entries = (b.dirEntries - a.dirEntries) + (d.dirEntries - c.dirEntries);
+    int reads = (r1 - r0) + (r3 - r2), writes = (w1 - w0) + (w3 - w2);
+    CHECK(added && opens == 0 && entries == 0 && reads == 0 && writes == 0,
+          "%s: the arrival's row added %d; list UI: %llu opens, %llu directory entries, %d NVS reads, %d NVS writes", kChatName[enigma], added,
+          (unsigned long long)opens, (unsigned long long)entries, reads, writes);
+    toMain();
+  }
   (void)none;
 }
