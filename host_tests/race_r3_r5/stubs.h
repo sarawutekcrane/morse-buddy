@@ -54,6 +54,9 @@ extern bool realWrap;
 // Settings stub: whether its one group (GROUP1) is configured (false: as
 // after deleting it). Reset by reset().
 extern bool groupConfigured;
+// Settings stub: how many groups are configured (1: GROUP1 "Fam"; 2: also
+// GROUP2 "Work"). Reset by reset().
+extern uint8_t groupCount;
 // REAL_NOTIFICATIONS builds only: MessageStore::findMessagesByPredicate()
 // scans the fake store; true makes it report the scan as unreliable.
 extern bool scanUnreliable;

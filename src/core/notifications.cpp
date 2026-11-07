@@ -891,13 +891,19 @@ void serviceTick() {
   startNextJob();
 }
 
-bool hasBadge(uint8_t mask) {
-  for (auto& s : g_summaries) {
-    if (s.state == SUMMARY_FREE) continue;  // COUNTED: counts; UNRESOLVED: category flags -- same test
-    if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0 || s.unread[SLOT_GAME] > 0)) return true;
-    if ((mask & BADGE_ENIGMA) && (s.unread[SLOT_ENIGMA] > 0 || s.unread[SLOT_GAME] > 0)) return true;
-  }
+// Whether one summary lights a badge category. COUNTED: counts; UNRESOLVED:
+// category flags (counts unknown, so possibly unread) -- the same test.
+bool summaryShows(const Summary& s, uint8_t mask) {
+  if (s.state == SUMMARY_FREE) return false;
+  if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0 || s.unread[SLOT_GAME] > 0)) return true;
+  if ((mask & BADGE_ENIGMA) && (s.unread[SLOT_ENIGMA] > 0 || s.unread[SLOT_GAME] > 0)) return true;
   return false;  // no stored message type maps to BADGE_TRAINING_GAME (Race ORs in its own flag)
+}
+
+bool hasBadge(uint8_t mask) {
+  for (auto& s : g_summaries)
+    if (summaryShows(s, mask)) return true;
+  return false;
 }
 
 // An UNREAD record (or one whose header could not be read) was evicted --
@@ -1042,6 +1048,16 @@ bool readMovedOnto(const char* group_code, const char* contact_key, uint32_t seq
 uint16_t getUnreadCount(const char* group_code, const char* contact_key) {
   Summary* s = findSummary(group_code, contact_key);
   return s != nullptr ? totalUnread(*s) : 0;
+}
+
+bool hasUnreadIn(const char* group_code, const char* contact_key, uint8_t badgeMask) {
+  if (group_code == nullptr) return false;
+  for (auto& s : g_summaries) {
+    if (strcmp(s.group_code, group_code) != 0) continue;
+    if (contact_key != nullptr && strcmp(s.contact_key, contact_key) != 0) continue;
+    if (summaryShows(s, badgeMask)) return true;
+  }
+  return false;
 }
 
 bool hasAnyUnreadText() { return hasBadge(BADGE_TEXT); }

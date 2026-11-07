@@ -110,12 +110,13 @@ uint32_t navigationEpoch() { return g_navigationEpoch; }
 }  // namespace Menu
 
 void ListMenu::configure(const SettingItem* items, uint8_t count, const BadgeFn* badges,
-                          uint8_t initialSelected, SelectionMode selectionMode) {
+                          uint8_t initialSelected, SelectionMode selectionMode, BadgeLayout badgeLayout) {
   items_ = items;
   badges_ = badges;
   count_ = count;
   selected_ = (count > 0 && initialSelected < count) ? initialSelected : 0;
   selectionMode_ = selectionMode;
+  badgeLayout_ = badgeLayout;
   needsFullRedraw_ = true;
   for (auto& b : lastBadge_) b = false;
 }
@@ -152,26 +153,6 @@ bool ListMenu::tickImpl(const char* title, InputFilterFn dropFilter, bool stopOn
     }
     // Phase 2C-2 (tickOwned only): this list is no longer the top screen.
     if (stopOnNavigation && Menu::navigationEpoch() != epochAtStart) return true;
-  }
-
-  // Badges are polled every tick regardless of redraw state (they're
-  // arbitrary caller-provided bool fns, e.g. unread-message checks, and
-  // must stay live) but only trigger a redraw when a value actually flips,
-  // per Hardware Fix #1. Beyond kBadgeCacheCap items the per-item cache
-  // can't be used safely, so those lists conservatively fall back to a
-  // full row-region redraw whenever badges_ is set (correct, just not
-  // optimized -- no current caller exceeds the cap). Within the cap,
-  // Hardware Fix #4.1 tracks exactly which items' badges changed so a
-  // same-viewport redraw can touch only those rows' badge cells.
-  bool canTrackBadges = (badges_ != nullptr) && (count_ <= kBadgeCacheCap);
-  bool forceFullBadgeRegion = (badges_ != nullptr) && !canTrackBadges;
-  bool badgeNow[kBadgeCacheCap];
-  bool anyBadgeChanged = false;
-  if (canTrackBadges) {
-    for (uint8_t i = 0; i < count_; i++) {
-      badgeNow[i] = (badges_[i] != nullptr) && badges_[i]();
-      if (badgeNow[i] != lastBadge_[i]) anyBadgeChanged = true;
-    }
   }
 
   Display::setFont(Display::Font::PRIMARY);
@@ -213,6 +194,29 @@ bool ListMenu::tickImpl(const char* title, InputFilterFn dropFilter, bool stopOn
   bool scrolled = !firstDraw && (startIdx != lastDrawnStartIdx_);
   bool selectionChanged = !firstDraw && !scrolled && (selected_ != lastDrawnSelected_);
 
+  // Badges are polled every tick regardless of redraw state (they're
+  // arbitrary caller-provided bool fns, e.g. unread-message checks, and
+  // must stay live) -- for the visible rows only -- but only trigger a
+  // redraw when a value actually flips, per Hardware Fix #1. lastBadge_
+  // holds the visible rows' last drawn values (Hardware Fix #4.1: a
+  // same-viewport flip redraws only those rows' badge cells); a scroll
+  // redraws the row region anyway. Should more rows ever be visible than
+  // kBadgeCacheCap, every tick conservatively redraws the row region.
+  uint8_t shownRows = 0;
+  if (count_ > static_cast<uint8_t>(startIdx))
+    shownRows = static_cast<uint8_t>(count_ - startIdx) < visibleRows ? static_cast<uint8_t>(count_ - startIdx) : visibleRows;
+  bool canTrackBadges = (badges_ != nullptr) && (shownRows <= kBadgeCacheCap);
+  bool forceFullBadgeRegion = (badges_ != nullptr) && !canTrackBadges;
+  bool badgeNow[kBadgeCacheCap];
+  bool anyBadgeChanged = false;
+  if (canTrackBadges) {
+    for (uint8_t k = 0; k < shownRows; k++) {
+      uint8_t i = static_cast<uint8_t>(startIdx + k);
+      badgeNow[k] = (badges_[i] != nullptr) && badges_[i]();
+      if (!firstDraw && !scrolled && badgeNow[k] != lastBadge_[k]) anyBadgeChanged = true;
+    }
+  }
+
   if (!firstDraw && !scrolled && !forceFullBadgeRegion && !anyBadgeChanged && !selectionChanged) return false;
 
   // Marker column: reserved width is measured from the marker glyph
@@ -229,22 +233,44 @@ bool ListMenu::tickImpl(const char* title, InputFilterFn dropFilter, bool stopOn
   int16_t markerW = static_cast<int16_t>(Display::textWidth(">") + 4);
   int16_t labelX = static_cast<int16_t>(2 + markerW);
   int16_t badgeCellW = static_cast<int16_t>(Display::textWidth(" *") + 4);
-
-  auto drawRowFull = [&](uint8_t i, int16_t rowY) {
-    if (i == selected_) Display::printLine(2, rowY, ">");
-    Display::printLine(labelX, rowY, items_[i].label);
-    bool badge = (badges_ != nullptr && badges_[i] != nullptr && badges_[i]());
-    if (badge) {
-      int16_t badgeX = static_cast<int16_t>(labelX + Display::textWidth(items_[i].label));
-      Display::printLine(badgeX, rowY, " *");
+  bool reserved = (badgeLayout_ == BadgeLayout::RESERVED_COLUMN);
+  // Right-aligned with the clipping measure (fitWidth(): the glyphs' actual
+  // extent, as printLine() clips), with a small margin, so the badge is
+  // never clipped at the screen edge.
+  int16_t reservedBadgeX = static_cast<int16_t>(Display::kScreenWidth - Display::fitWidth(" *") - 2);
+  auto badgeXFor = [&](uint8_t i) -> int16_t {
+    return reserved ? reservedBadgeX : static_cast<int16_t>(labelX + Display::textWidth(items_[i].label));
+  };
+  // RESERVED_COLUMN: the label is cut (whole glyphs) to end before the badge
+  // cell, badge drawn or not, so the layout never shifts.
+  auto drawLabel = [&](uint8_t i, int16_t rowY) {
+    if (!reserved) {
+      Display::printLine(labelX, rowY, items_[i].label);
+      return;
     }
+    char cut[Display::kPrintLineBufferSize];
+    strncpy(cut, items_[i].label, sizeof(cut) - 1);
+    cut[sizeof(cut) - 1] = '\0';
+    size_t n = strlen(cut);
+    while (n > 0 && labelX + Display::fitWidth(cut) > reservedBadgeX) cut[--n] = '\0';
+    Display::printLine(labelX, rowY, cut);
+  };
+
+  auto drawRowFull = [&](uint8_t i, int16_t rowY, bool badge) {
+    if (i == selected_) Display::printLine(2, rowY, ">");
+    drawLabel(i, rowY);
+    if (badge) Display::printLine(badgeXFor(i), rowY, " *");
+  };
+  auto badgeOf = [&](uint8_t i) -> bool {
+    if (canTrackBadges) return badgeNow[i - startIdx];
+    return badges_ != nullptr && badges_[i] != nullptr && badges_[i]();
   };
 
   if (firstDraw) {
     Display::clearContentArea();
     if (title != nullptr) Display::printLine(2, titleY, title);
     for (uint8_t i = static_cast<uint8_t>(startIdx); i < count_ && i < startIdx + visibleRows; i++) {
-      drawRowFull(i, static_cast<int16_t>(rowsTopY + (i - startIdx) * lh));
+      drawRowFull(i, static_cast<int16_t>(rowsTopY + (i - startIdx) * lh), badgeOf(i));
     }
     needsFullRedraw_ = false;
   } else if (scrolled || forceFullBadgeRegion) {
@@ -252,7 +278,7 @@ bool ListMenu::tickImpl(const char* title, InputFilterFn dropFilter, bool stopOn
     if (regionH < 0) regionH = 0;
     Display::tft().fillRect(0, rowsTopY, Display::kScreenWidth, regionH, ST77XX_BLACK);
     for (uint8_t i = static_cast<uint8_t>(startIdx); i < count_ && i < startIdx + visibleRows; i++) {
-      drawRowFull(i, static_cast<int16_t>(rowsTopY + (i - startIdx) * lh));
+      drawRowFull(i, static_cast<int16_t>(rowsTopY + (i - startIdx) * lh), badgeOf(i));
     }
   } else {
     // Same viewport: erase each cell explicitly before drawing -- PRIMARY
@@ -266,18 +292,19 @@ bool ListMenu::tickImpl(const char* title, InputFilterFn dropFilter, bool stopOn
       Display::printLine(2, newY, ">");
     }
     if (anyBadgeChanged) {
-      for (uint8_t i = static_cast<uint8_t>(startIdx); i < count_ && i < startIdx + visibleRows; i++) {
-        if (badgeNow[i] == lastBadge_[i]) continue;
-        int16_t rowY = static_cast<int16_t>(rowsTopY + (i - startIdx) * lh);
-        int16_t badgeX = static_cast<int16_t>(labelX + Display::textWidth(items_[i].label));
+      for (uint8_t k = 0; k < shownRows; k++) {
+        if (badgeNow[k] == lastBadge_[k]) continue;
+        uint8_t i = static_cast<uint8_t>(startIdx + k);
+        int16_t rowY = static_cast<int16_t>(rowsTopY + k * lh);
+        int16_t badgeX = badgeXFor(i);
         Display::tft().fillRect(badgeX, rowY, badgeCellW, lh, ST77XX_BLACK);
-        if (badgeNow[i]) Display::printLine(badgeX, rowY, " *");
+        if (badgeNow[k]) Display::printLine(badgeX, rowY, " *");
       }
     }
   }
 
   if (canTrackBadges) {
-    for (uint8_t i = 0; i < count_; i++) lastBadge_[i] = badgeNow[i];
+    for (uint8_t k = 0; k < kBadgeCacheCap; k++) lastBadge_[k] = k < shownRows && badgeNow[k];
   }
   lastDrawnStartIdx_ = startIdx;
   lastDrawnSelected_ = selected_;

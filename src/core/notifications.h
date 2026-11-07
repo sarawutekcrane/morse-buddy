@@ -49,6 +49,16 @@ bool readMovedOnto(const char* group_code, const char* contact_key, uint32_t seq
 
 uint16_t getUnreadCount(const char* group_code, const char* contact_key);
 
+// Read-only, from the in-memory summaries (no storage access): whether the
+// conversation (group_code, contact_key) -- or, contact_key nullptr, any
+// conversation of that group, its Everyone included -- may hold unread
+// received messages of the badge category (BADGE_TEXT or BADGE_ENIGMA), by
+// the same rule as the Main Menu badges: Text = TEXT or GAME records,
+// Enigma = ENIGMA or GAME (a Friend game record appears in both chats). An
+// UNRESOLVED conversation (counts unknown) answers by its category flags,
+// i.e. conservatively "possibly unread".
+bool hasUnreadIn(const char* group_code, const char* contact_key, uint8_t badgeMask);
+
 bool hasAnyUnreadText();
 bool hasAnyUnreadEnigma();
 bool hasAnyUnreadTrainingGame();

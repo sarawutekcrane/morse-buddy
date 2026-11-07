@@ -62,10 +62,11 @@ class ListMenu {
  public:
   // badges, when given, must point to an array the same length as items
   // (entries may be nullptr for "no badge"); the array must outlive this
-  // ListMenu instance (a static/global array, as with items). Badge-change
-  // dirty-tracking only applies up to kBadgeCacheCap items; beyond that,
-  // badges are treated as always-possibly-changed (correct, just not
-  // optimized -- no caller currently passes more than a handful).
+  // ListMenu instance (a static/global array, as with items). Badges are
+  // polled for the visible rows only; a change redraws just those badge
+  // cells. Up to kBadgeCacheCap visible rows are tracked (the screen shows
+  // far fewer); beyond that every tick redraws the row region (correct,
+  // just not optimized).
   static constexpr uint8_t kBadgeCacheCap = 8;
 
   // PUSH_SCREEN (default): DOT/DASH confirm pushes items_[selected_].onSelect
@@ -84,6 +85,13 @@ class ListMenu {
   // it should only save/apply the value and fire any required hook.
   enum class SelectionMode : uint8_t { PUSH_SCREEN, IN_PLACE };
 
+  // Where a row's badge (" *") goes. AFTER_LABEL (default, as ever): right
+  // after the label text. RESERVED_COLUMN: in a fixed cell at the right edge
+  // of the row, the label clipped before it -- a long label, or the
+  // selection marker, can never hide or overwrite the badge (the friend and
+  // group lists' unread markers).
+  enum class BadgeLayout : uint8_t { AFTER_LABEL, RESERVED_COLUMN };
+
   // initialSelected: the cursor's starting row. Callers rendering a
   // persisted enum/bool picker pass the index matching the currently saved
   // value, so the picker opens on the active choice instead of always
@@ -91,7 +99,8 @@ class ListMenu {
   // existing non-persisted-picker callers are unaffected. Out-of-range
   // values are clamped to 0.
   void configure(const SettingItem* items, uint8_t count, const BadgeFn* badges = nullptr,
-                 uint8_t initialSelected = 0, SelectionMode selectionMode = SelectionMode::PUSH_SCREEN);
+                 uint8_t initialSelected = 0, SelectionMode selectionMode = SelectionMode::PUSH_SCREEN,
+                 BadgeLayout badgeLayout = BadgeLayout::AFTER_LABEL);
   void tick(const char* title);
 
   // Phase 2C-2, opt-in (legacy tick() above is unchanged): returns true to
@@ -123,10 +132,11 @@ class ListMenu {
   uint8_t count_ = 0;
   uint8_t selected_ = 0;
   SelectionMode selectionMode_ = SelectionMode::PUSH_SCREEN;
+  BadgeLayout badgeLayout_ = BadgeLayout::AFTER_LABEL;
   bool needsFullRedraw_ = true;
   int16_t lastDrawnStartIdx_ = -1;  // -1: nothing drawn yet (forces firstDraw's own path anyway)
   uint8_t lastDrawnSelected_ = 0;
-  bool lastBadge_[kBadgeCacheCap] = {};
+  bool lastBadge_[kBadgeCacheCap] = {};  // per VISIBLE row (index - lastDrawnStartIdx_)
 };
 
 namespace Menu {

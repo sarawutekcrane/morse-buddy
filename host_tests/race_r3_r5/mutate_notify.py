@@ -6,11 +6,11 @@
 # mutation must fail at least one of them.
 import os, subprocess, sys, shutil, tempfile
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
-NT, TX, EN, SM, OB, IQ, HD = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h", "history_dates.h"
+NT, TX, EN, SM, OB, IQ, HD, MN = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h", "history_dates.h", "menu.cpp"
 muts = [
  # ---- categories ----
- (NT, "GAME record does not light the Text badge", "    if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0 || s.unread[SLOT_GAME] > 0)) return true;", "    if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0)) return true;"),
- (NT, "categories merged again (any unread lights every badge)", "    if (s.state == SUMMARY_FREE) continue;  // COUNTED: counts; UNRESOLVED: category flags -- same test\n", "    if (s.state == SUMMARY_FREE) continue;\n    if (totalUnread(s) > 0 && (mask & (BADGE_TEXT | BADGE_ENIGMA))) return true;\n"),
+ (NT, "GAME record does not light the Text badge", "  if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0 || s.unread[SLOT_GAME] > 0)) return true;", "  if ((mask & BADGE_TEXT) && (s.unread[SLOT_TEXT] > 0)) return true;"),
+ (NT, "categories merged again (any unread lights every badge)", "  if (s.state == SUMMARY_FREE) return false;\n", "  if (s.state == SUMMARY_FREE) return false;\n  if (totalUnread(s) > 0 && (mask & (BADGE_TEXT | BADGE_ENIGMA))) return true;\n"),
  (NT, "clear decrements the wrong category", "  int slot = slotForType(view.envelope.message_type);\n  if (slot >= 0 && s->unread[slot] > 0) {", "  int slot = SLOT_GAME;\n  if (slot >= 0 && s->unread[slot] > 0) {"),
  (NT, "arrival counted under a guessed category when the stored type is known", "    int slot = loaded ? slotForType(view.envelope.message_type) : -1;", "    int slot = loaded ? SLOT_GAME : -1;"),
  # ---- per-message read (round 5: replaces read up to the selection) ----
@@ -53,6 +53,22 @@ muts = [
  (NT, "ending a request ignores its sequence (another message's request ends too)", "strcmp(p.contact_key, contact_key) != 0 || p.sequence != *sequence) continue;", "strcmp(p.contact_key, contact_key) != 0) continue;"),
  (SM, "an evicted record whose header could not be read is not reported", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (removed && notifyIfUnread && haveHdr && (hdr.flags & FLAG_UNREAD) && g_onEvicted != nullptr) {"),
  (SM, "a failed removal is reported as an eviction", "  if (removed && notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {", "  if (notifyIfUnread && (!haveHdr || (hdr.flags & FLAG_UNREAD)) && g_onEvicted != nullptr) {"),
+ # ---- round 8: unread markers on the friend and group lists ----
+ (NT, "a friend row is lit by any conversation of its group", "    if (contact_key != nullptr && strcmp(s.contact_key, contact_key) != 0) continue;\n    if (summaryShows(s, badgeMask)) return true;", "    if (summaryShows(s, badgeMask)) return true;"),
+ (NT, "a row is lit by another group's conversation", "    if (strcmp(s.group_code, group_code) != 0) continue;\n    if (contact_key", "    if (contact_key"),
+ (TX, "Text: friend rows lit by either category", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT);", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA);"),
+ (EN, "Enigma: friend rows lit by either category", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_ENIGMA);", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA);"),
+ (TX, "Text: every friend row shows the first row's conversation", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT);", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[0], Notifications::BADGE_TEXT);"),
+ (EN, "Enigma: every friend row shows the first row's conversation", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_ENIGMA);", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[0], Notifications::BADGE_ENIGMA);"),
+ (TX, "Text: a group row shows only its Everyone", "  return g.configured && Notifications::hasUnreadIn(g.code, nullptr, Notifications::BADGE_TEXT);", "  return g.configured && Notifications::hasUnreadIn(g.code, MessageStore::kEveryone, Notifications::BADGE_TEXT);"),
+ (EN, "Enigma: a group row shows only its Everyone", "  return g.configured && Notifications::hasUnreadIn(g.code, nullptr, Notifications::BADGE_ENIGMA);", "  return g.configured && Notifications::hasUnreadIn(g.code, MessageStore::kEveryone, Notifications::BADGE_ENIGMA);"),
+ (TX, "Text: no markers on the friend list", "    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, 0,", "    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, nullptr, 0,"),
+ (EN, "Enigma: no markers on the group list", "    g_groupSelectListMenu.configure(g_groupSelectItems, n, kGroupRowBadges, 0, ListMenu::SelectionMode::PUSH_SCREEN,", "    g_groupSelectListMenu.configure(g_groupSelectItems, n, nullptr, 0, ListMenu::SelectionMode::PUSH_SCREEN,"),
+ (MN, "ListMenu: a badge change on the same screen is not redrawn", "      if (!firstDraw && !scrolled && badgeNow[k] != lastBadge_[k]) anyBadgeChanged = true;", "      (void)k;"),
+ (MN, "ListMenu: the reserved badge column is ignored (badge after a long label, clipped)", "    return reserved ? reservedBadgeX : static_cast<int16_t>(labelX + Display::textWidth(items_[i].label));", "    return static_cast<int16_t>(labelX + Display::textWidth(items_[i].label));"),
+ (MN, "ListMenu: the reserved column placed by textWidth (the badge clipped at the edge)", "  int16_t reservedBadgeX = static_cast<int16_t>(Display::kScreenWidth - Display::fitWidth(\" *\") - 2);", "  int16_t reservedBadgeX = static_cast<int16_t>(Display::kScreenWidth - badgeCellW);"),
+ (MN, "ListMenu: the label is not cut before the reserved column", "    while (n > 0 && labelX + Display::fitWidth(cut) > reservedBadgeX) cut[--n] = '\\0';", "    (void)n;"),
+ (MN, "ListMenu: badges beyond the cache cap force a full redraw every tick (as before round 8)", "  bool canTrackBadges = (badges_ != nullptr) && (shownRows <= kBadgeCacheCap);", "  bool canTrackBadges = (badges_ != nullptr) && (count_ <= kBadgeCacheCap);"),
  # ---- date headings (round 5) ----
  (HD, "headings in UTC, not Thailand time", "  return (ts + kThaiOffsetSeconds) / 86400u;", "  return ts / 86400u;"),
  (HD, "untrusted timestamps shown with an invented date (only 0 is unknown)", "  if (ts < kTrustedFrom || ts >= kTrustedUntil) return kUnknownDay;", "  if (ts == 0) return kUnknownDay;"),
@@ -258,7 +274,7 @@ def one(k, mut):
     target, name, old, new = mut
     out = os.path.join(H, "out", "mutn%d" % k)
     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
-    for x in (NT, TX, EN, SM, OB, IQ, HD, "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+    for x in (NT, TX, EN, SM, OB, IQ, HD, MN, "menu.h", "list_badges.h", "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
     p = out + "/core/" + target; src = open(p).read()
     open(p, "w").write(src.replace(old, new))
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])

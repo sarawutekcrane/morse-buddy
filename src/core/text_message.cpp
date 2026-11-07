@@ -6,6 +6,7 @@
 #include "core/display.h"
 #include "core/held_input.h"
 #include "core/history_dates.h"
+#include "core/list_badges.h"
 #include "core/hooks.h"
 #include "core/identity.h"
 #include "core/identity_color.h"
@@ -221,6 +222,18 @@ SettingItem g_groupSelectItems[Settings::kMaxGroups];
 char g_groupSelectLabelBuf[Settings::kMaxGroups][21];
 ListMenu g_groupSelectListMenu;
 
+// Unread markers on the list rows (round 8): from the in-memory summaries
+// only (Notifications::hasUnreadIn() -- no storage access), Text's
+// category. A group row aggregates that group's conversations, its
+// Everyone included; a recipient row is one conversation.
+template <uint8_t I>
+bool groupRowUnread() {
+  Settings::FamilyGroup g = Settings::getGroup(I);  // (RAM)
+  return g.configured && Notifications::hasUnreadIn(g.code, nullptr, Notifications::BADGE_TEXT);
+}
+const BadgeFn kGroupRowBadges[Settings::kMaxGroups] = {MB_BADGE_ROWS5(groupRowUnread, 0)};
+static_assert(Settings::kMaxGroups == 5, "one badge function per group row");
+
 void groupSelectTrampoline() {
   uint8_t idx = g_groupSelectListMenu.selectedIndex();
   Settings::FamilyGroup g = Settings::getGroup(idx);
@@ -239,7 +252,8 @@ void screenGroupSelect() {
       g_groupSelectLabelBuf[i][sizeof(g_groupSelectLabelBuf[i]) - 1] = '\0';
       g_groupSelectItems[i] = SettingItem{g_groupSelectLabelBuf[i], groupSelectTrampoline};
     }
-    g_groupSelectListMenu.configure(g_groupSelectItems, n);
+    g_groupSelectListMenu.configure(g_groupSelectItems, n, kGroupRowBadges, 0, ListMenu::SelectionMode::PUSH_SCREEN,
+                                    ListMenu::BadgeLayout::RESERVED_COLUMN);
   }
   Display::drawStatusBar();
   g_groupSelectListMenu.tick("Select Group");
@@ -254,6 +268,14 @@ char g_recipientLabelBuf[kMaxRecipientItems][40];
 char g_recipientContactKeys[kMaxRecipientItems][MessageStore::kContactKeyLen];
 uint8_t g_recipientItemCount = 0;
 ListMenu g_recipientListMenu;
+
+template <uint8_t I>
+bool recipientRowUnread() {
+  return I < g_recipientItemCount &&
+         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT);
+}
+const BadgeFn kRecipientRowBadges[kMaxRecipientItems] = {MB_BADGE_ROWS40(recipientRowUnread), recipientRowUnread<40>};
+static_assert(kMaxRecipientItems == 41, "one badge function per recipient row");
 
 void appendDeviceSuffix(char* label, size_t labelBufSize, const char* device_id) {
   size_t idLen = strlen(device_id);
@@ -333,7 +355,8 @@ void screenRecipient() {
       g_recipientItemCount++;
     }
 
-    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount);
+    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, 0,
+                                  ListMenu::SelectionMode::PUSH_SCREEN, ListMenu::BadgeLayout::RESERVED_COLUMN);
   }
   Display::drawStatusBar();
   g_recipientListMenu.tick("Recipient");
