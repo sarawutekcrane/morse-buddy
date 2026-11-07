@@ -536,7 +536,7 @@
           rowWhileFailing, starWhileFailing, starStill, cleared, stillListed, countPrefix(next, kAbsent));
   }
 
-  g_test = "LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows";
+  g_test = "LR6 (round 10: was \"one ordinary row dropped\") a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every ordinary row, every unread one and Everyone stay reachable";
   for (int enigma = 0; enigma < 2; enigma++) {
     freshDevice();
     storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
@@ -573,8 +573,8 @@
     loopPass(3);
     bool stillEveryone = selectedLabel() == "Everyone";
     std::vector<std::string> rows2 = listRows();
-    // A fourth arrives while the row it would replace (the last read one) is
-    // selected: that row stays, selected; another read row makes room.
+    // A fourth arrives while the row round 9 would have replaced (the last
+    // read one) is selected: it stays, selected, and nothing is dropped.
     std::string victim;
     for (auto& r : rows2)
       if (r.rfind("On", 0) == 0 || r.rfind("Rec", 0) == 0) victim = r;
@@ -584,17 +584,19 @@
     bool victimKept = selectedLabel() == victim;
     std::vector<std::string> rows3 = listRows();
     toMain();
-    CHECK(victimKept && rows3.size() == 41 && countPrefix(rows3, victim) == 1 && countPrefix(rows3, "AB5E00000004") == 1 &&
+    CHECK(countPrefix(rows3, "On") + countPrefix(rows3, "Rec") == 39, "%s: ordinary rows after two arrivals on the full list: %d (expected 39)",
+          kChatName[enigma], countPrefix(rows3, "On") + countPrefix(rows3, "Rec"));
+    CHECK(victimKept && rows3.size() == 44 && countPrefix(rows3, victim) == 1 && countPrefix(rows3, "AB5E00000004") == 1 &&
               countPrefix(rows3, "Everyone") == 1 && countPrefix(rows3, kAbsent3) == 1,
           "%s: arrival with the replaceable row '%s' selected: still selected %d, listed %d; new row %d; %zu rows", kChatName[enigma], victim.c_str(),
           victimKept, countPrefix(rows3, victim), countPrefix(rows3, "AB5E00000004"), rows3.size());
     int ordinary = countPrefix(rows, "On") + countPrefix(rows, "Rec");
-    CHECK(on == 20 && rec >= 19 && rows.size() == 41 && countPrefix(rows, "Everyone") == 1 && countPrefix(rows, kAbsent) == 1 &&
-              countPrefix(rows, kAbsent2) == 1 && aStar && bStar && ordinary == 38,
-          "%s: presence online %u recent %u; %zu rows (expected 41): Everyone %d, unread %d %d (starred %d %d), ordinary %d (expected 38: one dropped)",
+    CHECK(on == 20 && rec >= 19 && rows.size() == 42 && countPrefix(rows, "Everyone") == 1 && countPrefix(rows, kAbsent) == 1 &&
+              countPrefix(rows, kAbsent2) == 1 && aStar && bStar && ordinary == 39,
+          "%s: presence online %u recent %u; %zu rows (expected 42): Everyone %d, unread %d %d (starred %d %d), ordinary %d (expected 39: none dropped)",
           kChatName[enigma], on, rec, rows.size(), countPrefix(rows, "Everyone"), countPrefix(rows, kAbsent), countPrefix(rows, kAbsent2), aStar, bStar,
           ordinary);
-    CHECK(rows2.size() == 41 && countPrefix(rows2, kAbsent3) == 1 && countPrefix(rows2, "Everyone") == 1 && countPrefix(rows2, kAbsent) == 1 &&
+    CHECK(rows2.size() == 43 && countPrefix(rows2, kAbsent3) == 1 && countPrefix(rows2, "Everyone") == 1 && countPrefix(rows2, kAbsent) == 1 &&
               countPrefix(rows2, kAbsent2) == 1 && stillEveryone,
           "%s: after an arrival on the full list: %zu rows; the new one %d, Everyone %d (still selected %d)", kChatName[enigma], rows2.size(),
           countPrefix(rows2, kAbsent3), countPrefix(rows2, "Everyone"), stillEveryone);
@@ -661,5 +663,98 @@
           (unsigned long long)opens, (unsigned long long)entries, reads, writes);
     toMain();
   }
+  // ---- round 10: no ordinary row gives way to an unread one ---------------
+  g_test = "LR9 40 distinct online/recent contacts + Everyone, Everyone selected, unread arrivals from contacts outside them: the cursor stays on Everyone and every original contact, every new sender and one Everyone are reachable and open their own history";
+  for (int enigma = 0; enigma < 2; enigma++) {
+    for (int extras = 1; extras <= 3; extras += 2) {
+      for (int target = 0; target < 2; target++) {  // open: 0 the row round 9 dropped first, 1 the first new sender
+        freshDevice();
+        powerOn(); runFor(30);
+        // 20 online (named), then 20 recent offline seen later through
+        // OFFLINE-only presence (no online slot, so no online contact loses its
+        // place; the later timestamps take every recent slot): 40 distinct.
+        char id[16], name[16], p[120];
+        T::unixTime = 1950000000u;
+        for (int i = 0; i < 20; i++) {
+          snprintf(id, sizeof(id), "C0000000%04d", i);
+          snprintf(name, sizeof(name), "Onl%02d", i);
+          presence(kG, id, name);
+        }
+        T::unixTime = 1990000000u;
+        for (int i = 0; i < 20; i++) {
+          snprintf(id, sizeof(id), "D0000000%04d", i);
+          snprintf(p, sizeof(p), "MBP1|%s|Gone|OFFLINE|0|%lu|255", id, (unsigned long)T::unixTime);
+          Presence::handleIncoming(kG, p, static_cast<uint16_t>(strlen(p)));
+        }
+        T::unixTime = 1700000000u;
+        Presence::OnlineContact oc[20];
+        Presence::RecentContact rc[20];
+        uint8_t on = Presence::getOnlineContacts(kG, oc, 20), rec = Presence::getRecentContacts(kG, rc, 20);
+        int overlap = 0;
+        for (int i = 0; i < on; i++)
+          for (int j = 0; j < rec; j++) overlap += strcmp(oc[i].device_id, rc[j].device_id) == 0;
+        openMode(enigma);
+        FsStats f0 = g_fs;
+        int r0 = PrefsOps::reads(), w0 = PrefsOps::writes();
+        std::vector<std::string> orig = listRows();  // entry order (the selection starts on row 0)
+        bool distinct = true;
+        for (size_t i = 0; i < orig.size(); i++)
+          for (size_t j = i + 1; j < orig.size(); j++) distinct = distinct && orig[i] != orig[j];
+        bool atEveryone = selectRow("Everyone");
+        FsStats f1 = g_fs;
+        int r1 = PrefsOps::reads(), w1 = PrefsOps::writes();
+        const char* kX[3] = {"E000000000A1", "E000000000A2", "E000000000A3"};
+        for (int k = 0; k < extras; k++) {
+          arrive(kX[k], ofType(enigma), kDay06 + 900 + k);
+          loopPass(3);
+        }
+        bool stillEveryone = atEveryone && selectedLabel() == "Everyone";
+        FsStats f2 = g_fs;
+        int r2 = PrefsOps::reads(), w2 = PrefsOps::writes();
+        std::vector<std::string> after = listRows();  // from Everyone, round to it again
+        FsStats f3 = g_fs;
+        int r3 = PrefsOps::reads(), w3 = PrefsOps::writes();
+        int missing = 0;
+        std::string firstMissing;
+        for (auto& o : orig) {
+          int n = 0;
+          for (auto& a : after) n += a == o;
+          if (n != 1) {
+            missing++;
+            if (firstMissing.empty()) firstMissing = o;
+          }
+        }
+        int xRows = 0;
+        for (int k = 0; k < extras; k++) xRows += countPrefix(after, kX[k]) == 1;
+        // The row round 9 drops first: the last row before Everyone at entry.
+        std::string victim = orig.size() >= 2 ? orig[orig.size() - 2] : "";
+        char victimId[13] = {};
+        if (victim.size() >= 12) memcpy(victimId, victim.data(), 12);  // "D0000000nnnn (offline)"
+        const char* openId = target == 0 ? victimId : kX[0];
+        bool opened = false;
+        if (selectRow(target == 0 ? victim : std::string(kX[0]))) {
+          openSelected(enigma);
+          opened = TextMessage::isConversationOpen(kG, openId);
+        }
+        toMain();
+        uint64_t opens = (f1.fileOpens - f0.fileOpens) + (f3.fileOpens - f2.fileOpens);
+        uint64_t entries = (f1.dirEntries - f0.dirEntries) + (f3.dirEntries - f2.dirEntries);
+        int nvs = (r1 - r0) + (r3 - r2) + (w1 - w0) + (w3 - w2);
+        CHECK(on == 20 && rec == 20 && overlap == 0 && orig.size() == 41 && distinct && countPrefix(orig, "Everyone") == 1,
+              "%s: setup: online %u, recent %u, both %d; %zu distinct (%d) rows at entry, Everyone %d", kChatName[enigma], on, rec, overlap,
+              orig.size(), distinct, countPrefix(orig, "Everyone"));
+        CHECK(stillEveryone && after.size() == 41u + extras && missing == 0 && xRows == extras && countPrefix(after, "Everyone") == 1,
+              "%s, %d new sender(s): cursor on Everyone %d; %zu destinations (expected %d); original contacts unreachable %d (first: '%s'); new "
+              "senders listed %d; Everyone rows %d",
+              kChatName[enigma], extras, stillEveryone, after.size(), 41 + extras, missing, firstMissing.c_str(), xRows,
+              countPrefix(after, "Everyone"));
+        CHECK(opened, "%s, %d new sender(s): '%s' opens its own history (%s): %d", kChatName[enigma], extras,
+              target == 0 ? victim.c_str() : kX[0], openId, opened);
+        CHECK(opens == 0 && entries == 0 && nvs == 0, "%s: navigating the list: %llu opens, %llu directory entries, %d NVS reads+writes",
+              kChatName[enigma], (unsigned long long)opens, (unsigned long long)entries, nvs);
+      }
+    }
+  }
+
   (void)none;
 }
