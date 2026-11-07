@@ -367,6 +367,7 @@ namespace Notifications {
 void onMessageArrived(const char*, const char*, const MessageRef&, uint8_t, bool, bool) { T::notifications++; }
 void clearUnread(const char*, const char*, const MessageRef&) {}
 bool readMovedOnto(const char*, const char*, uint32_t, const char*) { return true; }
+bool hasUnreadIn(const char*, const char*, uint8_t) { return false; }
 }
 #endif
 namespace Settings {
