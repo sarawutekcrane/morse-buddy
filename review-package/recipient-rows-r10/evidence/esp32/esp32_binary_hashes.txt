@@ -1,0 +1,13 @@
+# ESP32 build of 2a5af03dcf0eeda7845c8a3e866ffd52252c09df (git archive; 89 files compared, 0 differ; pio run, espressif32@6.13.0; 0 warnings). Not flashed.
+# src identical to 929adf1 (the later commit changes only mutate_notify.py).
+# Static DRAM: dram0_0_seg 124580 B; used = _heap_start (0x3ffdbdb0) - 0x3ffbdb5c.
+RAM:   [====      ]  37.7% (used 123468 bytes from 327680 bytes)
+Flash: [========  ]  84.6% (used 1220333 bytes from 1441792 bytes)
+static DRAM used 123476 of 124580 B, headroom 1104 B (0c73862: 64 B)
+f3888acaf7193a224f7862f71c67ac0ef761ff46598a9389cc869ab968ff99b2  firmware.bin
+4c1ef81e8aa72a4c28c7242ca5ecd46ccb6e9879461456eac39b0c95aa91f989  firmware.elf
+# shared recipient row store (.bss; replaces two 41-row stores of 2666 B each in text_message.cpp and enigma.cpp):
+3ffc5db0 000010c4 V RecipientRows::rows()::s
+# per-row badge tables (.flash.rodata):
+3f401dd0 00000108 d (anonymous namespace)::kRecipientRowBadges
+3f404688 00000108 d (anonymous namespace)::kRecipientRowBadges

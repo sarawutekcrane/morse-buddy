@@ -1,0 +1,297 @@
+diff --git a/host_tests/race_r3_r5/list_marker_tests.inc b/host_tests/race_r3_r5/list_marker_tests.inc
+index 526c988..92e857d 100644
+--- a/host_tests/race_r3_r5/list_marker_tests.inc
++++ b/host_tests/race_r3_r5/list_marker_tests.inc
+@@ -342,7 +342,7 @@
+     std::vector<std::string> rows;
+     std::string first = selectedLabel();
+     rows.push_back(first);
+-    for (int i = 0; i < 60; i++) {
++    for (int i = 0; i < 100; i++) {  // (more than the 66 rows)
+       rot(1);
+       std::string l = selectedLabel();
+       if (l == first) break;
+@@ -357,7 +357,7 @@
+   };
+   // Moves the selection onto the row starting with `prefix` (false: not listed).
+   auto selectRow = [&](const std::string& prefix) {
+-    for (int i = 0; i < 60; i++) {
++    for (int i = 0; i < 100; i++) {  // (more than the 66 rows)
+       if (selectedLabel().rfind(prefix, 0) == 0) return true;
+       rot(1);
+     }
+@@ -536,7 +536,7 @@
+           rowWhileFailing, starWhileFailing, starStill, cleared, stillListed, countPrefix(next, kAbsent));
+   }
+ 
+-  g_test = "LR6 a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every unread one and Everyone stay reachable within the 41 rows";
++  g_test = "LR6 (round 10: was \"one ordinary row dropped\") a full ordinary list (20 online, 19 recent) plus unread contacts outside it: every ordinary row, every unread one and Everyone stay reachable";
+   for (int enigma = 0; enigma < 2; enigma++) {
+     freshDevice();
+     storeIn(enigma, kG, kAbsent, true, kDay06 + 60);
+@@ -573,8 +573,8 @@
+     loopPass(3);
+     bool stillEveryone = selectedLabel() == "Everyone";
+     std::vector<std::string> rows2 = listRows();
+-    // A fourth arrives while the row it would replace (the last read one) is
+-    // selected: that row stays, selected; another read row makes room.
++    // A fourth arrives while the row round 9 would have replaced (the last
++    // read one) is selected: it stays, selected, and nothing is dropped.
+     std::string victim;
+     for (auto& r : rows2)
+       if (r.rfind("On", 0) == 0 || r.rfind("Rec", 0) == 0) victim = r;
+@@ -584,17 +584,19 @@
+     bool victimKept = selectedLabel() == victim;
+     std::vector<std::string> rows3 = listRows();
+     toMain();
+-    CHECK(victimKept && rows3.size() == 41 && countPrefix(rows3, victim) == 1 && countPrefix(rows3, "AB5E00000004") == 1 &&
++    CHECK(countPrefix(rows3, "On") + countPrefix(rows3, "Rec") == 39, "%s: ordinary rows after two arrivals on the full list: %d (expected 39)",
++          kChatName[enigma], countPrefix(rows3, "On") + countPrefix(rows3, "Rec"));
++    CHECK(victimKept && rows3.size() == 44 && countPrefix(rows3, victim) == 1 && countPrefix(rows3, "AB5E00000004") == 1 &&
+               countPrefix(rows3, "Everyone") == 1 && countPrefix(rows3, kAbsent3) == 1,
+           "%s: arrival with the replaceable row '%s' selected: still selected %d, listed %d; new row %d; %zu rows", kChatName[enigma], victim.c_str(),
+           victimKept, countPrefix(rows3, victim), countPrefix(rows3, "AB5E00000004"), rows3.size());
+     int ordinary = countPrefix(rows, "On") + countPrefix(rows, "Rec");
+-    CHECK(on == 20 && rec >= 19 && rows.size() == 41 && countPrefix(rows, "Everyone") == 1 && countPrefix(rows, kAbsent) == 1 &&
+-              countPrefix(rows, kAbsent2) == 1 && aStar && bStar && ordinary == 38,
+-          "%s: presence online %u recent %u; %zu rows (expected 41): Everyone %d, unread %d %d (starred %d %d), ordinary %d (expected 38: one dropped)",
++    CHECK(on == 20 && rec >= 19 && rows.size() == 42 && countPrefix(rows, "Everyone") == 1 && countPrefix(rows, kAbsent) == 1 &&
++              countPrefix(rows, kAbsent2) == 1 && aStar && bStar && ordinary == 39,
++          "%s: presence online %u recent %u; %zu rows (expected 42): Everyone %d, unread %d %d (starred %d %d), ordinary %d (expected 39: none dropped)",
+           kChatName[enigma], on, rec, rows.size(), countPrefix(rows, "Everyone"), countPrefix(rows, kAbsent), countPrefix(rows, kAbsent2), aStar, bStar,
+           ordinary);
+-    CHECK(rows2.size() == 41 && countPrefix(rows2, kAbsent3) == 1 && countPrefix(rows2, "Everyone") == 1 && countPrefix(rows2, kAbsent) == 1 &&
++    CHECK(rows2.size() == 43 && countPrefix(rows2, kAbsent3) == 1 && countPrefix(rows2, "Everyone") == 1 && countPrefix(rows2, kAbsent) == 1 &&
+               countPrefix(rows2, kAbsent2) == 1 && stillEveryone,
+           "%s: after an arrival on the full list: %zu rows; the new one %d, Everyone %d (still selected %d)", kChatName[enigma], rows2.size(),
+           countPrefix(rows2, kAbsent3), countPrefix(rows2, "Everyone"), stillEveryone);
+@@ -661,5 +663,169 @@
+           (unsigned long long)opens, (unsigned long long)entries, reads, writes);
+     toMain();
+   }
++  // ---- round 10: no ordinary row gives way to an unread one ---------------
++  g_test = "LR9 40 distinct online/recent contacts + Everyone, Everyone selected, unread arrivals from contacts outside them: the cursor stays on Everyone and every original contact, every new sender and one Everyone are reachable and open their own history";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    for (int extras = 1; extras <= 3; extras += 2) {
++      for (int target = 0; target < 2; target++) {  // open: 0 the row round 9 dropped first, 1 the first new sender
++        freshDevice();
++        powerOn(); runFor(30);
++        // 20 online (named), then 20 recent offline seen later through
++        // OFFLINE-only presence (no online slot, so no online contact loses its
++        // place; the later timestamps take every recent slot): 40 distinct.
++        char id[16], name[16], p[120];
++        T::unixTime = 1950000000u;
++        for (int i = 0; i < 20; i++) {
++          snprintf(id, sizeof(id), "C0000000%04d", i);
++          snprintf(name, sizeof(name), "Onl%02d", i);
++          presence(kG, id, name);
++        }
++        T::unixTime = 1990000000u;
++        for (int i = 0; i < 20; i++) {
++          snprintf(id, sizeof(id), "D0000000%04d", i);
++          snprintf(p, sizeof(p), "MBP1|%s|Gone|OFFLINE|0|%lu|255", id, (unsigned long)T::unixTime);
++          Presence::handleIncoming(kG, p, static_cast<uint16_t>(strlen(p)));
++        }
++        T::unixTime = 1700000000u;
++        Presence::OnlineContact oc[20];
++        Presence::RecentContact rc[20];
++        uint8_t on = Presence::getOnlineContacts(kG, oc, 20), rec = Presence::getRecentContacts(kG, rc, 20);
++        int overlap = 0;
++        for (int i = 0; i < on; i++)
++          for (int j = 0; j < rec; j++) overlap += strcmp(oc[i].device_id, rc[j].device_id) == 0;
++        openMode(enigma);
++        FsStats f0 = g_fs;
++        int r0 = PrefsOps::reads(), w0 = PrefsOps::writes();
++        std::vector<std::string> orig = listRows();  // entry order (the selection starts on row 0)
++        bool distinct = true;
++        for (size_t i = 0; i < orig.size(); i++)
++          for (size_t j = i + 1; j < orig.size(); j++) distinct = distinct && orig[i] != orig[j];
++        bool atEveryone = selectRow("Everyone");
++        FsStats f1 = g_fs;
++        int r1 = PrefsOps::reads(), w1 = PrefsOps::writes();
++        const char* kX[3] = {"E000000000A1", "E000000000A2", "E000000000A3"};
++        for (int k = 0; k < extras; k++) {
++          arrive(kX[k], ofType(enigma), kDay06 + 900 + k);
++          loopPass(3);
++        }
++        bool stillEveryone = atEveryone && selectedLabel() == "Everyone";
++        FsStats f2 = g_fs;
++        int r2 = PrefsOps::reads(), w2 = PrefsOps::writes();
++        std::vector<std::string> after = listRows();  // from Everyone, round to it again
++        FsStats f3 = g_fs;
++        int r3 = PrefsOps::reads(), w3 = PrefsOps::writes();
++        int missing = 0;
++        std::string firstMissing;
++        for (auto& o : orig) {
++          int n = 0;
++          for (auto& a : after) n += a == o;
++          if (n != 1) {
++            missing++;
++            if (firstMissing.empty()) firstMissing = o;
++          }
++        }
++        int xRows = 0;
++        for (int k = 0; k < extras; k++) xRows += countPrefix(after, kX[k]) == 1;
++        // The row round 9 drops first: the last row before Everyone at entry.
++        std::string victim = orig.size() >= 2 ? orig[orig.size() - 2] : "";
++        char victimId[13] = {};
++        if (victim.size() >= 12) memcpy(victimId, victim.data(), 12);  // "D0000000nnnn (offline)"
++        const char* openId = target == 0 ? victimId : kX[0];
++        bool opened = false;
++        if (selectRow(target == 0 ? victim : std::string(kX[0]))) {
++          openSelected(enigma);
++          opened = TextMessage::isConversationOpen(kG, openId);
++        }
++        toMain();
++        uint64_t opens = (f1.fileOpens - f0.fileOpens) + (f3.fileOpens - f2.fileOpens);
++        uint64_t entries = (f1.dirEntries - f0.dirEntries) + (f3.dirEntries - f2.dirEntries);
++        int nvs = (r1 - r0) + (r3 - r2) + (w1 - w0) + (w3 - w2);
++        CHECK(on == 20 && rec == 20 && overlap == 0 && orig.size() == 41 && distinct && countPrefix(orig, "Everyone") == 1,
++              "%s: setup: online %u, recent %u, both %d; %zu distinct (%d) rows at entry, Everyone %d", kChatName[enigma], on, rec, overlap,
++              orig.size(), distinct, countPrefix(orig, "Everyone"));
++        CHECK(stillEveryone && after.size() == 41u + extras && missing == 0 && xRows == extras && countPrefix(after, "Everyone") == 1,
++              "%s, %d new sender(s): cursor on Everyone %d; %zu destinations (expected %d); original contacts unreachable %d (first: '%s'); new "
++              "senders listed %d; Everyone rows %d",
++              kChatName[enigma], extras, stillEveryone, after.size(), 41 + extras, missing, firstMissing.c_str(), xRows,
++              countPrefix(after, "Everyone"));
++        CHECK(opened, "%s, %d new sender(s): '%s' opens its own history (%s): %d", kChatName[enigma], extras,
++              target == 0 ? victim.c_str() : kX[0], openId, opened);
++        CHECK(opens == 0 && entries == 0 && nvs == 0, "%s: navigating the list: %llu opens, %llu directory entries, %d NVS reads+writes",
++              kChatName[enigma], (unsigned long long)opens, (unsigned long long)entries, nvs);
++      }
++    }
++  }
++
++  g_test = "LR10 rows all used while the list stays open (40 ordinary, 25 added, Everyone): a later new sender reuses only an added row whose conversation is no longer unread and is not selected; ordinary rows, Everyone, unread rows and the selected row stay";
++  for (int enigma = 0; enigma < 2; enigma++) {
++    freshDevice();
++    powerOn(); runFor(30);
++    char id[16], name[16], p[120];
++    T::unixTime = 1950000000u;
++    for (int i = 0; i < 20; i++) {
++      snprintf(id, sizeof(id), "C0000000%04d", i);
++      snprintf(name, sizeof(name), "Onl%02d", i);
++      presence(kG, id, name);
++    }
++    T::unixTime = 1990000000u;
++    for (int i = 0; i < 20; i++) {
++      snprintf(id, sizeof(id), "D0000000%04d", i);
++      snprintf(p, sizeof(p), "MBP1|%s|Gone|OFFLINE|0|%lu|255", id, (unsigned long)T::unixTime);
++      Presence::handleIncoming(kG, p, static_cast<uint16_t>(strlen(p)));
++    }
++    T::unixTime = 1700000000u;
++    openMode(enigma);
++    std::vector<std::string> orig = listRows();
++    selectRow("Everyone");
++    // 24 new senders: every tracked summary in use, 65 rows.
++    char xs[26][13];
++    MessageRef xref[26];
++    for (int k = 0; k < 26; k++) snprintf(xs[k], sizeof(xs[k]), "F00000000%03d", k);
++    for (int k = 0; k < 24; k++) {
++      xref[k] = arrive(xs[k], ofType(enigma), kDay06 + 900 + k);
++      loopPass(2);
++    }
++    size_t n24 = listRows().size();
++    // X0's read completes while the list is shown: its star clears, its row stays.
++    Notifications::clearUnread(kG, xs[0], xref[0]);
++    loopPass(3);
++    bool x0Kept = selectRow(xs[0]) && !starred(xs[0]);
++    selectRow("Everyone");
++    // X24 reuses X0's summary; the spare row takes it: nothing given up.
++    xref[24] = arrive(xs[24], ofType(enigma), kDay06 + 990);
++    loopPass(3);
++    std::vector<std::string> r66 = listRows();
++    // X1's read completes and X1 is selected; X25 arrives with all 66 rows used:
++    // X0 (read, not selected) is the only row that may give way.
++    Notifications::clearUnread(kG, xs[1], xref[1]);
++    loopPass(3);
++    selectRow(xs[1]);
++    xref[25] = arrive(xs[25], ofType(enigma), kDay06 + 991);
++    loopPass(3);
++    bool x1Selected = selectedLabel().rfind(xs[1], 0) == 0;
++    std::vector<std::string> fin = listRows();
++    bool opened = false;
++    if (selectRow(xs[25])) {
++      openSelected(enigma);
++      opened = TextMessage::isConversationOpen(kG, xs[25]);
++    }
++    toMain();
++    int origMissing = 0, xMissing = 0;
++    for (auto& o : orig) {
++      int n = 0;
++      for (auto& f : fin) n += f == o;
++      origMissing += n != 1;
++    }
++    for (int k = 1; k < 26; k++) xMissing += countPrefix(fin, xs[k]) != 1;
++    CHECK(orig.size() == 41 && n24 == 65 && x0Kept && r66.size() == 66 && countPrefix(r66, xs[0]) == 1 && countPrefix(r66, xs[24]) == 1,
++          "%s: %zu rows at entry, %zu after 24 senders; X0 read: row kept, star off %d; after X24: %zu rows, X0 %d, X24 %d", kChatName[enigma],
++          orig.size(), n24, x0Kept, r66.size(), countPrefix(r66, xs[0]), countPrefix(r66, xs[24]));
++    CHECK(fin.size() == 66 && origMissing == 0 && xMissing == 0 && countPrefix(fin, xs[0]) == 0 && x1Selected && opened &&
++              countPrefix(fin, "Everyone") == 1,
++          "%s: all rows used, X25 arrives with read X1 selected: %zu rows; originals missing %d, X1..X25 missing %d, X0 (read, not selected) "
++          "reused %d; X1 still selected %d; X25 opens its history %d",
++          kChatName[enigma], fin.size(), origMissing, xMissing, countPrefix(fin, xs[0]) == 0, x1Selected, opened);
++  }
++
+   (void)none;
+ }
+diff --git a/host_tests/race_r3_r5/mutate_notify.py b/host_tests/race_r3_r5/mutate_notify.py
+index 639dd82..3bbb239 100644
+--- a/host_tests/race_r3_r5/mutate_notify.py
++++ b/host_tests/race_r3_r5/mutate_notify.py
+@@ -57,29 +57,32 @@ muts = [
+  # ---- round 9: every unread conversation has a recipient row ----
+  (NT, "the unread-contact walk ignores the group", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;", "    if (summaryShows(s, badgeMask)) return s.contact_key;"),
+  (NT, "the unread-contact walk ignores the category", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, 0xFF)) return s.contact_key;"),
+- (RR, "entry: the unread rows wait for the next pass", "  refresh(t, 0);  // then", "  // then"),
+- (RR, "an unread listed contact gets a second row", "    if (findKey(t, summaryKey) >= 0) continue;", "    if (false) continue;"),
+- (RR, "a full list may drop an unread row", "    if (Notifications::hasUnreadIn(t.group, t.keys[i], t.badgeMask)) continue;\n    removeRow", "    removeRow"),
+- (RR, "a full list may drop Everyone", "    if (i == keep || strcmp(t.keys[i], MessageStore::kEveryone) == 0) continue;", "    if (i == keep) continue;"),
++ (RR, "entry: the unread rows wait for the next pass", "  refresh(m, 0);  // then", "  // then"),
++ (RR, "an unread listed contact gets a second row", "    if (findKey(summaryKey) >= 0) continue;", "    if (false) continue;"),
++ (RR, "a full list may reuse an unread row", "    if (Notifications::hasUnreadIn(m.group, r.keys[i], m.badgeMask)) continue;\n    removeRow", "    removeRow"),
++ (RR, "a full list may reuse Everyone", "    if (i == keep || strcmp(r.keys[i], MessageStore::kEveryone) == 0) continue;", "    if (i == keep) continue;"),
++ (RR, "a full list may reuse an ordinary row", "  for (int i = static_cast<int>(r.count) - 1; i >= r.ordinaryEnd; i--) {", "  for (int i = static_cast<int>(r.count) - 1; i >= 0; i--) {"),
+  (RR, "while shown: no row added for a new unread conversation", "  if (!changed) return kNoChange;", "  return kNoChange;"),
+- (RR, "while shown: the selection keeps its index, not its identity", "  int sel = findKey(t, selectedKey);", "  int sel = selected;"),
+- (RR, "while shown: the new row goes after Everyone", "    int at = findKey(t, MessageStore::kEveryone);\n    if (at < 0)", "    int at = -1;\n    if (at < 0)"),
+- (RR, "while shown: a full list may replace the selected row", "    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;", "    if (t.count >= t.cap && !dropReadRow(t, -1)) break;"),
+- (RR, "while shown: a full list adds nothing", "    if (t.count >= t.cap && !dropReadRow(t, findKey(t, selectedKey))) break;", "    if (t.count >= t.cap) break;"),
++ (RR, "while shown: the selection keeps its index, not its identity", "  int sel = findKey(selectedKey);", "  int sel = selected;"),
++ (RR, "while shown: the new row goes after Everyone", "    int at = findKey(MessageStore::kEveryone);\n    if (at < 0)", "    int at = -1;\n    if (at < 0)"),
++ (RR, "while shown: a full list may replace the selected row", "    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;", "    if (r.count >= kMaxRows && !reuseAddedRow(m, -1)) break;"),
++ (RR, "while shown: a full list adds nothing", "    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;", "    if (r.count >= kMaxRows) break;"),
++ (RR, "round 10: rows full at round 9's 41 (an ordinary row would give way)", "    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;", "    if (r.count >= 41 && !reuseAddedRow(m, findKey(selectedKey))) break;"),
++ (RR, "round 10: no spare row (the selected read row could leave no row to reuse)", "    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;", "    if (r.count >= kMaxRows - 1 && !reuseAddedRow(m, findKey(selectedKey))) break;"),
+  (TX, "Text: rows added while shown are not shown (no reconfigure)", "    if (selected != RecipientRows::kNoChange)", "    if (false)"),
+  (EN, "Enigma: rows added while shown are not shown (no reconfigure)", "    if (selected != RecipientRows::kNoChange)", "    if (false)"),
+- (TX, "Text: unread rows for either category", "                              g_selectedGroupCode, Notifications::BADGE_TEXT};", "                              g_selectedGroupCode, Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA};"),
+- (EN, "Enigma: unread rows for either category", "                              g_selectedGroupCode, Notifications::BADGE_ENIGMA};", "                              g_selectedGroupCode, Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA};"),
++ (TX, "Text: unread rows for either category", "  const RecipientRows::Mode mode{g_selectedGroupCode, Notifications::BADGE_TEXT, recipientTrampoline};", "  const RecipientRows::Mode mode{g_selectedGroupCode, Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA, recipientTrampoline};"),
++ (EN, "Enigma: unread rows for either category", "  const RecipientRows::Mode mode{g_selectedGroupCode, Notifications::BADGE_ENIGMA, recipientTrampoline};", "  const RecipientRows::Mode mode{g_selectedGroupCode, Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA, recipientTrampoline};"),
+  # ---- round 8: unread markers on the friend and group lists ----
+  (NT, "a friend row is lit by any conversation of its group", "    if (contact_key != nullptr && strcmp(s.contact_key, contact_key) != 0) continue;\n    if (summaryShows(s, badgeMask)) return true;", "    if (summaryShows(s, badgeMask)) return true;"),
+  (NT, "a row is lit by another group's conversation", "    if (strcmp(s.group_code, group_code) != 0) continue;\n    if (contact_key", "    if (contact_key"),
+- (TX, "Text: friend rows lit by either category", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT);", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA);"),
+- (EN, "Enigma: friend rows lit by either category", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_ENIGMA);", "         Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA);"),
+- (TX, "Text: every friend row shows the first row's conversation", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_TEXT);", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[0], Notifications::BADGE_TEXT);"),
+- (EN, "Enigma: every friend row shows the first row's conversation", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[I], Notifications::BADGE_ENIGMA);", "Notifications::hasUnreadIn(g_selectedGroupCode, g_recipientContactKeys[0], Notifications::BADGE_ENIGMA);"),
++ (TX, "Text: friend rows lit by either category", "  return I < r.count && Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[I], Notifications::BADGE_TEXT);", "  return I < r.count && Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[I], Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA);"),
++ (EN, "Enigma: friend rows lit by either category", "  return I < r.count && Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[I], Notifications::BADGE_ENIGMA);", "  return I < r.count && Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[I], Notifications::BADGE_TEXT | Notifications::BADGE_ENIGMA);"),
++ (TX, "Text: every friend row shows the first row's conversation", "Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[I], Notifications::BADGE_TEXT);", "Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[0], Notifications::BADGE_TEXT);"),
++ (EN, "Enigma: every friend row shows the first row's conversation", "Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[I], Notifications::BADGE_ENIGMA);", "Notifications::hasUnreadIn(g_selectedGroupCode, r.keys[0], Notifications::BADGE_ENIGMA);"),
+  (TX, "Text: a group row shows only its Everyone", "  return g.configured && Notifications::hasUnreadIn(g.code, nullptr, Notifications::BADGE_TEXT);", "  return g.configured && Notifications::hasUnreadIn(g.code, MessageStore::kEveryone, Notifications::BADGE_TEXT);"),
+  (EN, "Enigma: a group row shows only its Everyone", "  return g.configured && Notifications::hasUnreadIn(g.code, nullptr, Notifications::BADGE_ENIGMA);", "  return g.configured && Notifications::hasUnreadIn(g.code, MessageStore::kEveryone, Notifications::BADGE_ENIGMA);"),
+- (TX, "Text: no markers on the friend list", "    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, kRecipientRowBadges, 0,", "    g_recipientListMenu.configure(g_recipientItems, g_recipientItemCount, nullptr, 0,"),
++ (TX, "Text: no markers on the friend list", "    g_recipientListMenu.configure(r.items, r.count, kRecipientRowBadges, 0, ListMenu::SelectionMode::PUSH_SCREEN,", "    g_recipientListMenu.configure(r.items, r.count, nullptr, 0, ListMenu::SelectionMode::PUSH_SCREEN,"),
+  (EN, "Enigma: no markers on the group list", "    g_groupSelectListMenu.configure(g_groupSelectItems, n, kGroupRowBadges, 0, ListMenu::SelectionMode::PUSH_SCREEN,", "    g_groupSelectListMenu.configure(g_groupSelectItems, n, nullptr, 0, ListMenu::SelectionMode::PUSH_SCREEN,"),
+  (MN, "ListMenu: a badge change on the same screen is not redrawn", "      if (!firstDraw && !scrolled && badgeNow[k] != lastBadge_[k]) anyBadgeChanged = true;", "      (void)k;"),
+  (MN, "ListMenu: the reserved badge column is ignored (badge after a long label, clipped)", "    return reserved ? reservedBadgeX : static_cast<int16_t>(labelX + Display::textWidth(items_[i].label));", "    return static_cast<int16_t>(labelX + Display::textWidth(items_[i].label));"),
+@@ -254,6 +257,7 @@ muts = [
+ ]
+ # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
+ equivalent = {
++ "a full list may reuse an ordinary row": "added rows all lie after the ordinary ones (inserted before Everyone) and the scan runs from the end; it only reaches an ordinary row if no added row is reusable, and one always is when all 66 rows are used (25 added rows, at most 23 unread, at most one selected): the bound states the rule, the count guarantees it",
+  "entry: the unread rows wait for the next pass": "the per-pass refresh adds exactly the same rows on the next pass (about 20 ms later), inserting them before Everyone and keeping the selected identity, so input in the entry pass reaches the same row either way; the entry call only avoids a one-frame gap",
+  "the feed ignores the open chat (replaces the index it draws from)": "a current open-chat index is still protected by the cache check, and a stale one is reloaded by the chat's per-pass re-sync (CE23) anyway: the flag only saves that reload (cost, not correctness)",
+  "an unreadable record is fed as read": "without the explicit nullptr feed the next fed record is out of step, which drops the feed; either way the fed index is never used and the chat loads itself",
