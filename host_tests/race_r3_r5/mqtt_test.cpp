@@ -441,6 +441,34 @@ static void testFailureBackoff() {
   CHECK(g_offMainCalls.load() == 0, "calls off the main task: %d", g_offMainCalls.load());
 }
 
+static void testSetupStageFailures() {
+  g_test = "M2b a failed SUBSCRIBE or a failed ONLINE publish fails the attempt: closed, never adopted, counted, retried";
+  for (int which = 0; which < 2; which++) {
+    resetAll();
+    FakeNet::Script s;
+    if (which == 0) s.failSubscribeAt = 3;
+    else s.failPublishOnline = true;
+    setScript(kA, s);
+    addGroup("SF");
+    tick();
+    pumpWorker();
+    tick();
+    std::string id = clientIdOf("SF");
+    Endpoint* ep = findEndpoint(kA);
+    CHECK(ep != nullptr && ep->failures == 1 && !ep->everOk, "the endpoint is marked failed, not good (failures %u, ok %d)",
+          ep ? ep->failures : 0, ep ? ep->everOk : -1);
+    CHECK(!isGroupConnected("SF") && slotOf("SF")->consecutiveFailures == 1 && liveSessions(id) == 0 && g_liveConns.load() == 0,
+          "%s failure: connected %d, failures %u, live sessions %d, live connections %d", which ? "ONLINE" : "SUBSCRIBE",
+          isGroupConnected("SF"), slotOf("SF")->consecutiveFailures, liveSessions(id), g_liveConns.load());
+    setScript(kA, FakeNet::Script());
+    advance(3000);
+    tick();
+    pumpWorker();
+    tick();
+    CHECK(isGroupReady("SF"), "retried and ready");
+  }
+}
+
 static void testEndpoints() {
   g_test = "M3 endpoints: a failing address is avoided while another one DNS returned has worked; DNS down uses the last working one; avoidance expires; only DNS answers are used";
   resetAll();
@@ -680,6 +708,25 @@ static void testReplacement() {
         overlaps(), liveSessions(id));
 }
 
+static void testReplacementQueued() {
+  g_test = "M8b replacing a group while its setup is still queued: the new setup waits for the old cleanup; one session per client id";
+  resetAll();
+  addGroup("X2");
+  tick();  // old setup queued, not started
+  deleteGroup("X2");
+  addGroup("X2");
+  tick();
+  GroupClient* n = slotOf("X2");
+  CHECK(n != nullptr && !n->jobInFlight, "no setup for the new group while the old one drains");
+  for (int i = 0; i < 4; i++) {
+    pumpWorker();
+    tick();
+  }
+  std::string id = clientIdOf("X2");
+  CHECK(isGroupReady("X2") && overlaps() == 0 && liveSessions(id) == 1, "ready %d, overlapping sessions %d, live sessions %d",
+        isGroupReady("X2"), overlaps(), liveSessions(id));
+}
+
 static void testStaleResultNewOccupant() {
   g_test = "M9 a result from a slot's previous group is never adopted by the group now in that slot";
   resetAll();
@@ -709,7 +756,8 @@ static void testStaleResultNewOccupant() {
   CHECK(!isGroupConnected("NEW") && slotOf("NEW")->conn == nullptr, "not adopted for NEW");
   pumpWorker();
   tick();
-  CHECK(isGroupReady("NEW") && g_liveConns.load() == 1, "NEW connects through its own setup (live %d)", g_liveConns.load());
+  CHECK(isGroupReady("NEW") && g_liveConns.load() == 1 && overlaps() == 0 && slotOf("NEW")->jobInFlight == false,
+        "NEW connects through its own single setup (live %d, overlapping sessions %d)", g_liveConns.load(), overlaps());
 }
 
 static void testMaintenance() {
@@ -754,6 +802,22 @@ static void testMaintenance() {
             g_liveConns.load() == 0,
         "late result during maintenance closed with OFFLINE (live sessions %d)", liveSessions(id3));
   setMaintenanceModeActive(false);
+}
+
+static void testCleanupDuringMaintenance() {
+  g_test = "M10b a deleted group's cleanup that reaches the worker during maintenance opens no connection then";
+  resetAll();
+  connectGroup("Q1");
+  deleteGroup("Q1");  // cleanup queued with the connection
+  setMaintenanceModeActive(true);
+  pumpWorker();
+  std::string id = clientIdOf("Q1");
+  std::vector<FakeNet::Event> ev = FakeNet::events();
+  CHECK(count(ev, "connect", id, cleanConnect) == 0 && liveSessions(id) == 0 && g_liveConns.load() == 0,
+        "no cleanSession connect during maintenance (%d), connection closed %d", count(ev, "connect", id, cleanConnect),
+        liveSessions(id) == 0);
+  setMaintenanceModeActive(false);
+  tick();
 }
 
 static void testSleep() {
@@ -1005,6 +1069,25 @@ static void testDeleteWhileHeld() {
         count(ev, "publish", id, isOnline), overlaps(), concurrentUse(), liveSessions(id), g_liveConns.load());
 }
 
+static void testRecoveryStraddle() {
+  g_test = "T4 a setup that was past its last cancellation point when Wi-Fi recovered is discarded, not adopted; a fresh setup follows";
+  resetAll();
+  FakeNet::setGate("online");
+  addGroup("V1");
+  bool held = tickUntil([] { return FakeNet::atGate(); }, 3000);
+  g_wifi = false;
+  tick();
+  g_wifi = true;
+  tick();  // recovery: generation bumped while the worker is inside the ONLINE publish
+  FakeNet::release();
+  std::string id = clientIdOf("V1");
+  bool ready = tickUntil([&] { return isGroupReady("V1") && count(FakeNet::events(), "connect", id, sessionConnect) == 2; }, 5000);
+  settle();
+  CHECK(held && ready && overlaps() == 0 && liveSessions(id) == 1 && g_liveConns.load() == 1,
+        "held %d, ready after a second setup %d (session connects %d), overlaps %d, live sessions %d", held, ready,
+        count(FakeNet::events(), "connect", id, sessionConnect), overlaps(), liveSessions(id));
+}
+
 static void testStress(int iterations, uint32_t seed) {
   g_test = "T3 randomized lifecycle stress with a real worker: groups added/deleted/replaced, Wi-Fi flaps, maintenance, drops, publishes, deliveries";
   resetAll();
@@ -1113,14 +1196,17 @@ int main(int argc, char** argv) {
     testSetupContract();
     testLongGroupCode();
     testFailureBackoff();
+    testSetupStageFailures();
     testEndpoints();
     testReadyLoss();
     testWifi();
     testDeleteDuringSetup();
     testDeleteConnected();
     testReplacement();
+    testReplacementQueued();
     testStaleResultNewOccupant();
     testMaintenance();
+    testCleanupDuringMaintenance();
     testSleep();
     testReceive();
     testPresenceDrift();
@@ -1132,6 +1218,7 @@ int main(int argc, char** argv) {
     int n = argc > 2 ? atoi(argv[2]) : 300;
     testResponsiveness();
     testDeleteWhileHeld();
+    testRecoveryStraddle();
     for (uint32_t seed = 1; seed <= 3; seed++) testStress(n, seed);
     settle();
     FakeRtos::stopAll();

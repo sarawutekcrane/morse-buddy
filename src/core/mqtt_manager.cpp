@@ -987,7 +987,12 @@ bool ensureWorker() {
   if (xTaskCreatePinnedToCore(workerMain, "mqtt_conn", kWorkerStackBytes, nullptr, kWorkerPriority, &g_workerTask,
                               kWorkerCore) != pdPASS) {
     g_workerTask = nullptr;
-    Serial.println("[mqtt] connection worker could not be started; retrying");
+    static uint32_t lastLogMs = 0;
+    uint32_t now = millis();
+    if (lastLogMs == 0 || now - lastLogMs >= 10000) {
+      Serial.println("[mqtt] connection worker could not be started; retrying");
+      lastLogMs = now == 0 ? 1 : now;
+    }
     return false;
   }
   return true;
