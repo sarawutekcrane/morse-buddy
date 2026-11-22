@@ -818,6 +818,25 @@ static void testCleanupDuringMaintenance() {
         liveSessions(id) == 0);
   setMaintenanceModeActive(false);
   tick();
+  // a deleted group's setup that finishes after maintenance began: closed at once (OFFLINE + clear), not held through OTA
+  resetAll();
+  addGroup("Q2");
+  tick();
+  pumpWorker();       // setup finished; its result waits
+  deleteGroup("Q2");  // draining, its job still outstanding
+  setMaintenanceModeActive(true);
+  tick();
+  std::string id2 = clientIdOf("Q2");
+  ev = FakeNet::events();
+  CHECK(liveSessions(id2) == 0 && g_liveConns.load() == 0 && count(ev, "publish", id2, isOffline) == 1 &&
+            count(ev, "publish", id2, isClear) == 1,
+        "closed during maintenance with OFFLINE %d and clear %d (live sessions %d, live connections %d)",
+        count(ev, "publish", id2, isOffline), count(ev, "publish", id2, isClear), liveSessions(id2), g_liveConns.load());
+  setMaintenanceModeActive(false);
+  tick();
+  pumpWorker();
+  ev = FakeNet::events();
+  CHECK(count(ev, "connect", id2, cleanConnect) == 1, "its session cleanup runs after maintenance (%d)", count(ev, "connect", id2, cleanConnect));
 }
 
 static void testSleep() {

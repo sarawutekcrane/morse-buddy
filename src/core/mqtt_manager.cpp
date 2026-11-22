@@ -942,6 +942,22 @@ void dropAdoptedConn(GroupClient& c, bool publishOffline) {
   c.ready = false;
 }
 
+// Maintenance: a deleted group's connection is not kept open through OTA. It
+// publishes OFFLINE and clears its retained record (as its cleanup job
+// would) and is closed now; the broker-session cleanup runs after maintenance.
+void retireDrainingConnForMaintenance(GroupClient& c) {
+  if (c.conn == nullptr) return;
+  if (c.conn->mqtt.connected()) {
+    char topic[kTopicBufLen];
+    snprintf(topic, sizeof(topic), "morsebuddy/%s/presence/%s", c.group_code, Identity::deviceId());
+    char payload[Presence::kPresencePayloadMax];
+    Presence::buildOwnPresencePayload(payload, sizeof(payload), "OFFLINE", WifiManager::getUnixTime());
+    c.conn->mqtt.publish(topic, payload, /*retained=*/true, /*qos=*/1);
+    c.conn->mqtt.publish(topic, "", /*retained=*/true, /*qos=*/1);
+  }
+  dropAdoptedConn(c, /*publishOffline=*/false);
+}
+
 // The single place a slot gets a new identity (fresh or reused); every field
 // is reset, and the generation bumped so nothing from a prior occupant can
 // be mistaken for this one.
@@ -1080,6 +1096,7 @@ void handleSetupResult(const Result& r) {
     }
     if (c.state == SlotState::kDraining && c.conn == nullptr) {
       c.conn = r.conn;  // the group was deleted meanwhile: its cleanup job publishes OFFLINE and closes it
+      if (g_maintenanceMode) retireDrainingConnForMaintenance(c);
       return;
     }
     disposeConn(r.conn, /*publishOffline=*/g_maintenanceMode);
@@ -1414,14 +1431,7 @@ void setMaintenanceModeActive(bool active) {
     for (auto& gc : g_clients) {
       if (gc.state == SlotState::kFree) continue;
       bumpGeneration(slotIndex(gc));
-      if (gc.state == SlotState::kDraining && gc.conn != nullptr && gc.conn->mqtt.connected()) {
-        char topic[kTopicBufLen];
-        snprintf(topic, sizeof(topic), "morsebuddy/%s/presence/%s", gc.group_code, Identity::deviceId());
-        char payload[Presence::kPresencePayloadMax];
-        Presence::buildOwnPresencePayload(payload, sizeof(payload), "OFFLINE", WifiManager::getUnixTime());
-        gc.conn->mqtt.publish(topic, payload, /*retained=*/true, /*qos=*/1);
-        gc.conn->mqtt.publish(topic, "", /*retained=*/true, /*qos=*/1);
-      }
+      if (gc.state == SlotState::kDraining) retireDrainingConnForMaintenance(gc);
       if (gc.conn != nullptr) dropAdoptedConn(gc, /*publishOffline=*/false);
       gc.nextAttemptMs = 0;
     }
