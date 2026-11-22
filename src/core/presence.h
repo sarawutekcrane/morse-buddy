@@ -34,6 +34,15 @@ uint32_t changeGeneration();
 bool publishOnline(const char* group_code);
 void publishOffline(const char* group_code);
 
+// This device's own presence payload ("MBP1|...", exactly what
+// publishOnline()/publishOffline() send) for `status` ("ONLINE"/"OFFLINE"),
+// stamped with `unixTs` instead of the current time. Builds the string
+// only: no publish. MqttManager uses it to hand a finished payload to its
+// connection worker, which must not read Settings itself, and to tell
+// whether that payload is still current when the connection is adopted.
+void buildOwnPresencePayload(char* out, size_t outSize, const char* status, uint32_t unixTs);
+constexpr size_t kPresencePayloadMax = 110;  // the buffer publishOnline()/publishOffline() use
+
 // Addendum section 6.4 API, exposed now for Phase 4.
 bool isContactOnline(const char* group_code, const char* device_id);
 bool isContactRadioAvailable(const char* group_code, const char* device_id);

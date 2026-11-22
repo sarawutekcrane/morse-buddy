@@ -3,8 +3,17 @@
 #include <Arduino.h>
 #include <MQTT.h>
 #include <WiFi.h>
+#include <errno.h>
 #include <new>
 #include <string.h>
+
+#include <atomic>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
 
 #include "core/crc32.h"
 #include "core/hooks.h"
@@ -14,200 +23,197 @@
 #include "core/settings.h"
 #include "core/wifi_manager.h"
 
-// NOTE: this file targets 256dpi/MQTT@2.5.2 (Addendum section 1.2) from
-// memory of its public API (begin/setOptions/setWill/onMessageAdvanced/
-// connect/publish/subscribe/loop/connected/disconnect). Verify against the
-// actual installed library headers on first build; method names/signatures
-// here are the most likely spot to need a small adjustment.
+// Targets 256dpi/MQTT@2.5.2 (MQTTClient.cpp/lwmqtt read for this design):
+//  - connect() resolves and opens the TCP connection itself (via the
+//    Client's connect(host, port): on ESP32 that is WiFiGenericClass::
+//    hostByName(), up to 15 s, then a TCP connect with a 3000 ms default
+//    timeout) and then waits up to `timeout` for the CONNACK.
+//    connect(id, user, pass, /*skip=*/true) uses an already-open Client
+//    instead.
+//  - subscribe() and a QoS1 publish() wait up to `timeout` for their
+//    SUBACK/PUBACK; any error closes the connection (Client::stop()).
+//  - loop() reads only bytes already available (waiting up to `timeout`
+//    for the rest of a partly received packet) and sends PINGREQ when due
+//    without waiting for the PINGRESP.
+//  - One MQTTClient and its Client must never be used by two tasks at once.
+//
+// Ownership (connection worker, MQTT fix):
+//  - Every connection is a heap Conn (socket + MQTTClient). Exactly one task
+//    owns a Conn at any time and only that task touches it.
+//  - The connection worker (one FreeRTOS task) owns a Conn from creation
+//    through DNS, TCP connect, CONNECT/CONNACK, the 10 subscriptions and the
+//    ONLINE publish, then hands it to the main task through a queue. The
+//    main task owns an adopted Conn (loop(), publishes) until it closes it
+//    or passes it back to the worker in a cleanup job.
+//  - Main-task state (g_clients[]) is touched by the main task only. The
+//    worker reads only its job (a copy), immutable data (device id, topic
+//    list) and the per-slot generation atomics; the receive queue is shared
+//    under a spinlock.
+//  - Each slot has at most one setup job outstanding, and it stays
+//    outstanding until the main task has received its result: a stale
+//    result is never adopted (generation check), and the next attempt, or
+//    the group's cleanup job, is only queued after that result is back, so
+//    no two connections ever use one client id at once. The worker runs
+//    jobs strictly in queue order.
 
 namespace MqttManager {
 
 namespace {
 
-// Fix Phase 1C: explicit per-group setup stage, so a group's 10-subscribe
-// sequence can be spread across many ticks (one topic per eligible turn)
-// instead of run to completion inside one blocking connectGroupIfNeeded()
-// call. kNeedConnect is both the initial state and the state every
-// failure/transport-loss path resets a client back to, so "a fresh attempt
-// is starting" is always exactly "stage just became kNeedConnect".
-enum class SetupStage : uint8_t {
-  kNeedConnect,       // not connected; next eligible operation is connect()
-  kSubscribing,       // connected; subscribeCursor names the next topic to subscribe
-  kNeedPublishOnline, // all 10 subscriptions succeeded; next op is the ONLINE publish
-  kDone,              // fully Ready (see GroupClient::ready)
-};
-
-struct GroupClient {
-  bool active = false;
-  char group_code[33] = {0};
-  char client_id[24] = {0};
-  WiFiClient net;
-  MQTTClient* mqtt = nullptr;
-  // Hardware Fix #4.9d Part A1: rate-limits reconnect attempts. Real
-  // hardware testing found DOT/DASH, encoder rotation/push, and menu
-  // navigation ALL delayed together (a global loop-starvation symptom, not
-  // an individual input debounce defect) whenever a group was disconnected
-  // -- the old serviceTick() called connectGroupIfNeeded() on every
-  // disconnected group on EVERY tick, and MQTTClient::connect() is
-  // synchronous, so a single unreachable broker blocked the whole Arduino/
-  // main task (and therefore Input::popEvent()/Menu::tick()) for the
-  // entire command timeout, repeatedly. 0 means "never attempted yet /
-  // eligible immediately"; otherwise the millis() deadline before which no
-  // further attempt is made.
-  //
-  // Hardware Fix #4.9f: Part A1's ORIGINAL implementation called
-  // subscribeAll()/Presence::publishOnline() and THEN reset this back to
-  // 0 unconditionally, on connect() alone having returned true -- it never
-  // checked whether subscribeAll()/publishOnline() themselves actually
-  // succeeded or left the connection dead. The defect was failing to
-  // account for setup failure, not the ORDER of the reset: a connection
-  // lost during that setup window (a real, observed failure mode:
-  // subscribeAll() ignored every subscribe() result, and 256dpi/MQTT
-  // v2.5.2 closes the connection on a subscribe error) still got the
-  // reset-to-0 treatment, so the very next serviceTick() could retry
-  // immediately, completely bypassing this cooldown.
-  //
-  // Fix Phase 1C: the staged setup functions below set this to a FRESH
-  // deadline on every UNFINISHED-setup failure (connect/subscribe/
-  // publishOnline), and leave it UNTOUCHED (the prior deadline) when a
-  // client that had already reached Ready (see `ready` below) later loses
-  // its transport -- this is a deliberate, traced behavior choice, not an
-  // oversight: since a healthy connection typically stays up far longer
-  // than kMqttReconnectIntervalMs before eventually dropping, reusing the
-  // prior deadline is (in the common case) already in the past by the time
-  // Ready is lost, so the OBSERVED effect is "reconnect attempted
-  // immediately" -- except when the drop happens within
-  // kMqttReconnectIntervalMs of reaching Ready, where the remainder of
-  // that original window still throttles it (existing anti-thrash
-  // protection, unaffected by this candidate).
-  uint32_t nextReconnectAttemptMs = 0;
-
-  // Fix Phase 1C: staged-setup bookkeeping. `ready` is the ONLY field
-  // isGroupReady()/isAnyGroupReady() read (alongside a defensive
-  // connected() re-check, see their definitions) -- it becomes true only
-  // once every one of the sequential checks in doPublishOnlineOperation()
-  // has actually passed, and is reset to false by every path that resets
-  // `stage` back to kNeedConnect (setup failure, Ready-loss, WiFi-loss
-  // recovery, maintenance entry).
-  SetupStage stage = SetupStage::kNeedConnect;
-  uint8_t subscribeCursor = 0;
-  bool ready = false;
-
-  // Fix Phase 1C: setup timing, deliberately kept as TWO separate,
-  // differently-named figures -- see the final per-attempt summary log for
-  // why these must never be treated as the same quantity. `attemptStartMs`
-  // is stamped once, at the very first operation of a fresh attempt
-  // (always inside doConnectOperation(), the only place stage transitions
-  // FROM kNeedConnect); `busyMsSum` accumulates each individual
-  // operation's own blocking elapsed time across however many ticks the
-  // whole attempt spans, reset to 0 at that same moment.
-  uint32_t setupAttemptStartMs = 0;
-  uint32_t setupBusyMsSum = 0;
-};
-
-GroupClient g_clients[Settings::kMaxGroups];
-bool g_maintenanceMode = false;
-
-// Hardware Fix #4.9d Part A1/A2, corrected by #4.9f: a disconnected group
-// may retry at most once every 5000ms (rather than once per tick), and the
-// MQTT-level command timeout used for a connect attempt's protocol
-// exchange is bounded to 500ms instead of the old 5000ms. This does NOT
-// bound the entire connect() call -- MQTTClient::connect() first performs
-// the underlying TCP/DNS work via WiFiClient::connect(host, port), which
-// this timeout parameter has no effect on, before any MQTT-level exchange
-// even starts. Both the throttle AND the reduced command timeout are
-// necessary together: throttling alone would still let one attempt block
-// the UI task for however long that unbounded TCP/DNS phase takes, every
-// time its turn came up.
-constexpr uint32_t kMqttReconnectIntervalMs = 5000;
+// ---------------------------------------------------------------------------
+// Timing and retry policy
+// ---------------------------------------------------------------------------
+// Main task (unchanged from before this fix): the MQTT command timeout for
+// loop() and publishRaw(), and the wider wait for a QoS1 publishBinary()'s
+// PUBACK (Hardware Diagnostic #4.9t's experiment, kept as it was).
 constexpr uint32_t kMqttCommandTimeoutMs = 500;
-
-// Hardware Diagnostic #4.9g: TEMPORARY experiment only, not a final
-// latency fix. Hardware evidence shows msg/<device_id> repeatedly failing
-// to subscribe at 504-507ms with lastError=-9 (LWMQTT_MISSING_OR_WRONG_
-// PACKET, returned when lwmqtt_subscribe()'s wait finishes without a
-// SUBACK) while presence/+ succeeds -- this narrows the failure to "no
-// SUBACK arrived for this one topic within kMqttCommandTimeoutMs (500ms)"
-// but does NOT by itself establish WHY (broker-side delay, packet loss,
-// or something else). This wider timeout is applied ONLY for the
-// duration of one setup attempt (connect + subscribeAll + publishOnline)
-// to see whether msg/<device_id> succeeds given more time to wait for its
-// SUBACK -- it is restored to kMqttCommandTimeoutMs immediately after
-// setup finishes, on every success/failure path, so healthy connected
-// clients' normal loop()/publish() servicing is never affected. A
-// success here would narrow the cause further (a slow-but-eventually-
-// answering SUBACK) but would NOT itself prove the broker was at fault,
-// and a longer timeout does not make the UI-blocking synchronous call
-// non-blocking -- it can only make a single blocking attempt take longer.
-constexpr uint32_t kMqttSetupTimeoutMsExperiment = 1500;
-
-// Hardware Diagnostic #4.9t: TEMPORARY synchronous experiment, not a
-// non-blocking fix -- a separate constant from kMqttSetupTimeoutMsExperiment
-// above (never reused/renamed), scoped only to one QoS1 publishBinary()
-// call at a time. Hardware evidence shows QoS1 binary publishes
-// repeatedly returning false at ~507ms with lastError=-9 and
-// connectedAfter=0, while a later publish succeeds at ~466ms -- this
-// widens the wait for that one publish()'s PUBACK to see whether more
-// time changes the outcome; it does not by itself prove broker fault or
-// establish the exact packet-level cause. Restored to
-// kMqttCommandTimeoutMs immediately after that one call, on every
-// success/failure path, exactly like #4.9g's own restore pattern.
 constexpr uint32_t kMqttPublishTimeoutMsExperiment = 1500;
 
-// Hardware Fix #4.9f: single source of truth for computing the next
-// allowed reconnect deadline, used after every actual connection/setup
-// attempt (see connectGroupIfNeeded()) regardless of where it stopped
-// (connect failure, subscribe failure, publishOnline leaving the
-// connection down, or full success). 0 is reserved as
-// GroupClient::nextReconnectAttemptMs's "eligible immediately" sentinel
-// (the pre-first-attempt default) -- on the vanishingly rare millis()
-// rollover tick where now + kMqttReconnectIntervalMs would wrap to exactly
-// 0, this nudges the deadline to 1 instead, so a just-finished attempt can
-// never be silently reinterpreted as "never attempted yet".
-uint32_t computeNextReconnectDeadline(uint32_t now) {
-  uint32_t deadline = now + kMqttReconnectIntervalMs;
-  return (deadline == 0) ? 1 : deadline;
+// Connection worker only -- never on the main task, so these can allow for a
+// slow broker or link without delaying input. Hardware evidence: "2047 ms
+// lastError=-9 returnCode=6" is DNS+TCP (~550 ms) followed by the old
+// 1500 ms CONNACK wait expiring (returnCode 6 = LWMQTT_UNKNOWN_RETURN_CODE:
+// no CONNACK was decoded, not a refusal); "3005 ms lastError=-3" is the
+// ESP32 WiFiClient's 3000 ms TCP connect timeout.
+constexpr int32_t kTcpConnectTimeoutMs = 4000;
+constexpr uint32_t kHandshakeAckTimeoutMs = 5000;  // CONNACK, each SUBACK, the ONLINE PUBACK
+
+// A write never waits longer than this for socket buffer space (the ESP32
+// WiFiClient::write() retries up to 10 x 1 s with no progress): see
+// BoundedWriteClient.
+constexpr uint32_t kSendBudgetMs = 500;
+
+// Retry after a failed setup attempt: 2 s, 4, 8, 16, 32, then 60 s, each
+// +-20% jittered; reset by a successful setup. After a connection that
+// reached Ready is lost, the next attempt waits until kReadyAntiThrashMs
+// after Ready was reached (the existing anti-thrash window).
+constexpr uint32_t kRetryMinMs = 2000;
+constexpr uint32_t kRetryMaxMs = 60000;
+constexpr uint32_t kReadyAntiThrashMs = 5000;
+
+// Broker endpoints (addresses DNS returned for kBrokerHost during this
+// boot; never a built-in address). An endpoint that failed at TCP or MQTT
+// level is avoided for 30 s, doubling per consecutive failure up to 10 min,
+// while another one that worked recently is available.
+constexpr uint8_t kMaxEndpoints = 4;
+constexpr uint32_t kEndpointAvoidBaseMs = 30000;
+constexpr uint32_t kEndpointAvoidMaxMs = 600000;
+constexpr uint32_t kEndpointMaxAgeMs = 6UL * 3600UL * 1000UL;  // an alternative must have come from DNS this recently
+
+// Full topic buffers ("morsebuddy/<code up to 32>/presence/<12-hex id>" is up
+// to 66 bytes): the size publishRaw()/publishBinary() always used. Before
+// this fix the will and presence-clear topics used 48 bytes and were
+// silently truncated for group codes longer than 14 characters.
+constexpr size_t kTopicBufLen = 80;
+
+constexpr uint32_t kWorkerStackBytes = 6144;
+constexpr UBaseType_t kWorkerPriority = 1;
+constexpr BaseType_t kWorkerCore = 0;  // the Arduino loop runs on core 1
+constexpr UBaseType_t kJobQueueDepth = 8;
+constexpr UBaseType_t kResultQueueDepth = 8;
+
+// Rollover-safe "deadline reached" (0 = no deadline: eligible now).
+bool deadlineReached(uint32_t now, uint32_t deadline) {
+  return deadline == 0 || static_cast<int32_t>(now - deadline) >= 0;
 }
 
-// Hardware Fix #4.9d Part A3, extended by Fix Phase 1C: round-robin cursor
-// so that, across consecutive ticks, every group with an eligible setup
-// operation (connect due, or already connected and mid-subscribe/needs its
-// ONLINE publish) eventually gets its turn -- a single persistently-broken
-// group parked at a low array index can never starve the others by always
-// winning the scan. Previously this only ever gated whether a group got to
-// run its WHOLE atomic connectGroupIfNeeded() attempt; now it gates which
-// group gets the AT-MOST-ONE setup operation performed globally this tick
-// (see hasEligibleSetupOperation()/performEligibleSetupOperation() and the
-// scan in serviceTick()).
-uint8_t g_nextSetupCandidateIndex = 0;
+// 0 is the "eligible immediately" sentinel; a deadline that wraps to
+// exactly 0 is nudged to 1 (Hardware Fix #4.9f's rule).
+uint32_t deadlineAfter(uint32_t now, uint32_t delayMs) {
+  uint32_t d = now + delayMs;
+  return d == 0 ? 1 : d;
+}
 
-// Fix Phase 1C: tracks WiFi's own connected/disconnected transitions
-// (distinct from any individual group's MQTT transport) so serviceTick()
-// can detect exactly the tick WiFi recovers from a drop and force every
-// active client to restart its staged setup from scratch -- see the
-// WiFi-recovery handling at the top of serviceTick(). Initialized true so
-// the very first serviceTick() call (WiFi already up, nothing to recover
-// from) never spuriously triggers that reset path.
-bool g_wifiWasConnected = true;
+uint32_t retryDelayMs(uint8_t consecutiveFailures) {
+  uint8_t shift = consecutiveFailures == 0 ? 0 : static_cast<uint8_t>(consecutiveFailures - 1);
+  if (shift > 5) shift = 5;
+  uint32_t d = kRetryMinMs << shift;
+  if (d > kRetryMaxMs) d = kRetryMaxMs;
+  uint32_t jitter = d / 5;
+  return d - jitter + static_cast<uint32_t>(esp_random() % (2 * jitter + 1));
+}
 
-GroupClient* findClientSlot(const char* group_code) {
-  for (auto& c : g_clients) {
-    if (c.active && strcmp(c.group_code, group_code) == 0) return &c;
+void formatIp(uint32_t ip, char* out, size_t outSize) {  // ip as stored in sin_addr (network byte order)
+  const uint8_t* b = reinterpret_cast<const uint8_t*>(&ip);
+  snprintf(out, outSize, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+// ---------------------------------------------------------------------------
+// Connection objects
+// ---------------------------------------------------------------------------
+// WiFiClient with a bounded write(): one non-blocking send at a time, waiting
+// at most kSendBudgetMs in total for buffer space. Returns what was sent (0:
+// nothing; lwmqtt then reports LWMQTT_NETWORK_FAILED_WRITE and the MQTT
+// client closes the connection, which the owner then sees as a loss).
+class BoundedWriteClient : public WiFiClient {
+ public:
+  using WiFiClient::write;
+  size_t write(const uint8_t* buf, size_t size) override {
+    int fd = this->fd();
+    if (fd < 0 || buf == nullptr || size == 0) return 0;
+    uint32_t start = millis();
+    size_t sent = 0;
+    while (sent < size) {
+      fd_set set;
+      FD_ZERO(&set);
+      FD_SET(fd, &set);
+      struct timeval tv;
+      tv.tv_sec = 0;
+      tv.tv_usec = 20000;
+      int ready = select(fd + 1, nullptr, &set, nullptr, &tv);
+      if (ready < 0) break;
+      if (ready > 0) {
+        int r = send(fd, buf + sent, size - sent, MSG_DONTWAIT);
+        if (r > 0) {
+          sent += static_cast<size_t>(r);
+          continue;
+        }
+        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+          stop();
+          break;
+        }
+      }
+      if (static_cast<uint32_t>(millis()) - start >= kSendBudgetMs) break;
+    }
+    return sent;
   }
-  return nullptr;
-}
+};
 
-GroupClient* findClientByMqttPtr(MQTTClient* client) {
-  for (auto& c : g_clients) {
-    if (c.active && c.mqtt == client) return &c;
-  }
-  return nullptr;
-}
+struct Conn;
+
+// The MQTT client of one Conn; the receive callback finds its group through
+// owner() (only the task that owns the Conn ever runs that callback).
+class ConnMqttClient : public MQTTClient {
+ public:
+  explicit ConnMqttClient(Conn* owner) : MQTTClient(1024, 256), owner_(owner) {}
+  Conn* owner() const { return owner_; }
+
+ private:
+  Conn* owner_;
+};
+
+std::atomic<int> g_liveConns(0);  // Conn objects currently allocated (diagnostics, tests)
+
+struct Conn {
+  Conn() : mqtt(this) { g_liveConns.fetch_add(1); }
+  ~Conn() { g_liveConns.fetch_sub(1); }
+  Conn(const Conn&) = delete;
+  Conn& operator=(const Conn&) = delete;
+  BoundedWriteClient net;  // declared before mqtt: mqtt holds a reference to it
+  ConnMqttClient mqtt;
+  char group_code[33] = {0};
+  uint32_t endpoint = 0;  // broker address used (network byte order)
+};
 
 // ---------------------------------------------------------------------------
 // Bounded receive queue (Addendum section 3.11): the MQTT callback only
 // copies and enqueues; all parsing/dispatch happens from the AppService
 // tick, after client->loop() has returned.
+//
+// MQTT fix: the callback now also runs on the connection worker (retained
+// messages arriving while it waits for a SUBACK), so the ring's slots and
+// indexes are guarded by a spinlock. Only pointer/index updates happen
+// inside it: allocation, copying, freeing and dispatch stay outside.
 // ---------------------------------------------------------------------------
 constexpr uint8_t kQueueCapacity = 16;
 constexpr uint16_t kMaxStoredPacketSize = 1024;
@@ -217,20 +223,11 @@ constexpr uint16_t kMaxStoredPacketSize = 1024;
 // empty unconditionally.
 constexpr uint32_t kQueueDrainSoftBudgetMs = 8;
 
-// `data` is a heap pointer sized to the exact incoming packet length (not a
-// fixed 1024-byte array) — kMaxStoredPacketSize remains the cap on what a
-// single packet may occupy, it just no longer pre-reserves that much .bss
-// for every one of the 16 slots regardless of what's actually queued.
-// Lifecycle: onMqttMessage() allocates+copies+takes ownership on enqueue.
-// Fix Phase 1A: dequeueAndDispatchOne() (Fix Phase 1D: shared by both drain
-// variants) detaches a slot's contents into a local QueuedMessage copy and
-// frees the original slot's ownership (data=nullptr, used=false) BEFORE
-// calling processQueuedMessage() — not after. This struct has no
-// user-declared destructor or copy constructor, so the implicit copy is a
-// plain shallow memberwise copy (the pointer value is duplicated, nothing
-// is deep-copied or auto-freed); ownership of the one live payload always
-// follows whichever copy the code chooses to free — see
-// dequeueAndDispatchOne() for why the slot is relinquished first.
+// `data` is a heap pointer sized to the exact incoming packet length;
+// kMaxStoredPacketSize caps what one packet may occupy. Ownership follows
+// whichever copy the code chooses to free: a dequeued item is detached into
+// a local copy and the slot relinquished BEFORE dispatch (Fix Phase 1A), so
+// a reentrant enqueue can never free a payload still being dispatched.
 struct QueuedMessage {
   bool used = false;
   char group_code[33] = {0};
@@ -243,44 +240,69 @@ QueuedMessage g_queue[kQueueCapacity];
 uint8_t g_queueHead = 0;
 uint8_t g_queueTail = 0;
 uint8_t g_queueCount = 0;
+portMUX_TYPE g_queueMux = portMUX_INITIALIZER_UNLOCKED;
+
+uint8_t queueCount() {
+  portENTER_CRITICAL(&g_queueMux);
+  uint8_t n = g_queueCount;
+  portEXIT_CRITICAL(&g_queueMux);
+  return n;
+}
 
 void onMqttMessage(MQTTClient* client, char topic[], char bytes[], int length) {
-  if (length < 0 || static_cast<size_t>(length) > kMaxStoredPacketSize) return;  // drop oversized
-  if (g_queueCount >= kQueueCapacity) return;  // queue full; drop (QoS0 traffic may legitimately be dropped)
+  if (client == nullptr || length < 0 || static_cast<size_t>(length) > kMaxStoredPacketSize) return;
+  if (queueCount() >= kQueueCapacity) return;  // full: drop (QoS0 traffic may legitimately be dropped)
+  const Conn* conn = static_cast<ConnMqttClient*>(client)->owner();  // every client is a ConnMqttClient
 
-  GroupClient* gc = findClientByMqttPtr(client);
-  if (gc == nullptr) return;
-
-  // Allocate (sized exactly to this packet) and copy BEFORE touching the
-  // queue slot or its indexes, so a failed allocation can't corrupt state
-  // or overwrite another item — the slot at g_queueTail is only touched
-  // once we know the payload copy has already succeeded.
+  // Allocate and copy before touching the ring; a zero-length payload (a
+  // retained "clear") is queued with a null pointer.
   uint8_t* buf = nullptr;
   if (length > 0) {
     buf = new (std::nothrow) uint8_t[static_cast<size_t>(length)];
     if (buf == nullptr) {
       Serial.println("[mqtt] payload allocation failed; dropping incoming packet");
-      return;  // drop safely: queue indexes/state untouched, nothing else to free
+      return;
     }
-    memcpy(buf, bytes, static_cast<size_t>(length));  // never keep a pointer into the callback's own buffer
+    memcpy(buf, bytes, static_cast<size_t>(length));
   }
-  // length == 0 is a legitimate empty payload (e.g. a zero-length retained
-  // "clear" publish), not an allocation failure — buf stays null and is
-  // queued as such; decodeHeader()/handleIncoming() both bounds-check len
-  // before ever touching the pointer.
+  QueuedMessage item;
+  item.used = true;
+  strncpy(item.group_code, conn->group_code, sizeof(item.group_code) - 1);
+  strncpy(item.topic, topic, sizeof(item.topic) - 1);
+  item.len = static_cast<uint16_t>(length);
+  item.data = buf;
 
-  QueuedMessage& q = g_queue[g_queueTail];
-  delete[] q.data;  // defensive: should already be null in correct steady-state operation
-  q.data = buf;
-  q.used = true;
-  strncpy(q.group_code, gc->group_code, sizeof(q.group_code) - 1);
-  q.group_code[sizeof(q.group_code) - 1] = '\0';
-  strncpy(q.topic, topic, sizeof(q.topic) - 1);
-  q.topic[sizeof(q.topic) - 1] = '\0';
-  q.len = static_cast<uint16_t>(length);
+  bool queued = false;
+  uint8_t* stale = nullptr;
+  portENTER_CRITICAL(&g_queueMux);
+  if (g_queueCount < kQueueCapacity) {
+    stale = g_queue[g_queueTail].data;  // defensive: null in correct steady-state operation
+    g_queue[g_queueTail] = item;
+    g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueCapacity);
+    g_queueCount++;
+    queued = true;
+  }
+  portEXIT_CRITICAL(&g_queueMux);
+  delete[] stale;
+  if (!queued) delete[] buf;  // filled meanwhile by the other task
+}
 
-  g_queueTail = static_cast<uint8_t>((g_queueTail + 1) % kQueueCapacity);
-  g_queueCount++;
+// Detaches the head item into `out` (the caller then owns out.data).
+bool dequeueOne(QueuedMessage* out) {
+  bool got = false;
+  portENTER_CRITICAL(&g_queueMux);
+  if (g_queueCount > 0) {
+    uint8_t idx = g_queueHead;
+    *out = g_queue[idx];
+    g_queue[idx].data = nullptr;
+    g_queue[idx].used = false;
+    g_queue[idx].len = 0;
+    g_queueHead = static_cast<uint8_t>((idx + 1) % kQueueCapacity);
+    g_queueCount--;
+    got = true;
+  }
+  portEXIT_CRITICAL(&g_queueMux);
+  return got;
 }
 
 // Topic is "morsebuddy/<group_code>/<suffix>"; returns a pointer to
@@ -293,15 +315,15 @@ const char* extractTopicSuffix(const char* fullTopic) {
   return p + 1;
 }
 
-// One dequeued item's worth of dispatch — factored out of
-// dequeueAndDispatchOne() so every exit from this function (malformed
-// topic, presence, malformed packet, unregistered kind, or a successful
-// dispatch) returns to exactly one place. `q` is a detached local copy
-// owned by the caller (see Fix Phase 1A in dequeueAndDispatchOne()), not a
-// live reference into g_queue[] — this function never frees q.data itself;
-// the caller frees it exactly once after this function returns, regardless
-// of which path was taken.
+bool groupHasActiveClient(const char* group_code);  // main-task state; defined below
+
+// One dequeued item's dispatch. `q` is a detached copy owned by the caller,
+// which frees q.data once afterwards whatever path is taken here.
 void processQueuedMessage(const QueuedMessage& q) {
+  // MQTT fix: a message received for a group deleted since (it may have
+  // been queued by the worker while that group's connection was still being
+  // set up) is dropped, never dispatched for a group that no longer exists.
+  if (!groupHasActiveClient(q.group_code)) return;
   const char* suffix = extractTopicSuffix(q.topic);
   if (suffix == nullptr) return;
 
@@ -316,67 +338,25 @@ void processQueuedMessage(const QueuedMessage& q) {
 
   NetworkPacketHandlerFn handler = getNetworkPacketHandler(hdr.packet_kind);
   if (handler != nullptr) handler(q.group_code, suffix, payload, hdr.payload_length);
-  // else: unregistered kind (nothing has claimed it yet in this phase) — ignored safely.
+  // else: unregistered kind -- ignored safely.
 }
 
-// Detaches g_queue[g_queueHead]'s contents into a local copy, relinquishes
-// that slot (Phase 1A ownership: BEFORE dispatch), dispatches it, then
-// frees the detached payload exactly once. Shared by both drain variants
-// below so Phase 1A's ownership sequence exists in exactly one place and
-// cannot drift between them.
-//
-// Fix Phase 1A: detach this slot's contents into a local copy, and
-// relinquish the original slot's ownership (data=nullptr, used=false)
-// BEFORE calling processQueuedMessage() — not after, as this used to do by
-// keeping a live reference into g_queue[g_queueHead] across the whole
-// dispatch. A dispatched handler can itself call publishBinary()/
-// publishRaw(), which reach the MQTT library's own publish()/subscribe();
-// whether that library pumps a synchronous socket read internally and
-// reentrantly invokes onMqttMessage() before returning is not something
-// this file can rule out (256dpi/MQTT's source is not available in this
-// environment to verify either way — see this file's own header note).
-// g_queueCount was already decremented for this slot below, so once the
-// ring has wrapped near g_queueTail == this index is reachable, and a
-// reentrant enqueue landing there while the old code still held `q` as a
-// live reference would delete[] and overwrite the very payload dispatch
-// was using — a use-after-free. Taking a full value copy and clearing the
-// original slot's fields first closes that window: whatever a reentrant
-// onMqttMessage() call does to g_queue[idx] from here on, it is working
-// with a slot this function has already relinquished, never one still
-// referenced by `local`.
-void dequeueAndDispatchOne() {
-  uint8_t idx = g_queueHead;
-  QueuedMessage local = g_queue[idx];
-  g_queue[idx].data = nullptr;
-  g_queue[idx].used = false;
-  g_queue[idx].len = 0;
-  g_queueHead = static_cast<uint8_t>((idx + 1) % kQueueCapacity);
-  g_queueCount--;
-
+// Dequeues, dispatches and frees exactly one item (Fix Phase 1A ownership:
+// the slot is relinquished before dispatch). False if the queue was empty.
+bool dequeueAndDispatchOne() {
+  QueuedMessage local;
+  if (!dequeueOne(&local)) return false;
   processQueuedMessage(local);
-
-  // Free exactly once, from the detached local copy — never touch
-  // g_queue[idx] again past this point; processQueuedMessage() above may
-  // already have caused a different, still-live item to be enqueued there
-  // (or wherever the tail now points), and this function must never clear
-  // or free a slot it no longer owns.
   delete[] local.data;
+  return true;
 }
 
 // Fix Phase 1D: maintenance-mode full drain (setMaintenanceModeActive()
-// only). Loops until g_queueCount reaches 0, exactly as this file's drain
-// behaved before Phase 1D — no snapshot cap, no time budget. Maintenance
-// entry must not become a partial drain whose remainder then gets
-// discarded, so this stays unconditional on purpose; it does not call the
-// normal, budgeted drain below.
+// only): until empty, no snapshot cap, no time budget.
 void drainReceiveQueueFull() {
-  // Hardware Diagnostic #4.9e Part B2 item 4: instrumentation only.
   uint32_t drainStart = millis();
   uint16_t drainedCount = 0;
-  while (g_queueCount > 0) {
-    dequeueAndDispatchOne();
-    drainedCount++;
-  }
+  while (dequeueAndDispatchOne()) drainedCount++;
   uint32_t drainElapsed = millis() - drainStart;
   if (drainElapsed >= 20) {
     Serial.printf("[PERF][MQTT] drain %lu ms count=%u\n", static_cast<unsigned long>(drainElapsed),
@@ -384,72 +364,62 @@ void drainReceiveQueueFull() {
   }
 }
 
-// Fix Phase 1D: normal service-tick drain, cooperative with the rest of
-// the tick (setup operations, Menu/Input, other AppServices) instead of
-// looping until the LIVE queue is empty. Bounded two ways:
-//  - Entry snapshot: at most g_queueCount items AS OF ENTRY are processed.
-//    A reentrant arrival during dispatch (another AppService's publish
-//    reentering onMqttMessage(), or the dispatched handler's own publish
-//    doing so) increases g_queueCount but never extends `toProcess` --
-//    those new items wait for a later invocation.
-//  - Soft elapsed budget (kQueueDrainSoftBudgetMs): checked only BETWEEN
-//    items, after an item's dispatch and payload cleanup, so the first
-//    item always completes regardless of budget. This limits work started
-//    between handlers -- it cannot interrupt a single slow handler already
-//    in progress (a blocking filesystem write or synchronous MQTT publish
-//    inside processQueuedMessage() still runs to completion), so this is
-//    not a hard latency guarantee.
-// Never discards: whatever remains queued at exit (from an unfinished
-// snapshot, a budget stop, or a reentrant arrival) stays queued for a
-// later tick.
+// Fix Phase 1D: normal service-tick drain, bounded by an entry snapshot of
+// the count and a soft elapsed budget checked between items (the first item
+// always completes; a slow handler is not interrupted). Never discards.
 void drainReceiveQueueCooperative() {
   uint32_t drainStart = millis();
   uint16_t drainedCount = 0;
-  uint8_t toProcess = g_queueCount;  // entry snapshot -- see comment above
+  uint8_t toProcess = queueCount();  // entry snapshot
   for (uint8_t i = 0; i < toProcess; i++) {
-    dequeueAndDispatchOne();
+    if (!dequeueAndDispatchOne()) break;
     drainedCount++;
-    if (i + 1 >= toProcess) break;  // snapshot exhausted; nothing left in it to start
-    // Explicitly narrowed to uint32_t before subtracting, not
-    // `millis() - drainStart` directly: millis() returns unsigned long,
-    // which is exactly 32 bits on the real target (so this would be
-    // equivalent there either way) but wider on some hosts -- narrowing
-    // both operands to the SAME fixed width first is what makes unsigned
-    // subtraction rollover-safe, matching this file's own
-    // `uint32_t now = millis();` convention elsewhere (e.g. serviceTick()).
+    if (i + 1 >= toProcess) break;
     uint32_t nowMs = static_cast<uint32_t>(millis());
-    if (nowMs - drainStart >= kQueueDrainSoftBudgetMs) break;  // budget exhausted; leave the rest queued
+    if (nowMs - drainStart >= kQueueDrainSoftBudgetMs) break;
   }
   uint32_t drainElapsed = static_cast<uint32_t>(millis()) - drainStart;
-  bool deferred = (g_queueCount != 0);  // snapshot incomplete and/or new arrivals left behind
-  // Fix Phase 1D (corrected): logged only on the original slow-drain
-  // threshold (>=20ms), exactly as before this candidate -- not merely
-  // because deferred is true. A fast drain that stops early on budget
-  // (typically well under 20ms) stays silent, same as any other fast
-  // routine tick; remaining/deferred are added fields on the EXISTING
-  // slow-drain line, not a new independent log trigger.
+  uint8_t remaining = queueCount();
   if (drainElapsed >= 20) {
     Serial.printf("[PERF][MQTT] drain %lu ms count=%u remaining=%u deferred=%d\n",
                   static_cast<unsigned long>(drainElapsed), static_cast<unsigned>(drainedCount),
-                  static_cast<unsigned>(g_queueCount), deferred ? 1 : 0);
+                  static_cast<unsigned>(remaining), remaining != 0 ? 1 : 0);
   }
 }
 
+// Frees every payload still queued (maintenance entry's defensive fallback).
+void releaseQueuedPayloads() {
+  uint8_t* toFree[kQueueCapacity];
+  uint8_t n = 0;
+  portENTER_CRITICAL(&g_queueMux);
+  for (auto& q : g_queue) {
+    if (q.used) {
+      toFree[n++] = q.data;
+      q.data = nullptr;
+      q.used = false;
+      q.len = 0;
+    }
+  }
+  g_queueHead = 0;
+  g_queueTail = 0;
+  g_queueCount = 0;
+  portEXIT_CRITICAL(&g_queueMux);
+  for (uint8_t i = 0; i < n; i++) delete[] toFree[i];
+}
+
 // ---------------------------------------------------------------------------
-// Connect / subscribe
+// Client id and topics
 // ---------------------------------------------------------------------------
 void buildClientId(const char* group_code, char* outBuf, size_t outBufSize) {
   uint32_t crc = Crc32::computeStr(group_code);
   snprintf(outBuf, outBufSize, "%s_%08lX", Identity::deviceId(), static_cast<unsigned long>(crc));
 }
 
-// Fix Phase 1C: the topic list (10 since the Race room protocol replaced the
-// five race/* topics with r2/+ and r2q/<own id>; otherwise the same order and QoS
-// as before this candidate -- only WHEN each is attempted changes (staged,
-// one per eligible tick, via doSubscribeOperation() below, not all 10
-// back-to-back inside one blocking call). Built once (Identity::deviceId()
-// is immutable for the device's lifetime after Identity::init()) rather
-// than reconstructed on every subscribe operation.
+// The topic list (10 since the Race room protocol replaced the five race/*
+// topics with r2/+ and r2q/<own id>), in the same order and with the same
+// QoS as before; subscribed by the connection worker during setup. Built
+// once, by the main task before the worker starts (ensureWorker()); read-only
+// afterwards (Identity::deviceId() is immutable after Identity::init()).
 struct TopicSpec {
   char suffix[32];
   int qos;
@@ -518,320 +488,642 @@ const TopicSpec* getTopicSpecs() {
   return specs;
 }
 
-// Fix Phase 1C: single place every UNFINISHED-setup failure (connect fails;
-// any one of the 10 subscribes fails; publishOnline() returns false or the
-// connection is no longer up afterward) funnels through. Closes the same
-// gap Hardware Fix #4.9f's cooldown logic closed for the old atomic
-// connectGroupIfNeeded() -- explicitly disconnect()s if the transport is
-// still (or again) live so a failed attempt never leaves a connected-but-
-// not-Ready client stuck, then a FRESH kMqttReconnectIntervalMs cooldown
-// from THIS failure moment, distinct from Ready-loss (see the
-// mqtt->loop() servicing section of serviceTick(), which preserves the
-// PRIOR deadline instead -- gc.ready is what distinguishes the two cases).
-void handleSetupFailure(GroupClient& gc, const char* stage) {
-  if (gc.mqtt->connected()) gc.mqtt->disconnect();
-  gc.ready = false;
-  gc.stage = SetupStage::kNeedConnect;
-  gc.subscribeCursor = 0;
-  gc.nextReconnectAttemptMs = computeNextReconnectDeadline(millis());
 
-  uint32_t wallMs = millis() - gc.setupAttemptStartMs;
+// ---------------------------------------------------------------------------
+// Jobs and results (main task <-> connection worker, by value through
+// FreeRTOS queues; a Conn pointer in one is an ownership transfer)
+// ---------------------------------------------------------------------------
+enum class JobType : uint8_t { kSetup, kCleanup };
+
+// Where a setup attempt stopped.
+enum class Stage : uint8_t { kNone, kCanceled, kAlloc, kDns, kTcp, kConnack, kSubscribe, kPublishOnline };
+
+const char* stageName(Stage s) {
+  switch (s) {
+    case Stage::kNone: return "none";
+    case Stage::kCanceled: return "canceled";
+    case Stage::kAlloc: return "alloc";
+    case Stage::kDns: return "dns";
+    case Stage::kTcp: return "tcp";
+    case Stage::kConnack: return "connack";
+    case Stage::kSubscribe: return "subscribe";
+    case Stage::kPublishOnline: return "publishOnline";
+  }
+  return "?";
+}
+
+struct Job {
+  JobType type;
+  uint8_t slot;
+  uint32_t generation;
+  char group_code[33];
+  char client_id[24];
+  // kSetup: the will (this device's OFFLINE presence) and the ONLINE
+  // presence it publishes last. kCleanup: the OFFLINE presence to publish
+  // on `conn` before clearing it.
+  char willOrOffline[Presence::kPresencePayloadMax];
+  char online[Presence::kPresencePayloadMax];
+  Conn* conn;  // kCleanup: the group's connection to close (may be null)
+};
+
+struct Result {
+  JobType type;
+  uint8_t slot;
+  uint32_t generation;
+  bool ok;
+  Stage failedAt;
+  int lastError;
+  int returnCode;
+  uint32_t endpoint;
+  uint32_t elapsedMs;
+  Conn* conn;  // kSetup and ok: the ready connection, now the main task's
+};
+
+QueueHandle_t g_jobQueue = nullptr;
+QueueHandle_t g_resultQueue = nullptr;
+TaskHandle_t g_workerTask = nullptr;
+
+// Written by the main task only; read by the worker between steps. A job
+// whose generation no longer matches its slot's is canceled (before its
+// ONLINE publish) and its result is never adopted.
+std::atomic<uint32_t> g_slotGeneration[Settings::kMaxGroups];
+// Set for OTA maintenance and before sleep: the worker starts no network
+// step for a setup job while it is set.
+std::atomic<bool> g_workerSuspended(false);
+
+// ---------------------------------------------------------------------------
+// Broker endpoints (connection worker only)
+// ---------------------------------------------------------------------------
+struct Endpoint {
+  bool used = false;
+  uint32_t ip = 0;  // network byte order
+  uint32_t lastSeenMs = 0;  // last returned by DNS
+  uint32_t lastOkMs = 0;
+  uint32_t avoidUntilMs = 0;
+  uint8_t failures = 0;  // consecutive
+  bool everOk = false;
+};
+Endpoint g_endpoints[kMaxEndpoints];
+
+Endpoint* findEndpoint(uint32_t ip) {
+  for (auto& e : g_endpoints)
+    if (e.used && e.ip == ip) return &e;
+  return nullptr;
+}
+
+bool endpointAvoided(const Endpoint& e, uint32_t now) {
+  return e.failures > 0 && static_cast<int32_t>(e.avoidUntilMs - now) > 0;
+}
+
+Endpoint* noteResolvedEndpoint(uint32_t ip, uint32_t now) {
+  Endpoint* e = findEndpoint(ip);
+  if (e == nullptr) {
+    for (auto& c : g_endpoints) {
+      if (!c.used) {
+        e = &c;
+        break;
+      }
+    }
+    if (e == nullptr) {  // full: replace the one DNS returned least recently
+      e = &g_endpoints[0];
+      for (auto& c : g_endpoints)
+        if (static_cast<int32_t>(c.lastSeenMs - e->lastSeenMs) < 0) e = &c;
+    }
+    *e = Endpoint();
+    e->used = true;
+    e->ip = ip;
+  }
+  e->lastSeenMs = now;
+  return e;
+}
+
+// The address to try: what DNS returned, unless that address failed recently
+// and another one DNS returned within kEndpointMaxAgeMs has worked (the
+// most recently working such one is used). With DNS down, the most recently
+// working known address. Avoidance is a preference, never a hard block.
+uint32_t chooseEndpoint(bool resolved, uint32_t resolvedIp, uint32_t now) {
+  if (resolved) {
+    Endpoint* e = noteResolvedEndpoint(resolvedIp, now);
+    if (!endpointAvoided(*e, now)) return resolvedIp;
+  }
+  const Endpoint* best = nullptr;
+  for (const auto& e : g_endpoints) {
+    if (!e.used || !e.everOk || endpointAvoided(e, now)) continue;
+    if (resolved && e.ip == resolvedIp) continue;
+    if (static_cast<uint32_t>(now - e.lastSeenMs) > kEndpointMaxAgeMs) continue;
+    if (best == nullptr || static_cast<int32_t>(e.lastOkMs - best->lastOkMs) > 0) best = &e;
+  }
+  if (best != nullptr) return best->ip;
+  return resolved ? resolvedIp : 0;
+}
+
+void noteEndpointFailure(uint32_t ip, uint32_t now) {
+  Endpoint* e = findEndpoint(ip);
+  if (e == nullptr) return;
+  if (e->failures < 255) e->failures++;
+  uint8_t shift = static_cast<uint8_t>(e->failures - 1);
+  if (shift > 5) shift = 5;
+  uint32_t avoid = kEndpointAvoidBaseMs << shift;
+  if (avoid > kEndpointAvoidMaxMs) avoid = kEndpointAvoidMaxMs;
+  e->avoidUntilMs = now + avoid;
+}
+
+void noteEndpointOk(uint32_t ip, uint32_t now) {
+  Endpoint* e = findEndpoint(ip);
+  if (e == nullptr) return;
+  e->failures = 0;
+  e->avoidUntilMs = 0;
+  e->everOk = true;
+  e->lastOkMs = now;
+}
+
+// lwIP's own resolver (thread-safe, unlike WiFiGenericClass::hostByName()).
+// Returns the first IPv4 address (network byte order) or 0.
+uint32_t resolveBroker() {
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* res = nullptr;
+  int err = lwip_getaddrinfo(kBrokerHost, nullptr, &hints, &res);
+  uint32_t ip = 0;
+  if (err == 0) {
+    for (struct addrinfo* a = res; a != nullptr && ip == 0; a = a->ai_next) {
+      if (a->ai_family == AF_INET && a->ai_addr != nullptr)
+        ip = reinterpret_cast<struct sockaddr_in*>(a->ai_addr)->sin_addr.s_addr;
+    }
+  }
+  if (res != nullptr) lwip_freeaddrinfo(res);
+  return ip;
+}
+
+// ---------------------------------------------------------------------------
+// Connection worker
+// ---------------------------------------------------------------------------
+// Opens the TCP connection to an endpoint and runs CONNECT/CONNACK on `c`.
+// cleanSession=false and the will for a setup; cleanSession=true and no will
+// for a cleanup. Fills r's error fields; false on failure (c left closed).
+bool openConnection(Conn& c, const char* clientId, bool cleanSession, const char* willPayload, Result& r,
+                    uint32_t& dnsMs, uint32_t& tcpMs, uint32_t& connackMs) {
+  uint32_t t0 = millis();
+  uint32_t resolvedIp = resolveBroker();
+  uint32_t now = millis();
+  dnsMs = now - t0;
+  c.endpoint = chooseEndpoint(resolvedIp != 0, resolvedIp, now);
+  r.endpoint = c.endpoint;
+  if (c.endpoint == 0) {
+    r.failedAt = Stage::kDns;
+    return false;
+  }
+
+  t0 = millis();
+  int tcp = c.net.connect(IPAddress(c.endpoint), kBrokerPort, kTcpConnectTimeoutMs);
+  tcpMs = millis() - t0;
+  if (tcp <= 0) {
+    r.failedAt = Stage::kTcp;
+    r.lastError = LWMQTT_NETWORK_FAILED_CONNECT;
+    noteEndpointFailure(c.endpoint, millis());
+    return false;
+  }
+
+  c.mqtt.begin(c.net);
+  c.mqtt.onMessageAdvanced(onMqttMessage);
+  c.mqtt.setKeepAlive(20);
+  c.mqtt.setCleanSession(cleanSession);
+  c.mqtt.setTimeout(kHandshakeAckTimeoutMs);
+  if (willPayload != nullptr) {
+    char willTopic[kTopicBufLen];
+    snprintf(willTopic, sizeof(willTopic), "morsebuddy/%s/presence/%s", c.group_code, Identity::deviceId());
+    c.mqtt.setWill(willTopic, willPayload, /*retained=*/true, /*qos=*/1);
+  }
+  t0 = millis();
+  bool connected = c.mqtt.connect(clientId, nullptr, nullptr, /*skip=*/true);
+  connackMs = millis() - t0;
+  r.lastError = static_cast<int>(c.mqtt.lastError());
+  r.returnCode = static_cast<int>(c.mqtt.returnCode());
+  if (!connected) {
+    r.failedAt = Stage::kConnack;
+    // A refusal (CONNACK received, return code != 0) is the broker
+    // answering: not this endpoint's fault.
+    if (r.lastError != LWMQTT_CONNECTION_DENIED) noteEndpointFailure(c.endpoint, millis());
+    c.net.stop();
+    return false;
+  }
+  return true;
+}
+
+bool jobCanceled(const Job& job) {
+  return g_workerSuspended.load() || g_slotGeneration[job.slot].load() != job.generation;
+}
+
+void postResult(const Result& r) {
+  // The main task drains results every tick (and while entering
+  // maintenance); a result is never dropped, since it may carry a Conn and
+  // it is what releases the slot's one outstanding job.
+  while (xQueueSend(g_resultQueue, &r, portMAX_DELAY) != pdTRUE) {
+  }
+}
+
+void runSetupJob(const Job& job) {
+  uint32_t start = millis();
+  Result r;
+  memset(&r, 0, sizeof(r));
+  r.type = JobType::kSetup;
+  r.slot = job.slot;
+  r.generation = job.generation;
+  r.failedAt = Stage::kNone;
+
+  Conn* c = nullptr;
+  uint32_t dnsMs = 0, tcpMs = 0, connackMs = 0, subscribeMs = 0, onlineMs = 0;
+  if (jobCanceled(job)) {
+    r.failedAt = Stage::kCanceled;
+  } else if ((c = new (std::nothrow) Conn()) == nullptr) {
+    r.failedAt = Stage::kAlloc;
+  } else {
+    strncpy(c->group_code, job.group_code, sizeof(c->group_code) - 1);
+    if (openConnection(*c, job.client_id, /*cleanSession=*/false, job.willOrOffline, r, dnsMs, tcpMs, connackMs)) {
+      const TopicSpec* specs = getTopicSpecs();
+      uint32_t t0 = millis();
+      for (size_t i = 0; i < kTopicCount && r.failedAt == Stage::kNone; i++) {
+        if (jobCanceled(job)) {
+          r.failedAt = Stage::kCanceled;
+          break;
+        }
+        char topic[80];
+        snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", job.group_code, specs[i].suffix);
+        if (!c->mqtt.subscribe(topic, specs[i].qos)) {
+          r.failedAt = Stage::kSubscribe;
+          r.lastError = static_cast<int>(c->mqtt.lastError());
+          Serial.printf("[PERF][MQTT] subscribe group=%s topic=%s result=0 lastError=%d\n", job.group_code,
+                        specs[i].suffix, r.lastError);
+        }
+      }
+      subscribeMs = millis() - t0;
+      if (r.failedAt == Stage::kNone && jobCanceled(job)) r.failedAt = Stage::kCanceled;
+      if (r.failedAt == Stage::kNone) {
+        // Last step, as before: setup only counts once the ONLINE presence
+        // itself was acknowledged and the connection is still up.
+        char selfTopic[kTopicBufLen];
+        snprintf(selfTopic, sizeof(selfTopic), "morsebuddy/%s/presence/%s", job.group_code, Identity::deviceId());
+        t0 = millis();
+        bool published = c->mqtt.publish(selfTopic, job.online, /*retained=*/true, /*qos=*/1);
+        onlineMs = millis() - t0;
+        if (!published || !c->mqtt.connected()) {
+          r.failedAt = Stage::kPublishOnline;
+          r.lastError = static_cast<int>(c->mqtt.lastError());
+        }
+      }
+      if (r.failedAt == Stage::kSubscribe || r.failedAt == Stage::kPublishOnline) {
+        noteEndpointFailure(c->endpoint, millis());
+      }
+    }
+  }
+
+  if (r.failedAt == Stage::kNone) {
+    // From here on the main task owns it: its loop()/publishRaw() timeout.
+    c->mqtt.setTimeout(kMqttCommandTimeoutMs);
+    noteEndpointOk(c->endpoint, millis());
+    r.ok = true;
+    r.conn = c;
+  } else if (c != nullptr) {
+    if (c->mqtt.connected()) c->mqtt.disconnect();
+    delete c;
+  }
+  r.elapsedMs = millis() - start;
+
+  char ip[16];
+  formatIp(r.endpoint, ip, sizeof(ip));
   Serial.printf(
-      "[PERF][MQTT] setup group=%s result=0 stage=%s connected=%d nextRetryMs=%lu wallMs=%lu busyMsSum=%lu "
-      "setupTimeoutMs=%lu\n",
-      gc.group_code, stage, gc.mqtt->connected() ? 1 : 0, static_cast<unsigned long>(gc.nextReconnectAttemptMs),
-      static_cast<unsigned long>(wallMs), static_cast<unsigned long>(gc.setupBusyMsSum),
-      static_cast<unsigned long>(kMqttSetupTimeoutMsExperiment));
+      "[PERF][MQTT][worker] setup group=%s result=%d stage=%s ip=%s dnsMs=%lu tcpMs=%lu connackMs=%lu "
+      "subscribeMs=%lu onlineMs=%lu totalMs=%lu lastError=%d returnCode=%d stackFree=%u\n",
+      job.group_code, r.ok ? 1 : 0, stageName(r.failedAt), ip, static_cast<unsigned long>(dnsMs),
+      static_cast<unsigned long>(tcpMs), static_cast<unsigned long>(connackMs),
+      static_cast<unsigned long>(subscribeMs), static_cast<unsigned long>(onlineMs),
+      static_cast<unsigned long>(r.elapsedMs), r.lastError, r.returnCode,
+      static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+  postResult(r);
 }
 
-// One of at most one setup operation performed globally per serviceTick()
-// call (see the round-robin scan in serviceTick()). Only entered when
-// gc.stage == kNeedConnect and the per-group cooldown has elapsed.
-//
-// Hardware Fix #4.9d Part A2 / #4.9f / #4.9g's reasoning for the throttle,
-// the will payload shape, and the 500ms-vs-1500ms timeout all carry over
-// unchanged from the old connectGroupIfNeeded() -- only the granularity
-// (this is now ONE operation of a multi-tick attempt, not the whole
-// attempt) is new.
-void doConnectOperation(GroupClient& gc) {
-  // Fresh attempt starts here -- the only place stage transitions FROM
-  // kNeedConnect (every failure/loss path resets it back to kNeedConnect),
-  // so wall/busy timing for a NEW attempt always resets exactly once, here.
-  gc.setupAttemptStartMs = millis();
-  gc.setupBusyMsSum = 0;
+// Group deletion (Addendum section 5): OFFLINE presence and a zero-length
+// retained publish (removes the record) on the group's connection if it is
+// up, disconnect, then one connection with cleanSession=true under the same
+// client id to ask the broker to drop the session. Best-effort, as before.
+// The cleanSession connection is skipped while suspended (OTA/sleep).
+void runCleanupJob(const Job& job) {
+  uint32_t start = millis();
+  Result r;
+  memset(&r, 0, sizeof(r));
+  r.type = JobType::kCleanup;
+  r.slot = job.slot;
+  r.generation = job.generation;
+  r.failedAt = Stage::kNone;
 
-  char willTopic[48];
-  snprintf(willTopic, sizeof(willTopic), "morsebuddy/%s/presence/%s", gc.group_code, Identity::deviceId());
-  char willPayload[110];
-  // Feature Fix #4.8 section 2I: append the same optional trailing color
-  // index Presence::buildPayload() now sends on every ONLINE/OFFLINE
-  // publish, so a peer that only ever sees this device via its LWT (an
-  // unclean disconnect) still resolves its personal color the same way.
-  snprintf(willPayload, sizeof(willPayload), "MBP1|%s|%s|OFFLINE|0|%lu|%u", Identity::deviceId(),
-           Settings::getMyName(), static_cast<unsigned long>(WifiManager::getUnixTime()),
-           Settings::getMyColorIndex());
-  gc.mqtt->setWill(willTopic, willPayload, /*retained=*/true, /*qos=*/1);
+  if (job.conn != nullptr) {
+    Conn* c = job.conn;
+    if (c->mqtt.connected()) {
+      char selfTopic[kTopicBufLen];
+      snprintf(selfTopic, sizeof(selfTopic), "morsebuddy/%s/presence/%s", job.group_code, Identity::deviceId());
+      c->mqtt.setTimeout(kHandshakeAckTimeoutMs);
+      c->mqtt.publish(selfTopic, job.willOrOffline, /*retained=*/true, /*qos=*/1);
+      c->mqtt.publish(selfTopic, "", /*retained=*/true, /*qos=*/1);  // zero-length retained: remove our record
+      c->mqtt.disconnect();
+    }
+    delete c;
+  }
 
-  // Fix Phase 1C: timeout is scoped to THIS ONE connect() call, then
-  // restored to kMqttCommandTimeoutMs immediately after -- before
-  // returning to any other application work this tick -- on both outcomes
-  // below. setOptions() (not setTimeout()) is used here, exactly as the
-  // old code did, since keepAlive/cleanSession must also be (re)applied
-  // for a connect attempt; subscribe/publishOnline operations below use
-  // the narrower setTimeout()-only widen/restore instead.
-  gc.mqtt->setOptions(/*keepAlive=*/20, /*cleanSession=*/false, /*timeout=*/kMqttSetupTimeoutMsExperiment);
-
-  uint32_t connectStart = millis();
-  bool connected = gc.mqtt->connect(gc.client_id, nullptr, nullptr);
-  uint32_t connectElapsed = millis() - connectStart;
-  gc.mqtt->setTimeout(kMqttCommandTimeoutMs);
-  gc.setupBusyMsSum += connectElapsed;
-
-  Serial.printf("[PERF][MQTT] connect group=%s startMs=%lu %lu ms result=%d lastError=%d returnCode=%d\n",
-                gc.group_code, static_cast<unsigned long>(connectStart),
-                static_cast<unsigned long>(connectElapsed), connected ? 1 : 0,
-                static_cast<int>(gc.mqtt->lastError()), static_cast<int>(gc.mqtt->returnCode()));
-
-  if (connected) {
-    gc.stage = SetupStage::kSubscribing;
-    gc.subscribeCursor = 0;
+  if (!g_workerSuspended.load()) {
+    Conn* t = new (std::nothrow) Conn();
+    if (t == nullptr) {
+      r.failedAt = Stage::kAlloc;
+    } else {
+      strncpy(t->group_code, job.group_code, sizeof(t->group_code) - 1);
+      uint32_t dnsMs = 0, tcpMs = 0, connackMs = 0;
+      if (openConnection(*t, job.client_id, /*cleanSession=*/true, nullptr, r, dnsMs, tcpMs, connackMs)) {
+        r.ok = true;
+        t->mqtt.disconnect();
+      }
+      delete t;
+    }
   } else {
-    handleSetupFailure(gc, "connect");
+    r.failedAt = Stage::kCanceled;
   }
+  r.elapsedMs = millis() - start;
+  Serial.printf("[MQTT][worker] cleanup group=%s sessionCleared=%d stage=%s totalMs=%lu\n", job.group_code,
+                r.ok ? 1 : 0, stageName(r.failedAt), static_cast<unsigned long>(r.elapsedMs));
+  postResult(r);
 }
 
-// One subscribe per eligible turn, at gc.subscribeCursor. Stops the whole
-// attempt at the first failure (Hardware Fix #4.9f Part B's behavior,
-// unchanged) via handleSetupFailure(); on success, advances the cursor and
-// transitions to kNeedPublishOnline once all 10 have succeeded.
-void doSubscribeOperation(GroupClient& gc) {
-  const TopicSpec* specs = getTopicSpecs();
-  const TopicSpec& spec = specs[gc.subscribeCursor];
-  char topic[80];
-  snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", gc.group_code, spec.suffix);
-
-  // Fix Phase 1C: scoped to this one subscribe() call via setTimeout()
-  // only (keepAlive/cleanSession already set by the connect operation
-  // above and never need re-applying here) -- restored immediately after,
-  // before returning to other application work this tick, on both
-  // outcomes.
-  gc.mqtt->setTimeout(kMqttSetupTimeoutMsExperiment);
-  uint32_t t0 = millis();
-  bool ok = gc.mqtt->subscribe(topic, spec.qos);
-  uint32_t elapsed = millis() - t0;
-  gc.mqtt->setTimeout(kMqttCommandTimeoutMs);
-  gc.setupBusyMsSum += elapsed;
-
-  if (!ok || elapsed >= 20) {
-    Serial.printf("[PERF][MQTT] subscribe group=%s topic=%s %lu ms result=%d lastError=%d connected=%d\n",
-                  gc.group_code, spec.suffix, static_cast<unsigned long>(elapsed), ok ? 1 : 0,
-                  static_cast<int>(gc.mqtt->lastError()), gc.mqtt->connected() ? 1 : 0);
-  }
-
-  if (!ok) {
-    handleSetupFailure(gc, "subscribe");
-    return;
-  }
-  gc.subscribeCursor++;
-  if (gc.subscribeCursor >= kTopicCount) {
-    gc.stage = SetupStage::kNeedPublishOnline;
-  }
-}
-
-// Final setup operation: the ONLINE presence publish. Setup only counts as
-// complete once publishOnline() itself reports true AND the connection is
-// still live afterward (Fix Phase 1B's propagated bool closes the exact
-// gap Hardware Fix #4.9f Part B could not -- "connected() after" alone
-// never proved the publish itself succeeded).
-void doPublishOnlineOperation(GroupClient& gc) {
-  gc.mqtt->setTimeout(kMqttSetupTimeoutMsExperiment);
-  uint32_t t0 = millis();
-  bool publishOk = Presence::publishOnline(gc.group_code);
-  uint32_t elapsed = millis() - t0;
-  gc.mqtt->setTimeout(kMqttCommandTimeoutMs);
-  gc.setupBusyMsSum += elapsed;
-
-  bool connectedAfter = gc.mqtt->connected();
-  bool setupOk = publishOk && connectedAfter;
-
-  if (!setupOk || elapsed >= 20) {
-    Serial.printf("[PERF][MQTT] publishOnline group=%s %lu ms result=%d connected=%d\n", gc.group_code,
-                  static_cast<unsigned long>(elapsed), publishOk ? 1 : 0, connectedAfter ? 1 : 0);
-  }
-
-  if (setupOk) {
-    gc.stage = SetupStage::kDone;
-    gc.ready = true;
-    // Fix Phase 1C (corrected): stamp a FRESH cooldown deadline at the
-    // moment Ready is actually reached, rather than leaving
-    // nextReconnectAttemptMs untouched (whatever it happened to be from
-    // an earlier failure, or its 0 "never attempted" sentinel on a
-    // first-ever success). This is what reconcileClientConnectivity()
-    // later PRESERVES on Ready-loss -- making "preserve the prior
-    // deadline" a deliberate, well-defined anti-thrash window measured
-    // from when Ready was reached, not an accidental inheritance from an
-    // unrelated earlier event (or, worse, the 0 sentinel being
-    // "preserved" only by coincidence). Uses the same
-    // computeNextReconnectDeadline() helper as every other deadline
-    // assignment, so the zero-sentinel/rollover-safety guarantees it
-    // already provides carry over unchanged.
-    gc.nextReconnectAttemptMs = computeNextReconnectDeadline(millis());
-    // Fix Phase 1C: wallMs (spans every tick from the first connect
-    // attempt to this completion, INCLUDES inter-tick gaps spent servicing
-    // other groups/application work) vs busyMsSum (the running total of
-    // each operation's own blocking elapsed -- comparable to the old
-    // atomic connectGroupIfNeeded()'s single subscribeAllElapsed-style
-    // number) are deliberately different, differently-named quantities:
-    // never conflate them when reading this log.
-    uint32_t wallMs = millis() - gc.setupAttemptStartMs;
-    Serial.printf(
-        "[PERF][MQTT] setup group=%s result=1 stage=none connected=1 nextRetryMs=%lu wallMs=%lu busyMsSum=%lu "
-        "setupTimeoutMs=%lu\n",
-        gc.group_code, static_cast<unsigned long>(gc.nextReconnectAttemptMs), static_cast<unsigned long>(wallMs),
-        static_cast<unsigned long>(gc.setupBusyMsSum), static_cast<unsigned long>(kMqttSetupTimeoutMsExperiment));
+void runJob(const Job& job) {
+  if (job.type == JobType::kSetup) {
+    runSetupJob(job);
   } else {
-    handleSetupFailure(gc, "publishOnline");
+    runCleanupJob(job);
   }
 }
 
-// Fix Phase 1C (corrected): reconciles a client whose transport is
-// currently disconnected but whose staged-setup bookkeeping still reflects
-// an earlier connected state (kSubscribing/kNeedPublishOnline/kDone, or
-// ready=true). Checks the CURRENT connected() state directly, not a
-// before/after snapshot taken only around one tick's own mqtt->loop()
-// call: an earlier revision of this candidate only reconciled a client
-// when `connectedBefore && !connectedAfter` was observed DURING this
-// exact tick's loop() call. That missed any disconnection that had
-// already happened BEFORE this tick started -- e.g. an application
-// publish() from a completely different AppService's tick, earlier in the
-// same main loop() iteration or a previous one, that caused the library
-// to close the connection -- because connectedBefore would already read
-// false in that case, so the old guard never fired at all. A client left
-// in kDone/kSubscribing/kNeedPublishOnline while actually disconnected was
-// then PERMANENTLY stuck there: hasEligibleSetupOperation() excludes
-// kDone unconditionally, and requires connected()==true for the other two
-// staged-in-progress stages, so nothing would ever make it eligible to
-// retry again.
-//
-// The `gc.stage != SetupStage::kNeedConnect` guard applies the loss
-// transition EXACTLY ONCE: once reconciled to kNeedConnect, a client that
-// remains disconnected on every subsequent tick already reads
-// stage==kNeedConnect, so this function correctly does nothing further on
-// those later ticks -- it never re-triggers a fresh cooldown, and never
-// re-"preserves" an already-preserved one, merely because the tick ran
-// again while still disconnected.
-void reconcileClientConnectivity(GroupClient& gc) {
-  if (gc.mqtt->connected()) return;
-  if (gc.stage == SetupStage::kNeedConnect) return;  // already idle; apply-once guard
-  bool wasReady = gc.ready;
-  gc.ready = false;
-  gc.stage = SetupStage::kNeedConnect;
-  gc.subscribeCursor = 0;
-  // Fix Phase 1C (corrected): a client that reached Ready always has a
-  // deadline explicitly (re-)stamped at that moment (see
-  // doPublishOnlineOperation()) -- preserving it here reuses that
-  // freshly-established anti-thrash window, not a stale or accidental
-  // value. A client that never finished setup gets a fresh one from this
-  // failure moment, same as handleSetupFailure().
-  if (!wasReady) gc.nextReconnectAttemptMs = computeNextReconnectDeadline(millis());
-}
-
-// Fix Phase 1C: true iff `gc` has an operation eligible to run THIS tick --
-// either it's due for a (re)connect attempt (same per-group cooldown
-// throttle as before), or it's already connected and mid-subscribe/needs
-// its ONLINE publish. reconcileClientConnectivity() (called from
-// serviceTick() before this scan runs, and from handleSetupFailure() for a
-// loss detected mid-operation) guarantees a disconnected client always
-// reads stage==kNeedConnect by the time this runs, so this one check
-// covers every stage uniformly.
-bool hasEligibleSetupOperation(const GroupClient& gc, uint32_t now) {
-  if (!gc.active || gc.mqtt == nullptr) return false;
-  if (gc.stage == SetupStage::kDone) return false;
-  if (gc.stage == SetupStage::kNeedConnect) {
-    if (gc.mqtt->connected()) return false;  // defensive: loop() section reconciles this before we'd see it
-    return gc.nextReconnectAttemptMs == 0 || static_cast<int32_t>(now - gc.nextReconnectAttemptMs) >= 0;
-  }
-  return gc.mqtt->connected();  // kSubscribing / kNeedPublishOnline: only while transport is actually still up
-}
-
-// Performs exactly the one operation `gc.stage` currently calls for.
-void performEligibleSetupOperation(GroupClient& gc) {
-  switch (gc.stage) {
-    case SetupStage::kNeedConnect:
-      doConnectOperation(gc);
-      break;
-    case SetupStage::kSubscribing:
-      doSubscribeOperation(gc);
-      break;
-    case SetupStage::kNeedPublishOnline:
-      doPublishOnlineOperation(gc);
-      break;
-    case SetupStage::kDone:
-      break;  // unreachable via hasEligibleSetupOperation()'s guard
+void workerMain(void*) {
+  for (;;) {
+    Job job;
+    if (xQueueReceive(g_jobQueue, &job, portMAX_DELAY) == pdTRUE) runJob(job);
   }
 }
 
-// Fix Phase 1C: this is the single choke point where a `g_clients[]` array
-// slot is given a NEW identity, whether it was never used before or is
-// being reused after a prior group's destroyClientForGroup() freed it --
-// every staged-setup field is explicitly reset here, closing a pre-
-// existing latent gap: destroyClientForGroup() never reset
-// nextReconnectAttemptMs, so a slot reused before that deadline passed
-// could throttle a brand-new group's very first connect attempt. Resetting
-// it (and stage/subscribeCursor/ready/the timing fields) here, rather than
-// at deletion time, covers every path that can hand a slot a new identity,
-// not just deletion-then-reuse.
+// ---------------------------------------------------------------------------
+// Main-task state: one slot per Family Group
+// ---------------------------------------------------------------------------
+enum class SlotState : uint8_t {
+  kFree,
+  kActive,    // a configured group
+  kDraining,  // deleted; waiting for its setup job's result before its cleanup job is queued
+};
+
+struct GroupClient {
+  SlotState state = SlotState::kFree;
+  char group_code[33] = {0};
+  char client_id[24] = {0};
+  // Adopted connection (main task only). Non-null only once setup has fully
+  // completed on the worker: transport up, 10 subscriptions and the ONLINE
+  // publish acknowledged.
+  Conn* conn = nullptr;
+  bool ready = false;
+  bool jobInFlight = false;  // one setup job with the worker; cleared only by its result
+  uint32_t jobGeneration = 0;
+  uint32_t nextAttemptMs = 0;  // 0: eligible immediately
+  uint8_t consecutiveFailures = 0;
+  // The ONLINE payload handed to the worker (CRC and timestamp), to tell at
+  // adoption whether this device's presence changed meanwhile.
+  uint32_t onlineCrc = 0;
+  uint32_t onlineTs = 0;
+};
+
+GroupClient g_clients[Settings::kMaxGroups];
+bool g_maintenanceMode = false;
+// Wi-Fi's own connected/disconnected transitions, to detect the tick it
+// recovers. Initialized true so the first tick never runs the recovery path.
+bool g_wifiWasConnected = true;
+
+uint8_t slotIndex(const GroupClient& c) { return static_cast<uint8_t>(&c - g_clients); }
+
+GroupClient* findClientSlot(const char* group_code) {
+  for (auto& c : g_clients) {
+    if (c.state == SlotState::kActive && strcmp(c.group_code, group_code) == 0) return &c;
+  }
+  return nullptr;
+}
+
+bool groupHasActiveClient(const char* group_code) { return findClientSlot(group_code) != nullptr; }
+
+// Cancels the slot's outstanding setup job, if any (it stops before its
+// ONLINE publish) and makes its result stale.
+void bumpGeneration(uint8_t slot) { g_slotGeneration[slot].fetch_add(1); }
+
+// Closes and frees a connection the main task owns. With publishOffline,
+// first publishes this device's OFFLINE presence on it (maintenance/sleep:
+// a graceful disconnect suppresses the will).
+void disposeConn(Conn* c, bool publishOffline) {
+  if (c == nullptr) return;
+  if (c->mqtt.connected()) {
+    if (publishOffline) {
+      char payload[Presence::kPresencePayloadMax];
+      Presence::buildOwnPresencePayload(payload, sizeof(payload), "OFFLINE", WifiManager::getUnixTime());
+      char topic[kTopicBufLen];
+      snprintf(topic, sizeof(topic), "morsebuddy/%s/presence/%s", c->group_code, Identity::deviceId());
+      c->mqtt.publish(topic, payload, /*retained=*/true, /*qos=*/1);
+    }
+    c->mqtt.disconnect();
+  }
+  delete c;
+}
+
+// The slot's adopted connection is gone or must go: frees it and clears Ready.
+void dropAdoptedConn(GroupClient& c, bool publishOffline) {
+  disposeConn(c.conn, publishOffline);
+  c.conn = nullptr;
+  c.ready = false;
+}
+
+// The single place a slot gets a new identity (fresh or reused); every field
+// is reset, and the generation bumped so nothing from a prior occupant can
+// be mistaken for this one.
 GroupClient* findOrCreateClientSlot(const char* group_code) {
   GroupClient* existing = findClientSlot(group_code);
   if (existing != nullptr) return existing;
-
   for (auto& c : g_clients) {
-    if (!c.active) {
-      c.active = true;
-      strncpy(c.group_code, group_code, sizeof(c.group_code) - 1);
-      c.group_code[sizeof(c.group_code) - 1] = '\0';
-      buildClientId(group_code, c.client_id, sizeof(c.client_id));
-      c.mqtt = new MQTTClient(1024, 256);
-      c.mqtt->begin(kBrokerHost, kBrokerPort, c.net);
-      c.mqtt->onMessageAdvanced(onMqttMessage);
-      c.nextReconnectAttemptMs = 0;  // eligible immediately, not throttled by a stale prior occupant's deadline
-      c.stage = SetupStage::kNeedConnect;
-      c.subscribeCursor = 0;
-      c.ready = false;
-      c.setupAttemptStartMs = 0;
-      c.setupBusyMsSum = 0;
-      return &c;
-    }
+    if (c.state != SlotState::kFree) continue;
+    c = GroupClient();
+    c.state = SlotState::kActive;
+    strncpy(c.group_code, group_code, sizeof(c.group_code) - 1);
+    buildClientId(group_code, c.client_id, sizeof(c.client_id));
+    bumpGeneration(slotIndex(c));
+    return &c;
   }
-  return nullptr;  // all 5 slots active; should not happen (max 5 groups exist)
+  return nullptr;  // every slot active or draining: ensureSlotsForConfiguredGroups() retries
 }
 
-// Group deletion sequence (Addendum section 5): offline publish, then one
-// reconnect with cleanSession=true to request broker-side session cleanup,
-// then disconnect and free. Best-effort and bounded by each call's own
-// connect timeout; run synchronously here since deletion is a rare,
-// deliberate user action, not a per-frame concern.
-void destroyClientForGroup(const char* group_code) {
-  GroupClient* gc = findClientSlot(group_code);
-  if (gc == nullptr) return;
-
-  if (gc->mqtt->connected()) {
-    Presence::publishOffline(group_code);
-    char selfTopic[48];
-    snprintf(selfTopic, sizeof(selfTopic), "morsebuddy/%s/presence/%s", group_code, Identity::deviceId());
-    gc->mqtt->publish(selfTopic, "", /*retained=*/true, /*qos=*/1);  // zero-length retained: remove our record
-    gc->mqtt->disconnect();
+// Creates a slot for every configured group that has none (e.g. a group
+// added while the slot of a just-deleted one was still draining). RAM only.
+void ensureSlotsForConfiguredGroups() {
+  uint8_t n = Settings::getGroupCount();
+  for (uint8_t i = 0; i < n; i++) {
+    Settings::FamilyGroup g = Settings::getGroup(i);
+    if (!g.configured || g.code[0] == '\0') continue;
+    if (findClientSlot(g.code) == nullptr) findOrCreateClientSlot(g.code);
   }
+}
 
-  gc->mqtt->setOptions(20, /*cleanSession=*/true, 5000);
-  if (gc->mqtt->connect(gc->client_id, nullptr, nullptr)) {
-    gc->mqtt->disconnect();
+bool clientIdDraining(const char* client_id) {
+  for (auto& c : g_clients) {
+    if (c.state == SlotState::kDraining && strcmp(c.client_id, client_id) == 0) return true;
   }
+  return false;
+}
 
-  delete gc->mqtt;
-  gc->mqtt = nullptr;
-  gc->active = false;
-  memset(gc->group_code, 0, sizeof(gc->group_code));
+bool ensureWorker() {
+  if (g_workerTask != nullptr) return true;
+  if (g_jobQueue == nullptr) g_jobQueue = xQueueCreate(kJobQueueDepth, sizeof(Job));
+  if (g_resultQueue == nullptr) g_resultQueue = xQueueCreate(kResultQueueDepth, sizeof(Result));
+  if (g_jobQueue == nullptr || g_resultQueue == nullptr) return false;
+  getTopicSpecs();  // built here, before the worker can read it
+  if (xTaskCreatePinnedToCore(workerMain, "mqtt_conn", kWorkerStackBytes, nullptr, kWorkerPriority, &g_workerTask,
+                              kWorkerCore) != pdPASS) {
+    g_workerTask = nullptr;
+    Serial.println("[mqtt] connection worker could not be started; retrying");
+    return false;
+  }
+  return true;
+}
+
+// Queues a deleted group's cleanup once its setup job (if any) is back.
+// Not during maintenance (resumed on exit).
+void postPendingCleanups() {
+  if (g_maintenanceMode || g_jobQueue == nullptr) return;
+  for (auto& c : g_clients) {
+    if (c.state != SlotState::kDraining || c.jobInFlight) continue;
+    Job job;
+    memset(&job, 0, sizeof(job));
+    job.type = JobType::kCleanup;
+    job.slot = slotIndex(c);
+    job.generation = g_slotGeneration[job.slot].load();
+    strncpy(job.group_code, c.group_code, sizeof(job.group_code) - 1);
+    strncpy(job.client_id, c.client_id, sizeof(job.client_id) - 1);
+    Presence::buildOwnPresencePayload(job.willOrOffline, sizeof(job.willOrOffline), "OFFLINE",
+                                      WifiManager::getUnixTime());
+    job.conn = c.conn;
+    if (xQueueSend(g_jobQueue, &job, 0) != pdTRUE) return;  // queue full: next tick
+    uint8_t slot = job.slot;
+    c = GroupClient();  // kFree; the connection now belongs to the job
+    bumpGeneration(slot);
+  }
+}
+
+// Queues a setup job for every group due for an attempt. Posting copies a
+// few hundred bytes: nothing here waits on the network.
+void postDueSetupJobs(uint32_t now) {
+  if (g_jobQueue == nullptr) return;
+  for (auto& c : g_clients) {
+    if (c.state != SlotState::kActive || c.conn != nullptr || c.jobInFlight) continue;
+    if (!deadlineReached(now, c.nextAttemptMs)) continue;
+    if (clientIdDraining(c.client_id)) continue;  // its cleanup (same client id) must run first
+    Job job;
+    memset(&job, 0, sizeof(job));
+    job.type = JobType::kSetup;
+    job.slot = slotIndex(c);
+    job.generation = g_slotGeneration[job.slot].load();
+    strncpy(job.group_code, c.group_code, sizeof(job.group_code) - 1);
+    strncpy(job.client_id, c.client_id, sizeof(job.client_id) - 1);
+    // Will: unchanged format (Feature Fix #4.8 section 2I).
+    snprintf(job.willOrOffline, sizeof(job.willOrOffline), "MBP1|%s|%s|OFFLINE|0|%lu|%u", Identity::deviceId(),
+             Settings::getMyName(), static_cast<unsigned long>(WifiManager::getUnixTime()),
+             Settings::getMyColorIndex());
+    uint32_t ts = WifiManager::getUnixTime();
+    Presence::buildOwnPresencePayload(job.online, sizeof(job.online), "ONLINE", ts);
+    if (xQueueSend(g_jobQueue, &job, 0) != pdTRUE) return;  // queue full: next tick
+    c.jobInFlight = true;
+    c.jobGeneration = job.generation;
+    c.onlineCrc = Crc32::computeStr(job.online);
+    c.onlineTs = ts;
+  }
+}
+
+void adopt(GroupClient& c, const Result& r) {
+  c.conn = r.conn;
+  c.ready = true;
+  c.consecutiveFailures = 0;
+  c.nextAttemptMs = deadlineAfter(millis(), kReadyAntiThrashMs);  // anti-thrash window if Ready is lost
+  // This device's presence changed while the worker was connecting (a
+  // rename, radio availability): publish the current one now.
+  char current[Presence::kPresencePayloadMax];
+  Presence::buildOwnPresencePayload(current, sizeof(current), "ONLINE", c.onlineTs);
+  if (Crc32::computeStr(current) != c.onlineCrc) Presence::publishOnline(c.group_code);
+}
+
+void handleSetupResult(const Result& r) {
+  GroupClient& c = g_clients[r.slot];
+  // Only the slot's own outstanding job's result releases it (a slot never
+  // has two, and is never freed or reused while one is out); anything else
+  // is closed and otherwise ignored.
+  if (!c.jobInFlight || r.generation != c.jobGeneration) {
+    if (r.ok) disposeConn(r.conn, /*publishOffline=*/false);
+    return;
+  }
+  c.jobInFlight = false;
+  bool current = c.state == SlotState::kActive && r.generation == g_slotGeneration[r.slot].load();
+  if (r.ok) {
+    if (current && c.conn == nullptr && !g_maintenanceMode && WifiManager::isConnected() && r.conn->mqtt.connected()) {
+      adopt(c, r);
+      return;
+    }
+    if (c.state == SlotState::kDraining && c.conn == nullptr) {
+      c.conn = r.conn;  // the group was deleted meanwhile: its cleanup job publishes OFFLINE and closes it
+      return;
+    }
+    disposeConn(r.conn, /*publishOffline=*/g_maintenanceMode);
+    if (c.state != SlotState::kActive) return;
+    if (!current) {
+      c.nextAttemptMs = 0;  // canceled (Wi-Fi recovery): try again as soon as allowed
+      return;
+    }
+    // Current, but Wi-Fi went down or the connection died before it could be
+    // adopted: a failed attempt.
+    if (c.consecutiveFailures < 255) c.consecutiveFailures++;
+    c.nextAttemptMs = deadlineAfter(millis(), retryDelayMs(c.consecutiveFailures));
+    return;
+  }
+  if (c.state != SlotState::kActive) return;
+  if (!current || r.failedAt == Stage::kCanceled) {
+    c.nextAttemptMs = 0;
+    return;
+  }
+  if (c.consecutiveFailures < 255) c.consecutiveFailures++;
+  c.nextAttemptMs = deadlineAfter(millis(), retryDelayMs(c.consecutiveFailures));
+  char ip[16];
+  formatIp(r.endpoint, ip, sizeof(ip));
+  Serial.printf("[MQTT] setup group=%s failed stage=%s ip=%s lastError=%d returnCode=%d failures=%u retryInMs=%lu\n",
+                c.group_code, stageName(r.failedAt), ip, r.lastError, r.returnCode,
+                static_cast<unsigned>(c.consecutiveFailures),
+                static_cast<unsigned long>(c.nextAttemptMs - millis()));
+}
+
+void processWorkerResults() {
+  if (g_resultQueue == nullptr) return;
+  Result r;
+  while (xQueueReceive(g_resultQueue, &r, 0) == pdTRUE) {
+    if (r.type == JobType::kSetup) handleSetupResult(r);
+    // kCleanup: nothing to do (the worker logged it).
+  }
+}
+
+// Wi-Fi came back: every adopted connection died with the link, and any job
+// in flight began before or during the outage. Close the former, cancel the
+// latter, and attempt again at once.
+void onWifiRecovered() {
+  for (auto& c : g_clients) {
+    if (c.state != SlotState::kActive) continue;
+    if (c.conn != nullptr) dropAdoptedConn(c, /*publishOffline=*/false);
+    if (c.jobInFlight) bumpGeneration(slotIndex(c));
+    c.consecutiveFailures = 0;
+    c.nextAttemptMs = 0;
+  }
 }
 
 void onSettingsChanged(const SettingsChangeInfo& info) {
@@ -840,13 +1132,23 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
       uint8_t n = Settings::getGroupCount();
       if (info.index < n) {
         Settings::FamilyGroup g = Settings::getGroup(info.index);
-        findOrCreateClientSlot(g.code);  // connects once WiFi/tick picks it up
+        findOrCreateClientSlot(g.code);  // the worker connects it when the service tick queues its setup
       }
       break;
     }
-    case SET_GROUP_DELETED:
-      destroyClientForGroup(info.group_code);
+    case SET_GROUP_DELETED: {
+      // Group deletion (Addendum section 5) never waits on the network
+      // here: the group's slot is retired at once (no publish, no
+      // reconnect, no dispatch for it from now on) and its cleanup runs on
+      // the worker -- after its setup job, if one is in flight.
+      GroupClient* c = findClientSlot(info.group_code);
+      if (c == nullptr) break;
+      bumpGeneration(slotIndex(*c));
+      c->ready = false;
+      c->state = SlotState::kDraining;  // keeps c->conn for the cleanup job
+      postPendingCleanups();
       break;
+    }
     case SET_MY_NAME_CHANGED:
       Presence::republishOwnPresenceAllGroups();
       break;
@@ -855,36 +1157,39 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
   }
 }
 
-// Bounded best-effort OFFLINE publish across every connected group. Shared
-// by the existing BeforeSleep hook and Phase 5 OTA Maintenance Mode entry
-// (section 19: "best-effort publish OFFLINE Presence for all groups; do
-// not block OTA indefinitely if Presence publish fails").
+// Bounded best-effort OFFLINE publish across every adopted connection.
+// Shared by the BeforeSleep hook and OTA Maintenance Mode entry (section 19:
+// "do not block OTA indefinitely if Presence publish fails").
 void publishOfflineAllGroupsBounded() {
   uint32_t start = millis();
   for (auto& gc : g_clients) {
     if (millis() - start >= 2000) break;
-    if (gc.active && gc.mqtt != nullptr && gc.mqtt->connected()) {
+    if (gc.state == SlotState::kActive && gc.conn != nullptr && gc.conn->mqtt.connected()) {
       Presence::publishOffline(gc.group_code);
     }
   }
 }
 
-void onBeforeSleep() { publishOfflineAllGroupsBounded(); }
+// Deep sleep follows these hooks unconditionally (wake is a power cycle): no
+// new setup step may start, and any setup in flight stops before its ONLINE
+// publish.
+void onBeforeSleep() {
+  publishOfflineAllGroupsBounded();
+  g_workerSuspended.store(true);
+  for (uint8_t i = 0; i < Settings::kMaxGroups; i++) bumpGeneration(i);
+}
 
 uint8_t connectivityStatusProvider() {
   if (!WifiManager::isConnected()) return CONN_OFFLINE;
   for (auto& gc : g_clients) {
-    if (gc.active && gc.mqtt != nullptr && gc.mqtt->connected()) return CONN_ONLINE;
+    if (gc.state == SlotState::kActive && gc.conn != nullptr && gc.conn->mqtt.connected()) return CONN_ONLINE;
   }
   return CONN_WIFI_ONLY;
 }
 
 void serviceInit() {
-  uint8_t n = Settings::getGroupCount();
-  for (uint8_t i = 0; i < n; i++) {
-    Settings::FamilyGroup g = Settings::getGroup(i);
-    findOrCreateClientSlot(g.code);
-  }
+  ensureSlotsForConfiguredGroups();
+  ensureWorker();
   registerSettingsChangeHook(onSettingsChanged);
   registerBeforeSleepHook(onBeforeSleep);
   registerConnectivityStatusProvider(connectivityStatusProvider);
@@ -916,8 +1221,7 @@ void serviceInit() {
 //
 // Declared here, ahead of serviceTick(), specifically so serviceTick() can
 // call flushQos0DiagIfDue() directly below (Fix Phase 1E, corrected) --
-// both live in this file's same top-level anonymous namespace, just
-// reordered; no new header, API, or cross-TU sharing was added.
+// both live in this file's same top-level anonymous namespace.
 struct Qos0Diag {
   uint32_t windowStartMs = 0;
   uint32_t attempted = 0;
@@ -980,128 +1284,48 @@ void flushQos0DiagIfDue(uint32_t nowMs) {
 
 void serviceTick() {
   // Fix Phase 1E (corrected): flush a pending notable qos0 diagnostic
-  // window unconditionally, before any early return below, using this
-  // tick's own periodic call. No network operation and no extra polling
-  // are added -- this only reads millis() and this file's own in-RAM
-  // diagnostic state; see flushQos0DiagIfDue()'s comment above.
+  // window unconditionally, before any early return below.
   flushQos0DiagIfDue(static_cast<uint32_t>(millis()));
+  ensureWorker();
+  // Results first, every tick and in every mode: they release the slot's
+  // outstanding job and carry connections that must be adopted or closed.
+  processWorkerResults();
   if (g_maintenanceMode) return;  // Phase 5 OTA: reconnect/receive paused
 
-  // Fix Phase 1C: detect exactly the tick WiFi recovers from a drop (not
-  // just "WiFi is down right now", which the early-return below already
-  // handled before this candidate). While WiFi was down, serviceTick()
-  // never ran at all, so no group's `connected()`/`ready` state was kept
-  // honest -- the underlying TCP socket almost certainly died with the
-  // WiFi link, but this file cannot assume WHEN the MQTT library itself
-  // notices that (unverified, no library source available). Rather than
-  // trust a possibly-stale gc.ready/connected() the instant WiFi returns,
-  // every active client that had actual in-progress or completed setup
-  // state is force-reset to restart staged setup from scratch -- using the
-  // SAME wasReady-based cooldown rule as any other transport loss (fresh
-  // cooldown if it hadn't finished setup yet; preserve the prior deadline
-  // if it had already reached Ready).
   bool wifiConnected = WifiManager::isConnected();
-  if (wifiConnected && !g_wifiWasConnected) {
-    for (auto& gc : g_clients) {
-      if (!gc.active || gc.mqtt == nullptr) continue;
-      // Fix Phase 1C (corrected): a client already sitting at kNeedConnect
-      // with the transport already down has NOTHING for this block to
-      // reconcile -- touching it anyway would do one of two wrong things:
-      // (a) a client that has NEVER attempted setup yet (cooldown still 0,
-      // the "eligible immediately" sentinel) would have a cooldown
-      // INVENTED for it here, delaying its very first connection attempt
-      // for no reason -- it never failed anything; or (b) a client already
-      // idling on an existing cooldown from an earlier real failure would
-      // have that cooldown reset/extended merely because WiFi happened to
-      // recover, which is not a reason to change it. Skipping both cases
-      // and only reconciling a client with actual stale state (mid-setup,
-      // or reached Ready, or -- defensively -- still reporting
-      // connected()==true despite the outage) preserves immediate
-      // first-attempt eligibility and any already-appropriate cooldown.
-      if (gc.stage == SetupStage::kNeedConnect && !gc.mqtt->connected()) continue;
-      bool wasReady = gc.ready;
-      if (gc.mqtt->connected()) gc.mqtt->disconnect();
-      gc.mqtt->setTimeout(kMqttCommandTimeoutMs);  // never left in a stale widened state across the outage
-      gc.ready = false;
-      gc.stage = SetupStage::kNeedConnect;
-      gc.subscribeCursor = 0;
-      if (!wasReady) gc.nextReconnectAttemptMs = computeNextReconnectDeadline(millis());
-      // else: preserve the prior deadline, per the same Ready-loss rule as below.
-    }
-  }
+  if (wifiConnected && !g_wifiWasConnected) onWifiRecovered();
   g_wifiWasConnected = wifiConnected;
+  ensureSlotsForConfiguredGroups();
+  postPendingCleanups();
   if (!wifiConnected) return;  // never block; just wait until WiFi is up
 
-  uint32_t now = millis();
-
-  // mqtt->loop() is the library's own per-connection servicing (keepalive/
-  // incoming-message pump). Hardware Diagnostic #4.9e Part B2 item 1 /
-  // Part C, reaffirmed by #4.9f: do NOT assume this is always
-  // non-blocking, and do NOT assume every reconnect path is already fully
-  // throttled just because Part A1 rate-limits the setup operations below
-  // -- 256dpi/MQTT uses synchronous lwmqtt operations internally, so a
-  // CONNECTED client can still momentarily wait on network data within
-  // loop(). Timed individually so a single slow group is visible, not just
-  // the whole for-loop; an already-disconnected client that returns fast
-  // never prints here (Part B2's "do not print for every disconnected
-  // client on every tick"), but one that WAS connected and comes back from
-  // loop() either erroring or no longer connected always does, regardless
-  // of duration, since that's a real connectivity event worth seeing.
-  //
-  // Fix Phase 1C (corrected): this is also where a transport loss BETWEEN
-  // staged setup operations (or after reaching Ready) is reconciled, via
-  // reconcileClientConnectivity() -- called unconditionally for every
-  // active client below, regardless of whether a connectedBefore/After
-  // transition was observed during THIS tick's own loop() call. That
-  // distinction matters: a connection closed by an application publish()
-  // from a different AppService's tick (or any other cause outside this
-  // loop) already reads connected()==false by the time this tick starts,
-  // so a check gated on "transitioned during this tick's loop()" would
-  // never see it and the client would be stuck. See
-  // reconcileClientConnectivity()'s own comment for the full trace.
+  // Adopted connections: the library's own servicing (keepalive, incoming
+  // packets). loop() only reads bytes already available, waiting at most
+  // kMqttCommandTimeoutMs for the rest of a partly received packet, and
+  // never waits for a PINGRESP; its writes are bounded by kSendBudgetMs.
+  // A connection found closed -- by this loop() or by any earlier publish
+  // from another AppService -- is freed here, and the group is attempted
+  // again after its anti-thrash window.
   for (auto& gc : g_clients) {
-    if (!gc.active || gc.mqtt == nullptr) continue;
-    bool connectedBefore = gc.mqtt->connected();
+    if (gc.state != SlotState::kActive || gc.conn == nullptr) continue;
     uint32_t loopStart = millis();
-    bool loopOk = gc.mqtt->loop();
+    bool loopOk = gc.conn->mqtt.loop();
     uint32_t loopElapsed = millis() - loopStart;
-    bool connectedAfter = gc.mqtt->connected();
-
-    reconcileClientConnectivity(gc);
-
-    if (connectedBefore && (!loopOk || !connectedAfter)) {
-      Serial.printf(
-          "[PERF][MQTT] loop-error group=%s %lu ms loopResult=%d connectedBefore=1 connectedAfter=%d lastError=%d\n",
-          gc.group_code, static_cast<unsigned long>(loopElapsed), loopOk ? 1 : 0, connectedAfter ? 1 : 0,
-          static_cast<int>(gc.mqtt->lastError()));
+    bool connectedAfter = gc.conn->mqtt.connected();
+    if (!loopOk || !connectedAfter) {
+      Serial.printf("[PERF][MQTT] loop-error group=%s %lu ms loopResult=%d connectedAfter=%d lastError=%d\n",
+                    gc.group_code, static_cast<unsigned long>(loopElapsed), loopOk ? 1 : 0, connectedAfter ? 1 : 0,
+                    static_cast<int>(gc.conn->mqtt.lastError()));
     } else if (loopElapsed >= 20) {
-      Serial.printf("[PERF][MQTT] loop group=%s %lu ms connected=%d\n", gc.group_code,
-                    static_cast<unsigned long>(loopElapsed), connectedAfter ? 1 : 0);
+      Serial.printf("[PERF][MQTT] loop group=%s %lu ms connected=1\n", gc.group_code,
+                    static_cast<unsigned long>(loopElapsed));
     }
+    if (!connectedAfter) dropAdoptedConn(gc, /*publishOffline=*/false);  // nextAttemptMs: the window stamped at Ready
   }
 
-  // Fix Phase 1C: AT MOST ONE setup operation -- connect OR one subscribe
-  // OR the ONLINE publish -- performed globally per tick, chosen
-  // round-robin starting from g_nextSetupCandidateIndex across every group
-  // with an eligible operation right now (hasEligibleSetupOperation()), so
-  // a single broken/slow group can never starve the others' turns, and no
-  // group's setup work blocks Input::popEvent()/Menu::tick() for longer
-  // than one operation's own timeout. Note: this bounds the OPERATION
-  // COUNT per tick, not wall-clock time -- a single operation can still
-  // block for up to kMqttSetupTimeoutMsExperiment (plus connect()'s own
-  // unbounded TCP/DNS phase for a connect operation specifically).
-  for (uint8_t attempts = 0; attempts < Settings::kMaxGroups; attempts++) {
-    uint8_t idx = g_nextSetupCandidateIndex;
-    g_nextSetupCandidateIndex = static_cast<uint8_t>((g_nextSetupCandidateIndex + 1) % Settings::kMaxGroups);
-    GroupClient& gc = g_clients[idx];
-    if (hasEligibleSetupOperation(gc, now)) {
-      performEligibleSetupOperation(gc);
-      break;
-    }
-  }
+  postDueSetupJobs(static_cast<uint32_t>(millis()));
 
-  // Fix Phase 1D: the normal, cooperative (bounded, not full-drain) variant
-  // -- see drainReceiveQueueCooperative()'s own comment.
+  // Fix Phase 1D: the normal, cooperative (bounded) drain.
   drainReceiveQueueCooperative();
 }
 
@@ -1117,82 +1341,45 @@ Registrar g_registrar;
 
 }  // namespace
 
-// TRANSPORT-ONLY: true the instant the underlying MQTT connection is up,
-// which (as of Fix Phase 1C's staged setup) can be BEFORE this device's own
-// 10 subscriptions or its ONLINE presence publish have necessarily
-// completed. Meaning UNCHANGED by this candidate -- every existing caller
-// (Outbox flush eligibility, chat/game/race send-gates, group-deletion
-// cleanup) was already written to treat "connected" as "safe to attempt a
-// bare outbound publish", which remains true: publishRaw()/publishBinary()
-// only ever need the wire to be up, never any of this device's OWN
-// subscriptions. Do NOT use this to decide whether an action that depends
-// on RECEIVING something addressed to this device (a reply on one of its
-// own subscribed topics) is safe -- see isGroupReady() below for that.
+// TRANSPORT-ONLY meaning, unchanged: true while this group's connection is up
+// and usable by the main task for a bare outbound publish (publishRaw()/
+// publishBinary() only ever need the wire to be up). Timing note (MQTT fix):
+// the main task first sees a connection when the connection worker hands it
+// over, which is after setup has completed, so this now turns true together
+// with isGroupReady() instead of a few setup steps earlier. Do NOT use this
+// to decide whether an action that depends on RECEIVING something addressed
+// to this device is safe -- see isGroupReady() below for that.
 bool isGroupConnected(const char* group_code) {
   GroupClient* gc = findClientSlot(group_code);
-  return gc != nullptr && gc->mqtt != nullptr && gc->mqtt->connected();
+  return gc != nullptr && gc->conn != nullptr && gc->conn->mqtt.connected();
 }
 
 bool isAnyGroupConnected() {
   for (auto& gc : g_clients) {
-    if (gc.active && gc.mqtt != nullptr && gc.mqtt->connected()) return true;
+    if (gc.state == SlotState::kActive && gc.conn != nullptr && gc.conn->mqtt.connected()) return true;
   }
   return false;
 }
 
-// Fix Phase 1C, additive: true only once transport is connected AND all 10
-// subscriptions succeeded AND Presence::publishOnline() itself returned
-// true with the connection still live afterward (see
-// doPublishOnlineOperation()). This is a STRICTLY STRONGER, separate
-// contract from isGroupConnected() above, not a redefinition of it --
-// every existing isGroupConnected()/isAnyGroupConnected() caller keeps its
-// current (transport-only) behavior unchanged.
-//
-// Use this only for an action whose correctness actually depends on THIS
-// device's own subscriptions already being active -- i.e. it is waiting to
-// receive a reply addressed to it. A new query alone does not make a
-// caller safe merely by existing; as of this candidate the audited callers
-// that actually need it are RadioTransport::startPrivateCall() (waits for
-// a GRANT/DENY on its own radio/busy_reply/<device> subscription) and
-// RadioTransport::handleRadioBusyPacket()'s BUSY_CLAIM branch (granting
-// implicitly promises the claimer a SESSION_START/ACK exchange that
-// depends on THIS device's own radio/session subscription already being
-// live), plus Presence::republishOwnPresenceAllGroups() (to avoid a
-// redundant/out-of-order ONLINE announcement racing the staged setup
-// engine's own single publishOnline() step for the same group). Every
-// other publishRaw()/publishBinary() caller audited for this candidate
-// (chat/game sends, Outbox flush) does NOT need it -- those really are
-// bare outbound publishes with no dependency on this device's own
-// subscriptions, so isGroupConnected() remains sufficient and correct for
-// them, unchanged.
-//
-// Race rooms are the other documented user (see roomReady() in race.cpp):
-// every room action anticipates the room state or a reply on this device's
-// own r2/+ and r2q/<own id> subscriptions, so the user ACTION is gated on
-// isGroupReady() before the room engine sends anything; the engine itself
-// also waits for isGroupReady() before resending. publishRaw()/
-// publishBinary() themselves still gate on isGroupConnected() only.
-// Fix Phase 1C (corrected): explicitly checks WifiManager::isConnected()
-// first. While WiFi is down, serviceTick() returns immediately (see
-// serviceTick()'s own early return) and never runs the WiFi-recovery
-// reconciliation block, so gc.ready/gc.mqtt->connected() are not
-// necessarily kept honest for the FULL duration of an outage -- a caller
-// polling isGroupReady() DURING that window (before the next serviceTick()
-// after WiFi returns has had a chance to reconcile anything) must not see
-// a stale true. This check is READ-ONLY: it does not mutate gc.ready or
-// gc.stage, so the `wasReady` information the WiFi-recovery block and
-// reconcileClientConnectivity() need to decide fresh-vs-preserved cooldown
-// is never destroyed by merely querying readiness during an outage.
+// Fix Phase 1C, unchanged contract: STRICTLY STRONGER than isGroupConnected()
+// -- true only once transport is connected AND all 10 subscriptions
+// succeeded AND the ONLINE presence publish was acknowledged with the
+// connection still up, and never while Wi-Fi is down (read-only check, so
+// a stale flag during an outage cannot answer true). Audited callers that
+// need it: RadioTransport::startPrivateCall() and its BUSY_CLAIM branch,
+// Presence::republishOwnPresenceAllGroups(), and the Race room engine
+// (roomReady() in race.cpp). Chat/game sends and the Outbox flush only need
+// isGroupConnected().
 bool isGroupReady(const char* group_code) {
   if (!WifiManager::isConnected()) return false;
   GroupClient* gc = findClientSlot(group_code);
-  return gc != nullptr && gc->mqtt != nullptr && gc->mqtt->connected() && gc->ready;
+  return gc != nullptr && gc->conn != nullptr && gc->conn->mqtt.connected() && gc->ready;
 }
 
 bool isAnyGroupReady() {
   if (!WifiManager::isConnected()) return false;
   for (auto& gc : g_clients) {
-    if (gc.active && gc.mqtt != nullptr && gc.mqtt->connected() && gc.ready) return true;
+    if (gc.state == SlotState::kActive && gc.conn != nullptr && gc.conn->mqtt.connected() && gc.ready) return true;
   }
   return false;
 }
@@ -1200,87 +1387,52 @@ bool isAnyGroupReady() {
 void setMaintenanceModeActive(bool active) {
   if (active == g_maintenanceMode) return;
   if (active) {
-    // Set the flag first so serviceTick() stops reconnecting/re-queuing
-    // for the rest of this call, then drain what's already queued
-    // ourselves -- serviceTick() (the only other caller of a drain
-    // variant) is now gated behind this same flag and would otherwise
-    // never run again for the whole OTA HTTPS/TLS operation, leaving every
-    // already-queued payload's heap allocation parked for that entire
-    // duration. onMqttMessage() only ever enqueues (parsing/dispatch
-    // happens exclusively inside the drain functions), so everything
-    // already sitting in g_queue[] was fully received before this call and
-    // is safe to process synchronously right here. Fix Phase 1D: uses the
-    // FULL drain variant deliberately, not the normal cooperative one --
-    // maintenance entry must still fully drain (preserving existing
-    // message persistence/dedup behavior), not stop partway on the
-    // cooperative drain's budget and leave a remainder that the defensive
-    // force-release block below would then discard.
+    // Set the flags first: no new setup step starts on the worker, and the
+    // service tick stops reconnecting/receiving. Then drain what is already
+    // queued ourselves (Fix Phase 1D: the FULL drain, so nothing queued is
+    // discarded), with the defensive release kept as a leak-proof fallback.
     g_maintenanceMode = true;
+    g_workerSuspended.store(true);
     drainReceiveQueueFull();
-
-    // Defensive verification, not expected to ever fire: drainReceiveQueueFull()
-    // unconditionally loops until g_queueCount reaches 0, re-checking the
-    // count on every iteration -- so even a reentrant onMqttMessage() call
-    // during this drain would itself get picked up and drained before the
-    // loop exits, not left behind. This is NOT limited to reentrancy via
-    // gc.mqtt->loop() (which serviceTick() -- now paused -- is the only
-    // caller of): a dispatched handler can itself call publishBinary()/
-    // publishRaw(), and whether the MQTT library's publish()/subscribe()
-    // pump a synchronous read internally and reentrantly invoke
-    // onMqttMessage() before returning is not something this file can rule
-    // out (256dpi/MQTT's source is not available here to verify). Kept as
-    // an explicit, leak-proof fallback rather than trusting the drain-to-
-    // empty invariant silently: if it ever fires for some other reason,
-    // every dynamic payload still marked used is freed exactly once here
-    // rather than left allocated for the duration of OTA.
-    if (g_queueCount != 0) {
+    uint8_t left = queueCount();
+    if (left != 0) {
       Serial.printf("[mqtt] maintenance mode: %u receive-queue payload(s) left after drain; forcing release\n",
-                   static_cast<unsigned>(g_queueCount));
-      for (auto& q : g_queue) {
-        if (q.used) {
-          delete[] q.data;
-          q.data = nullptr;
-          q.used = false;
-          q.len = 0;
-        }
-      }
-      g_queueHead = 0;
-      g_queueTail = 0;
-      g_queueCount = 0;
+                    static_cast<unsigned>(left));
+      releaseQueuedPayloads();
     }
 
     publishOfflineAllGroupsBounded();
-    // Fix Phase 1C: force-disconnect every connected client exactly as
-    // before, and explicitly reset each one's staged-setup bookkeeping
-    // here too -- not strictly required for correctness (isGroupReady()
-    // already re-checks connected() defensively, so a stale gc.ready
-    // alongside connected()==false could never be misread as Ready), but
-    // this keeps a freshly-exited-maintenance client's internal state
-    // honestly consistent rather than relying on that defensive check.
-    // nextReconnectAttemptMs is deliberately left untouched, exactly as
-    // before this candidate -- maintenance entry/exit follows the same
-    // "preserve the prior deadline" mechanism as any other Ready-loss,
-    // and typical OTA/sleep windows already exceed kMqttReconnectIntervalMs
-    // anyway, so reconnect after exit is virtually always immediate.
+    // Every connection is closed and every setup in flight canceled (its
+    // result, whenever it arrives, is closed rather than adopted). A
+    // deleted group's connection publishes OFFLINE and its record clear
+    // here; its broker session cleanup runs after maintenance.
     for (auto& gc : g_clients) {
-      if (!gc.active || gc.mqtt == nullptr) continue;
-      if (gc.mqtt->connected()) gc.mqtt->disconnect();
-      gc.mqtt->setTimeout(kMqttCommandTimeoutMs);
-      gc.ready = false;
-      gc.stage = SetupStage::kNeedConnect;
-      gc.subscribeCursor = 0;
+      if (gc.state == SlotState::kFree) continue;
+      bumpGeneration(slotIndex(gc));
+      if (gc.state == SlotState::kDraining && gc.conn != nullptr && gc.conn->mqtt.connected()) {
+        char topic[kTopicBufLen];
+        snprintf(topic, sizeof(topic), "morsebuddy/%s/presence/%s", gc.group_code, Identity::deviceId());
+        char payload[Presence::kPresencePayloadMax];
+        Presence::buildOwnPresencePayload(payload, sizeof(payload), "OFFLINE", WifiManager::getUnixTime());
+        gc.conn->mqtt.publish(topic, payload, /*retained=*/true, /*qos=*/1);
+        gc.conn->mqtt.publish(topic, "", /*retained=*/true, /*qos=*/1);
+      }
+      if (gc.conn != nullptr) dropAdoptedConn(gc, /*publishOffline=*/false);
+      gc.nextAttemptMs = 0;
     }
   } else {
-    g_maintenanceMode = false;  // un-pauses serviceTick(), which reconnects normally
+    // Reconnect exactly like a Wi-Fi recovery: at once.
+    g_workerSuspended.store(false);
+    g_maintenanceMode = false;
   }
 }
 
 bool publishRaw(const char* group_code, const char* topic_suffix, const char* payload, bool retained, int qos) {
   GroupClient* gc = findClientSlot(group_code);
-  if (gc == nullptr || gc->mqtt == nullptr || !gc->mqtt->connected()) return false;
+  if (gc == nullptr || gc->conn == nullptr || !gc->conn->mqtt.connected()) return false;
   char topic[80];
   snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", group_code, topic_suffix);
-  return gc->mqtt->publish(topic, payload, retained, qos);
+  return gc->conn->mqtt.publish(topic, payload, retained, qos);
 }
 
 // Hardware Diagnostic #4.9s: QoS1 publishes, timed around the actual
@@ -1303,33 +1455,25 @@ bool publishRaw(const char* group_code, const char* topic_suffix, const char* pa
 // Qos0Diag/recordQos0Publish()/flushQos0DiagIfDue() above.
 //
 // Hardware Diagnostic #4.9t: TEMPORARY synchronous experiment, not a
-// non-blocking fix -- see kMqttPublishTimeoutMsExperiment's own comment.
-// Audited: publishBinary() is never called from within any of the staged
-// setup operation functions' own widened-timeout windows (each of
-// doConnectOperation()/doSubscribeOperation()/doPublishOnlineOperation()
-// restores kMqttCommandTimeoutMs itself, immediately after its own single
-// gc.mqtt call, before returning -- see Fix Phase 1C) and never reentrantly
-// from the MQTT callback (onMessageAdvanced's onMqttMessage() only
-// enqueues; dispatch to any handler that might call this happens later, via
-// drainReceiveQueueCooperative(), which serviceTick() always calls after
-// that tick's one setup operation, if any, has already restored the normal
-// timeout) -- so this function can safely assume it is always entered with
-// kMqttCommandTimeoutMs already in effect.
+// non-blocking fix -- see kMqttPublishTimeoutMsExperiment's own comment. Main
+// task only: an adopted connection always carries kMqttCommandTimeoutMs
+// (the worker sets it at handover), and this call restores it before
+// returning, so it is always entered with the normal timeout in effect.
 bool publishBinary(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                    bool retained, int qos) {
   GroupClient* gc = findClientSlot(group_code);
-  if (gc == nullptr || gc->mqtt == nullptr || !gc->mqtt->connected()) return false;
+  if (gc == nullptr || gc->conn == nullptr || !gc->conn->mqtt.connected()) return false;
   char topic[80];
   snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", group_code, topic_suffix);
   if (qos == 1) {
-    gc->mqtt->setTimeout(kMqttPublishTimeoutMsExperiment);
+    gc->conn->mqtt.setTimeout(kMqttPublishTimeoutMsExperiment);
     uint32_t publishStart = millis();
-    bool result = gc->mqtt->publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
+    bool result = gc->conn->mqtt.publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
     uint32_t publishElapsed = millis() - publishStart;
-    int lastErr = static_cast<int>(gc->mqtt->lastError());
-    bool connectedAfter = gc->mqtt->connected();
+    int lastErr = static_cast<int>(gc->conn->mqtt.lastError());
+    bool connectedAfter = gc->conn->mqtt.connected();
     // Restore before any logging/return, on both success and failure.
-    gc->mqtt->setTimeout(kMqttCommandTimeoutMs);
+    gc->conn->mqtt.setTimeout(kMqttCommandTimeoutMs);
     if (!result || publishElapsed >= 20) {
       Serial.printf(
           "[PERF][MQTT] publish group=%s qos=%d retained=%d bytes=%u %lu ms result=%d lastError=%d "
@@ -1347,10 +1491,10 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
   // connected() are snapshotted in that exact order, immediately after
   // publish() returns, before any recording/logging.
   uint32_t qos0Start = static_cast<uint32_t>(millis());
-  bool qos0Result = gc->mqtt->publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
+  bool qos0Result = gc->conn->mqtt.publish(topic, reinterpret_cast<const char*>(data), static_cast<int>(len), retained, qos);
   uint32_t qos0Elapsed = static_cast<uint32_t>(millis()) - qos0Start;
-  int qos0LastErr = static_cast<int>(gc->mqtt->lastError());
-  bool qos0ConnectedAfter = gc->mqtt->connected();
+  int qos0LastErr = static_cast<int>(gc->conn->mqtt.lastError());
+  bool qos0ConnectedAfter = gc->conn->mqtt.connected();
   recordQos0Publish(qos0Elapsed, qos0Result, qos0LastErr, qos0ConnectedAfter);
   flushQos0DiagIfDue(static_cast<uint32_t>(millis()));
   return qos0Result;
