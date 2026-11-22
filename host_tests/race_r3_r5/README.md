@@ -102,6 +102,33 @@ from here; or set `REPO=/path/to/morse-buddy`).
 - RB4 is now "the room closes" (was RESET).
 - RB3 now covers a missed result followed directly by the next round.
 
+### `mqtt_test.cpp` (step 4d: MQTT connection worker)
+
+ACTUAL `mqtt_manager.cpp`, `crc32.cpp` and `packet_codec.cpp` against a
+scripted broker (`fake_net/`: FreeRTOS queues and tasks on `std::thread`,
+lwIP's resolver, `WiFiClient`, and 256dpi/MQTT's `MQTTClient` surface).
+Settings, hooks, Identity, Presence and WifiManager are stubs, and each call
+into them from a thread other than the main task counts as a failure: the
+worker may touch only its job, immutable data and the shared receive queue.
+
+- `mqtt_test manual`: deterministic; the worker's jobs run when the test
+  says. Setup contract (client id, will, keepalive, clean session, the 10
+  topics and their QoS, ONLINE last), retry backoff, failing stages, broker
+  endpoint memory, Ready-loss, Wi-Fi recovery, group deletion and
+  replacement at every point of a setup, stale results, OTA maintenance,
+  before-sleep, receive dispatch, presence changes during setup, full slots,
+  worker-start failure, and the bounded write on a real socket pair.
+- `mqtt_test threads N`: a real worker thread held inside each network step
+  while the main tick is timed, deletion and Wi-Fi recovery mid-setup, and an
+  N-step randomized lifecycle stress. Also built with ThreadSanitizer.
+- `mutate_mqtt.py` (step 7c): targeted mutants of the worker and lifecycle
+  rules; each must be caught (locking mutants under TSan).
+
+The fake broker counts two connections under one client id at once, two
+threads inside one client at once, and operations on a closed client.
+Host timing is not device timing; the real lwIP, Wi-Fi and broker are not
+modelled.
+
 ### Other steps
 - `solo_test.cpp`, `friend_test.cpp` (step 4): unchanged tests.
 - Step 5: C++11/17 syntax checks of every changed production file against
@@ -758,4 +785,6 @@ followed by the next round; RB2c/RB11 count CLAIM requests (was
     only.
   - `fake_sys/`: WiFi.h, LittleFS.h and MQTT.h stubs, for the syntax check
     only.
+  - `fake_net/`: the scripted network for `mqtt_test.cpp` (also used by the
+    syntax check of `mqtt_manager.cpp`).
 - **`race_stubs.cpp`:** counts `setRaceInvitePending(true)`.
