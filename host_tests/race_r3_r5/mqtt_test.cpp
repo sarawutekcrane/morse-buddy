@@ -1080,6 +1080,98 @@ static void testCleanupRetryBounded() {
         isGroupReady("Q5"), overlaps());
 }
 
+static std::vector<std::pair<uint32_t, bool>> g_doneLog;
+static void onPublishDone(uint32_t ticket, bool ok) {
+  mainOnly();
+  g_doneLog.push_back(std::make_pair(ticket, ok));
+}
+static bool isChat(const FakeNet::Event& e) { return e.topic.find("/broadcast") != std::string::npos; }
+
+static void testAsyncPublish() {
+  g_test = "M17 async publish: the connection is lent to the worker for one publish; meanwhile the group reads as connected, nothing else uses it, and the result comes back once";
+  resetAll();
+  g_doneLog.clear();
+  connectGroup("A1");
+  std::string id = clientIdOf("A1");
+  int connectsBefore = count(FakeNet::events(), "connect", id);
+  uint32_t t = publishBinaryAsync("A1", "broadcast", reinterpret_cast<const uint8_t*>("hello"), 5, false, 1, onPublishDone);
+  bool lentState = t != 0 && slotOf("A1")->conn == nullptr && slotOf("A1")->connLent;
+  bool stillUp = isGroupConnected("A1") && isGroupReady("A1") && g_connFn() == CONN_ONLINE;
+  bool syncRefused = !publishBinary("A1", "broadcast", reinterpret_cast<const uint8_t*>("x"), 1, false, 1) &&
+                     publishBinaryAsync("A1", "broadcast", reinterpret_cast<const uint8_t*>("y"), 1, false, 1, onPublishDone) == 0;
+  for (int i = 0; i < 5; i++) {
+    advance(2000);
+    tick();  // no loop() on the lent connection, no setup for the group
+  }
+  bool noCallbackYet = g_doneLog.empty() && count(FakeNet::events(), "connect", id) == connectsBefore;
+  pumpWorker();
+  bool publishedOnWorker = count(FakeNet::events(), "publish", id, isChat) == 1;
+  tick();
+  CHECK(lentState && stillUp && syncRefused && noCallbackYet && publishedOnWorker,
+        "lent %d, still connected/ready/ON %d, other publishes refused meanwhile %d, nothing before the worker ran %d, published %d",
+        lentState, stillUp, syncRefused, noCallbackYet, publishedOnWorker);
+  CHECK(g_doneLog.size() == 1 && g_doneLog[0].first == t && g_doneLog[0].second && slotOf("A1")->conn != nullptr &&
+            !slotOf("A1")->connLent && publishRaw("A1", "broadcast", "z", false, 1),
+        "callback once (%zu, ok %d), connection back and usable", g_doneLog.size(), !g_doneLog.empty() && g_doneLog[0].second);
+  CHECK(concurrentUse() == 0 && overlaps() == 0 && g_offMainCalls.load() == 0, "concurrent %d overlaps %d off-main %d",
+        concurrentUse(), overlaps(), g_offMainCalls.load());
+
+  g_test = "M18 async publish fails (no PUBACK): the callback says so, the closed connection is freed, the group reconnects after its window";
+  resetAll();
+  g_doneLog.clear();
+  connectGroup("A2");
+  {
+    std::lock_guard<std::mutex> l(FakeNet::st().m);
+    FakeNet::st().livePublishFailures = 1;
+  }
+  t = publishBinaryAsync("A2", "broadcast", reinterpret_cast<const uint8_t*>("hello"), 5, false, 1, onPublishDone);
+  pumpWorker();
+  tick();
+  bool failedSeen = g_doneLog.size() == 1 && !g_doneLog[0].second && !isGroupConnected("A2") && g_liveConns.load() == 0;
+  advance(6000);
+  tick();
+  pumpWorker();
+  tick();
+  CHECK(t != 0 && failedSeen && isGroupReady("A2") && overlaps() == 0, "failure reported and freed %d, reconnected %d",
+        failedSeen, isGroupReady("A2"));
+
+  g_test = "M19 the group deleted / Wi-Fi recovering / OTA maintenance starting while its connection is lent: the callback still comes once; no duplicate client id";
+  for (int variant = 0; variant < 3; variant++) {
+    resetAll();
+    g_doneLog.clear();
+    connectGroup("A3");
+    std::string id3 = clientIdOf("A3");
+    t = publishBinaryAsync("A3", "broadcast", reinterpret_cast<const uint8_t*>("hello"), 5, false, 1, onPublishDone);
+    if (variant == 0) {
+      deleteGroup("A3");
+    } else if (variant == 1) {
+      g_wifi = false;
+      tick();
+      g_wifi = true;
+      tick();
+    } else {
+      setMaintenanceModeActive(true);
+    }
+    tick();
+    bool waited = count(FakeNet::events(), "connect", id3, cleanConnect) == 0 && count(FakeNet::events(), "connect", id3) == 1;
+    pumpWorker();
+    for (int i = 0; i < 6; i++) {
+      advance(1000);
+      tick();
+      pumpWorker();
+    }
+    std::vector<FakeNet::Event> ev = FakeNet::events();
+    bool ok;
+    if (variant == 0) ok = count(ev, "connect", id3, cleanConnect) == 1 && count(ev, "publish", id3, isOffline) == 1 && liveSessions(id3) == 0;
+    else if (variant == 1) ok = isGroupReady("A3") && liveSessions(id3) == 1;
+    else ok = !isGroupConnected("A3") && liveSessions(id3) == 0 && count(ev, "publish", id3, isOffline) >= 1;
+    CHECK(t != 0 && waited && ok && g_doneLog.size() == 1 && overlaps() == 0,
+          "%s: nothing started on its client id while lent %d, outcome %d, callbacks %zu, overlaps %d",
+          variant == 0 ? "deleted" : variant == 1 ? "Wi-Fi recovery" : "maintenance", waited, ok, g_doneLog.size(), overlaps());
+    if (variant == 2) setMaintenanceModeActive(false);
+  }
+}
+
 static void testSleep() {
   g_test = "M11 before deep sleep: OFFLINE for ready groups; a queued setup never publishes ONLINE";
   resetAll();
@@ -1348,6 +1440,36 @@ static void testRecoveryStraddle() {
         count(FakeNet::events(), "connect", id, sessionConnect), overlaps(), liveSessions(id));
 }
 
+static void testAsyncPublishHeld() {
+  g_test = "T5 the main tick stays fast while the worker waits for a chat message's PUBACK; the group stays ON";
+  resetAll();
+  g_doneLog.clear();
+  addGroup("P5");
+  tickUntil([] { return isGroupReady("P5"); }, 3000);
+  FakeNet::setGate("publish");
+  uint32_t t = publishBinaryAsync("P5", "broadcast", reinterpret_cast<const uint8_t*>("hello"), 5, false, 1, onPublishDone);
+  uint32_t maxUs = 0;
+  bool held = tickUntil([] { return FakeNet::atGate(); }, 3000, &maxUs);
+  bool on = true;
+  auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+  while (std::chrono::steady_clock::now() < end) {
+    auto t0 = std::chrono::steady_clock::now();
+    tick();
+    uint32_t us = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    if (us > maxUs) maxUs = us;
+    on = on && g_connFn() == CONN_ONLINE && g_doneLog.empty();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  FakeNet::release();
+  bool done = tickUntil([] { return !g_doneLog.empty(); }, 3000, &maxUs);
+  settle();
+  printf("   MEASURE T5 publish held 1 s: longest tick %u us\n", maxUs);
+  CHECK(t != 0 && held && on && done && g_doneLog.size() == 1 && g_doneLog[0].second && maxUs < 20000 && concurrentUse() == 0,
+        "held %d, ON and no callback while held %d, callback once ok %d, longest tick %u us, concurrent %d", held, on, done, maxUs,
+        concurrentUse());
+}
+
 static void testStress(int iterations, uint32_t seed) {
   g_test = "T3 randomized lifecycle stress with a real worker: groups added/deleted/replaced, Wi-Fi flaps, maintenance, drops, publishes, deliveries";
   resetAll();
@@ -1389,6 +1511,7 @@ static void testStress(int iterations, uint32_t seed) {
         break;
       }
       case 6:
+        publishBinaryAsync(code, "broadcast", reinterpret_cast<const uint8_t*>("aa"), 2, false, 1, onPublishDone);
         publishRaw(code, "broadcast", "x", false, 1);
         publishBinary(code, "radio/session", reinterpret_cast<const uint8_t*>("yy"), 2, false, 0);
         break;
@@ -1472,6 +1595,7 @@ int main(int argc, char** argv) {
     testMaintenance();
     testCleanupDuringMaintenance();
     testCleanupAcrossMaintenance();
+    testAsyncPublish();
     testCleanupRetryBounded();
     testSleep();
     testReceive();
@@ -1485,6 +1609,7 @@ int main(int argc, char** argv) {
     testResponsiveness();
     testDeleteWhileHeld();
     testRecoveryStraddle();
+    testAsyncPublishHeld();
     for (uint32_t seed = 1; seed <= 3; seed++) testStress(n, seed);
     settle();
     FakeRtos::stopAll();

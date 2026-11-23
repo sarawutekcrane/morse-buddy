@@ -343,6 +343,7 @@ static void freshDevice() {
   LittleFS.onFileOpen = nullptr;
   LittleFS.reverseListing = false;
   LittleFS.endListing = nullptr;
+  LittleFS.fakeUsedBytes = 200000;
   LittleFS.wipe();
   MessageStore::notifyExternalStorageMutationAttempted();  // a wiped device: nothing cached survives (as after the reboot that follows)
   T::reset();

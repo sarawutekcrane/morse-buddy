@@ -64,4 +64,20 @@ bool publishRaw(const char* group_code, const char* topic_suffix, const char* pa
 bool publishBinary(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                    bool retained, int qos);
 
+// Asynchronous publish (MQTT fix, hardware device A: "[PERF][MQTT] publish
+// ... qos=1 ... 605 ms" inside a chat send). The group's connection is lent
+// to the connection worker for this one publish, so the PUBACK wait never
+// blocks the main loop; `done(ticket, ok)` is then called exactly once, on
+// the main task, from MqttManager's service tick (ok: the publish succeeded,
+// for QoS1 a PUBACK was received -- the same evidence publishBinary() gives).
+// Returns the ticket (non-zero) once started; 0 when it could not start (no
+// connection, the connection already lent, the worker queue full, no memory,
+// OTA maintenance) -- the caller then does what it does after a failed
+// publish. While the connection is lent the group still reads as connected,
+// but publishRaw()/publishBinary() for it return false (as on any failed
+// publish) until it is back.
+using PublishDoneFn = void (*)(uint32_t ticket, bool ok);
+uint32_t publishBinaryAsync(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
+                            bool retained, int qos, PublishDoneFn done);
+
 }  // namespace MqttManager

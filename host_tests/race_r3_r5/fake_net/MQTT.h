@@ -142,7 +142,7 @@ class MQTTClient {
     }
     bool online = std::string(topic).find("/presence/") != std::string::npos && length > 0 &&
                   std::string(payload, static_cast<size_t>(length)).find("|ONLINE|") != std::string::npos;
-    if (online) FakeNet::maybeGate("online");
+    FakeNet::maybeGate(online ? "online" : "publish");
     FakeNet::Event e = base("publish");
     e.topic = topic;
     e.payload.assign(payload, static_cast<size_t>(length));

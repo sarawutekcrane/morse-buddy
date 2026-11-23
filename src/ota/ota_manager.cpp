@@ -7,6 +7,8 @@
 #include <esp_ota_ops.h>
 #include <string.h>
 
+#include <atomic>
+
 #if __has_include("sdkconfig.h")
 #include "sdkconfig.h"
 #endif
@@ -649,6 +651,15 @@ void selectRestartDevice() { ESP.restart(); }
 // Settings > System > Firmware Update > Check for Update.
 // =============================================================================
 bool g_backgroundCheckDone = false;
+// The background check runs on its own one-shot task (hardware, device A:
+// "[PERF] services=1081 ms" around "[ota] background check: firmware is up
+// to date" -- the HTTPS fetch, TLS handshake included, ran inside the main
+// loop's service tick). fetchManifest() uses only its own locals (its
+// WiFiClientSecure/HTTPClient, a heap buffer) and logs; nothing else is
+// shared. A manual check waits while this runs, so two TLS sessions never
+// overlap (and an install, which starts from a manual check, never meets it).
+std::atomic<bool> g_backgroundCheckRunning(false);
+constexpr uint32_t kBackgroundCheckStackBytes = 8192;  // the Arduino loop task's own size, which ran this before
 
 void runBackgroundAvailabilityCheck() {
   if (OtaConfig::isPlaceholderServer()) {
@@ -671,11 +682,24 @@ void runBackgroundAvailabilityCheck() {
 
 void serviceInit() { runPostOtaValidation(); }
 
+void backgroundCheckTask(void*) {
+  runBackgroundAvailabilityCheck();
+  g_backgroundCheckRunning.store(false);
+  vTaskDelete(nullptr);
+}
+
 void serviceTick() {
   if (g_backgroundCheckDone) return;
   if (!WifiManager::isConnected() || !WifiManager::isNtpSynced()) return;
   g_backgroundCheckDone = true;
-  runBackgroundAvailabilityCheck();
+  g_backgroundCheckRunning.store(true);
+  // Core 0 (with the network stack), below the Wi-Fi tasks: the TLS work
+  // does not take CPU time from the Arduino loop on core 1.
+  if (xTaskCreatePinnedToCore(backgroundCheckTask, "ota_bgcheck", kBackgroundCheckStackBytes, nullptr, 1, nullptr, 0) !=
+      pdPASS) {
+    g_backgroundCheckRunning.store(false);
+    Serial.println("[ota] background check skipped: could not start its task");
+  }
 }
 
 struct Registrar {
@@ -771,6 +795,7 @@ void screenFirmwareUpdate() {
         g_checkingDrawn = true;
         return;
       }
+      if (g_backgroundCheckRunning.load()) return;  // the boot-time background check finishes first
       g_checkingDrawn = false;
       runCheckForUpdateBlocking();
       return;
