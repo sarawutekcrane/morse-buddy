@@ -12,8 +12,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "lwip/dns.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "lwip/tcpip.h"
 
 #include "core/crc32.h"
 #include "core/hooks.h"
@@ -90,6 +92,11 @@ constexpr uint32_t kSendBudgetMs = 500;
 constexpr uint32_t kRetryMinMs = 2000;
 constexpr uint32_t kRetryMaxMs = 60000;
 constexpr uint32_t kReadyAntiThrashMs = 5000;
+// A deleted group's broker-session cleanup (cleanSession connection) that
+// fails on the network is retried on the same schedule, at most this many
+// attempts in all; one skipped for OTA maintenance is redone after it and
+// does not count.
+constexpr uint8_t kCleanupMaxAttempts = 3;
 
 // Broker endpoints (addresses DNS returned for kBrokerHost during this
 // boot; never a built-in address). An endpoint that failed at TCP or MQTT
@@ -597,25 +604,55 @@ Endpoint* noteResolvedEndpoint(uint32_t ip, uint32_t now) {
   return e;
 }
 
-// The address to try: what DNS returned, unless that address failed recently
-// and another one DNS returned within kEndpointMaxAgeMs has worked (the
-// most recently working such one is used). With DNS down, the most recently
-// working known address. Avoidance is a preference, never a hard block.
-uint32_t chooseEndpoint(bool resolved, uint32_t resolvedIp, uint32_t now) {
-  if (resolved) {
-    Endpoint* e = noteResolvedEndpoint(resolvedIp, now);
-    if (!endpointAvoided(*e, now)) return resolvedIp;
+bool endpointRecent(const Endpoint& e, uint32_t now) {
+  return static_cast<uint32_t>(now - e.lastSeenMs) <= kEndpointMaxAgeMs;
+}
+
+// The address to try, from the addresses this lookup returned (`resolved`,
+// in DNS order) and those earlier lookups returned within kEndpointMaxAgeMs:
+//  1. one from this lookup that is not being avoided -- one that has
+//     worked before first, then the others in DNS order (so a second
+//     address of the same answer is tried after the first failed, with no
+//     earlier success needed);
+//  2. else an earlier lookup's address that is not being avoided -- the
+//     most recently working one, then one never tried yet;
+//  3. else (all avoided) the address whose avoidance ends first.
+// Avoidance is a preference, never a hard block. Only addresses DNS
+// returned are ever used. 0: nothing known (DNS down, empty table).
+uint32_t chooseEndpoint(const uint32_t* resolved, uint8_t n, uint32_t now) {
+  for (uint8_t i = 0; i < n; i++) noteResolvedEndpoint(resolved[i], now);
+  for (int pass = 0; pass < 2; pass++) {
+    for (uint8_t i = 0; i < n; i++) {
+      const Endpoint* e = findEndpoint(resolved[i]);
+      if (e != nullptr && !endpointAvoided(*e, now) && (pass == 1 || e->everOk)) return resolved[i];
+    }
   }
   const Endpoint* best = nullptr;
-  for (const auto& e : g_endpoints) {
-    if (!e.used || !e.everOk || endpointAvoided(e, now)) continue;
-    if (resolved && e.ip == resolvedIp) continue;
-    if (static_cast<uint32_t>(now - e.lastSeenMs) > kEndpointMaxAgeMs) continue;
+  for (const auto& e : g_endpoints) {  // earlier lookups' addresses that worked
+    if (!e.used || !e.everOk || endpointAvoided(e, now) || !endpointRecent(e, now)) continue;
     if (best == nullptr || static_cast<int32_t>(e.lastOkMs - best->lastOkMs) > 0) best = &e;
   }
   if (best != nullptr) return best->ip;
-  return resolved ? resolvedIp : 0;
+  for (const auto& e : g_endpoints) {  // earlier lookups' addresses never tried
+    if (!e.used || e.everOk || e.failures != 0 || !endpointRecent(e, now)) continue;
+    if (best == nullptr || static_cast<int32_t>(e.lastSeenMs - best->lastSeenMs) > 0) best = &e;
+  }
+  if (best != nullptr) return best->ip;
+  for (const auto& e : g_endpoints) {  // all avoided: the one free soonest
+    if (!e.used || !endpointRecent(e, now)) continue;
+    if (best == nullptr || static_cast<int32_t>(e.avoidUntilMs - best->avoidUntilMs) < 0) best = &e;
+  }
+  return best != nullptr ? best->ip : 0;
 }
+
+// ESP32 lwIP keeps ONE address per name (the first A record of the answer)
+// until its TTL expires, so a later lookup would return the same failing
+// address again. After an endpoint failure the DNS cache is cleared -- in
+// lwIP's own thread, as its API requires -- so the next lookup asks the DNS
+// server again and may learn another address. At most once per failed
+// attempt, so bounded by the retry backoff. (Other names cached by lwIP
+// are simply looked up again on their next use.)
+void clearDnsCacheInTcpipThread(void*) { dns_clear_cache(); }
 
 void noteEndpointFailure(uint32_t ip, uint32_t now) {
   Endpoint* e = findEndpoint(ip);
@@ -626,6 +663,7 @@ void noteEndpointFailure(uint32_t ip, uint32_t now) {
   uint32_t avoid = kEndpointAvoidBaseMs << shift;
   if (avoid > kEndpointAvoidMaxMs) avoid = kEndpointAvoidMaxMs;
   e->avoidUntilMs = now + avoid;
+  tcpip_callback(clearDnsCacheInTcpipThread, nullptr);
 }
 
 void noteEndpointOk(uint32_t ip, uint32_t now) {
@@ -638,23 +676,28 @@ void noteEndpointOk(uint32_t ip, uint32_t now) {
 }
 
 // lwIP's own resolver (thread-safe, unlike WiFiGenericClass::hostByName()).
-// Returns the first IPv4 address (network byte order) or 0.
-uint32_t resolveBroker() {
+// Fills `out` with up to `cap` distinct IPv4 addresses (network byte order)
+// in the answer's order; returns how many. (On this ESP32 lwIP an answer
+// carries one address; a resolver returning several is handled the same way.)
+uint8_t resolveBroker(uint32_t* out, uint8_t cap) {
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   struct addrinfo* res = nullptr;
   int err = lwip_getaddrinfo(kBrokerHost, nullptr, &hints, &res);
-  uint32_t ip = 0;
+  uint8_t n = 0;
   if (err == 0) {
-    for (struct addrinfo* a = res; a != nullptr && ip == 0; a = a->ai_next) {
-      if (a->ai_family == AF_INET && a->ai_addr != nullptr)
-        ip = reinterpret_cast<struct sockaddr_in*>(a->ai_addr)->sin_addr.s_addr;
+    for (struct addrinfo* a = res; a != nullptr && n < cap; a = a->ai_next) {
+      if (a->ai_family != AF_INET || a->ai_addr == nullptr) continue;
+      uint32_t ip = reinterpret_cast<struct sockaddr_in*>(a->ai_addr)->sin_addr.s_addr;
+      bool dup = ip == 0;
+      for (uint8_t i = 0; i < n && !dup; i++) dup = out[i] == ip;
+      if (!dup) out[n++] = ip;
     }
   }
   if (res != nullptr) lwip_freeaddrinfo(res);
-  return ip;
+  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -666,10 +709,11 @@ uint32_t resolveBroker() {
 bool openConnection(Conn& c, const char* clientId, bool cleanSession, const char* willPayload, Result& r,
                     uint32_t& dnsMs, uint32_t& tcpMs, uint32_t& connackMs) {
   uint32_t t0 = millis();
-  uint32_t resolvedIp = resolveBroker();
+  uint32_t resolved[kMaxEndpoints];
+  uint8_t resolvedCount = resolveBroker(resolved, kMaxEndpoints);
   uint32_t now = millis();
   dnsMs = now - t0;
-  c.endpoint = chooseEndpoint(resolvedIp != 0, resolvedIp, now);
+  c.endpoint = chooseEndpoint(resolved, resolvedCount, now);
   r.endpoint = c.endpoint;
   if (c.endpoint == 0) {
     r.failedAt = Stage::kDns;
@@ -874,7 +918,7 @@ void workerMain(void*) {
 enum class SlotState : uint8_t {
   kFree,
   kActive,    // a configured group
-  kDraining,  // deleted; waiting for its setup job's result before its cleanup job is queued
+  kDraining,  // deleted; until its cleanup job has completed (a setup job still out comes back first)
 };
 
 struct GroupClient {
@@ -894,6 +938,11 @@ struct GroupClient {
   // adoption whether this device's presence changed meanwhile.
   uint32_t onlineCrc = 0;
   uint32_t onlineTs = 0;
+  // kDraining: the cleanup job is with the worker / failed cleanup attempts.
+  // The slot (and so its client id, see clientIdDraining()) stays reserved
+  // until the cleanup is done or given up.
+  bool cleanupInFlight = false;
+  uint8_t cleanupAttempts = 0;
 };
 
 GroupClient g_clients[Settings::kMaxGroups];
@@ -1014,12 +1063,15 @@ bool ensureWorker() {
   return true;
 }
 
-// Queues a deleted group's cleanup once its setup job (if any) is back.
-// Not during maintenance (resumed on exit).
+// Queues a deleted group's cleanup once its setup job (if any) is back and
+// its retry time has come. Not during maintenance and not while Wi-Fi is
+// down (it needs the network); the slot stays draining meanwhile.
 void postPendingCleanups() {
-  if (g_maintenanceMode || g_jobQueue == nullptr) return;
+  if (g_maintenanceMode || g_jobQueue == nullptr || !WifiManager::isConnected()) return;
+  uint32_t now = millis();
   for (auto& c : g_clients) {
-    if (c.state != SlotState::kDraining || c.jobInFlight) continue;
+    if (c.state != SlotState::kDraining || c.jobInFlight || c.cleanupInFlight) continue;
+    if (!deadlineReached(now, c.nextAttemptMs)) continue;
     Job job;
     memset(&job, 0, sizeof(job));
     job.type = JobType::kCleanup;
@@ -1031,10 +1083,37 @@ void postPendingCleanups() {
                                       WifiManager::getUnixTime());
     job.conn = c.conn;
     if (xQueueSend(g_jobQueue, &job, 0) != pdTRUE) return;  // queue full: next tick
-    uint8_t slot = job.slot;
-    c = GroupClient();  // kFree; the connection now belongs to the job
-    bumpGeneration(slot);
+    c.conn = nullptr;  // the connection now belongs to the job
+    c.cleanupInFlight = true;
   }
+}
+
+void freeSlot(GroupClient& c) {
+  uint8_t slot = slotIndex(c);
+  c = GroupClient();
+  bumpGeneration(slot);
+}
+
+void handleCleanupResult(const Result& r) {
+  GroupClient& c = g_clients[r.slot];
+  if (c.state != SlotState::kDraining || !c.cleanupInFlight) return;  // defensive: not this slot's cleanup
+  c.cleanupInFlight = false;
+  if (r.ok) {
+    freeSlot(c);
+    return;
+  }
+  if (r.failedAt == Stage::kCanceled) {
+    c.nextAttemptMs = 0;  // skipped for maintenance: redone after it, not an attempt
+    Serial.printf("[MQTT] cleanup group=%s deferred until maintenance ends\n", c.group_code);
+    return;
+  }
+  if (++c.cleanupAttempts >= kCleanupMaxAttempts) {
+    Serial.printf("[MQTT] cleanup group=%s broker session not cleared after %u attempts; giving up\n", c.group_code,
+                  static_cast<unsigned>(c.cleanupAttempts));
+    freeSlot(c);
+    return;
+  }
+  c.nextAttemptMs = deadlineAfter(millis(), retryDelayMs(c.cleanupAttempts));
 }
 
 // Queues a setup job for every group due for an attempt. Posting copies a
@@ -1131,7 +1210,7 @@ void processWorkerResults() {
   Result r;
   while (xQueueReceive(g_resultQueue, &r, 0) == pdTRUE) {
     if (r.type == JobType::kSetup) handleSetupResult(r);
-    // kCleanup: nothing to do (the worker logged it).
+    else handleCleanupResult(r);
   }
 }
 
@@ -1168,6 +1247,8 @@ void onSettingsChanged(const SettingsChangeInfo& info) {
       bumpGeneration(slotIndex(*c));
       c->ready = false;
       c->state = SlotState::kDraining;  // keeps c->conn for the cleanup job
+      c->nextAttemptMs = 0;              // from now on: the cleanup's retry time
+      c->cleanupAttempts = 0;
       postPendingCleanups();
       break;
     }

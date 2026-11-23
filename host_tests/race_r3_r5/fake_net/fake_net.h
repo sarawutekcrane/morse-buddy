@@ -201,6 +201,15 @@ struct State {
   std::map<uint32_t, Script> scripts;  // by address (network byte order)
   Script defaultScript;
   std::deque<uint32_t> dnsAnswers;     // consumed in order; the last one repeats
+  // Multi-address answers (used instead of dnsAnswers when non-empty): one
+  // entry per DNS response, consumed in order, the last one repeats. With
+  // dnsCacheModel (ESP32 lwIP: one cached answer per name until its TTL), the
+  // same response is returned until dns_clear_cache() runs.
+  std::deque<std::vector<uint32_t>> dnsResponses;
+  bool dnsCacheModel = false;
+  bool dnsCacheValid = false;
+  std::vector<uint32_t> dnsCached;
+  int dnsCacheClears = 0;
   bool dnsFail = false;
   int dnsQueries = 0;
   // Gate: the worker blocks when it reaches this step ("dns", "tcp",
@@ -284,6 +293,11 @@ inline void reset() {
   s.scripts.clear();
   s.defaultScript = Script();
   s.dnsAnswers.clear();
+  s.dnsResponses.clear();
+  s.dnsCacheModel = false;
+  s.dnsCacheValid = false;
+  s.dnsCached.clear();
+  s.dnsCacheClears = 0;
   s.dnsFail = false;
   s.dnsQueries = 0;
   s.gate.clear();
@@ -301,31 +315,67 @@ inline void reset() {
 }
 }  // namespace FakeNet
 
-// lwIP resolver (lwip/netdb.h)
+// lwIP resolver (lwip/netdb.h): every address of the answer, in order.
 inline int lwip_getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo** res) {
   FakeNet::maybeGate("dns");
-  uint32_t ip = 0;
+  std::vector<uint32_t> ips;
   {
     std::lock_guard<std::mutex> l(FakeNet::st().m);
-    FakeNet::st().dnsQueries++;
-    if (FakeNet::st().dnsFail || FakeNet::st().dnsAnswers.empty()) {
+    FakeNet::State& s = FakeNet::st();
+    s.dnsQueries++;
+    if (s.dnsFail) {
       *res = nullptr;
       return EAI_FAIL;
     }
-    ip = FakeNet::st().dnsAnswers.front();
-    if (FakeNet::st().dnsAnswers.size() > 1) FakeNet::st().dnsAnswers.pop_front();
+    if (!s.dnsResponses.empty()) {
+      if (!s.dnsCacheModel || !s.dnsCacheValid) {
+        s.dnsCached = s.dnsResponses.front();
+        if (s.dnsResponses.size() > 1) s.dnsResponses.pop_front();
+        s.dnsCacheValid = true;
+      }
+      ips = s.dnsCached;
+    } else if (!s.dnsAnswers.empty()) {
+      ips.push_back(s.dnsAnswers.front());
+      if (s.dnsAnswers.size() > 1) s.dnsAnswers.pop_front();
+    }
   }
-  struct addrinfo* a = new struct addrinfo();
-  struct sockaddr_in* sin = new struct sockaddr_in();
-  sin->sin_family = AF_INET;
-  sin->sin_addr.s_addr = ip;
-  a->ai_family = AF_INET;
-  a->ai_socktype = SOCK_STREAM;
-  a->ai_addr = reinterpret_cast<struct sockaddr*>(sin);
-  a->ai_addrlen = sizeof(*sin);
-  a->ai_next = nullptr;
-  *res = a;
+  if (ips.empty()) {
+    *res = nullptr;
+    return EAI_FAIL;
+  }
+  struct addrinfo* head = nullptr;
+  struct addrinfo** tail = &head;
+  for (uint32_t ip : ips) {
+    struct addrinfo* a = new struct addrinfo();
+    struct sockaddr_in* sin = new struct sockaddr_in();
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = ip;
+    a->ai_family = AF_INET;
+    a->ai_socktype = SOCK_STREAM;
+    a->ai_addr = reinterpret_cast<struct sockaddr*>(sin);
+    a->ai_addrlen = sizeof(*sin);
+    a->ai_next = nullptr;
+    *tail = a;
+    tail = &a->ai_next;
+  }
+  *res = head;
   return 0;
+}
+// lwIP DNS cache and tcpip thread (lwip/dns.h, lwip/tcpip.h): the callback
+// runs at once (the fake has no tcpip thread).
+typedef int8_t err_t;
+#ifndef ERR_OK
+#define ERR_OK 0
+#endif
+typedef void (*tcpip_callback_fn)(void* ctx);
+inline void dns_clear_cache() {
+  std::lock_guard<std::mutex> l(FakeNet::st().m);
+  FakeNet::st().dnsCacheValid = false;
+  FakeNet::st().dnsCacheClears++;
+}
+inline err_t tcpip_callback(tcpip_callback_fn fn, void* ctx) {
+  fn(ctx);
+  return ERR_OK;
 }
 inline void lwip_freeaddrinfo(struct addrinfo* a) {
   while (a != nullptr) {

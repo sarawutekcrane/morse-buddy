@@ -179,6 +179,8 @@ using namespace MqttManager;
 static const uint32_t kA = FakeNet::ip4(18, 158, 167, 130);
 static const uint32_t kB = FakeNet::ip4(3, 64, 233, 141);
 static const uint32_t kBad = FakeNet::ip4(3, 122, 167, 42);
+static const uint32_t kBad2 = FakeNet::ip4(18, 157, 221, 89);
+static const uint32_t kC = FakeNet::ip4(35, 158, 1, 2);
 
 static void tick() { g_svc.tick(); }
 static void advance(uint32_t ms) { g_simMs += ms; }
@@ -543,6 +545,145 @@ static void testEndpoints() {
   CHECK(onlyDns, "every address used came from DNS");
 }
 
+static void setDnsResponses(std::vector<std::vector<uint32_t>> responses, bool cacheModel) {
+  std::lock_guard<std::mutex> l(FakeNet::st().m);
+  FakeNet::st().dnsAnswers.clear();
+  FakeNet::st().dnsResponses.assign(responses.begin(), responses.end());
+  FakeNet::st().dnsCacheModel = cacheModel;
+  FakeNet::st().dnsCacheValid = false;
+}
+static std::vector<uint32_t> connectIps(const std::string& id) {
+  std::vector<uint32_t> ips;
+  for (auto& e : FakeNet::events())
+    if ((e.kind == "connect" || e.kind == "connect-failed") && e.clientId == id && !e.cleanSession) ips.push_back(e.ip);
+  return ips;
+}
+static void attempt() {  // one setup attempt once its retry time has come
+  GroupClient* c = nullptr;
+  for (auto& g : g_clients)
+    if (g.state == SlotState::kActive) c = &g;
+  if (c != nullptr && c->nextAttemptMs != 0 && !deadlineReached(millis(), c->nextAttemptMs)) g_simMs = c->nextAttemptMs;
+  tick();
+  pumpWorker();
+  tick();
+}
+
+static void testDnsSecondAddress() {
+  g_test = "M3b the first address of a DNS answer accepts TCP but sends no CONNACK; the second address of the same answer is used next, with no earlier success";
+  resetAll();
+  FakeNet::Script noAck;
+  noAck.connackError = LWMQTT_MISSING_OR_WRONG_PACKET;
+  setScript(kBad, noAck);
+  setDnsResponses({{kBad, kA}}, false);
+  addGroup("N1");
+  attempt();
+  CHECK(!isGroupConnected("N1"), "first attempt (kBad) fails");
+  attempt();
+  std::vector<uint32_t> ips = connectIps(clientIdOf("N1"));
+  CHECK(isGroupReady("N1") && ips.size() == 2 && ips[0] == kBad && ips[1] == kA,
+        "ready on the second attempt through the answer's second address (ready %d, attempts %zu)", isGroupReady("N1"), ips.size());
+}
+
+static void testDnsFreshAnswer() {
+  g_test = "M3c ESP32 lwIP (one cached address per lookup): after an endpoint fails, a fresh DNS answer is requested and its new address used, with no earlier success";
+  resetAll();
+  FakeNet::Script noAck;
+  noAck.connackError = LWMQTT_MISSING_OR_WRONG_PACKET;
+  setScript(kBad, noAck);
+  setDnsResponses({{kBad}, {kA}}, true);
+  addGroup("N2");
+  attempt();
+  int clearsAfterFailure;
+  {
+    std::lock_guard<std::mutex> l(FakeNet::st().m);
+    clearsAfterFailure = FakeNet::st().dnsCacheClears;
+  }
+  attempt();
+  std::vector<uint32_t> ips = connectIps(clientIdOf("N2"));
+  CHECK(clearsAfterFailure >= 1 && isGroupReady("N2") && ips.size() == 2 && ips[0] == kBad && ips[1] == kA,
+        "cache refresh requested %d; ready %d through the new address (attempts %zu)", clearsAfterFailure, isGroupReady("N2"),
+        ips.size());
+  int clearsBefore;
+  {
+    std::lock_guard<std::mutex> l(FakeNet::st().m);
+    clearsBefore = FakeNet::st().dnsCacheClears;
+  }
+  {
+    std::lock_guard<std::mutex> l(FakeNet::st().m);
+    FakeNet::st().dropNext.insert(clientIdOf("N2"));
+  }
+  tick();
+  advance(6000);
+  attempt();
+  int clearsAfter;
+  {
+    std::lock_guard<std::mutex> l(FakeNet::st().m);
+    clearsAfter = FakeNet::st().dnsCacheClears;
+  }
+  CHECK(isGroupReady("N2") && clearsAfter == clearsBefore, "no DNS refresh for a loss that was not an endpoint failure (%d)",
+        clearsAfter - clearsBefore);
+}
+
+static void testDnsAllBad() {
+  g_test = "M3d every address of the answer fails: both are tried, retries stay on the backoff schedule, nothing outside the answer is used";
+  resetAll();
+  FakeNet::Script noAck;
+  noAck.connackError = LWMQTT_MISSING_OR_WRONG_PACKET;
+  setScript(kBad, noAck);
+  setScript(kBad2, noAck);
+  setDnsResponses({{kBad, kBad2}}, false);
+  addGroup("N3");
+  uint32_t t0 = millis();
+  for (int i = 0; i < 6; i++) attempt();
+  std::vector<uint32_t> ips = connectIps(clientIdOf("N3"));
+  int bad = 0, bad2 = 0, other = 0;
+  for (uint32_t ip : ips) (ip == kBad ? bad : ip == kBad2 ? bad2 : other)++;
+  uint32_t span = millis() - t0;
+  // 6 attempts on the 2,4,8,16,32 s schedule (+-20%): at least 0.8*(2+4+8+16+32) s
+  CHECK(ips.size() == 6 && bad >= 1 && bad2 >= 1 && other == 0 && slotOf("N3")->consecutiveFailures == 6 && span >= 49600,
+        "attempts %zu (kBad %d, kBad2 %d, other %d), failures %u, span %u ms", ips.size(), bad, bad2, other,
+        slotOf("N3")->consecutiveFailures, span);
+}
+
+static void testDnsPrefersWorking() {
+  g_test = "M3e an address that has worked is preferred to one never tried: within one answer, after a failure, and with DNS down";
+  for (int variant = 0; variant < 3; variant++) {
+    resetAll();
+    setDnsResponses({{kB}}, false);
+    connectGroup("W9");  // B works
+    std::string id = clientIdOf("W9");
+    {
+      std::lock_guard<std::mutex> l(FakeNet::st().m);
+      FakeNet::st().dropNext.insert(id);
+    }
+    tick();
+    if (variant == 0) {
+      setDnsResponses({{kC, kB}}, false);  // C (never tried) first in the answer
+    } else {
+      advance(1000);
+      noteResolvedEndpoint(kC, millis());  // a later lookup returned C; it was never tried
+      g_simMs = slotOf("W9")->nextAttemptMs;
+      if (variant == 1) {
+        FakeNet::Script dead;
+        dead.tcpOk = false;
+        setScript(kBad, dead);
+        setDnsResponses({{kBad}}, false);  // the next answer fails
+        attempt();
+      } else {
+        setDnsResponses({}, false);
+        std::lock_guard<std::mutex> l(FakeNet::st().m);
+        FakeNet::st().dnsFail = true;  // DNS down
+      }
+    }
+    attempt();
+    std::vector<uint32_t> ips = connectIps(id);
+    CHECK(isGroupReady("W9") && !ips.empty() && ips.back() == kB,
+          "variant %d (%s): reconnected through B (ready %d, last address B %d)", variant,
+          variant == 0 ? "same answer" : variant == 1 ? "after a failure" : "DNS down", isGroupReady("W9"),
+          !ips.empty() && ips.back() == kB);
+  }
+}
+
 static void testReadyLoss() {
   g_test = "M4 a ready connection lost (loop, or a failed publish) is freed at once and retried after the 5 s anti-thrash window";
   resetAll();
@@ -692,7 +833,9 @@ static void testReplacement() {
   pumpWorker();  // old setup finished, result pending
   deleteGroup("X1");
   addGroup("X1");  // same code, new slot
-  tick();          // old result taken (kept for cleanup); cleanup queued; then the new setup
+  tick();          // old result taken (kept for cleanup); cleanup queued
+  pumpWorker();
+  tick();          // cleanup result frees the old slot; only then is the new setup queued
   pumpWorker();
   tick();
   std::vector<FakeNet::Event> ev = FakeNet::events();
@@ -737,7 +880,8 @@ static void testStaleResultNewOccupant() {
   deleteGroup("OLD");
   pumpWorker();
   tick();
-  pumpWorker();  // cleanup done; slot free
+  pumpWorker();  // cleanup done
+  tick();        // its result frees the slot (since the session-cleanup fix the slot stays reserved until then)
   addGroup("NEW");
   CHECK(slotOf("NEW") != nullptr && slotIndex(*slotOf("NEW")) == slot, "NEW reuses the slot");
   tick();  // NEW's job queued
@@ -837,6 +981,103 @@ static void testCleanupDuringMaintenance() {
   pumpWorker();
   ev = FakeNet::events();
   CHECK(count(ev, "connect", id2, cleanConnect) == 1, "its session cleanup runs after maintenance (%d)", count(ev, "connect", id2, cleanConnect));
+}
+
+static void testCleanupAcrossMaintenance() {
+  g_test = "M10c delete a connected group, its cleanup queued, OTA maintenance starts before the worker runs it, maintenance ends: the broker-session cleanup still happens, once, with no duplicate client id";
+  resetAll();
+  connectGroup("Q3");
+  std::string id = clientIdOf("Q3");
+  deleteGroup("Q3");               // cleanup queued, holding the connection
+  setMaintenanceModeActive(true);  // before the worker runs it
+  pumpWorker();                    // worker: OFFLINE + clear + disconnect; session cleanup skipped (suspended)
+  for (int i = 0; i < 3; i++) {
+    advance(1000);
+    tick();
+    pumpWorker();
+  }
+  std::vector<FakeNet::Event> ev = FakeNet::events();
+  CHECK(count(ev, "connect", id, cleanConnect) == 0 && liveSessions(id) == 0 && count(ev, "publish", id, isOffline) == 1 &&
+            count(ev, "publish", id, isClear) == 1,
+        "during maintenance: OFFLINE %d, clear %d, no cleanSession connect (%d), no live session (%d)",
+        count(ev, "publish", id, isOffline), count(ev, "publish", id, isClear), count(ev, "connect", id, cleanConnect),
+        liveSessions(id));
+  setMaintenanceModeActive(false);
+  for (int i = 0; i < 4; i++) {
+    advance(1000);
+    tick();
+    pumpWorker();
+  }
+  ev = FakeNet::events();
+  CHECK(count(ev, "connect", id, cleanConnect) == 1 && count(ev, "connect", id, sessionConnect) == 1 && overlaps() == 0 &&
+            liveSessions(id) == 0 && g_liveConns.load() == 0,
+        "after maintenance: cleanSession connects %d (expected 1), session connects %d, overlaps %d, live sessions %d",
+        count(ev, "connect", id, cleanConnect), count(ev, "connect", id, sessionConnect), overlaps(), liveSessions(id));
+  // same order, and the group is added again (same code) during maintenance
+  resetAll();
+  connectGroup("Q4");
+  id = clientIdOf("Q4");
+  deleteGroup("Q4");
+  setMaintenanceModeActive(true);
+  pumpWorker();
+  addGroup("Q4");
+  tick();
+  setMaintenanceModeActive(false);
+  for (int i = 0; i < 6; i++) {
+    advance(1000);
+    tick();
+    pumpWorker();
+  }
+  tick();
+  ev = FakeNet::events();
+  int iClean = -1, iNew = -1, sessions = 0;
+  for (size_t i = 0; i < ev.size(); i++) {
+    if (ev[i].clientId != id || ev[i].kind != "connect") continue;
+    if (ev[i].cleanSession) iClean = static_cast<int>(i);
+    else if (++sessions == 2) iNew = static_cast<int>(i);
+  }
+  CHECK(isGroupReady("Q4") && iClean >= 0 && iNew > iClean && overlaps() == 0 && liveSessions(id) == 1,
+        "re-added during maintenance: session cleanup %d before the new session %d, ready %d, overlaps %d, live sessions %d",
+        iClean, iNew, isGroupReady("Q4"), overlaps(), liveSessions(id));
+}
+
+static void testCleanupRetryBounded() {
+  g_test = "M10d a session cleanup that fails on the network is retried on the backoff schedule, 3 attempts in all, then given up; the client id stays reserved until then";
+  resetAll();
+  connectGroup("Q5");
+  std::string id = clientIdOf("Q5");
+  FakeNet::Script dead;
+  dead.tcpOk = false;
+  setScript(kA, dead);
+  deleteGroup("Q5");
+  addGroup("Q5");  // re-added at once: must wait for the cleanup to finish or be given up
+  int newSessionsWhileDraining = 0, cleanupAttempts = 0;
+  for (int i = 0; i < 40; i++) {
+    advance(1000);
+    tick();
+    pumpWorker();
+    bool draining = false;
+    for (auto& c : g_clients) draining = draining || (c.state == SlotState::kDraining && c.client_id == id);
+    if (draining) {
+      newSessionsWhileDraining = count(FakeNet::events(), "connect", id, sessionConnect) - 1;
+      // TCP fails before CONNECT, so the cleanup's attempts are counted through the endpoint's failures
+      Endpoint* ep = findEndpoint(kA);
+      cleanupAttempts = ep != nullptr ? ep->failures : -1;
+    }
+  }
+  bool drainingLeft = false;
+  for (auto& c : g_clients) drainingLeft = drainingLeft || c.state == SlotState::kDraining;
+  CHECK(!drainingLeft && newSessionsWhileDraining == 0 && cleanupAttempts == 3,
+        "draining slot released %d, new sessions while draining %d, failed cleanup attempts while the client id was reserved %d (expected 3)", !drainingLeft,
+        newSessionsWhileDraining, cleanupAttempts);
+  setScript(kA, FakeNet::Script());
+  for (int i = 0; i < 70; i++) {
+    advance(1000);
+    tick();
+    pumpWorker();
+  }
+  CHECK(isGroupReady("Q5") && overlaps() == 0, "re-added group ready after the cleanup was given up (%d), overlaps %d",
+        isGroupReady("Q5"), overlaps());
 }
 
 static void testSleep() {
@@ -1217,6 +1458,10 @@ int main(int argc, char** argv) {
     testFailureBackoff();
     testSetupStageFailures();
     testEndpoints();
+    testDnsSecondAddress();
+    testDnsFreshAnswer();
+    testDnsAllBad();
+    testDnsPrefersWorking();
     testReadyLoss();
     testWifi();
     testDeleteDuringSetup();
@@ -1226,6 +1471,8 @@ int main(int argc, char** argv) {
     testStaleResultNewOccupant();
     testMaintenance();
     testCleanupDuringMaintenance();
+    testCleanupAcrossMaintenance();
+    testCleanupRetryBounded();
     testSleep();
     testReceive();
     testPresenceDrift();
