@@ -323,8 +323,18 @@ void logRaceHeap(const char* event) {
 }
 
 // =============================================================================
-// Engine platform: MQTT (PacketCodec header + publishBinary, QoS 1), the
+// Engine platform: MQTT (PacketCodec header + publishBinaryAsync, QoS 1), the
 // mb_race NVS namespace, esp_random(), Identity's persistent counter.
+//
+// Publishes go out on the MQTT connection worker (hardware, both devices on
+// b573ec7: the coordinator's 60 s retained heartbeat -- 130 bytes, a
+// two-member room -- timed out its PUBACK after 1506 ms on the main loop,
+// and MQTT 2.5.2 closes the connection on any publish error). The worker
+// waits up to 5 s without blocking the loop, and the room's publishes keep
+// their order (a commit's state, then its reply) on one chained loan. The
+// engine never acts on a publish result -- its own retries cover a lost one
+// (the echo backoff for its state, the requester's resend for requests) --
+// so "queued" is reported as success, exactly as a refusal reports failure.
 // =============================================================================
 bool platformPublish(void*, const char* group, const char* suffix, uint8_t kind, const uint8_t* payload, uint16_t len,
                      bool retained) {
@@ -332,8 +342,8 @@ bool platformPublish(void*, const char* group, const char* suffix, uint8_t kind,
   if (len > RaceProtocol::kStateMaxBytes) return false;
   if (!PacketCodec::encodeHeader(kind, len, wire, sizeof(wire))) return false;
   memcpy(wire + PacketCodec::kHeaderSize, payload, len);
-  return MqttManager::publishBinary(group, suffix, wire, static_cast<uint16_t>(PacketCodec::kHeaderSize + len),
-                                    retained, 1);
+  return MqttManager::publishBinaryAsync(group, suffix, wire, static_cast<uint16_t>(PacketCodec::kHeaderSize + len),
+                                         retained, 1, nullptr) != 0;
 }
 bool platformGroupReady(void*, const char* group) { return MqttManager::isGroupReady(group); }
 bool platformNvsWrite(void*, const char* key, const void* data, size_t len) {

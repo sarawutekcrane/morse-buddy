@@ -63,12 +63,25 @@
 //  - loop(): reads only bytes already available, but a packet received in
 //    part makes lwmqtt wait up to kMqttCommandTimeoutMs (500 ms) for the rest;
 //    its PINGREQ write is bounded by kSendBudgetMs (500 ms).
-//  - QoS1 publishes wait for the PUBACK: publishBinary() up to
-//    kMqttPublishTimeoutMsExperiment (1500 ms), publishRaw() (presence) up to
-//    500 ms, plus the write (<= 500 ms). QoS0 publishes: the write only.
-//    Text and Enigma chat sends use publishBinaryAsync() instead (the wait
-//    runs on the worker; core/chat_send.h) whenever it can start; the Outbox
-//    retry, Friend game and Race publishes still use publishBinary().
+//  - Synchronous QoS1 publishes wait for the PUBACK: publishBinary() up to
+//    kMqttPublishTimeoutMsExperiment (1500 ms), publishRaw() (presence, when
+//    the connection is not lent) up to 500 ms, plus the write (<= 500 ms);
+//    QoS0 publishes: the write only. Still synchronous: the Friend game
+//    (it shows the PUBACK result), radio (QoS0), presence when not lent, and
+//    a chat send whose store failed. On the worker instead
+//    (publishBinaryAsync()): Text/Enigma chat sends (core/chat_send.h), the
+//    Outbox retry, every Race publish (state heartbeat, requests, replies).
+//
+// Connection states (callers pick the one they need):
+//  - isGroupConnected()/isGroupReady(), the ON/WIFI status: the group has a
+//    live session -- adopted by the main task OR lent to the worker for a
+//    publish chain. A loan never flips ON to WIFI.
+//  - Publishable now on the main task: adopted and not lent. While lent,
+//    publishBinary() returns false at once (a Friend move or radio frame in
+//    that window fails as on any failed publish; QoS0 radio frames are
+//    dropped), publishRaw() (presence) joins the chain, publishBinaryAsync()
+//    joins the chain (at most kMaxLentPublishes). Nothing ever touches the
+//    client from two tasks.
 //  - Received messages are dispatched on the main task (cooperative drain:
 //    8 ms budget between items; one slow handler is not interrupted).
 //  - OTA maintenance entry and before-sleep: OFFLINE publishes, at most 2 s
@@ -135,6 +148,10 @@ constexpr uint32_t kWorkerStackBytes = 6144;
 constexpr UBaseType_t kWorkerPriority = 1;
 constexpr BaseType_t kWorkerCore = 0;  // the Arduino loop runs on core 1
 constexpr UBaseType_t kJobQueueDepth = 8;
+// Publishes chained on one group's lent connection (publishBinaryAsync()):
+// bounds how much the worker holds for a group; beyond it a publish is
+// refused (the caller's retry applies) rather than queued without limit.
+constexpr uint8_t kMaxLentPublishes = 4;
 constexpr UBaseType_t kResultQueueDepth = 8;
 
 // Rollover-safe "deadline reached" (0 = no deadline: eligible now).
@@ -556,6 +573,7 @@ struct Job {
   bool retained;
   uint8_t qos;
   uint32_t ticket;
+  void (*done)(uint32_t ticket, bool ok);  // kPublish: called with the result on the main task (may be null)
 };
 
 struct Result {
@@ -570,6 +588,7 @@ struct Result {
   uint32_t elapsedMs;
   Conn* conn;  // kSetup and ok: the ready connection, now the main task's; kPublish: the lent one, back
   uint32_t ticket;  // kPublish
+  void (*done)(uint32_t ticket, bool ok);  // kPublish
 };
 
 QueueHandle_t g_jobQueue = nullptr;
@@ -934,10 +953,14 @@ void runPublishJob(const Job& job) {
   r.slot = job.slot;
   r.generation = job.generation;
   r.ticket = job.ticket;
+  r.done = job.done;
   r.conn = job.conn;
   Conn* c = job.conn;
   uint32_t start = millis();
-  if (c != nullptr && c->mqtt.connected()) {
+  // A canceled loan (Wi-Fi recovery, maintenance, sleep) publishes nothing
+  // more: its connection comes back closed. A publish after an earlier one
+  // of the same loan failed finds the connection closed and fails at once.
+  if (c != nullptr && !jobCanceled(job) && c->mqtt.connected()) {
     char topic[kTopicBufLen];
     snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", job.group_code, job.suffix);
     c->mqtt.setTimeout(kHandshakeAckTimeoutMs);
@@ -1004,15 +1027,19 @@ struct GroupClient {
   // until the cleanup is done or given up.
   bool cleanupInFlight = false;
   uint8_t cleanupAttempts = 0;
-  // The adopted connection is lent to the worker for one publish
-  // (publishBinaryAsync()); `conn` is null meanwhile. It still counts as the
-  // group's live connection: no setup or cleanup (same client id) starts,
-  // and the group still reads as connected. `lentDone` is called once with
-  // the result.
-  bool connLent = false;
-  uint32_t lentTicket = 0;
-  void (*lentDone)(uint32_t ticket, bool ok) = nullptr;
+  // The adopted connection is lent to the worker for a chain of publishes
+  // (publishBinaryAsync(), and publishRaw() while lent): `lentPublishes`
+  // queued or running, at most kMaxLentPublishes, published by the worker in
+  // order; `conn` is null and `lentConn` is the worker's meanwhile. It still
+  // counts as the group's live connection: no setup or cleanup (same client
+  // id) starts, and the group still reads as connected. It comes back with
+  // the chain's last result; each publish's callback runs with its own.
+  uint8_t lentPublishes = 0;
+  Conn* lentConn = nullptr;
+  uint32_t lentGeneration = 0;
 };
+
+bool isLent(const GroupClient& c) { return c.lentPublishes > 0; }
 
 GroupClient g_clients[Settings::kMaxGroups];
 bool g_maintenanceMode = false;
@@ -1139,7 +1166,7 @@ void postPendingCleanups() {
   if (g_maintenanceMode || g_jobQueue == nullptr || !WifiManager::isConnected()) return;
   uint32_t now = millis();
   for (auto& c : g_clients) {
-    if (c.state != SlotState::kDraining || c.jobInFlight || c.cleanupInFlight || c.connLent) continue;
+    if (c.state != SlotState::kDraining || c.jobInFlight || c.cleanupInFlight || isLent(c)) continue;
     if (!deadlineReached(now, c.nextAttemptMs)) continue;
     Job job;
     memset(&job, 0, sizeof(job));
@@ -1190,7 +1217,7 @@ void handleCleanupResult(const Result& r) {
 void postDueSetupJobs(uint32_t now) {
   if (g_jobQueue == nullptr) return;
   for (auto& c : g_clients) {
-    if (c.state != SlotState::kActive || c.conn != nullptr || c.jobInFlight || c.connLent) continue;
+    if (c.state != SlotState::kActive || c.conn != nullptr || c.jobInFlight || isLent(c)) continue;
     if (!deadlineReached(now, c.nextAttemptMs)) continue;
     if (clientIdDraining(c.client_id)) continue;  // its cleanup (same client id) must run first
     Job job;
@@ -1281,28 +1308,31 @@ void handleSetupResult(const Result& r) {
 // caller's callback runs last, once.
 void handlePublishResult(const Result& r) {
   GroupClient& c = g_clients[r.slot];
-  if (!c.connLent || r.ticket != c.lentTicket) {  // defensive: not this slot's loan
-    disposeConn(r.conn, /*publishOffline=*/false);
+  if (!isLent(c)) {  // cannot happen: every publish job belongs to its slot's loan
+    Serial.printf("[mqtt] publish result for slot %u without a loan (ignored)\n", static_cast<unsigned>(r.slot));
+    if (r.done != nullptr) r.done(r.ticket, r.ok);
     return;
   }
-  void (*done)(uint32_t, bool) = c.lentDone;
-  c.connLent = false;
-  c.lentDone = nullptr;
-  bool current = c.state == SlotState::kActive && r.generation == g_slotGeneration[r.slot].load() &&
-                 !g_maintenanceMode && WifiManager::isConnected();
-  if (current && r.conn != nullptr && r.conn->mqtt.connected()) {
-    c.conn = r.conn;
-  } else if (c.state == SlotState::kDraining && c.conn == nullptr) {
-    c.conn = r.conn;  // deleted meanwhile: its cleanup publishes OFFLINE and closes it
-    if (g_maintenanceMode) retireDrainingConnForMaintenance(c);
-  } else {
-    disposeConn(r.conn, /*publishOffline=*/g_maintenanceMode);
-    if (c.state == SlotState::kActive) {
-      c.ready = false;
-      if (!current) c.nextAttemptMs = 0;  // canceled meanwhile (Wi-Fi recovery, maintenance): as soon as allowed
+  c.lentPublishes--;
+  if (c.lentPublishes == 0) {  // the chain's last result: the connection is the main task's again
+    Conn* conn = c.lentConn;
+    c.lentConn = nullptr;
+    bool current = c.state == SlotState::kActive && c.lentGeneration == g_slotGeneration[r.slot].load() &&
+                   !g_maintenanceMode && WifiManager::isConnected();
+    if (current && conn != nullptr && conn->mqtt.connected()) {
+      c.conn = conn;
+    } else if (c.state == SlotState::kDraining && c.conn == nullptr) {
+      c.conn = conn;  // deleted meanwhile: its cleanup publishes OFFLINE and closes it
+      if (g_maintenanceMode) retireDrainingConnForMaintenance(c);
+    } else {
+      disposeConn(conn, /*publishOffline=*/g_maintenanceMode);
+      if (c.state == SlotState::kActive) {
+        c.ready = false;
+        if (!current) c.nextAttemptMs = 0;  // canceled meanwhile (Wi-Fi recovery, maintenance): as soon as allowed
+      }
     }
   }
-  if (done != nullptr) done(r.ticket, r.ok);
+  if (r.done != nullptr) r.done(r.ticket, r.ok);
 }
 
 void processWorkerResults() {
@@ -1322,7 +1352,7 @@ void onWifiRecovered() {
   for (auto& c : g_clients) {
     if (c.state != SlotState::kActive) continue;
     if (c.conn != nullptr) dropAdoptedConn(c, /*publishOffline=*/false);
-    if (c.jobInFlight || c.connLent) bumpGeneration(slotIndex(c));  // a lent connection comes back stale: closed
+    if (c.jobInFlight || isLent(c)) bumpGeneration(slotIndex(c));  // a lent connection comes back stale: closed
     c.consecutiveFailures = 0;
     c.nextAttemptMs = 0;
   }
@@ -1386,7 +1416,7 @@ void onBeforeSleep() {
 // The group's connection is up: adopted and open, or lent to the worker for
 // one publish (it was open when lent; its result says otherwise if not).
 bool linkUp(GroupClient& gc) {
-  return gc.state == SlotState::kActive && ((gc.conn != nullptr && gc.conn->mqtt.connected()) || gc.connLent);
+  return gc.state == SlotState::kActive && ((gc.conn != nullptr && gc.conn->mqtt.connected()) || isLent(gc));
 }
 
 uint8_t connectivityStatusProvider() {
@@ -1636,9 +1666,21 @@ uint32_t publishBinaryAsync(const char* group_code, const char* topic_suffix, co
                             bool retained, int qos, PublishDoneFn done) {
   static uint32_t s_nextTicket = 0;
   GroupClient* gc = findClientSlot(group_code);
-  if (gc == nullptr || gc->conn == nullptr || gc->connLent || !gc->conn->mqtt.connected()) return 0;
+  if (gc == nullptr || gc->state != SlotState::kActive) return 0;
   if (g_jobQueue == nullptr || g_workerTask == nullptr || g_maintenanceMode) return 0;
   if (strlen(topic_suffix) >= sizeof(Job().suffix)) return 0;
+  uint8_t slot = slotIndex(*gc);
+  Conn* conn;
+  if (isLent(*gc)) {
+    // Joins the loan: published after the ones already queued, on the same
+    // connection (only the worker touches it until the chain's last result).
+    if (gc->lentPublishes >= kMaxLentPublishes) return 0;
+    if (gc->lentGeneration != g_slotGeneration[slot].load()) return 0;  // canceled loan: comes back closed
+    conn = gc->lentConn;
+  } else {
+    if (gc->conn == nullptr || !gc->conn->mqtt.connected()) return 0;
+    conn = gc->conn;
+  }
   uint8_t* copy = new (std::nothrow) uint8_t[len > 0 ? len : 1];
   if (copy == nullptr) return 0;
   if (len > 0) memcpy(copy, data, len);
@@ -1646,8 +1688,8 @@ uint32_t publishBinaryAsync(const char* group_code, const char* topic_suffix, co
   Job job;
   memset(&job, 0, sizeof(job));
   job.type = JobType::kPublish;
-  job.slot = slotIndex(*gc);
-  job.generation = g_slotGeneration[job.slot].load();
+  job.slot = slot;
+  job.generation = g_slotGeneration[slot].load();
   strncpy(job.group_code, gc->group_code, sizeof(job.group_code) - 1);
   strncpy(job.suffix, topic_suffix, sizeof(job.suffix) - 1);
   job.payload = copy;
@@ -1655,20 +1697,30 @@ uint32_t publishBinaryAsync(const char* group_code, const char* topic_suffix, co
   job.retained = retained;
   job.qos = static_cast<uint8_t>(qos);
   job.ticket = s_nextTicket;
-  job.conn = gc->conn;
-  if (xQueueSend(g_jobQueue, &job, 0) != pdTRUE) {
+  job.done = done;
+  job.conn = conn;
+  if (xQueueSend(g_jobQueue, &job, 0) != pdTRUE) {  // bounded: the queue is full, nothing waits
     delete[] copy;
     return 0;
   }
-  gc->conn = nullptr;
-  gc->connLent = true;
-  gc->lentTicket = job.ticket;
-  gc->lentDone = done;
+  if (!isLent(*gc)) {
+    gc->lentConn = conn;
+    gc->conn = nullptr;
+    gc->lentGeneration = job.generation;
+  }
+  gc->lentPublishes++;
   return job.ticket;
 }
 
 bool publishRaw(const char* group_code, const char* topic_suffix, const char* payload, bool retained, int qos) {
   GroupClient* gc = findClientSlot(group_code);
+  // While the connection is lent, a presence update joins the worker's chain
+  // instead of being lost (no caller acts on presence results: true here
+  // means queued, not acknowledged).
+  if (gc != nullptr && isLent(*gc)) {
+    return publishBinaryAsync(group_code, topic_suffix, reinterpret_cast<const uint8_t*>(payload),
+                              static_cast<uint16_t>(strlen(payload)), retained, qos, nullptr) != 0;
+  }
   if (gc == nullptr || gc->conn == nullptr || !gc->conn->mqtt.connected()) return false;
   char topic[80];
   snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", group_code, topic_suffix);

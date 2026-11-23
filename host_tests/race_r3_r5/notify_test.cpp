@@ -16,6 +16,7 @@
 // ---- the MessageStore/Storage/Sleep/sound hooks notifications.cpp needs ----
 namespace MessageStore {
 bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
+  T::updateCalls++;  // counted (the chat-send tests check when the pending flag is rewritten)
   bool found = false;
   for (auto& r : T::store)
     if (r.ref.sequence == ref.sequence && !strcmp(r.ref.group_code, ref.group_code) && !strcmp(r.ref.contact_key, ref.contact_key)) {

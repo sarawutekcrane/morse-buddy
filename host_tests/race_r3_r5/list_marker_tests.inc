@@ -827,5 +827,99 @@
           kChatName[enigma], fin.size(), origMissing, xMissing, countPrefix(fin, xs[0]) == 0, x1Selected, opened);
   }
 
+  // Presence while a recipient list is open (hardware, both devices on
+  // b573ec7: a contact that came online kept showing "(offline)" until the
+  // list was re-entered). Text and Enigma share RecipientRows::refresh().
+  auto presenceAs = [](const char* group, const char* id, const char* name, const char* st) {
+    char p[120];
+    snprintf(p, sizeof(p), "MBP1|%s|%s|%s|0|%lu|255", id, name, st, (unsigned long)T::unixTime);
+    Presence::handleIncoming(group, p, static_cast<uint16_t>(strlen(p)));
+  };
+  // Earlier tests' presence lives on in RAM: emptied the way a group deletion empties it.
+  auto clearPresence = [] {
+    SettingsChangeInfo info{};
+    info.event = SET_GROUP_DELETED;
+    strncpy(info.group_code, kG, sizeof(info.group_code) - 1);
+    T_fireSettingsChange(info);
+  };
+  auto shown = [](const std::string& label) {
+    for (auto& d : T::screen)
+      if (d.text == label) return true;
+    return false;
+  };
+  for (int enigma = 0; enigma < 2; enigma++) {
+    g_test = std::string("PR1 ") + kChatName[enigma] + " list open: a contact coming online, going offline and a new one appearing update the rows in place; the highlighted identity stays; no file opened";
+    clearPresence();
+    freshDevice();
+    powerOn(); runFor(30);
+    presenceAs(kG, kBob, "Bob", "ONLINE");
+    presenceAs(kG, kBob, "Bob", "OFFLINE");  // Bob: a recent, offline contact
+    presenceAs(kG, kCarl, "Carol", "ONLINE");
+    openMode(enigma);
+    bool before = shown("Bob (offline)") && shown("Carol") && shown("Everyone");
+    rot(1); rot(1); loopPass(2);  // highlight Everyone (rows: Carol, Bob (offline), Everyone)
+    uint64_t opens = g_fs.fileOpens + g_fs.dirOpens;
+    presenceAs(kG, kBob, "Bob", "ONLINE");
+    loopPass(2);
+    bool bobOnline = shown("Bob") && !shown("Bob (offline)");
+    presenceAs(kG, kCarl, "Carol", "OFFLINE");
+    presenceAs(kG, kDave, "Dave", "ONLINE");
+    loopPass(2);
+    bool after = shown("Carol (offline)") && shown("Dave") && shown("Bob") && shown("Everyone");
+    uint64_t opened = g_fs.fileOpens + g_fs.dirOpens - opens;
+    // The cursor (">") is drawn on the highlighted row: still Everyone's.
+    int cursorY = -1, everyoneY = -2;
+    for (auto& d : T::screen) {
+      if (d.text == ">") cursorY = d.y;
+      if (d.text == "Everyone") everyoneY = d.y;
+    }
+    bool everyone = cursorY == everyoneY;
+    CHECK(before && bobOnline && after && everyone && opened == 0,
+          "%s: before %d, Bob online in place %d, Carol offline + Dave added %d, highlight kept on Everyone %d, files/dirs opened %llu",
+          kChatName[enigma], before, bobOnline, after, everyone, static_cast<unsigned long long>(opened));
+    toMain();
+
+    g_test = std::string("PR2 ") + kChatName[enigma] + " list open: repeated identical presence redraws nothing";
+    clearPresence();
+    freshDevice();
+    powerOn(); runFor(30);
+    presenceAs(kG, kBob, "Bob", "ONLINE");
+    openMode(enigma);
+    loopPass(3);
+    size_t d0 = T::drawLog.size();
+    loopPass(3);
+    size_t idle = T::drawLog.size() - d0;  // what three passes draw anyway (status bar)
+    size_t d1 = T::drawLog.size();
+    presenceAs(kG, kBob, "Bob", "ONLINE");
+    loopPass(3);
+    size_t dup = T::drawLog.size() - d1;
+    CHECK(dup == idle, "%s: %zu draws after an identical presence message (idle passes: %zu)", kChatName[enigma], dup, idle);
+    g_test = std::string("PR2b ") + kChatName[enigma] + " list open: a presence change in ANOTHER group (the generation moves, these rows do not) redraws nothing";
+    size_t d2 = T::drawLog.size();
+    presenceAs("GROUP2", kDave, "Dave", "ONLINE");
+    loopPass(3);
+    size_t other = T::drawLog.size() - d2;
+    CHECK(other == idle, "%s: %zu draws after another group's presence change (idle passes: %zu)", kChatName[enigma], other, idle);
+    toMain();
+
+    g_test = std::string("PR3 ") + kChatName[enigma] + " list open: presence emptied (the rebuild has no online/recent rows): rows already shown stay";
+    clearPresence();
+    freshDevice();
+    powerOn(); runFor(30);
+    presenceAs(kG, kBob, "Bob", "ONLINE");
+    presenceAs(kG, kCarl, "Carol", "ONLINE");
+    openMode(enigma);
+    bool had = shown("Bob") && shown("Carol");
+    clearPresence();  // the group's presence and recent lists emptied while the list is open
+    loopPass(3);
+    // (presence forgot the names too: a kept row is labelled with its id, as for any unknown contact)
+    auto row = [&](const char* name, const char* id) {
+      return shown(name) || shown(std::string(name) + " (offline)") || shown(std::string(id) + " (offline)");
+    };
+    bool kept = row("Bob", kBob) && row("Carol", kCarl) && shown("Everyone");
+    CHECK(had && kept, "%s: before %d, rows kept %d: %s", kChatName[enigma], had, kept, T::visibleJoined().c_str());
+    toMain();
+  }
+
   (void)none;
 }

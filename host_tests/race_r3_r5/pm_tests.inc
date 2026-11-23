@@ -667,6 +667,7 @@
 #include "pm_overflow_tests.inc"
 #include "pm_uncertain_tests.inc"
 #include "list_marker_tests.inc"
+#include "chat_send_recovery_tests.inc"
 #include "storage_latency_tests.inc"
 
   // ---- measurements (printed, not checked): device-cost model, 63 ms per open ----

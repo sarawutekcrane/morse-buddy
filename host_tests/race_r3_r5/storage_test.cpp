@@ -55,6 +55,7 @@ static Preferences g_notifyPrefs;
 namespace Storage { Preferences& notify() { return g_notifyPrefs; } }
 void T_initServices();
 void T_tickServices();
+void T_fireSettingsChange(const SettingsChangeInfo& info);
 
 static int g_fail = 0, g_pass = 0;
 static std::string g_test;
@@ -322,6 +323,15 @@ static void resetOutboxVolatile() {
 #ifndef OUTBOX_2FDE185  // the reviewed candidate's outbox.cpp lacks these
   Outbox::g_passRetryMs = Outbox::kRetryMs;
   Outbox::g_externalAtPassStart = 0;
+  Outbox::g_inFlightTicket = 0;
+  // A reset also loses the chat sends in flight and every publish result not
+  // yet delivered (the MQTT session went with it).
+  for (uint8_t i = 0; i < ChatSend::kMaxInFlight; i++) {
+    delete ChatSend::slots()[i];
+    ChatSend::slots()[i] = nullptr;
+  }
+  T::asyncPending.clear();
+  T::deferredResults.clear();
 #else
   Outbox::g_externalSeen = 0;
 #endif

@@ -30,12 +30,19 @@ int updateCount = 0;
 bool connected = true;
 bool asyncPublish = false;
 std::deque<AsyncPub> asyncPending;
+int asyncChainCap = 4;
+std::vector<DeferredResult> deferredResults;
 void completeAsync(bool ok) {
   if (asyncPending.empty()) { seq.push_back("async:none"); return; }
   AsyncPub p = asyncPending.front();
   asyncPending.pop_front();
   seq.push_back(ok ? "async:true" : "async:false");
-  p.done(p.ticket, ok);
+  if (p.done != nullptr) p.done(p.ticket, ok);
+}
+void deliverDeferred() {
+  std::vector<DeferredResult> d;
+  d.swap(deferredResults);
+  for (auto& r : d) r.done(r.ticket, r.ok);
 }
 std::deque<bool> publishScript;
 std::vector<Pub> pubs;
@@ -62,7 +69,7 @@ unsigned listings = 0;
 std::function<void(const std::string&)> onDraw;
 void reset() {
   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0; deviceQueue().clear();
-  connected = true; asyncPublish = false; asyncPending.clear(); publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
+  connected = true; asyncPublish = false; asyncPending.clear(); deferredResults.clear(); asyncChainCap = 4; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
   seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; realWrap = false; groupConfigured = true; groupCount = 1; scanUnreliable = false; listUnreliable = false; listings = 0;
 }
@@ -213,12 +220,23 @@ bool publishBinary(const char* group, const char* topic, const uint8_t* data, ui
   if (r && T::onPublished) { T::Pub p = T::pubs.back(); T::onPublished(p); }
   return r;
 }
-uint32_t publishBinaryAsync(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool, int,
-                            PublishDoneFn done) {
+uint32_t publishBinaryAsync(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained,
+                            int qos, PublishDoneFn done) {
   static uint32_t nextTicket = 1;
-  if (!T::asyncPublish || !T::connected) return 0;
-  for (auto& p : T::asyncPending) if (p.group == group) return 0;  // the connection is already lent
-  T::asyncPending.push_back({nextTicket, group, topic, std::vector<uint8_t>(data, data + len), done});
+  if (!T::connected) return 0;  // not queued: no connection
+  if (!T::asyncPublish) {
+    // Default model: published at once (exactly as publishBinary(), so the
+    // suites written for the synchronous path see the same publishes); the
+    // result is delivered on the next service round (T_tickServices()), as
+    // MqttManager's service tick does -- never from inside this call.
+    bool r = publishBinary(group, topic, data, len, retained, qos);
+    if (done != nullptr) T::deferredResults.push_back({nextTicket, r, done});
+    return nextTicket++;
+  }
+  int sameGroup = 0;
+  for (auto& p : T::asyncPending) sameGroup += p.group == group ? 1 : 0;
+  if (sameGroup >= T::asyncChainCap) return 0;  // the group's chain is full
+  T::asyncPending.push_back({nextTicket, group, topic, std::vector<uint8_t>(data, data + len), done, retained, qos});
   T::seq.push_back("async:start");
   return nextTicket++;
 }
@@ -314,6 +332,16 @@ uint16_t findMessagesByPredicate(const char* g, const char* c, MessagePredicate 
 #else
 uint16_t findMessagesByPredicate(const char*, const char*, MessagePredicate, void*, MessageRef*, uint16_t, bool* rel) {
   if (rel) *rel = true; return 0;
+}
+// (notify_test.cpp defines its own, with REAL_NOTIFICATIONS.) Chat sends
+// clear the pending flag with it once their publish succeeds.
+bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
+  T::updateCalls++;
+  if (!T::updateResult) return false;
+  T::Rec* r = find(ref);
+  if (!r) return false;
+  r->hdr.flags = static_cast<uint16_t>((r->hdr.flags | setMask) & ~clearMask);
+  return true;
 }
 #endif
 uint16_t listMessageSequences(const char* g, const char* c, uint32_t* out, uint16_t cap, bool* reliable, bool* truncated) {
@@ -449,6 +477,7 @@ bool claimBackgroundStorageStep(BackgroundReader who) {
 // A new round of service ticks (as tickRegisteredServices() begins one).
 void T_beginServiceRound() { g_stepWaitingLast = g_stepWaiting; g_stepWaiting = 0; g_stepClaimed = false; }
 void T_tickServices() {
+  T::deliverDeferred();  // MqttManager's service tick delivers publish results
   T_beginServiceRound();
   for (int i = 0; i < g_serviceCount; i++) if (g_services[i].tick) g_services[i].tick();
 }

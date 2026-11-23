@@ -65,17 +65,21 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
                    bool retained, int qos);
 
 // Asynchronous publish (MQTT fix, hardware device A: "[PERF][MQTT] publish
-// ... qos=1 ... 605 ms" inside a chat send). The group's connection is lent
-// to the connection worker for this one publish, so the PUBACK wait never
-// blocks the main loop; `done(ticket, ok)` is then called exactly once, on
-// the main task, from MqttManager's service tick (ok: the publish succeeded,
-// for QoS1 a PUBACK was received -- the same evidence publishBinary() gives).
-// Returns the ticket (non-zero) once started; 0 when it could not start (no
-// connection, the connection already lent, the worker queue full, no memory,
-// OTA maintenance) -- the caller then does what it does after a failed
-// publish. While the connection is lent the group still reads as connected,
-// but publishRaw()/publishBinary() for it return false (as on any failed
-// publish) until it is back.
+// ... qos=1 ... 605 ms" inside a chat send; a Race heartbeat's 1506 ms PUBACK
+// timeout). The group's connection is lent to the connection worker, which
+// publishes (worker timeouts: PUBACK 5 s) so the wait never blocks the main
+// loop. Publishes started while it is lent join the same loan and go out in
+// order, at most kMaxLentPublishes per group; the connection comes back with
+// the last result. `done(ticket, ok)`, if not null, is called exactly once,
+// on the main task, from MqttManager's service tick -- never from inside
+// this call (ok: the publish succeeded; for QoS1 a PUBACK was received --
+// the same evidence publishBinary() gives).
+// Returns the ticket (non-zero) once queued; 0 when it could not be queued
+// (group not active, no connection, the loan full or canceled, the worker
+// queue full, no memory, OTA maintenance) -- nothing is published then and
+// the caller does what it does after a failed publish (nothing waits).
+// While the connection is lent the group still reads as connected/ready;
+// publishBinary() for it returns false at once, publishRaw() joins the loan.
 using PublishDoneFn = void (*)(uint32_t ticket, bool ok);
 uint32_t publishBinaryAsync(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                             bool retained, int qos, PublishDoneFn done);

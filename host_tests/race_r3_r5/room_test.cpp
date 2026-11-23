@@ -1105,6 +1105,50 @@ static void heapDiagnostics() {
   g_hostSerialSink = nullptr;
 }
 
+// Hardware, both devices on b573ec7: "[PERF][MQTT] publish group=... qos=1
+// retained=1 bytes=130 1506 ms result=0 lastError=-9" about every 60 s --
+// the coordinator's retained room state (78 fixed + 23 per member bytes:
+// a two-member room is 124, plus the 6-byte header) on its 60 s heartbeat,
+// waiting for the PUBACK on the main loop. Now every Race publish goes to
+// the MQTT worker (publishBinaryAsync), in order.
+static void heartbeatOffLoop() {
+  g_test = "RH1 the coordinator's 60 s heartbeat: a retained QoS1 130-byte state for a two-member room, queued to the MQTT worker -- never a publishBinary() on the main loop";
+  ownerLobby(1);
+  T::pubs.clear();
+  T::asyncPublish = true;
+  std::vector<T::AsyncPub> started;
+  uint32_t end = T::now + 125000;
+  while (static_cast<int32_t>(T::now - end) < 0) {
+    T::now += 95; loopOnce();
+    while (!T::asyncPending.empty()) { started.push_back(T::asyncPending.front()); T::completeAsync(true); }
+  }
+  std::string self = std::string("r2/") + Identity::deviceId();
+  int heartbeats = 0, other = 0;
+  for (auto& p : started) {
+    if (p.topic == self && p.retained && p.qos == 1 && p.data.size() == 130) heartbeats++;
+    else other++;
+  }
+  int syncState = 0;
+  for (auto& p : T::pubs) syncState += p.topic.rfind("r2/", 0) == 0 ? 1 : 0;
+  CHECK(heartbeats >= 2 && heartbeats <= 3 && syncState == 0,
+        "heartbeats over 125 s: %d (want 2), other async %d, synchronous state publishes %d", heartbeats, other, syncState);
+  g_test = "RH2 a heartbeat that cannot be queued (connection busy) is simply skipped: the room stays intact, the next one goes out";
+  T::asyncChainCap = 0;  // nothing can be queued
+  settleMs(61000);
+  T::asyncChainCap = 4;
+  started.clear();
+  end = T::now + 61000;
+  while (static_cast<int32_t>(T::now - end) < 0) {
+    T::now += 95; loopOnce();
+    while (!T::asyncPending.empty()) { started.push_back(T::asyncPending.front()); T::completeAsync(true); }
+  }
+  heartbeats = 0;
+  for (auto& p : started) heartbeats += (p.topic == self && p.retained) ? 1 : 0;
+  CHECK(heartbeats >= 1 && g_engine->isCoordinator() && devRoom() && RaceProtocol::activeCount(*devRoom()) == 2,
+        "after a refused heartbeat: %d sent, coordinator %d", heartbeats, g_engine->isCoordinator());
+  T::asyncPublish = false;
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // FAIL lines survive a later crash
   Identity::init();  // the actual identity.cpp: device id from the (fake) MAC
@@ -1118,6 +1162,7 @@ int main() {
   historyBinding();
   scorePlacement();
   heapDiagnostics();
+  heartbeatOffLoop();
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

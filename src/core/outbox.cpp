@@ -5,6 +5,7 @@
 
 #include <new>
 
+#include "core/chat_send.h"
 #include "core/hooks.h"
 #include "core/mqtt_manager.h"
 #include "core/packet_codec.h"
@@ -65,6 +66,11 @@ struct Queue {
 Queue* g_queue = nullptr;
 bool g_queueOverflowed = false;  // something pending was not queued: another pass finds it
 uint32_t g_publishRetryAtMs = 0;
+// The one Outbox publish with the MQTT worker (publishBinaryAsync()); its
+// record stays queued until the result: cleared and dropped on success,
+// retried after kRetryMs otherwise.
+uint32_t g_inFlightTicket = 0;
+MessageRef g_inFlightRef;
 
 struct Pass {
   MessageStore::ConversationWalk* walk;
@@ -146,16 +152,41 @@ bool confirmedAbsent(const MessageRef& ref) {
 
 void onPendingWritten(const MessageRef& ref) { enqueue(ref); }
 
-// Publishes the oldest queued record if its group is connected. True if
-// this step did storage or network work.
+// Result of the Outbox's publish, on the main task (MqttManager's service
+// tick). The flag is cleared only on success; a failure (no PUBACK, closed
+// or canceled connection) leaves the record pending for the next attempt.
+void onPublished(uint32_t ticket, bool ok) {
+  if (ticket != g_inFlightTicket) return;
+  g_inFlightTicket = 0;
+  if (!ok) {
+    g_publishRetryAtMs = millis() + kRetryMs;
+    return;
+  }
+  MessageStore::updateLocalFlags(g_inFlightRef, 0, MessageStore::FLAG_PENDING_OUTBOX);
+  if (g_queue == nullptr) return;
+  for (uint8_t i = 0; i < g_queue->count; i++) {
+    if (sameRef(g_queue->items[i].ref, g_inFlightRef)) {
+      removeAt(i);
+      return;
+    }
+  }
+}
+
+// Starts the publish of the oldest queued record if its group is connected
+// (the PUBACK wait runs on the MQTT worker, never here). True if this step
+// did storage or network work.
 bool publishStep() {
-  if (g_queue == nullptr) return false;
+  if (g_queue == nullptr || g_inFlightTicket != 0) return false;
   uint32_t now = millis();
   if (static_cast<int32_t>(now - g_publishRetryAtMs) < 0) return false;
   // The oldest entry whose read retry is due (a record waiting on one does
-  // not hold up the rest).
+  // not hold up the rest), skipping a chat send's own record while its first
+  // publish is out (core/chat_send.h): published twice otherwise.
   uint8_t k = 0;
-  while (k < g_queue->count && static_cast<int32_t>(now - g_queue->items[k].retryAtMs) < 0) k++;
+  while (k < g_queue->count && (static_cast<int32_t>(now - g_queue->items[k].retryAtMs) < 0 ||
+                                ChatSend::holds(g_queue->items[k].ref))) {
+    k++;
+  }
   if (k == g_queue->count) return false;
   MessageRef ref = g_queue->items[k].ref;
   if (!MqttManager::isGroupConnected(ref.group_code)) {
@@ -195,20 +226,14 @@ bool publishStep() {
     snprintf(suffixBuf, sizeof(suffixBuf), "msg/%s", ref.contact_key);
     suffix = suffixBuf;
   }
-  uint32_t publishStart = millis();
-  bool ok = MqttManager::publishBinary(ref.group_code, suffix, view.wirePacket, view.wirePacketLen,
-                                       /*retained=*/false, /*qos=*/1);
-  uint32_t publishElapsed = millis() - publishStart;
-  if (publishElapsed >= 20) {
-    Serial.printf("[PERF][OUTBOX] publish %lu ms group=%s ok=%d\n", static_cast<unsigned long>(publishElapsed),
-                  ref.group_code, ok ? 1 : 0);
-  }
-  if (!ok) {
+  uint32_t ticket = MqttManager::publishBinaryAsync(ref.group_code, suffix, view.wirePacket, view.wirePacketLen,
+                                                    /*retained=*/false, /*qos=*/1, onPublished);
+  if (ticket == 0) {  // not queued (connection lent and its chain full, worker queue full, maintenance)
     g_publishRetryAtMs = millis() + kRetryMs;
     return true;
   }
-  MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);
-  removeAt(k);
+  g_inFlightTicket = ticket;
+  g_inFlightRef = ref;
   return true;
 }
 

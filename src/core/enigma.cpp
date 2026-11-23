@@ -1501,30 +1501,17 @@ SendResult resultForCompletion(bool online, bool published, bool storeOk) {
   return {online ? "Unconfirmed; not saved" : "Offline; not saved", false};  // 2B-1: draft kept
 }
 
-// Completion of an asynchronous send (core/chat_send.h): same rules as
-// text_message.cpp's onAsyncSendDone() -- Phase 2B-1 draft retention on
-// total failure (same conversation, no new draft started), markIndexDirty(),
-// the resultForCompletion() status.
+// Completion of an asynchronous send (core/chat_send.h): same as
+// text_message.cpp's onAsyncSendDone() -- the record was stored before the
+// publish started; only the status (in its own conversation) and a redraw.
 void onAsyncSendDone(const ChatSend::Outcome& o) {
-  bool sameConversation = strcmp(o.group, g_selectedGroupCode) == 0 && strcmp(o.contact, g_selectedContactKey) == 0;
-  if (!o.published && !o.stored && !o.groupGone && sameConversation && g_composeLen == 0 &&
-      g_composePatternLen == 0) {
-    strncpy(g_composeText, o.text, sizeof(g_composeText) - 1);
-    g_composeText[sizeof(g_composeText) - 1] = '\0';
-    g_composeLen = strlen(g_composeText);
-  }
   markIndexDirty();
-  if (!sameConversation) return;
-  if (o.groupGone) {
-    setSendStatus({"Group removed; not saved", true});
-  } else {
-    setSendStatus(resultForCompletion(true, o.published, o.stored));
-  }
+  if (strcmp(o.ref.group_code, g_selectedGroupCode) != 0 || strcmp(o.ref.contact_key, g_selectedContactKey) != 0) return;
+  if (o.groupGone) return;
+  setSendStatus(resultForCompletion(true, o.published, true));
 }
 
 SendResult sendEnigmaMessage() {
-  // One send per group at a time (core/chat_send.h): the draft stays.
-  if (ChatSend::inFlight(g_selectedGroupCode)) return {"Still sending", true};
   char escaped[EnigmaCrypto::kMaxEscapedLen + 1];
   if (!EnigmaCrypto::normalizeAndEscape(g_composeText, escaped, sizeof(escaped))) {
     g_composeError = "Message too long after Enigma encoding";
@@ -1586,35 +1573,35 @@ SendResult sendEnigmaMessage() {
   size_t localLen = encodeLocalPayload(LOCK_UNLOCKED, normalizedPlaintext, localPayload, sizeof(localPayload));
 
   bool online = MqttManager::isGroupConnected(g_selectedGroupCode);
-  // Asynchronous path: same as text_message.cpp's sendComposedMessage() --
-  // the record (with this same local payload) is stored when the publish
-  // result is back; otherwise the synchronous path below, unchanged.
-  if (online && ChatSend::start(g_selectedGroupCode, g_selectedContactKey, topicSuffix, env.timestamp, wireBuf,
-                                static_cast<uint16_t>(wireLen), localPayload, static_cast<uint16_t>(localLen),
-                                g_composeText, onAsyncSendDone)) {
+  // Store first, then publish asynchronously: the same rules as
+  // text_message.cpp's sendComposedMessage() (core/chat_send.h), with this
+  // record's local payload.
+  MessageRef outRef;
+  bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
+                                                   MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX,
+                                                   env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), localPayload,
+                                                   localLen, &outRef);
+  if (storeOk) {
     clearDraft();
-    return {"Sending...", false};
+    markIndexDirty();
+    if (online && ChatSend::start(outRef, topicSuffix, wireBuf, static_cast<uint16_t>(wireLen), onAsyncSendDone)) {
+      return {"Sending...", false};
+    }
+    return {online ? "Queued" : "Offline: queued", true};
   }
+  // The store failed: the synchronous path decides, with the Phase 2B-1
+  // draft-retention rule and caveats of text_message.cpp's
+  // sendComposedMessage() (the draft kept unless the publish succeeded; a
+  // user re-send is a NEW message and may duplicate one the broker did
+  // receive without confirming).
   bool published = false;
   if (online) {
     published = MqttManager::publishBinary(g_selectedGroupCode, topicSuffix, wireBuf,
                                            static_cast<uint16_t>(wireLen), false, 1);
   }
-  uint16_t flags = published ? 0 : MessageStore::FLAG_PENDING_OUTBOX;
-
-  MessageRef outRef;
-  bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
-                                                   MessageStore::Direction::SENT, flags, env.timestamp, wireBuf,
-                                                   static_cast<uint16_t>(wireLen), localPayload, localLen, &outRef);
-
-  // Phase 2B-1: same draft-retention rule and caveats as text_message.cpp's
-  // sendComposedMessage() -- keep the finalized draft only when BOTH the
-  // publish and the store failed (nothing else holds the message). A
-  // user re-send of that draft is a NEW message and may duplicate one the
-  // broker did receive without confirming; no automatic retry here.
-  if (published || storeOk) clearDraft();
+  if (published) clearDraft();
   markIndexDirty();  // a storage attempt was made either way (eviction may have run)
-  return resultForCompletion(online, published, storeOk);
+  return resultForCompletion(online, published, false);
 }
 
 void finalizeComposeChar() {

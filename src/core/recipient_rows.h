@@ -20,6 +20,12 @@
 // never live together. Sharing keeps static RAM below the two former 41-row
 // stores.
 //
+// Presence: while the list is shown, a change of Presence::changeGeneration()
+// (a contact came online or went offline) rebuilds the rows from presence,
+// keeping the selected identity and every row already shown
+// (followPresence(); hardware: an open list kept showing "(offline)" until
+// re-entered).
+//
 // During one visit rows are never removed, with one bounded exception: if new
 // unread conversations keep appearing while the list stays open (a summary
 // whose last read completed is reused by a new sender) until all kMaxRows
@@ -33,6 +39,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <new>
 
 #include "core/menu.h"
 #include "core/notifications.h"
@@ -136,14 +144,16 @@ inline void bindItems(const Mode& m) {
   for (uint8_t i = 0; i < r.count; i++) r.items[i] = SettingItem{r.labels[i], m.onSelect};
 }
 
-// While the list is shown: adds a row, before Everyone, for each unread
-// conversation not yet listed (e.g. a message from a sender absent at entry).
-// Returns the selected row's new index (same identity) if rows changed, else
-// kNoChange.
-inline uint8_t refresh(const Mode& m, uint8_t selected) {
+// Presence::changeGeneration() when the rows were last built from presence.
+inline uint32_t& builtPresenceGeneration() {
+  static uint32_t g = 0;
+  return g;
+}
+
+// Adds a row, before Everyone, for each unread conversation not yet listed
+// (e.g. a message from a sender absent at entry). True if rows changed.
+inline bool addUnreadRows(const Mode& m, const char* selectedKey) {
   Storage& r = rows();
-  char selectedKey[MessageStore::kContactKeyLen];
-  setKey(selectedKey, selected < r.count ? r.keys[selected] : "");
   bool changed = false;
   uint8_t cursor = 0;
   const char* summaryKey;
@@ -172,6 +182,54 @@ inline uint8_t refresh(const Mode& m, uint8_t selected) {
     if (suffixNew) appendDeviceSuffix(r.labels[at], kLabelLen, r.keys[at]);
     changed = true;
   }
+  return changed;
+}
+
+inline void build(const Mode& m);
+
+// Presence changed while the list is shown (a contact came online or went
+// offline): the rows are rebuilt from presence, and every row the visit
+// already showed is kept (after the ordinary rows, before Everyone, labelled
+// with its current presence) -- rows are never removed during a visit. Only
+// a real change of keys or labels counts: identical presence traffic causes
+// no redraw. The previous rows are copied to transient heap only when the
+// generation moved (no file, no NVS). True if rows changed.
+inline bool followPresence(const Mode& m) {
+  uint32_t gen = Presence::changeGeneration();
+  if (gen == builtPresenceGeneration()) return false;
+  Storage* before = new (std::nothrow) Storage;
+  if (before == nullptr) return false;  // no memory now: tried again on the next pass
+  Storage& r = rows();
+  memcpy(before, &r, sizeof(Storage));
+  build(m);  // records gen
+  for (uint8_t i = 0; i < before->count; i++) {
+    if (findKey(before->keys[i]) >= 0) continue;
+    if (r.count >= kMaxRows) break;  // cannot happen with rows never removed: kMaxRows holds every recipient
+    int at = findKey(MessageStore::kEveryone);
+    if (at < 0) at = r.count;
+    insertRow(static_cast<uint8_t>(at));
+    setKey(r.keys[at], before->keys[i]);
+    labelUnreadRow(m, static_cast<uint8_t>(at));
+  }
+  bindItems(m);
+  bool same = r.count == before->count;
+  for (uint8_t i = 0; same && i < r.count; i++) {
+    same = strcmp(r.keys[i], before->keys[i]) == 0 && strcmp(r.labels[i], before->labels[i]) == 0;
+  }
+  delete before;
+  return !same;
+}
+
+// While the list is shown, once per pass: follows presence changes and adds
+// rows for new unread conversations. Returns the selected row's new index
+// (same identity; the first row if it is no longer listed) if rows changed,
+// else kNoChange.
+inline uint8_t refresh(const Mode& m, uint8_t selected) {
+  Storage& r = rows();
+  char selectedKey[MessageStore::kContactKeyLen];
+  setKey(selectedKey, selected < r.count ? r.keys[selected] : "");
+  bool changed = followPresence(m);
+  if (addUnreadRows(m, selectedKey)) changed = true;
   if (!changed) return kNoChange;
   bindItems(m);
   int sel = findKey(selectedKey);
@@ -181,6 +239,7 @@ inline uint8_t refresh(const Mode& m, uint8_t selected) {
 // Entry: builds every row afresh.
 inline void build(const Mode& m) {
   Storage& r = rows();
+  builtPresenceGeneration() = Presence::changeGeneration();
   r.count = 0;
   Presence::OnlineContact online[kMaxOnline];
   uint8_t onlineN = Presence::getOnlineContacts(m.group, online, kMaxOnline);
@@ -221,8 +280,8 @@ inline void build(const Mode& m) {
   setKey(r.keys[r.count], MessageStore::kEveryone);
   snprintf(r.labels[r.count], kLabelLen, "Everyone");
   r.count++;
+  addUnreadRows(m, "");  // then the unread conversations not listed above
   bindItems(m);
-  refresh(m, 0);  // then the unread conversations not listed above
 }
 
 }  // namespace RecipientRows

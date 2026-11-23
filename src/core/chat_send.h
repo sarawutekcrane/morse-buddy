@@ -3,29 +3,26 @@
 // of which "[PERF][MQTT] publish ... qos=1 ... 605 ms" was the PUBACK wait
 // on the main task). Used by Text (text_message.cpp) and Enigma (enigma.cpp).
 //
-// The ORDER of a send is unchanged: publish first, then store the record
-// once, with the flags the publish result decides (0 when the publish
-// succeeded, FLAG_PENDING_OUTBOX otherwise, so the Outbox retries it --
-// exactly as the synchronous path). Only the wait in between moves: the
-// publish runs on the MQTT connection worker (MqttManager::publishBinaryAsync)
-// and the store runs later on the MAIN task, from MqttManager's service tick,
-// when the result is back. No filesystem work ever runs on another task.
-//
-// Message identity: the record is stored from a copy of the exact wire bytes
-// that were published (same message_id, timestamp, payload); the Enigma
-// local payload is copied too. Nothing is re-encoded.
-//
-// Crash window: a reset between the publish and the store loses the local
-// record -- the same window the synchronous path has (publish, then store),
-// only longer (the publish's duration, at most the worker's 5 s timeout).
-//
-// One send per group at a time: while a group's send is in flight the
-// caller refuses a new one (the draft stays), so records are stored in the
-// order they were sent and the Outbox never sees a later message first.
+// Store first, then publish:
+//  1. The caller stores the record durably, on the main task, flagged
+//     FLAG_PENDING_OUTBOX -- exactly as an offline send is stored. From here
+//     the message survives a reset or power loss: the Outbox's boot pass
+//     finds the pending record and publishes it (same message_id; receivers
+//     drop a message_id they already hold -- MessageStore's dedup ring, the
+//     newest 32 records of the conversation). Delivery is at-least-once,
+//     never exactly-once.
+//  2. start() hands the same wire bytes to the MQTT worker
+//     (MqttManager::publishBinaryAsync()); the PUBACK wait never blocks the
+//     main loop.
+//  3. The result arrives on the main task (MqttManager's service tick). On
+//     success the pending flag is cleared (updateLocalFlags(), main task);
+//     on failure the record stays pending and the Outbox retries it.
+// While a record's publish is out, the Outbox skips it (holds()), so it is
+// not published twice. No filesystem work ever runs on another task.
 //
 // Header-only (inline functions share one set of statics across the units
-// that include it), so the host test builds that link text_message.cpp and
-// enigma.cpp need no extra source file.
+// that include it), so the host test builds that link text_message.cpp,
+// enigma.cpp and outbox.cpp need no extra source file.
 #include <Arduino.h>
 #include <string.h>
 
@@ -38,54 +35,44 @@
 namespace ChatSend {
 
 struct Outcome {
-  const char* group;
-  const char* contact;
+  MessageRef ref;
   bool published;    // the publish succeeded (QoS1: PUBACK received)
-  bool stored;       // appendStoredMessage() returned true
-  bool groupGone;    // the group was deleted meanwhile: nothing stored
-  const char* text;  // the draft text that was sent (for the retention rule)
+  bool flagCleared;  // ...and the record's pending flag was cleared (else the Outbox republishes it)
+  bool groupGone;    // the group was deleted meanwhile (its records with it)
 };
 using DoneFn = void (*)(const Outcome&);
 
 struct InFlight {
   uint32_t ticket;
   uint32_t startedMs;
-  uint32_t timestamp;
-  char group[sizeof(Settings::FamilyGroup::code)];
-  char contact[MessageStore::kContactKeyLen];
-  uint8_t* wire;
-  uint16_t wireLen;
-  uint8_t* local;
-  uint16_t localLen;
-  char* text;
+  MessageRef ref;
   DoneFn done;
 };
 
+// At most this many chat publishes out at once (all groups): the worker's
+// per-group chain (kMaxLentPublishes, 4) bounds it already; this bounds RAM.
+constexpr uint8_t kMaxInFlight = 8;
+
 inline InFlight** slots() {
-  static InFlight* s[Settings::kMaxGroups] = {};
+  static InFlight* s[kMaxInFlight] = {};
   return s;
 }
 
-inline void freeRecord(InFlight* f) {
-  if (f == nullptr) return;
-  delete[] f->wire;
-  delete[] f->local;
-  delete[] f->text;
-  delete f;
+inline bool sameRef(const MessageRef& a, const MessageRef& b) {
+  return a.sequence == b.sequence && strcmp(a.contact_key, b.contact_key) == 0 && strcmp(a.group_code, b.group_code) == 0;
 }
 
-// True while a send for this group waits for its publish result.
-inline bool inFlight(const char* group) {
-  for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
-    InFlight* f = slots()[i];
-    if (f != nullptr && strcmp(f->group, group) == 0) return true;
+// True while this record's first publish is with the worker.
+inline bool holds(const MessageRef& ref) {
+  for (uint8_t i = 0; i < kMaxInFlight; i++) {
+    if (slots()[i] != nullptr && sameRef(slots()[i]->ref, ref)) return true;
   }
   return false;
 }
 
 inline void onPublished(uint32_t ticket, bool ok) {
   InFlight* f = nullptr;
-  for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
+  for (uint8_t i = 0; i < kMaxInFlight; i++) {
     if (slots()[i] != nullptr && slots()[i]->ticket == ticket) {
       f = slots()[i];
       slots()[i] = nullptr;
@@ -94,69 +81,47 @@ inline void onPublished(uint32_t ticket, bool ok) {
   }
   if (f == nullptr) return;  // not ours (cannot happen: tickets are unique)
   uint32_t waitedMs = millis() - f->startedMs;
-  Outcome o = {f->group, f->contact, ok, false, false, f->text};
-  uint32_t storeStart = millis();
-  // A group deleted while its send was in flight has no conversation to
-  // store into any more (its records were removed with it).
-  o.groupGone = Settings::isGroupCodeUnique(f->group);
-  if (!o.groupGone) {
-    uint16_t flags = ok ? 0 : MessageStore::FLAG_PENDING_OUTBOX;
-    MessageRef outRef;
-    o.stored = MessageStore::appendStoredMessage(f->group, f->contact, MessageStore::Direction::SENT, flags,
-                                                 f->timestamp, f->wire, f->wireLen, f->local, f->localLen, &outRef);
-  }
-  uint32_t storeMs = millis() - storeStart;
+  Outcome o;
+  o.ref = f->ref;
+  o.published = ok;
+  o.flagCleared = false;
+  o.groupGone = Settings::isGroupCodeUnique(f->ref.group_code);
+  uint32_t clearStart = millis();
+  if (ok && !o.groupGone) o.flagCleared = MessageStore::updateLocalFlags(f->ref, 0, MessageStore::FLAG_PENDING_OUTBOX);
+  uint32_t clearMs = millis() - clearStart;
   // waited = wall time between the send and its result (the main loop kept
-  // running meanwhile; NOT blocking time). store = blocking time of this
-  // tick's append.
-  Serial.printf("[PERF][CHAT_SEND] async-complete waited=%lu ms store=%lu ms publishOk=%d storeOk=%d groupGone=%d\n",
-                static_cast<unsigned long>(waitedMs), static_cast<unsigned long>(storeMs), ok ? 1 : 0,
-                o.stored ? 1 : 0, o.groupGone ? 1 : 0);
-  if (f->done != nullptr) f->done(o);
-  freeRecord(f);
+  // running meanwhile; NOT blocking time). clear = blocking time of this
+  // tick's flag rewrite (0 when the publish failed: the record stays pending).
+  Serial.printf("[PERF][CHAT_SEND] async-complete waited=%lu ms clear=%lu ms publishOk=%d flagCleared=%d groupGone=%d\n",
+                static_cast<unsigned long>(waitedMs), static_cast<unsigned long>(clearMs), ok ? 1 : 0,
+                o.flagCleared ? 1 : 0, o.groupGone ? 1 : 0);
+  DoneFn done = f->done;
+  delete f;
+  if (done != nullptr) done(o);
 }
 
-// Starts an asynchronous send. False when it could not start (another send
-// for this group in flight, no memory, or publishBinaryAsync() refused: no
-// connection, worker busy, maintenance) -- nothing was published then and
-// the caller uses its synchronous path, unchanged.
-inline bool start(const char* group, const char* contact, const char* topicSuffix, uint32_t timestamp,
-                  const uint8_t* wire, uint16_t wireLen, const uint8_t* local, uint16_t localLen, const char* text,
-                  DoneFn done) {
-  if (inFlight(group)) return false;
-  uint8_t idx = Settings::kMaxGroups;
-  for (uint8_t i = 0; i < Settings::kMaxGroups; i++) {
+// Starts the publish of a record already stored with FLAG_PENDING_OUTBOX.
+// False when it could not start (no memory, too many out, or
+// publishBinaryAsync() refused: no connection, the group's chain full,
+// worker queue full, maintenance) -- the record simply stays pending for
+// the Outbox; nothing waits and nothing is published here.
+inline bool start(const MessageRef& ref, const char* topicSuffix, const uint8_t* wire, uint16_t wireLen, DoneFn done) {
+  uint8_t idx = kMaxInFlight;
+  for (uint8_t i = 0; i < kMaxInFlight; i++) {
     if (slots()[i] == nullptr) {
       idx = i;
       break;
     }
   }
-  if (idx == Settings::kMaxGroups) return false;
+  if (idx == kMaxInFlight) return false;
   InFlight* f = new (std::nothrow) InFlight();
   if (f == nullptr) return false;
-  size_t textLen = strlen(text);
-  f->wire = new (std::nothrow) uint8_t[wireLen];
-  f->local = localLen > 0 ? new (std::nothrow) uint8_t[localLen] : nullptr;
-  f->text = new (std::nothrow) char[textLen + 1];
-  if (f->wire == nullptr || (localLen > 0 && f->local == nullptr) || f->text == nullptr) {
-    freeRecord(f);
-    return false;
-  }
-  memcpy(f->wire, wire, wireLen);
-  f->wireLen = wireLen;
-  if (localLen > 0) memcpy(f->local, local, localLen);
-  f->localLen = localLen;
-  memcpy(f->text, text, textLen + 1);
-  strncpy(f->group, group, sizeof(f->group) - 1);
-  f->group[sizeof(f->group) - 1] = '\0';
-  strncpy(f->contact, contact, sizeof(f->contact) - 1);
-  f->contact[sizeof(f->contact) - 1] = '\0';
-  f->timestamp = timestamp;
+  f->ref = ref;
   f->done = done;
   f->startedMs = millis();
-  f->ticket = MqttManager::publishBinaryAsync(group, topicSuffix, wire, wireLen, false, 1, onPublished);
+  f->ticket = MqttManager::publishBinaryAsync(ref.group_code, topicSuffix, wire, wireLen, false, 1, onPublished);
   if (f->ticket == 0) {
-    freeRecord(f);
+    delete f;
     return false;
   }
   slots()[idx] = f;  // the result is delivered from a later service tick, never from inside the call above
