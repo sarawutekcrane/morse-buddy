@@ -57,6 +57,21 @@
 //    the group's cleanup job, is only queued after that result is back, so
 //    no two connections ever use one client id at once. The worker runs
 //    jobs strictly in queue order.
+//
+// What still blocks the main task (NOT eliminated by the worker; each is
+// bounded, from the library's own code; a healthy link costs ~1 round trip):
+//  - loop(): reads only bytes already available, but a packet received in
+//    part makes lwmqtt wait up to kMqttCommandTimeoutMs (500 ms) for the rest;
+//    its PINGREQ write is bounded by kSendBudgetMs (500 ms).
+//  - QoS1 publishes wait for the PUBACK: publishBinary() up to
+//    kMqttPublishTimeoutMsExperiment (1500 ms), publishRaw() (presence) up to
+//    500 ms, plus the write (<= 500 ms). QoS0 publishes: the write only.
+//  - Received messages are dispatched on the main task (cooperative drain:
+//    8 ms budget between items; one slow handler is not interrupted).
+//  - OTA maintenance entry and before-sleep: OFFLINE publishes, at most 2 s
+//    in all, plus up to 500 ms per connection closed with an OFFLINE publish.
+//  - While Wi-Fi is down loop() is not called, so a stale socket may still
+//    take a publish until its PUBACK wait (above) runs out and closes it.
 
 namespace MqttManager {
 
