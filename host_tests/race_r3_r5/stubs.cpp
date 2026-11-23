@@ -28,6 +28,15 @@ std::vector<Draw> screen, drawLog;
 std::deque<InputEvent> inputQ, raw;
 int updateCount = 0;
 bool connected = true;
+bool asyncPublish = false;
+std::deque<AsyncPub> asyncPending;
+void completeAsync(bool ok) {
+  if (asyncPending.empty()) { seq.push_back("async:none"); return; }
+  AsyncPub p = asyncPending.front();
+  asyncPending.pop_front();
+  seq.push_back(ok ? "async:true" : "async:false");
+  p.done(p.ticket, ok);
+}
 std::deque<bool> publishScript;
 std::vector<Pub> pubs;
 std::function<void()> duringPublish;
@@ -53,7 +62,7 @@ unsigned listings = 0;
 std::function<void(const std::string&)> onDraw;
 void reset() {
   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0; deviceQueue().clear();
-  connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
+  connected = true; asyncPublish = false; asyncPending.clear(); publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
   seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; realWrap = false; groupConfigured = true; groupCount = 1; scanUnreliable = false; listUnreliable = false; listings = 0;
 }
@@ -203,6 +212,15 @@ bool publishBinary(const char* group, const char* topic, const uint8_t* data, ui
   if (!r) T::connected = false;  // MQTT 2.5.2: a failed publish closes the connection
   if (r && T::onPublished) { T::Pub p = T::pubs.back(); T::onPublished(p); }
   return r;
+}
+uint32_t publishBinaryAsync(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool, int,
+                            PublishDoneFn done) {
+  static uint32_t nextTicket = 1;
+  if (!T::asyncPublish || !T::connected) return 0;
+  for (auto& p : T::asyncPending) if (p.group == group) return 0;  // the connection is already lent
+  T::asyncPending.push_back({nextTicket, group, topic, std::vector<uint8_t>(data, data + len), done});
+  T::seq.push_back("async:start");
+  return nextTicket++;
 }
 }  // namespace MqttManager
 
@@ -381,6 +399,12 @@ FamilyGroup getGroup(uint8_t i) {
   return g;
 }
 uint8_t getGroupCount() { return T::groupCount; }
+bool isGroupCodeUnique(const char* code) {
+  if (!T::groupConfigured) return true;
+  if (strcmp(code, "GROUP1") == 0) return T::groupCount < 1;
+  if (strcmp(code, "GROUP2") == 0) return T::groupCount < 2;
+  return true;
+}
 const char* getMyName() { return ""; }
 uint8_t getMyColorIndex() { return IdentityColor::kInvalidColor; }
 TypingDisplay getTypingDisplay() { return TypingDisplay::LETTERS_ONLY; }

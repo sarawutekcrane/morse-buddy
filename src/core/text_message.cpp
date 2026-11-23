@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "core/chat_send.h"
 #include "core/display.h"
 #include "core/held_input.h"
 #include "core/history_dates.h"
@@ -1047,9 +1048,40 @@ SendResult resultForCompletion(bool online, bool published, bool storeOk) {
 // not attempted because the group was offline) -- deliberately far
 // outside any real millis() delta this function could ever measure, so a
 // skipped phase can never be misread as "ran and took 0 ms."
+// Completion of an asynchronous send (core/chat_send.h), on the main task.
+// Applies what the synchronous path below applies right after its store:
+// the Phase 2B-1 draft retention (when neither the publish nor the store
+// succeeded the draft text is put back -- only into the same conversation
+// and only if the user has not started a new draft meanwhile; chat entry
+// clears drafts anyway), markIndexDirty(), and the outcome status, with
+// the same resultForCompletion() wording (online: the publish was
+// attempted on a connected group).
+void onAsyncSendDone(const ChatSend::Outcome& o) {
+  bool sameConversation = strcmp(o.group, g_selectedGroupCode) == 0 && strcmp(o.contact, g_selectedContactKey) == 0;
+  if (!o.published && !o.stored && !o.groupGone && sameConversation && g_composeLen == 0 &&
+      g_composePatternLen == 0) {
+    strncpy(g_composeText, o.text, sizeof(g_composeText) - 1);
+    g_composeText[sizeof(g_composeText) - 1] = '\0';
+    g_composeLen = strlen(g_composeText);
+  }
+  markIndexDirty();
+  if (!sameConversation) return;  // its outcome is not shown in another conversation
+  if (o.groupGone) {
+    setSendStatus({"Group removed; not saved", true});
+  } else {
+    setSendStatus(resultForCompletion(true, o.published, o.stored));
+  }
+}
+
 SendResult sendComposedMessage() {
   constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
   uint32_t totalStart = millis();
+
+  // One send per group at a time (core/chat_send.h): the draft stays.
+  if (ChatSend::inFlight(g_selectedGroupCode)) {
+    Serial.println("[PERF][CHAT_SEND] exit=busy (previous send in flight)");
+    return {"Still sending", true};
+  }
 
   uint32_t identityStart = millis();
   char messageId[PacketCodec::kMessageIdLen];
@@ -1118,6 +1150,28 @@ SendResult sendComposedMessage() {
 
   bool online = MqttManager::isGroupConnected(g_selectedGroupCode);
   uint32_t topicElapsed = millis() - topicStart;
+
+  // Asynchronous path (connected group): the publish runs on the MQTT
+  // worker and the record is stored when its result is back
+  // (onAsyncSendDone()). The draft is cleared now: the message is held by
+  // the in-flight record, and restored on total failure. When the
+  // asynchronous publish cannot start, the synchronous path below runs
+  // exactly as before.
+  if (online) {
+    uint32_t asyncStart = millis();
+    if (ChatSend::start(g_selectedGroupCode, g_selectedContactKey, topicSuffix, env.timestamp, wireBuf,
+                        static_cast<uint16_t>(wireLen), nullptr, 0, g_composeText, onAsyncSendDone)) {
+      clearDraft();
+      uint32_t asyncElapsed = millis() - asyncStart;
+      uint32_t totalElapsed = millis() - totalStart;
+      Serial.printf(
+          "[PERF][CHAT_SEND] total=%lu ms exit=async identity=%lu ms envelope=%lu ms topic=%lu ms start=%lu ms\n",
+          static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(identityElapsed),
+          static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(topicElapsed),
+          static_cast<unsigned long>(asyncElapsed));
+      return {"Sending...", false};
+    }
+  }
 
   uint32_t publishElapsed = kUnmeasuredMs;
   bool published = false;

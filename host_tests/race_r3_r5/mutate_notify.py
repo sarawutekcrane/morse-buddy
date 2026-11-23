@@ -7,6 +7,7 @@
 import os, subprocess, sys, shutil, tempfile
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
 RR = "recipient_rows.h"
+CS = "chat_send.h"
 NT, TX, EN, SM, OB, IQ, HD, MN = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h", "history_dates.h", "menu.cpp"
 muts = [
  # ---- categories ----
@@ -254,6 +255,25 @@ muts = [
  (EN, "Enigma: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
  (TX, "Text: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
  (EN, "Enigma: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
+ # ---- asynchronous chat send (core/chat_send.h; device A: CHAT_SEND total=1195 ms, PUBACK wait 605 ms) ----
+ (CS, "async: a failed publish is stored without FLAG_PENDING_OUTBOX (never retried)", "    uint16_t flags = ok ? 0 : MessageStore::FLAG_PENDING_OUTBOX;", "    uint16_t flags = 0;"),
+ (CS, "async: a deleted group's message is stored anyway", "  o.groupGone = Settings::isGroupCodeUnique(f->group);", "  o.groupGone = false;"),
+ (CS, "async: two sends of one group in flight at once", "    if (f != nullptr && strcmp(f->group, group) == 0) return true;", "    (void)f;"),
+ (CS, "async: the stored bytes differ from the published ones", "f->timestamp, f->wire, f->wireLen, f->local, f->localLen, &outRef);", "f->timestamp, f->wire, static_cast<uint16_t>(f->wireLen - 1), f->local, f->localLen, &outRef);"),
+ (CS, "async: the Enigma local payload is not kept", "  if (localLen > 0) memcpy(f->local, local, localLen);\n  f->localLen = localLen;", "  f->localLen = 0;"),
+ (CS, "async: the result is not delivered to the chat", "  if (f->done != nullptr) f->done(o);", "  (void)o;"),
+ (TX, "Text async: the draft is not cleared when the send starts", "      clearDraft();\n      uint32_t asyncElapsed", "      uint32_t asyncElapsed"),
+ (TX, "Text async: no draft retention on total failure", "  if (!o.published && !o.stored && !o.groupGone && sameConversation && g_composeLen == 0 &&", "  if (false &&"),
+ (TX, "Text async: the retained draft overwrites a new one", "sameConversation && g_composeLen == 0 &&\n      g_composePatternLen == 0) {", "sameConversation) {"),
+ (TX, "Text async: a send while one is in flight is not refused", "  if (ChatSend::inFlight(g_selectedGroupCode)) {\n    Serial.println", "  if (false) {\n    Serial.println"),
+ (TX, "Text async: the outcome is shown in another conversation", "  if (!sameConversation) return;  // its outcome is not shown in another conversation\n", ""),
+ (TX, "Text async: the history is not refreshed after the store", "    g_composeLen = strlen(g_composeText);\n  }\n  markIndexDirty();", "    g_composeLen = strlen(g_composeText);\n  }"),
+ (TX, "Text async: always the synchronous path (PUBACK wait on the main task again)", "  if (online) {\n    uint32_t asyncStart = millis();", "  if (false) {\n    uint32_t asyncStart = millis();"),
+ (EN, "Enigma async: no draft retention on total failure", "  if (!o.published && !o.stored && !o.groupGone && sameConversation && g_composeLen == 0 &&", "  if (false &&"),
+ (EN, "Enigma async: a send while one is in flight is not refused", "  if (ChatSend::inFlight(g_selectedGroupCode)) return {\"Still sending\", true};", ""),
+ (EN, "Enigma async: the draft is not cleared when the send starts", "    clearDraft();\n    return {\"Sending...\", false};", "    return {\"Sending...\", false};"),
+ (EN, "Enigma async: the history is not refreshed after the store", "    g_composeLen = strlen(g_composeText);\n  }\n  markIndexDirty();", "    g_composeLen = strlen(g_composeText);\n  }"),
+ (EN, "Enigma async: always the synchronous path", "  if (online && ChatSend::start(", "  if (false && ChatSend::start("),
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
@@ -296,7 +316,7 @@ def one(k, mut):
     target, name, old, new = mut
     out = os.path.join(H, "out", "mutn%d" % k)
     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
-    for x in (NT, TX, EN, SM, OB, IQ, HD, MN, "menu.h", "list_badges.h", "recipient_rows.h", "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+    for x in (NT, TX, EN, SM, OB, IQ, HD, MN, "menu.h", "list_badges.h", "recipient_rows.h", "chat_send.h", "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
     p = out + "/core/" + target; src = open(p).read()
     open(p, "w").write(src.replace(old, new))
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])

@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "core/chat_send.h"
 #include "core/display.h"
 #include "core/enigma_crypto.h"
 #include "core/enigma_keys.h"
@@ -1500,7 +1501,30 @@ SendResult resultForCompletion(bool online, bool published, bool storeOk) {
   return {online ? "Unconfirmed; not saved" : "Offline; not saved", false};  // 2B-1: draft kept
 }
 
+// Completion of an asynchronous send (core/chat_send.h): same rules as
+// text_message.cpp's onAsyncSendDone() -- Phase 2B-1 draft retention on
+// total failure (same conversation, no new draft started), markIndexDirty(),
+// the resultForCompletion() status.
+void onAsyncSendDone(const ChatSend::Outcome& o) {
+  bool sameConversation = strcmp(o.group, g_selectedGroupCode) == 0 && strcmp(o.contact, g_selectedContactKey) == 0;
+  if (!o.published && !o.stored && !o.groupGone && sameConversation && g_composeLen == 0 &&
+      g_composePatternLen == 0) {
+    strncpy(g_composeText, o.text, sizeof(g_composeText) - 1);
+    g_composeText[sizeof(g_composeText) - 1] = '\0';
+    g_composeLen = strlen(g_composeText);
+  }
+  markIndexDirty();
+  if (!sameConversation) return;
+  if (o.groupGone) {
+    setSendStatus({"Group removed; not saved", true});
+  } else {
+    setSendStatus(resultForCompletion(true, o.published, o.stored));
+  }
+}
+
 SendResult sendEnigmaMessage() {
+  // One send per group at a time (core/chat_send.h): the draft stays.
+  if (ChatSend::inFlight(g_selectedGroupCode)) return {"Still sending", true};
   char escaped[EnigmaCrypto::kMaxEscapedLen + 1];
   if (!EnigmaCrypto::normalizeAndEscape(g_composeText, escaped, sizeof(escaped))) {
     g_composeError = "Message too long after Enigma encoding";
@@ -1556,18 +1580,27 @@ SendResult sendEnigmaMessage() {
     snprintf(topicSuffix, sizeof(topicSuffix), "msg/%s", g_selectedContactKey);
   }
 
+  char normalizedPlaintext[EnigmaCrypto::kMaxEscapedLen + 1];
+  EnigmaCrypto::reverseEscape(escaped, normalizedPlaintext, sizeof(normalizedPlaintext));
+  uint8_t localPayload[280];
+  size_t localLen = encodeLocalPayload(LOCK_UNLOCKED, normalizedPlaintext, localPayload, sizeof(localPayload));
+
   bool online = MqttManager::isGroupConnected(g_selectedGroupCode);
+  // Asynchronous path: same as text_message.cpp's sendComposedMessage() --
+  // the record (with this same local payload) is stored when the publish
+  // result is back; otherwise the synchronous path below, unchanged.
+  if (online && ChatSend::start(g_selectedGroupCode, g_selectedContactKey, topicSuffix, env.timestamp, wireBuf,
+                                static_cast<uint16_t>(wireLen), localPayload, static_cast<uint16_t>(localLen),
+                                g_composeText, onAsyncSendDone)) {
+    clearDraft();
+    return {"Sending...", false};
+  }
   bool published = false;
   if (online) {
     published = MqttManager::publishBinary(g_selectedGroupCode, topicSuffix, wireBuf,
                                            static_cast<uint16_t>(wireLen), false, 1);
   }
   uint16_t flags = published ? 0 : MessageStore::FLAG_PENDING_OUTBOX;
-
-  char normalizedPlaintext[EnigmaCrypto::kMaxEscapedLen + 1];
-  EnigmaCrypto::reverseEscape(escaped, normalizedPlaintext, sizeof(normalizedPlaintext));
-  uint8_t localPayload[280];
-  size_t localLen = encodeLocalPayload(LOCK_UNLOCKED, normalizedPlaintext, localPayload, sizeof(localPayload));
 
   MessageRef outRef;
   bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,

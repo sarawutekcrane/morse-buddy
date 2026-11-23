@@ -973,6 +973,8 @@ int main() {
   notifyTick(7);  // past the longest backoff (60 s)
   CHECK(stateOf(kBob) == NV::SUMMARY_COUNTED && textBadge(), "not reconciled: state %d badge %d", stateOf(kBob), textBadge());
 
+#include "chat_send_tests.inc"
+
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

@@ -66,6 +66,9 @@
 //  - QoS1 publishes wait for the PUBACK: publishBinary() up to
 //    kMqttPublishTimeoutMsExperiment (1500 ms), publishRaw() (presence) up to
 //    500 ms, plus the write (<= 500 ms). QoS0 publishes: the write only.
+//    Text and Enigma chat sends use publishBinaryAsync() instead (the wait
+//    runs on the worker; core/chat_send.h) whenever it can start; the Outbox
+//    retry, Friend game and Race publishes still use publishBinary().
 //  - Received messages are dispatched on the main task (cooperative drain:
 //    8 ms budget between items; one slow handler is not interrupted).
 //  - OTA maintenance entry and before-sleep: OFFLINE publishes, at most 2 s
