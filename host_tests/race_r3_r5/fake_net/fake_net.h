@@ -313,6 +313,34 @@ inline void reset() {
   s.dropNext.clear();
   s.livePublishFailures = 0;
 }
+
+// Send fault model (test hook): lwIP can refuse a write (ERR_MEM: no pbuf or
+// heap, or TCP_SND_QUEUELEN reached) while select() still reports the socket
+// writable -- select() only checks free send-buffer bytes. When armed, the
+// next `sendAcceptBytes` bytes pass through to the real socket, then every
+// send() fails with EAGAIN until disarmed (-1: no fault).
+inline std::atomic<long>& sendAcceptBytes() {
+  static std::atomic<long> v(-1);
+  return v;
+}
+inline std::atomic<long>& sendEagainCount() {
+  static std::atomic<long> v(0);
+  return v;
+}
+inline ssize_t faultySend(int fd, const void* buf, size_t len, int flags) {
+  long left = sendAcceptBytes().load();
+  if (left < 0) return ::send(fd, buf, len, flags);
+  if (left == 0) {
+    sendEagainCount().fetch_add(1);
+    errno = EAGAIN;
+    return -1;
+  }
+  size_t n = len < static_cast<size_t>(left) ? len : static_cast<size_t>(left);
+  ssize_t r = ::send(fd, buf, n, flags);
+  if (r > 0) sendAcceptBytes().fetch_sub(r);
+  return r;
+}
+
 }  // namespace FakeNet
 
 // lwIP resolver (lwip/netdb.h): every address of the answer, in order.

@@ -89,7 +89,18 @@ constexpr uint16_t kStunPort = 19302;
 
 constexpr uint32_t kClaimRefreshMs = 2000;
 constexpr uint32_t kClaimRetryIntervalMs = 250;   // Phase 4 acceptance: retry CLAIM every 250ms...
-constexpr uint32_t kClaimTotalTimeoutMs = 1000;   // ...for up to 1s total before failing the PTT attempt
+constexpr uint32_t kClaimTotalTimeoutMs = 1000;   // ...for up to 1s after the first published CLAIM before failing
+// Gate 1: the 1 s window above is a reply window -- it starts when a CLAIM is
+// actually published, not when one is queued. While the group's connection
+// is lent to the MQTT worker (a Race heartbeat waiting up to 5 s for its
+// PUBACK, a chat send, the Outbox), a CLAIM waits in that chain; counting
+// the window from the enqueue timed it out before it ever left the device.
+// The queue wait itself is capped here (normal heartbeat ~0.6 s), so a held
+// PTT shows "Claiming..." for at most this + the reply window (3 s), then
+// "Send timeout". A CLAIM published after that is followed, in the same
+// chain, by the RELEASE for its session (see releaseAndResetPrivateCall()):
+// the receiver grants and releases at once; its GRANT is a late reply here.
+constexpr uint32_t kClaimQueueMaxMs = 2000;
 constexpr uint32_t kBusyTtlMs = 5000;
 constexpr uint32_t kNegotiateTimeoutMs = 2000;
 constexpr uint32_t kJitterFrameMs = 20;
@@ -318,20 +329,49 @@ ReceiverBusy g_receiverBusy;
 void resetPrivateCall();
 void releaseCalleeCallIfMatches(const char* claimerDeviceId, const char* sessionId);
 
-bool sendBusyReply(const char* group_code, const char* toDeviceId, const char* sessionId, uint8_t type) {
+const char* outcomeName(MqttManager::ControlOutcome o) {
+  return o == MqttManager::ControlOutcome::PUBLISHED ? "published"
+         : o == MqttManager::ControlOutcome::QUEUED  ? "queued"
+                                                      : "failed";
+}
+
+// A queued control packet's actual result (GRANT/DENY, SESSION_START/ACK,
+// RELEASE): logged when it fails after being queued, the case a "queued"
+// line alone cannot show.
+uint32_t g_replyTicket = 0;  // the last queued GRANT/DENY, for its queue time
+uint32_t g_replyQueuedAtMs = 0;
+void onControlPublishDone(uint32_t ticket, bool ok) {
+  if (ticket != 0 && ticket == g_replyTicket) {
+    g_replyTicket = 0;
+    Serial.printf("[RADIO][BUSY] queued reply ticket=%lu %s queuedMs=%lu\n", static_cast<unsigned long>(ticket),
+                  ok ? "published" : "failed", static_cast<unsigned long>(millis() - g_replyQueuedAtMs));
+    return;
+  }
+  if (!ok) Serial.printf("[RADIO][MQTT] queued control packet ticket=%lu failed\n", static_cast<unsigned long>(ticket));
+}
+
+MqttManager::ControlOutcome sendBusyReply(const char* group_code, const char* toDeviceId, const char* sessionId,
+                                          uint8_t type) {
   uint8_t payload[1 + kDeviceIdLen + kIdLen];
   size_t len = buildReplyPayload(type, Identity::deviceId(), sessionId, payload, sizeof(payload));
-  if (len == 0) return false;
+  if (len == 0) return MqttManager::ControlOutcome::FAILED;
   uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
   if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY_REPLY, static_cast<uint16_t>(len), wireBuf,
                                  sizeof(wireBuf))) {
-    return false;
+    return MqttManager::ControlOutcome::FAILED;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
   char topicSuffix[32];
   snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy_reply/%s", toDeviceId);
-  return MqttManager::publishBinary(group_code, topicSuffix, wireBuf,
-                                    static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  uint32_t ticket = 0;
+  MqttManager::ControlOutcome o =
+      MqttManager::publishControl(group_code, topicSuffix, wireBuf, static_cast<uint16_t>(PacketCodec::kHeaderSize + len),
+                                  onControlPublishDone, &ticket);
+  if (o == MqttManager::ControlOutcome::QUEUED) {
+    g_replyTicket = ticket;
+    g_replyQueuedAtMs = millis();
+  }
+  return o;
 }
 
 void handleRadioBusyPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
@@ -391,16 +431,16 @@ void handleRadioBusyPacket(const char* group_code, const char* topic, const uint
       strncpy(g_receiverBusy.claimerDeviceId, claimer, sizeof(g_receiverBusy.claimerDeviceId) - 1);
       strncpy(g_receiverBusy.sessionId, sessionId, sizeof(g_receiverBusy.sessionId) - 1);
       g_receiverBusy.lastRefreshMs = millis();
-      bool sent = sendBusyReply(group_code, claimer, sessionId, REPLY_GRANT);
+      MqttManager::ControlOutcome o = sendBusyReply(group_code, claimer, sessionId, REPLY_GRANT);
       // Logged once per session (the caller's 2 s keep-alive CLAIMs are
-      // re-granted silently) and on every failed reply.
-      if (firstForSession || !sent) {
-        Serial.printf("[RADIO][BUSY] claim from=%s sid=%s -> GRANT sent=%d\n", claimer, sessionId, sent ? 1 : 0);
+      // re-granted silently) and on every reply not published at once.
+      if (firstForSession || o != MqttManager::ControlOutcome::PUBLISHED) {
+        Serial.printf("[RADIO][BUSY] claim from=%s sid=%s -> GRANT %s\n", claimer, sessionId, outcomeName(o));
       }
     } else {
-      bool sent = sendBusyReply(group_code, claimer, sessionId, REPLY_DENY);
-      Serial.printf("[RADIO][BUSY] claim from=%s sid=%s -> DENY (busy with %s) sent=%d\n", claimer, sessionId,
-                    g_receiverBusy.claimerDeviceId, sent ? 1 : 0);
+      MqttManager::ControlOutcome o = sendBusyReply(group_code, claimer, sessionId, REPLY_DENY);
+      Serial.printf("[RADIO][BUSY] claim from=%s sid=%s -> DENY (busy with %s) %s\n", claimer, sessionId,
+                    g_receiverBusy.claimerDeviceId, outcomeName(o));
     }
   } else if (type == BUSY_RELEASE) {
     // Only honor a RELEASE that matches the exact session we granted —
@@ -482,7 +522,7 @@ struct PrivateCall {
   char group_code[33] = {0};
   char peer_device_id[kDeviceIdLen] = {0};
   char session_id[kIdLen] = {0};
-  uint32_t claimFirstSentMs = 0;  // when CLAIMING started — bounds the 1s total retry window
+  uint32_t claimFirstSentMs = 0;  // when CLAIMING started — bounds the queue wait (kClaimQueueMaxMs) / unsent window
   uint32_t claimLastSentMs = 0;   // last CLAIM sent — paced at 250ms while CLAIMING, 2s once active
   uint32_t negotiateStartMs = 0;
   bool myEndpointKnown = false;
@@ -494,7 +534,15 @@ struct PrivateCall {
   uint16_t txSequence = 0;
   bool denied = false;
   uint8_t claimSends = 0;      // CLAIMs attempted while CLAIMING (diagnostics, failure kind)
-  uint8_t claimSendFails = 0;  // ...of which publishBinary() refused (no connection)
+  uint8_t claimSendFails = 0;  // ...of which refused at once or failed after queuing
+  uint8_t claimQueued = 0;     // ...of which queued behind worker publishes (connection lent)
+  uint8_t claimPublished = 0;  // ...of which actually written (at once, or reported by the worker)
+  // Gate 1: a CLAIM in the worker's chain whose result is not back yet (0:
+  // none). No retry is queued behind it -- it would only wait in the same
+  // chain -- and the reply window has not started.
+  uint32_t claimQueuedTicket = 0;
+  uint32_t claimQueuedAtMs = 0;
+  uint32_t claimPublishedMs = 0;  // first CLAIM actually written (0: none yet): starts the reply window
 };
 PrivateCall g_call;
 
@@ -507,30 +555,106 @@ PrivateFailure g_lastFailure = PrivateFailure::NONE;
 char g_failedSessionId[kIdLen] = {0};
 uint32_t g_failedAtMs = 0;
 
-// Sends (or resends) a CLAIM for the current g_call — used for the initial
-// claim, the 250ms/1s retry cadence while CLAIMING, and the 2s keep-alive
-// refresh once active. Always carries g_call's own session_id so replies
-// and TTL tracking stay correlated to this exact call.
-bool sendClaim() {
+// Gate 1: a session given up (timeout or PTT release) while its CLAIM was
+// still queued. Its RELEASE goes into the same chain, behind the CLAIM, so
+// the receiver sees them in order. If that RELEASE could not be queued (the
+// chain full), it is owed: published when the CLAIM's own result comes back
+// -- that result frees a place in the chain (or ends the loan), and only a
+// CLAIM that was actually written needs withdrawing. Heap-held: rare, and
+// no static RAM beyond these two words.
+struct OwedRelease {
+  char group_code[33];
+  char peer_device_id[kDeviceIdLen];
+  char session_id[kIdLen];
+};
+uint32_t g_abandonedClaimTicket = 0;
+OwedRelease* g_owedRelease = nullptr;
+
+MqttManager::ControlOutcome sendBusyPacket(const char* group_code, const char* peer, uint8_t type, const char* sessionId,
+                                           MqttManager::PublishDoneFn done, uint32_t* ticket) {
+  if (ticket != nullptr) *ticket = 0;
   uint8_t payload[1 + kDeviceIdLen + kIdLen];
-  size_t len = buildBusyPayload(BUSY_CLAIM, Identity::deviceId(), g_call.session_id, payload, sizeof(payload));
-  if (len == 0) return false;
+  size_t len = buildBusyPayload(type, Identity::deviceId(), sessionId, payload, sizeof(payload));
+  if (len == 0) return MqttManager::ControlOutcome::FAILED;
   uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
   if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY, static_cast<uint16_t>(len), wireBuf, sizeof(wireBuf))) {
-    return false;
+    return MqttManager::ControlOutcome::FAILED;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
   char topicSuffix[32];
-  snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", g_call.peer_device_id);
-  bool ok = MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
-                                       static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
-  if (g_call.state == PrivateState::CLAIMING) {
-    g_call.claimSends++;
-    if (!ok) g_call.claimSendFails++;
+  snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", peer);
+  return MqttManager::publishControl(group_code, topicSuffix, wireBuf,
+                                     static_cast<uint16_t>(PacketCodec::kHeaderSize + len), done, ticket);
+}
+
+void onClaimPublishDone(uint32_t ticket, bool ok);
+
+// Sends (or resends) a CLAIM for the current g_call — used for the initial
+// claim, the 250ms/1s retry cadence while CLAIMING, and the 2s keep-alive
+// refresh once active. Always carries g_call's own session_id so replies
+// and TTL tracking stay correlated to this exact call. Gate 1: published,
+// queued (the connection lent to the worker) and failed are counted apart;
+// while a CLAIM is still queued no further one is queued behind it.
+bool sendClaim() {
+  if (g_call.claimQueuedTicket != 0) return true;  // the previous CLAIM has not left yet
+  bool claiming = g_call.state == PrivateState::CLAIMING;
+  uint32_t ticket = 0;
+  MqttManager::ControlOutcome o =
+      sendBusyPacket(g_call.group_code, g_call.peer_device_id, BUSY_CLAIM, g_call.session_id, onClaimPublishDone, &ticket);
+  if (claiming) g_call.claimSends++;
+  if (o == MqttManager::ControlOutcome::PUBLISHED) {
+    if (claiming) {
+      g_call.claimPublished++;
+      if (g_call.claimPublishedMs == 0) g_call.claimPublishedMs = millis() | 1;
+    }
+  } else if (o == MqttManager::ControlOutcome::QUEUED) {
+    g_call.claimQueuedTicket = ticket;
+    g_call.claimQueuedAtMs = millis();
+    if (claiming) g_call.claimQueued++;
+    Serial.printf("[RADIO][CLAIM] queued sid=%s ticket=%lu (connection lent to the MQTT worker)\n", g_call.session_id,
+                  static_cast<unsigned long>(ticket));
+  } else {
+    if (claiming) g_call.claimSendFails++;
+    Serial.printf("[RADIO][CLAIM] publish failed sid=%s state=%u\n", g_call.session_id,
+                  static_cast<unsigned>(g_call.state));
   }
-  if (!ok) Serial.printf("[RADIO][CLAIM] publish failed sid=%s state=%u\n", g_call.session_id,
-                         static_cast<unsigned>(g_call.state));
-  return ok;
+  return o != MqttManager::ControlOutcome::FAILED;
+}
+
+// The worker's result for a queued CLAIM (main task, MqttManager's tick).
+void onClaimPublishDone(uint32_t ticket, bool ok) {
+  if (ticket != 0 && ticket == g_call.claimQueuedTicket) {
+    g_call.claimQueuedTicket = 0;
+    unsigned long queuedMs = static_cast<unsigned long>(millis() - g_call.claimQueuedAtMs);
+    if (g_call.state == PrivateState::CLAIMING) {
+      if (ok) {
+        g_call.claimPublished++;
+        if (g_call.claimPublishedMs == 0) g_call.claimPublishedMs = millis() | 1;
+      } else {
+        g_call.claimSendFails++;
+      }
+    }
+    Serial.printf("[RADIO][CLAIM] %s sid=%s queuedMs=%lu\n", ok ? "published" : "queued publish failed",
+                  g_call.session_id, queuedMs);
+    return;
+  }
+  if (ticket != 0 && ticket == g_abandonedClaimTicket) {
+    g_abandonedClaimTicket = 0;
+    Serial.printf("[RADIO][CLAIM] abandoned-claim %s ticket=%lu (session already given up)\n",
+                  ok ? "published" : "failed", static_cast<unsigned long>(ticket));
+    OwedRelease* r = g_owedRelease;
+    g_owedRelease = nullptr;
+    if (r != nullptr) {
+      // Only a CLAIM that was written needs withdrawing; a failed one closed
+      // the connection and never reached the receiver.
+      if (ok) {
+        MqttManager::ControlOutcome o =
+            sendBusyPacket(r->group_code, r->peer_device_id, BUSY_RELEASE, r->session_id, onControlPublishDone, nullptr);
+        Serial.printf("[RADIO][CLAIM] owed RELEASE sid=%s %s\n", r->session_id, outcomeName(o));
+      }
+      delete r;
+    }
+  }
 }
 
 // Definition of the helper forward-declared alongside resetPrivateCall,
@@ -720,9 +844,12 @@ void handleRadioBusyReplyPacket(const char* group_code, const char* topic, const
   if (strcmp(responder, g_call.peer_device_id) != 0) return;
   if (strcmp(sessionId, g_call.session_id) != 0) return;  // stale GRANT/DENY for an earlier attempt
 
-  Serial.printf("[RADIO][CLAIM] %s sid=%s afterMs=%lu sends=%u sendFails=%u\n", type == REPLY_GRANT ? "granted" : "denied",
-                sessionId, static_cast<unsigned long>(millis() - g_call.claimFirstSentMs),
-                static_cast<unsigned>(g_call.claimSends), static_cast<unsigned>(g_call.claimSendFails));
+  Serial.printf("[RADIO][CLAIM] %s sid=%s afterMs=%lu afterPublishMs=%lu sends=%u queued=%u published=%u sendFails=%u\n",
+                type == REPLY_GRANT ? "granted" : "denied", sessionId,
+                static_cast<unsigned long>(millis() - g_call.claimFirstSentMs),
+                static_cast<unsigned long>(g_call.claimPublishedMs != 0 ? millis() - g_call.claimPublishedMs : 0),
+                static_cast<unsigned>(g_call.claimSends), static_cast<unsigned>(g_call.claimQueued),
+                static_cast<unsigned>(g_call.claimPublished), static_cast<unsigned>(g_call.claimSendFails));
   if (type == REPLY_GRANT) {
     beginNegotiation();
   } else if (type == REPLY_DENY) {
@@ -743,10 +870,12 @@ bool publishSessionStart() {
     return false;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
-  bool ok = MqttManager::publishBinary(g_call.group_code, "radio/session", wireBuf,
-                                       static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
-  if (!ok) Serial.printf("[RADIO][SESSION] START publish failed sid=%s\n", g_call.session_id);
-  return ok;
+  MqttManager::ControlOutcome o =
+      MqttManager::publishControl(g_call.group_code, "radio/session", wireBuf,
+                                  static_cast<uint16_t>(PacketCodec::kHeaderSize + len), onControlPublishDone, nullptr);
+  if (o != MqttManager::ControlOutcome::PUBLISHED)
+    Serial.printf("[RADIO][SESSION] START %s sid=%s\n", outcomeName(o), g_call.session_id);
+  return o != MqttManager::ControlOutcome::FAILED;
 }
 
 bool publishSessionAck() {
@@ -760,10 +889,12 @@ bool publishSessionAck() {
     return false;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
-  bool ok = MqttManager::publishBinary(g_call.group_code, "radio/session", wireBuf,
-                                       static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
-  if (!ok) Serial.printf("[RADIO][SESSION] ACK publish failed sid=%s\n", g_call.session_id);
-  return ok;
+  MqttManager::ControlOutcome o =
+      MqttManager::publishControl(g_call.group_code, "radio/session", wireBuf,
+                                  static_cast<uint16_t>(PacketCodec::kHeaderSize + len), onControlPublishDone, nullptr);
+  if (o != MqttManager::ControlOutcome::PUBLISHED)
+    Serial.printf("[RADIO][SESSION] ACK %s sid=%s\n", outcomeName(o), g_call.session_id);
+  return o != MqttManager::ControlOutcome::FAILED;
 }
 
 void handleRadioSessionPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
@@ -989,20 +1120,30 @@ void serviceTick() {
   }
 
   if (g_call.state == PrivateState::CLAIMING) {
-    if (now - g_call.claimFirstSentMs >= kClaimTotalTimeoutMs) {
-      // No matching GRANT/DENY within 1 s: the attempt fails, visibly
-      // ("No response", or "Send failed" when not one CLAIM could be
-      // published) until the PTT is released. A release cancels CLAIMING
+    // Gate 1: the reply window runs from the first CLAIM actually published;
+    // while one is still queued, the queue limit applies instead.
+    uint32_t deadline = g_call.claimPublishedMs != 0  ? g_call.claimPublishedMs + kClaimTotalTimeoutMs
+                        : g_call.claimQueuedTicket != 0 ? g_call.claimFirstSentMs + kClaimQueueMaxMs
+                                                        : g_call.claimFirstSentMs + kClaimTotalTimeoutMs;
+    if (static_cast<int32_t>(now - deadline) >= 0) {
+      // No matching GRANT/DENY in time: the attempt fails, visibly ("No
+      // response" 1 s after a published CLAIM, "Send timeout" when the
+      // CLAIM was still queued at the 2 s queue limit, "Send failed" when
+      // not one CLAIM could be published) until the PTT is released. A release cancels CLAIMING
       // first, so reaching here means the screen saw no release. RELEASE
       // goes out for this session, so a grant the receiver sends late is
       // withdrawn instead of holding its channel for the 5 s busy TTL.
-      PrivateFailure f = (g_call.claimSends > 0 && g_call.claimSendFails == g_call.claimSends)
-                             ? PrivateFailure::SEND_FAILED
-                             : PrivateFailure::NO_RESPONSE;
-      Serial.printf("[RADIO][CLAIM] timeout sid=%s peer=%s elapsedMs=%lu sends=%u sendFails=%u result=%s\n",
-                    g_call.session_id, g_call.peer_device_id, static_cast<unsigned long>(now - g_call.claimFirstSentMs),
-                    static_cast<unsigned>(g_call.claimSends), static_cast<unsigned>(g_call.claimSendFails),
-                    f == PrivateFailure::SEND_FAILED ? "send-failed" : "no-response");
+      PrivateFailure f = g_call.claimPublishedMs != 0    ? PrivateFailure::NO_RESPONSE
+                         : g_call.claimQueuedTicket != 0 ? PrivateFailure::SEND_TIMEOUT
+                                                         : PrivateFailure::SEND_FAILED;
+      Serial.printf(
+          "[RADIO][CLAIM] timeout sid=%s peer=%s elapsedMs=%lu sends=%u queued=%u published=%u sendFails=%u "
+          "stillQueued=%d result=%s\n",
+          g_call.session_id, g_call.peer_device_id, static_cast<unsigned long>(now - g_call.claimFirstSentMs),
+          static_cast<unsigned>(g_call.claimSends), static_cast<unsigned>(g_call.claimQueued),
+          static_cast<unsigned>(g_call.claimPublished), static_cast<unsigned>(g_call.claimSendFails),
+          g_call.claimQueuedTicket != 0 ? 1 : 0,
+          f == PrivateFailure::NO_RESPONSE ? "no-response" : f == PrivateFailure::SEND_TIMEOUT ? "send-timeout" : "send-failed");
       strncpy(g_failedSessionId, g_call.session_id, sizeof(g_failedSessionId) - 1);
       g_failedSessionId[sizeof(g_failedSessionId) - 1] = '\0';
       g_failedAtMs = now;
@@ -1096,19 +1237,29 @@ StartCallResult startPrivateCall(const char* group_code, const char* recipient_d
 // logic.
 void releaseAndResetPrivateCall() {
   if (g_call.isCaller && g_call.state != PrivateState::IDLE) {
-    uint8_t payload[1 + kDeviceIdLen + kIdLen];
-    size_t len = buildBusyPayload(BUSY_RELEASE, Identity::deviceId(), g_call.session_id, payload, sizeof(payload));
-    if (len > 0) {
-      uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
-      if (PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY, static_cast<uint16_t>(len), wireBuf,
-                                    sizeof(wireBuf))) {
-        memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
-        char topicSuffix[32];
-        snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", g_call.peer_device_id);
-        bool ok = MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
-                                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
-        if (!ok) Serial.printf("[RADIO][CLAIM] RELEASE publish failed sid=%s\n", g_call.session_id);
+    // Gate 1: a CLAIM still queued is published after this point; the
+    // RELEASE below joins the same chain behind it (same connection, same
+    // order). Remember the CLAIM so its late result is recognized.
+    uint32_t queuedClaim = g_call.claimQueuedTicket;
+    if (queuedClaim != 0) {
+      g_abandonedClaimTicket = queuedClaim;
+      delete g_owedRelease;
+      g_owedRelease = nullptr;
+    }
+    MqttManager::ControlOutcome o = sendBusyPacket(g_call.group_code, g_call.peer_device_id, BUSY_RELEASE,
+                                                   g_call.session_id, onControlPublishDone, nullptr);
+    if (o == MqttManager::ControlOutcome::FAILED && queuedClaim != 0) {
+      // The chain is full: owed until the queued CLAIM's result frees a place.
+      g_owedRelease = new (std::nothrow) OwedRelease();
+      if (g_owedRelease != nullptr) {
+        strncpy(g_owedRelease->group_code, g_call.group_code, sizeof(g_owedRelease->group_code) - 1);
+        strncpy(g_owedRelease->peer_device_id, g_call.peer_device_id, sizeof(g_owedRelease->peer_device_id) - 1);
+        strncpy(g_owedRelease->session_id, g_call.session_id, sizeof(g_owedRelease->session_id) - 1);
       }
+    }
+    if (o != MqttManager::ControlOutcome::PUBLISHED) {
+      Serial.printf("[RADIO][CLAIM] RELEASE %s sid=%s claimStillQueued=%d owed=%d\n", outcomeName(o), g_call.session_id,
+                    queuedClaim != 0 ? 1 : 0, g_owedRelease != nullptr ? 1 : 0);
     }
   }
   resetPrivateCall();

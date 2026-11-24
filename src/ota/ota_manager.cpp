@@ -2,6 +2,7 @@
 
 #include <Adafruit_ST7789.h>
 #include <Arduino.h>
+#include <esp_heap_caps.h>
 #include <LittleFS.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
@@ -683,7 +684,25 @@ void runBackgroundAvailabilityCheck() {
 void serviceInit() { runPostOtaValidation(); }
 
 void backgroundCheckTask(void*) {
+  // Gate 4 (heap root cause, hardware: min_since_boot=12184 already at ~60 s,
+  // before any radio call): the TLS handshake of this fetch is the largest
+  // transient allocation in that window and overlaps the MQTT setup. Logged
+  // around it so the hardware log shows whether the boot minimum falls here
+  // (diagnostic only; locals, no static RAM).
+  uint32_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t minBefore = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t startMs = millis();
   runBackgroundAvailabilityCheck();
+  Serial.printf(
+      "[HEAP][OTA] background check uptime_s=%lu ms=%lu before: free=%lu min_since_boot=%lu largest=%lu "
+      "after: free=%lu min_since_boot=%lu largest=%lu\n",
+      static_cast<unsigned long>(startMs / 1000), static_cast<unsigned long>(millis() - startMs),
+      static_cast<unsigned long>(freeBefore), static_cast<unsigned long>(minBefore),
+      static_cast<unsigned long>(largestBefore),
+      static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+      static_cast<unsigned long>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+      static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
   g_backgroundCheckRunning.store(false);
   vTaskDelete(nullptr);
 }

@@ -80,16 +80,34 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
 // the caller does what it does after a failed publish (nothing waits).
 // While the connection is lent the group still reads as connected/ready;
 // publishBinary() for it returns false at once for QoS1, while publishRaw()
-// and a QoS0 publishBinary() (radio control packets) join the loan.
+// and a QoS0 publishBinary() join the loan (true then means queued, not
+// published -- radio control packets use publishControl(), which tells the
+// two apart).
 using PublishDoneFn = void (*)(uint32_t ticket, bool ok);
 uint32_t publishBinaryAsync(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                             bool retained, int qos, PublishDoneFn done);
+
+// Radio control packets (CLAIM/RELEASE, GRANT/DENY, SESSION_START/ACK; QoS0,
+// not retained), with the outcome spelled out (Gate 1: a CLAIM queued behind
+// a Race heartbeat's PUBACK wait is not a CLAIM sent):
+//  - PUBLISHED: written now on the main task (the group's own connection).
+//  - QUEUED: the connection is lent to the worker; the packet joined the
+//    loan behind the publishes already queued, in order. *ticketOut gets the
+//    ticket and `done(ticket, ok)` reports the actual result later, once, on
+//    the main task (ok: written to the connection).
+//  - FAILED: neither (no connection, the loan full, no memory, ...).
+enum class ControlOutcome : uint8_t { FAILED, PUBLISHED, QUEUED };
+ControlOutcome publishControl(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
+                              PublishDoneFn done, uint32_t* ticketOut);
 
 // Radio audio frames (QoS0, not retained): published only if it costs no
 // waiting -- the group's own connection, not lent to the worker, its socket
 // writable right now. Otherwise the frame is skipped (false; counted in the
 // "[DIAG][MQTT] qos0 ... skipped=" line) instead of holding the main loop
-// for TCP buffer space. Never queues, so a late frame is never sent.
+// for TCP buffer space. Never queues, so a late frame is never sent. The
+// write itself (header + payload) is bounded to 50 ms in all: past that the
+// frame is cut, and the library closes the connection (the group then
+// reconnects) rather than holding the main loop for up to 500 ms (Gate 2).
 bool publishBinaryNoWait(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len);
 
 }  // namespace MqttManager

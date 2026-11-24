@@ -89,6 +89,45 @@ static MessageRef arriveEnigma(const std::string& cipher, const EnigmaKeyConfig&
   handleEnigmaArrival(kG, kBob, env, env.timestamp, payload, static_cast<uint16_t>(n));
   return T::store.back().ref;
 }
+// The sender's own history record, exactly as sendEnigmaMessage() stores it:
+// the same wire packet, local payload LOCK_UNLOCKED + the normalized text.
+static MessageRef sentEnigma(const std::string& cipher, const EnigmaKeyConfig& key, const std::string& normalizedPlain) {
+  PacketCodec::MessageEnvelope env{};
+  snprintf(env.message_id, sizeof(env.message_id), "MSG%020u", ++g_msgNo);
+  env.schema_version = 1;
+  env.message_type = PacketCodec::MSG_TYPE_ENIGMA;
+  strncpy(env.sender_device_id, "DEADBEEFAAAA", sizeof(env.sender_device_id) - 1);
+  strncpy(env.group_code, kG, sizeof(env.group_code) - 1);
+  env.timestamp = 1700000100u + g_msgNo;
+  uint8_t payload[340];
+  size_t n = EnigmaKeys::encodeEnigmaPayload(cipher.c_str(), EnigmaCrypto::computeFingerprint(key), 1, key, payload,
+                                             sizeof(payload));
+  uint8_t wire[PacketCodec::kHeaderSize + 340];
+  size_t wl = PacketCodec::encodeMessagePacket(env, payload, static_cast<uint16_t>(n), wire, sizeof(wire));
+  uint8_t local[280];
+  size_t ll = encodeLocalPayload(LOCK_UNLOCKED, normalizedPlain.c_str(), local, sizeof(local));
+  MessageRef ref;
+  MessageStore::appendStoredMessage(kG, kBob, MessageStore::Direction::SENT, 0, env.timestamp, wire, static_cast<uint16_t>(wl),
+                                    local, static_cast<uint16_t>(ll), &ref);
+  return ref;
+}
+// An older record whose local lock byte was rewritten (WHITE after a wrong
+// attempt, UNLOCKED after the right one) -- possible on 997d383, where a
+// zero-key message still opened the key editor.
+static void setLocal(const MessageRef& ref, uint8_t lock, const char* cached) {
+  uint8_t local[280];
+  size_t ll = encodeLocalPayload(lock, cached, local, sizeof(local));
+  MessageStore::updateTypeLocalPayload(ref, local, ll);
+}
+// Did the gesture open a screen (key editor / Reveal)? pushScreen() bumps
+// the navigation epoch; the screens' state is reset between checks.
+static bool gestureNavigates(const MessageRef& ref, MessageEventType ev) {
+  uint32_t before = Menu::navigationEpoch();
+  onEnigmaMessageEvent(ref, ev);
+  bool moved = Menu::navigationEpoch() != before;
+  if (moved) Menu::goBack();
+  return moved;
+}
 static T::Rec* recOf(const MessageRef& ref) {
   for (auto& r : T::store)
     if (r.ref.sequence == ref.sequence) return &r;
@@ -158,7 +197,7 @@ int main() {
   // ---- Case A: no rotors, no plugboard ----
   const char* plains[] = {"D EE", "HELLO WORLD", "X", "XX", "XQ", "XXQ", "XXXX", "A   B", "  LEAD", "TRAIL  ", "  BOTH  ", "x q"};
   for (const char* p : plains) {
-    g_test = std::string("EA1 zero key, '") + p + "': shown readable (spaces restored, X kept), still locked (red icon), stored bytes untouched";
+    g_test = std::string("EA1 zero key, '") + p + "': shown readable (spaces restored, X kept), NO padlock (Gate 6), stored bytes untouched (lock byte still BLACK: no migration)";
     fresh();
     std::string esc = escape(p);
     std::string cipher = encrypt(esc, zeroKey());
@@ -166,7 +205,7 @@ int main() {
     std::vector<uint8_t> wireBefore = recOf(ref)->wire, localBefore = recOf(ref)->local;
     std::string expected = unescape(esc);  // the sender's own history text (enigma.cpp send path)
     std::string got = shown(ref);
-    CHECK(cipher == esc && got == expected && icon(ref) == MessageIconKind::LOCK_CLOSED_RED && lockOf(ref) == LOCK_BLACK &&
+    CHECK(cipher == esc && got == expected && icon(ref) == MessageIconKind::NONE && lockOf(ref) == LOCK_BLACK &&
               recOf(ref)->wire == wireBefore && recOf(ref)->local == localBefore,
           "escaped '%s' cipher '%s' shown '%s' expected '%s' icon %d lock %u", esc.c_str(), cipher.c_str(), got.c_str(),
           expected.c_str(), static_cast<int>(icon(ref)), lockOf(ref));
@@ -175,20 +214,54 @@ int main() {
   fresh();
   MessageRef dee = arriveEnigma("DXQEE", zeroKey());
   CHECK(shown(dee) == "D EE", "shown '%s'", shown(dee).c_str());
-  g_test = "EA3 zero key, hold preview unchanged: a locked (BLACK) message still holds to [locked]; the correct key unlocks it (green) with the same text";
+  g_test = "EA3 zero key, gestures (Gate 6): DOT hold shows the same readable text (never [locked]); Encoder short opens no key editor; the combined gesture opens no Reveal; nothing is rewritten";
+  std::vector<uint8_t> localBefore = recOf(dee)->local;
   onEnigmaMessageEvent(dee, EVT_DOT_HOLD_START);
   std::string held = shown(dee);
   onEnigmaMessageEvent(dee, EVT_DOT_HOLD_END);
-  attempt(dee, zeroKey());
-  CHECK(held == "[locked]" && lockOf(dee) == LOCK_UNLOCKED && icon(dee) == MessageIconKind::LOCK_OPEN_GREEN &&
-            shown(dee) == "D EE" && cachedOf(dee) == "D EE",
-        "held '%s' lock %u shown '%s' cached '%s'", held.c_str(), lockOf(dee), shown(dee).c_str(), cachedOf(dee).c_str());
-  g_test = "EA4 zero key, a wrong key attempt: WHITE (yellow), the default view stays readable; not marked unlocked";
+  bool shortNav = gestureNavigates(dee, EVT_ENCODER_SHORT);
+  bool revealNav = gestureNavigates(dee, EVT_COMBINED_REVEAL);
+  CHECK(held == "D EE" && !shortNav && !revealNav && lockOf(dee) == LOCK_BLACK && recOf(dee)->local == localBefore &&
+            icon(dee) == MessageIconKind::NONE && shown(dee) == "D EE",
+        "held '%s'; short opened a screen %d; reveal opened a screen %d; lock %u; local unchanged %d", held.c_str(), shortNav,
+        revealNav, lockOf(dee), recOf(dee)->local == localBefore);
+  g_test = "EA4 previously stored zero-key records (WHITE after a wrong attempt or UNLOCKED after the right one, from 997d383) are presented the same: readable, no padlock, no editor/Reveal -- without rewriting them";
   fresh();
-  MessageRef z = arriveEnigma("DXQEE", zeroKey());
-  attempt(z, rotorKey(1, 2, 3));
-  CHECK(lockOf(z) == LOCK_WHITE && icon(z) == MessageIconKind::LOCK_CLOSED_YELLOW && shown(z) == "D EE",
-        "lock %u icon %d shown '%s'", lockOf(z), static_cast<int>(icon(z)), shown(z).c_str());
+  MessageRef zw = arriveEnigma("DXQEE", zeroKey());
+  setLocal(zw, LOCK_WHITE, "KXLRP");  // a wrong attempt's garbage cache
+  MessageRef zu = arriveEnigma("HELLOXQWORLD", zeroKey());
+  setLocal(zu, LOCK_UNLOCKED, "HELLO WORLD");
+  std::vector<uint8_t> wLocal = recOf(zw)->local, uLocal = recOf(zu)->local;
+  bool noNav = !gestureNavigates(zw, EVT_ENCODER_SHORT) && !gestureNavigates(zw, EVT_COMBINED_REVEAL) &&
+               !gestureNavigates(zu, EVT_ENCODER_SHORT) && !gestureNavigates(zu, EVT_COMBINED_REVEAL);
+  onEnigmaMessageEvent(zw, EVT_DOT_HOLD_START);
+  std::string heldW = shown(zw);
+  onEnigmaMessageEvent(zw, EVT_DOT_HOLD_END);
+  CHECK(shown(zw) == "D EE" && heldW == "D EE" && icon(zw) == MessageIconKind::NONE && shown(zu) == "HELLO WORLD" &&
+            icon(zu) == MessageIconKind::NONE && noNav && recOf(zw)->local == wLocal && recOf(zu)->local == uLocal,
+        "WHITE: shown '%s' held '%s' icon %d; UNLOCKED: shown '%s' icon %d; no navigation %d; records untouched %d/%d",
+        shown(zw).c_str(), heldW.c_str(), static_cast<int>(icon(zw)), shown(zu).c_str(), static_cast<int>(icon(zu)), noNav,
+        recOf(zw)->local == wLocal, recOf(zu)->local == uLocal);
+  g_test = "EA5 sender and receiver histories agree for a zero-key message: the sender's own record (LOCK_UNLOCKED, cached text) shows the same text and also no padlock";
+  fresh();
+  for (const char* p : {"D EE", "X", "XQ", "  BOTH  "}) {
+    std::string esc = escape(p);
+    MessageRef rx = arriveEnigma(encrypt(esc, zeroKey()), zeroKey());
+    MessageRef tx = sentEnigma(encrypt(esc, zeroKey()), zeroKey(), unescape(esc));
+    CHECK(shown(rx) == shown(tx) && shown(tx) == unescape(esc) && icon(tx) == MessageIconKind::NONE &&
+              icon(rx) == MessageIconKind::NONE && !gestureNavigates(tx, EVT_ENCODER_SHORT),
+          "'%s': receiver '%s' sender '%s' icons %d/%d", p, shown(rx).c_str(), shown(tx).c_str(), static_cast<int>(icon(rx)),
+          static_cast<int>(icon(tx)));
+  }
+  g_test = "EA6 a configured-key SENT record keeps its green open padlock (only zero-key presentation changed)";
+  fresh();
+  {
+    EnigmaKeyConfig key = rotorKey(4, 11, 19);
+    std::string esc = escape("HELLO");
+    MessageRef tx = sentEnigma(encrypt(esc, key), key, "HELLO");
+    CHECK(icon(tx) == MessageIconKind::LOCK_OPEN_GREEN && shown(tx) == "HELLO", "icon %d shown '%s'", static_cast<int>(icon(tx)),
+          shown(tx).c_str());
+  }
 
   // ---- Case B: rotors ----
   for (const char* p : {"D EE", "HELLO WORLD", "X", "XX", "XQ", "XXQ", "XXXX", "A   B", "  BOTH  "}) {
@@ -227,6 +300,26 @@ int main() {
           cipher.c_str(), before.c_str(), wrongStays, shown(ref).c_str(), unescape(esc).c_str());
   }
 
+  g_test = "EB3 rotor key keeps the lock workflow (Gate 6 Case B): red padlock, DOT hold [locked], Encoder short opens the key editor, the combined gesture opens Reveal; after the right key: green open padlock, plaintext";
+  fresh();
+  {
+    EnigmaKeyConfig key = rotorKey(4, 11, 19);
+    std::string esc = escape("D EE");
+    std::string c = encrypt(esc, key);
+    MessageRef ref = arriveEnigma(c, key);
+    onEnigmaMessageEvent(ref, EVT_DOT_HOLD_START);
+    std::string held = shown(ref);
+    onEnigmaMessageEvent(ref, EVT_DOT_HOLD_END);
+    bool editor = gestureNavigates(ref, EVT_ENCODER_SHORT);
+    bool reveal = gestureNavigates(ref, EVT_COMBINED_REVEAL);
+    MessageIconKind lockedIcon = icon(ref);
+    attempt(ref, key);
+    CHECK(lockedIcon == MessageIconKind::LOCK_CLOSED_RED && held == "[locked]" && editor && reveal &&
+              icon(ref) == MessageIconKind::LOCK_OPEN_GREEN && shown(ref) == "D EE",
+          "icon before %d held '%s' editor %d reveal %d icon after %d shown '%s'", static_cast<int>(lockedIcon), held.c_str(), editor,
+          reveal, static_cast<int>(icon(ref)), shown(ref).c_str());
+  }
+
   // ---- Case C: plugboard, no rotors ----
   g_test = "EC1 plugboard only, no rotors: 'AB' with A-X, B-Q encrypts to XQ -- shown as XQ (never as a space); the right key gives AB back";
   fresh();
@@ -244,6 +337,19 @@ int main() {
   pref = arriveEnigma(cipher, pk2);
   CHECK(cipher == "MXQEE" && shown(pref) == "MXQEE" && icon(pref) == MessageIconKind::LOCK_CLOSED_RED, "cipher '%s' shown '%s'",
         cipher.c_str(), shown(pref).c_str());
+
+  g_test = "EC3 plugboard only keeps the lock workflow (Gate 6 Case C): red padlock, key editor and Reveal open; a wrong key gives the yellow padlock";
+  fresh();
+  {
+    EnigmaKeyConfig pk3 = plugKey("DM");
+    MessageRef ref = arriveEnigma(encrypt(escape("D EE"), pk3), pk3);
+    bool editor = gestureNavigates(ref, EVT_ENCODER_SHORT);
+    bool reveal = gestureNavigates(ref, EVT_COMBINED_REVEAL);
+    MessageIconKind before = icon(ref);
+    attempt(ref, plugKey("DN"));
+    CHECK(before == MessageIconKind::LOCK_CLOSED_RED && editor && reveal && icon(ref) == MessageIconKind::LOCK_CLOSED_YELLOW,
+          "icon %d editor %d reveal %d after wrong key %d", static_cast<int>(before), editor, reveal, static_cast<int>(icon(ref)));
+  }
 
   g_test = "ED1 previous-firmware compatibility: the payload format and stored bytes are unchanged (display only); a message decoded with the right key keeps its unlocked text";
   fresh();

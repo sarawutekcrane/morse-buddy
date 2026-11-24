@@ -72,7 +72,7 @@ echo "== 4d. MQTT connection worker (mqtt_manager.cpp: setup/cleanup off the mai
 MQ="-I $H/fake_net -I $H/fake -I $REPO/src $H/mqtt_test.cpp $R/crc32.cpp $R/packet_codec.cpp -lpthread"
 build mqm -std=gnu++17 $SAN -Wall -Wextra $MQ && {
   st=0; "$OUT/mqm" manual > "$OUT/mqm.txt" 2>&1 || st=$?
-  grep -E "FAIL|passed|runtime error|ERROR" "$OUT/mqm.txt" | sed 's/^/   manual (ASan+UBSan): /' || true
+  grep -E "FAIL|passed|MEASURE|runtime error|ERROR" "$OUT/mqm.txt" | sed 's/^/   manual (ASan+UBSan): /' || true
   [ $st -eq 0 ] || fail "mqtt_test manual exited with status $st"; }
 build mqt -std=gnu++17 $SAN -Wall -Wextra $MQ && {
   st=0; "$OUT/mqt" threads 300 > "$OUT/mqt.txt" 2>&1 || st=$?
@@ -82,9 +82,9 @@ build mqtsan -std=gnu++17 -g -O1 -fsanitize=thread -Wall -Wextra $MQ && {
   st=0; "$OUT/mqtsan" threads 300 > "$OUT/mqtsan.txt" 2>&1 || st=$?
   grep -E "FAIL|passed|WARNING: ThreadSanitizer" "$OUT/mqtsan.txt" | sort | uniq -c | sed 's/^/   threads (TSan): /' || true
   [ $st -eq 0 ] || fail "mqtt_test threads under TSan exited with status $st"; }
-echo "== 4e. Private radio PTT and radio MQTT paths (hardware: 'Claiming...' back to 'Ready' while held; QoS0 audio 288 ms): ACTUAL radio.cpp + radio_transport.cpp + menu.cpp; the peer modeled by its packets"
+echo "== 4e. Private radio PTT and radio MQTT paths (hardware: 'Claiming...' back to 'Ready' while held; QoS0 audio 288 ms; Gate 1: CLAIM queued behind worker publishes vs the claim window; Gate 3: framing/dispatch of the three audio paths): ACTUAL radio.cpp + radio_transport.cpp + menu.cpp; the peer and the MQTT worker chain modeled"
 build radt -std=gnu++17 $SAN -Wall -Wextra -I "$H" -I "$H/fake_radio" -I "$H/fake" -I "$REPO/src" "$H/radio_test.cpp" "$H/stubs.cpp" "$R/packet_codec.cpp" "$R/presence.cpp" "$R/crc32.cpp" "$R/morse.cpp" && run radt
-echo "== 4f. Enigma received-message display (zero key readable; rotor/plugboard ciphertext untouched, XQ/XX collisions, real decode round trips): ACTUAL enigma.cpp + enigma_crypto.cpp + enigma_keys.cpp"
+echo "== 4f. Enigma message display (zero key: readable, no padlock, no key editor/Reveal (Gate 6); rotor/plugboard ciphertext and lock workflow untouched, XQ/XX collisions, real decode round trips): ACTUAL enigma.cpp + enigma_crypto.cpp + enigma_keys.cpp"
 build ent -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -I "$H" -I "$H/fake" -I "$REPO/src" "$H/enigma_test.cpp" "$H/stubs.cpp" "$R/menu.cpp" "$R/notifications.cpp" "$R/text_message.cpp" "$R/number_guessing.cpp" "$R/packet_codec.cpp" "$R/morse.cpp" "$R/enigma_crypto.cpp" "$R/enigma_keys.cpp" "$R/crc32.cpp" "$R/presence.cpp" && run ent
 W=$(cat "$OUT"/*.warnings.txt | grep -E '(race|race_protocol|identity|number_guessing|number_guessing_friend)\.(cpp|h):[0-9]+:[0-9]+: warning' | sed 's|.*/src/core/||' | sort -u | tr '\n' ' ' || true)
 echo "   warnings in changed/related files (all builds): ${W:-none}"

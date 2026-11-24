@@ -7,6 +7,10 @@
 // broadcast audio) and menu.cpp into this translation unit, against the
 // shared stubs (stubs.cpp: Display, Input, MqttManager publishBinary()).
 // The peer is modeled by delivering its packets to the registered handlers.
+// The MQTT worker's publish chain (connection lent for a Race heartbeat /
+// chat / Outbox publish) is modeled by stubs.cpp's asyncPublish FIFO;
+// workerNext() completes its oldest job, so the tests choose exactly when a
+// queued CLAIM/GRANT/RELEASE actually goes out (Gate 1).
 // NOT modeled: STUN/UDP direct (fake_radio/WiFi.h never delivers UDP), I2S,
 // timing on the ESP32, a real broker or a second device.
 #include "stubs.h"
@@ -45,13 +49,13 @@ void playFrame(const int16_t*, size_t) { g_framesPlayed++; }
 // MqttManager::publishBinaryNoWait() (radio audio): every attempt recorded;
 // accepts while T::connected and g_noWaitAccepts (false models "socket not
 // writable now / connection lent").
-struct NoWaitPub { std::string topic; size_t len; bool result; };
+struct NoWaitPub { std::string topic; size_t len; bool result; std::vector<uint8_t> data; std::string group; };
 static std::vector<NoWaitPub> g_noWait;
 static bool g_noWaitAccepts = true;
 namespace MqttManager {
-bool publishBinaryNoWait(const char*, const char* topic, const uint8_t*, uint16_t len) {
+bool publishBinaryNoWait(const char* group, const char* topic, const uint8_t* data, uint16_t len) {
   bool r = T::connected && g_noWaitAccepts;
-  g_noWait.push_back({topic, len, r});
+  g_noWait.push_back({topic, len, r, std::vector<uint8_t>(data, data + len), group});
   return r;
 }
 }  // namespace MqttManager
@@ -115,6 +119,39 @@ static std::vector<T::Pub> pubsTo(const std::string& prefix) {
   return out;
 }
 
+// What actually went out to the broker, in order: synchronous publishes
+// (T::onPublished) and the worker chain's publishes as workerNext() completes
+// them. A queued packet is NOT on the wire until then (Gate 1).
+struct WirePkt { std::string topic; std::vector<uint8_t> data; };
+static std::vector<WirePkt> g_wire;
+static std::string wSession(const WirePkt& w) { return w.data.size() >= 6 + 41 ? std::string(reinterpret_cast<const char*>(&w.data[6 + 17])) : ""; }
+static uint8_t wType(const WirePkt& w) { return w.data.size() > 6 ? w.data[6] : 0xFF; }
+static int wireCount(const std::string& prefix, int type = -1, const std::string& sid = "") {
+  int n = 0;
+  for (auto& w : g_wire)
+    if (w.topic.compare(0, prefix.size(), prefix) == 0 && (type < 0 || wType(w) == type) && (sid.empty() || wSession(w) == sid)) n++;
+  return n;
+}
+// The MQTT worker finishes the oldest job of the lent connection's chain
+// (MqttManager: in order; the result reaches the main task on its tick).
+static void workerNext(bool ok) {
+  if (T::asyncPending.empty()) return;
+  if (ok) g_wire.push_back({T::asyncPending.front().topic, T::asyncPending.front().data});
+  T::completeAsync(ok);
+}
+static int queuedTo(const std::string& prefix) {
+  int n = 0;
+  for (auto& p : T::asyncPending) n += p.topic.compare(0, prefix.size(), prefix) == 0 ? 1 : 0;
+  return n;
+}
+// A Race heartbeat (or chat / Outbox publish) that lends the connection to
+// the worker: QoS1, its PUBACK wait on the worker (up to 5 s).
+static void lendForWorkerPublish(const char* what) {
+  T::asyncPublish = true;
+  uint8_t b[4] = {1, 2, 3, 4};
+  MqttManager::publishBinaryAsync(kGroup, what, b, 4, false, 1, nullptr);
+}
+
 static void openTalk(const char* contact) {
   T::reset();
   g_noWait.clear();
@@ -126,6 +163,11 @@ static void openTalk(const char* contact) {
   RadioTransport::g_receiverBusy = RadioTransport::ReceiverBusy{};
   RadioTransport::g_lastFailure = RadioTransport::PrivateFailure::NONE;
   RadioTransport::g_failedSessionId[0] = '\0';
+  RadioTransport::g_abandonedClaimTicket = 0;
+  delete RadioTransport::g_owedRelease;
+  RadioTransport::g_owedRelease = nullptr;
+  g_wire.clear();
+  T::onPublished = [](const T::Pub& p) { g_wire.push_back({p.topic, p.data}); };
   T::pubs.clear();
   g_fakeHeapFree = 200 * 1024;
   g_fakeHeapLargest = 110 * 1024;
@@ -199,7 +241,13 @@ int main() {
   openTalk(kPeer);
   T::publishScript = {false, false, false, false, false, false};  // every CLAIM refused; the first refusal closes the connection
   pttDown(); tick();
-  runFor(1100);
+  runFor(500);
+  CHECK(RadioTransport::g_call.claimSendFails >= 2 && RadioTransport::g_call.claimSendFails == RadioTransport::g_call.claimSends &&
+            RadioTransport::g_call.claimPublished == 0 && RadioTransport::g_call.claimQueued == 0,
+        "diagnostic counters while refused: sends %u fails %u published %u queued %u",
+        static_cast<unsigned>(RadioTransport::g_call.claimSends), static_cast<unsigned>(RadioTransport::g_call.claimSendFails),
+        static_cast<unsigned>(RadioTransport::g_call.claimPublished), static_cast<unsigned>(RadioTransport::g_call.claimQueued));
+  runFor(600);
   CHECK(RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::SEND_FAILED && status() == "Send failed",
         "all refused: failure %u status '%s'", static_cast<unsigned>(RadioTransport::getPrivateFailure()), status().c_str());
   T::connected = true;
@@ -366,6 +414,290 @@ int main() {
   CHECK(flushed == 67 && g_noWait.empty() && status() == "Talking (relay)",
         "flushed %zu (want 67); low heap: buffered %zu (want 0), status '%s'", flushed, g_noWait.size(), status().c_str());
   pttUp(2200); tick(2);
+
+
+  // ===========================================================================
+  // Gate 1: CLAIM queued behind worker publishes vs the 1 s claim window
+  // ===========================================================================
+  const std::string busyTo = std::string("radio/busy/") + kPeer;
+
+  g_test = "RQ1 PTT while a Race heartbeat holds the worker: the CLAIM is QUEUED (not on the wire, not counted as published), no retry stacks behind it; published when the heartbeat completes; GRANT 200 ms later -> call";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  pttDown(); tick();
+  bool queuedNotSent = queuedTo(busyTo) == 1 && wireCount(busyTo) == 0 && RadioTransport::g_call.claimQueued == 1 &&
+                       RadioTransport::g_call.claimPublished == 0 && RadioTransport::g_call.claimPublishedMs == 0 &&
+                       status() == "Claiming...";
+  runFor(600);  // heartbeat PUBACK takes 600 ms (hardware: normal)
+  int stacked = queuedTo(busyTo);
+  workerNext(true);  // heartbeat
+  workerNext(true);  // the CLAIM
+  tick();
+  std::string sidQ = RadioTransport::g_call.session_id;
+  bool publishedNow = wireCount(busyTo, 0, sidQ) == 1 && RadioTransport::g_call.claimPublished == 1 &&
+                      RadioTransport::g_call.claimPublishedMs != 0 && RadioTransport::g_call.claimQueuedTicket == 0;
+  runFor(200);
+  peerReply(0, sidQ); tick();
+  CHECK(queuedNotSent && stacked == 1 && publishedNow &&
+            RadioTransport::getPrivateState() == RadioTransport::PrivateState::NEGOTIATING,
+        "queued-not-sent %d, CLAIMs in the chain after 600 ms %d (want 1), published on completion %d, state %u",
+        queuedNotSent, stacked, publishedNow, static_cast<unsigned>(RadioTransport::getPrivateState()));
+  pttUp(900); tick(2);
+
+  g_test = "RQ2 CLAIM published 900 ms after the press (heartbeat), GRANT 300 ms after that: 1.2 s from the press, inside the reply window counted from the publish -> call (the old window from the enqueue failed it)";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  pttDown(); tick();
+  runFor(900);
+  workerNext(true);
+  workerNext(true);
+  tick();
+  sidQ = RadioTransport::g_call.session_id;
+  runFor(300);
+  bool stillClaiming = RadioTransport::getPrivateState() == RadioTransport::PrivateState::CLAIMING &&
+                       RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::NONE;
+  peerReply(0, sidQ); tick();
+  CHECK(stillClaiming && RadioTransport::getPrivateState() == RadioTransport::PrivateState::NEGOTIATING,
+        "at 1.2 s still claiming %d; after GRANT state %u", stillClaiming,
+        static_cast<unsigned>(RadioTransport::getPrivateState()));
+  pttUp(1300); tick(2);
+
+  g_test = "RQ2b CLAIM published late, then no reply: 'No response' 1 s after the publish (not after the press), retries every 250 ms once published";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  pttDown(); tick();
+  runFor(800);
+  workerNext(true);
+  workerNext(true);
+  tick();
+  sidQ = RadioTransport::g_call.session_id;
+  runFor(900);
+  bool notYet = RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::NONE;
+  runFor(200);
+  CHECK(notYet && RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::NO_RESPONSE &&
+            status() == "No response" && wireCount(busyTo, 0, sidQ) >= 4 && wireCount(busyTo, 1, sidQ) == 1,
+        "900 ms after the publish no failure yet %d; at 1.1 s failure %u status '%s'; CLAIMs on the wire %d, RELEASE %d",
+        notYet, static_cast<unsigned>(RadioTransport::getPrivateFailure()), status().c_str(), wireCount(busyTo, 0, sidQ),
+        wireCount(busyTo, 1, sidQ));
+  pttUp(2000); tick(2);
+
+  g_test = "RQ3 CLAIM still queued when the 2 s queue limit runs out: 'Send timeout' while held (not 'No response'); the RELEASE queues BEHIND the CLAIM (same session); when the worker gets to them they go out in that order; the receiver's GRANT is then a late reply, never acted on";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  pttDown(); tick();
+  sidQ = RadioTransport::g_call.session_id;
+  runFor(1900);
+  bool claimingAt19 = RadioTransport::getPrivateState() == RadioTransport::PrivateState::CLAIMING;
+  runFor(200);
+  bool sendTimeout = RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::SEND_TIMEOUT &&
+                     status() == "Send timeout" && wireCount(busyTo) == 0;
+  bool orderInChain = T::asyncPending.size() == 3 && typeOf(T::Pub{T::asyncPending[1].topic, 0, true, false, "", T::asyncPending[1].data, false}) == 0 &&
+                      typeOf(T::Pub{T::asyncPending[2].topic, 0, true, false, "", T::asyncPending[2].data, false}) == 1;
+  runFor(2000);  // heartbeat PUBACK only at 4.1 s (degraded link)
+  workerNext(true);
+  workerNext(true);
+  workerNext(true);
+  tick();
+  bool wireOrder = g_wire.size() >= 2 && wType(g_wire[g_wire.size() - 2]) == 0 && wType(g_wire.back()) == 1 &&
+                   wSession(g_wire[g_wire.size() - 2]) == sidQ && wSession(g_wire.back()) == sidQ;
+  peerReply(0, sidQ); tick();  // the receiver granted the late CLAIM
+  CHECK(claimingAt19 && sendTimeout && orderInChain && wireOrder &&
+            RadioTransport::getPrivateState() == RadioTransport::PrivateState::IDLE && g_capture == nullptr &&
+            status() == "Send timeout",
+        "claiming at 1.9 s %d; Send timeout at 2.1 s %d (failure %u, status '%s', on wire %d); chain order CLAIM,RELEASE %d; wire order %d; after late GRANT state %u",
+        claimingAt19, sendTimeout, static_cast<unsigned>(RadioTransport::getPrivateFailure()), status().c_str(),
+        wireCount(busyTo), orderInChain, wireOrder, static_cast<unsigned>(RadioTransport::getPrivateState()));
+  pttUp(4500); tick(2);
+  CHECK(status() == "Ready", "released: '%s'", status().c_str());
+
+  g_test = "RQ4 several jobs ahead (heartbeat, chat, Outbox) and the PTT released while the CLAIM waits: the chain is full (4), the RELEASE is OWED and goes out right after the CLAIM is published -- CLAIM then RELEASE, same session";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  lendForWorkerPublish("msg/AABBCCDDEEF0");
+  lendForWorkerPublish("msg/AABBCCDDEEF1");
+  pttDown(); tick();
+  sidQ = RadioTransport::g_call.session_id;
+  bool fourth = queuedTo(busyTo) == 1 && T::asyncPending.size() == 4;
+  runFor(300);
+  pttUp(300); tick(2);
+  bool owed = RadioTransport::g_owedRelease != nullptr && queuedTo(busyTo) == 1;
+  workerNext(true); workerNext(true); workerNext(true);  // heartbeat, chat, Outbox
+  bool noReleaseYet = wireCount(busyTo, 1) == 0;
+  workerNext(true);  // the CLAIM: its result sends the owed RELEASE
+  tick();
+  bool claimThenRelease = g_wire.size() >= 2 && wType(g_wire[g_wire.size() - 2]) == 0 && wType(g_wire.back()) == 1 &&
+                          wSession(g_wire.back()) == sidQ && wSession(g_wire[g_wire.size() - 2]) == sidQ;
+  CHECK(fourth && owed && noReleaseYet && claimThenRelease && RadioTransport::g_owedRelease == nullptr && status() == "Ready",
+        "CLAIM 4th in the chain %d; RELEASE owed %d; none before the CLAIM %d; CLAIM then RELEASE (same session) %d; owed cleared %d; status '%s'",
+        fourth, owed, noReleaseYet, claimThenRelease, RadioTransport::g_owedRelease == nullptr, status().c_str());
+
+  g_test = "RQ4b an owed RELEASE is dropped when the queued CLAIM failed (the connection closed: the CLAIM never reached the receiver)";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  lendForWorkerPublish("msg/AABBCCDDEEF0");
+  lendForWorkerPublish("msg/AABBCCDDEEF1");
+  pttDown(); tick();
+  pttUp(100); tick(2);
+  bool owed2 = RadioTransport::g_owedRelease != nullptr;
+  workerNext(false); workerNext(false); workerNext(false); workerNext(false);
+  tick();
+  CHECK(owed2 && RadioTransport::g_owedRelease == nullptr && wireCount(busyTo) == 0,
+        "owed %d, cleared %d, nothing on the wire %d", owed2, RadioTransport::g_owedRelease == nullptr, wireCount(busyTo));
+
+  g_test = "RQ5 worker publish failure after a successful enqueue: counted as a send failure (not published, not 'No response'); with the connection gone the retries fail too -> 'Send failed'";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  pttDown(); tick();
+  runFor(300);
+  T::connected = false;  // the failed heartbeat closed the connection (MQTT 2.5.2)
+  workerNext(false);
+  workerNext(false);
+  tick();
+  bool countedFail = RadioTransport::g_call.claimSendFails >= 1 && RadioTransport::g_call.claimPublished == 0 &&
+                     RadioTransport::g_call.claimQueuedTicket == 0;
+  runFor(900);
+  CHECK(countedFail && RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::SEND_FAILED &&
+            status() == "Send failed",
+        "counted as failed %d (fails %u published %u); failure %u status '%s'", countedFail,
+        static_cast<unsigned>(RadioTransport::g_call.claimSendFails), static_cast<unsigned>(RadioTransport::g_call.claimPublished),
+        static_cast<unsigned>(RadioTransport::getPrivateFailure()), status().c_str());
+  T::connected = true;
+  pttUp(1300); tick(2);
+
+  g_test = "RQ6 session identity: a press released while its CLAIM is queued, then a new press at once: the old CLAIM's publish does not count for the new session; wire order CLAIM(s1), RELEASE(s1), CLAIM(s2)";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  pttDown(); tick();
+  std::string s1 = RadioTransport::g_call.session_id;
+  runFor(100);
+  pttUp(100); tick(2);
+  pttDown(); tick();
+  std::string s2 = RadioTransport::g_call.session_id;
+  workerNext(true);  // heartbeat
+  workerNext(true);  // CLAIM s1
+  tick();
+  bool s2NotPublished = RadioTransport::g_call.claimPublishedMs == 0 && RadioTransport::g_call.claimQueuedTicket != 0;
+  workerNext(true);  // RELEASE s1
+  workerNext(true);  // CLAIM s2
+  tick();
+  bool order = g_wire.size() == 4 && wType(g_wire[1]) == 0 && wSession(g_wire[1]) == s1 && wType(g_wire[2]) == 1 &&
+               wSession(g_wire[2]) == s1 && wType(g_wire[3]) == 0 && wSession(g_wire[3]) == s2;
+  CHECK(s1 != s2 && s2NotPublished && order && RadioTransport::g_call.claimPublishedMs != 0,
+        "sessions differ %d; s2 not published by s1's CLAIM %d; wire order %d (wire %zu); s2 published %d", s1 != s2,
+        s2NotPublished, order, g_wire.size(), RadioTransport::g_call.claimPublishedMs != 0);
+  peerReply(0, s1); tick();  // a GRANT for the released session: ignored
+  bool ignoredOld = RadioTransport::getPrivateState() == RadioTransport::PrivateState::CLAIMING;
+  peerReply(0, s2); tick();
+  CHECK(ignoredOld && RadioTransport::getPrivateState() == RadioTransport::PrivateState::NEGOTIATING,
+        "GRANT(s1) ignored %d; GRANT(s2) -> state %u", ignoredOld, static_cast<unsigned>(RadioTransport::getPrivateState()));
+  pttUp(500); tick(2);
+
+  g_test = "RQ7 receiver side, delayed GRANT: the receiver's own connection is lent; the GRANT is QUEUED (with the session) and goes out when the worker gets to it";
+  openTalk(kPeer);
+  lendForWorkerPublish("race/state");
+  deliver(PacketCodec::PK_RADIO_BUSY, idPayload(0, kPeer, "S-LATE"));
+  const std::string replyTo = std::string("radio/busy_reply/") + kPeer;
+  bool grantQueued = queuedTo(replyTo) == 1 && wireCount(replyTo) == 0 && RadioTransport::g_replyTicket != 0;
+  workerNext(true);
+  workerNext(true);
+  tick();
+  CHECK(grantQueued && wireCount(replyTo, 0, "S-LATE") == 1 && RadioTransport::g_replyTicket == 0,
+        "GRANT queued (not on the wire) %d; after the worker: on the wire %d", grantQueued, wireCount(replyTo, 0, "S-LATE"));
+
+
+  // ===========================================================================
+  // Gate 3: the three users of publishAudioPacket() -- framing, topic, the
+  // receiver's dispatch by scope, drops and recovery
+  // ===========================================================================
+  g_test = "RA1 framing: a Race Room voice frame (race.cpp's call: radio/audio/broadcast, AUDIO_RACE_ROOM, room key) is one PK_RADIO_AUDIO packet of header + scope + sender + key + seq + length + 640 B PCM; delivered back it reaches the AUDIO_RACE_ROOM handler with the same key, sender, sequence and samples";
+  openTalk(kPeer);
+  static std::string rxKey, rxSender;
+  static uint16_t rxSeq = 0;
+  static std::vector<int16_t> rxPcm;
+  static int rxCount = 0;
+  rxCount = 0;
+  RadioTransport::registerAudioScopeHandler(RadioTransport::AUDIO_RACE_ROOM,
+                                            [](const char*, const char* sender, const char* key, uint16_t seq, const int16_t* pcm, size_t n) {
+                                              rxKey = key; rxSender = sender; rxSeq = seq; rxPcm.assign(pcm, pcm + n); rxCount++;
+                                            });
+  int16_t voice[RadioAudio::kFrameSamples];
+  for (size_t i = 0; i < RadioAudio::kFrameSamples; i++) voice[i] = static_cast<int16_t>(i * 97 - 15000);
+  bool sentRace = RadioTransport::publishAudioPacket(kGroup, "radio/audio/broadcast", RadioTransport::AUDIO_RACE_ROOM,
+                                                     "C0EE0000000100ABCDEF", 7, voice, RadioAudio::kFrameSamples);
+  bool raceFrame = sentRace && g_noWait.size() == 1 && g_noWait[0].topic == "radio/audio/broadcast" && g_noWait[0].group == kGroup &&
+                   g_noWait[0].len == PacketCodec::kHeaderSize + 1 + 16 + 24 + 2 + 2 + 640;
+  PacketCodec::Header h;
+  const uint8_t* body = nullptr;
+  bool decoded = raceFrame && PacketCodec::decodeHeader(g_noWait[0].data.data(), g_noWait[0].data.size(), &h, &body) &&
+                 h.packet_kind == PacketCodec::PK_RADIO_AUDIO;
+  if (decoded) deliver(PacketCodec::PK_RADIO_AUDIO, std::vector<uint8_t>(body, body + h.payload_length));
+  bool roundTrip = rxCount == 1 && rxKey == "C0EE0000000100ABCDEF" && rxSender == "DEADBEEFAAAA" && rxSeq == 7 &&
+                   rxPcm.size() == RadioAudio::kFrameSamples && std::equal(rxPcm.begin(), rxPcm.end(), voice);
+  CHECK(raceFrame && decoded && roundTrip, "frame on radio/audio/broadcast (%zu bytes) %d; decodes as PK_RADIO_AUDIO %d; round trip to the room handler (key/sender/seq/PCM) %d",
+        g_noWait.empty() ? 0 : g_noWait[0].len, raceFrame, decoded, roundTrip);
+
+  g_test = "RA2 drops and recovery, all three paths (Race voice, broadcast, private relay): a skipped frame returns false, is attempted once and never resent; after congestion the next frame goes out with its own (advanced) sequence";
+  g_noWait.clear();
+  uint16_t seq = 0;
+  int raceOk = 0, raceSkipped = 0;
+  for (int i = 0; i < 6; i++) {
+    g_noWaitAccepts = !(i >= 2 && i < 4);
+    bool ok = RadioTransport::publishAudioPacket(kGroup, "radio/audio/broadcast", RadioTransport::AUDIO_RACE_ROOM, "K", seq++, voice,
+                                                 RadioAudio::kFrameSamples);
+    (ok ? raceOk : raceSkipped)++;
+  }
+  g_noWaitAccepts = true;
+  bool oneAttemptEach = g_noWait.size() == 6;
+  rxCount = 0;
+  for (auto& w : g_noWait) {
+    if (!w.result) continue;
+    if (PacketCodec::decodeHeader(w.data.data(), w.data.size(), &h, &body))
+      deliver(PacketCodec::PK_RADIO_AUDIO, std::vector<uint8_t>(body, body + h.payload_length));
+  }
+  bool lastSeq5 = rxCount == 4 && rxSeq == 5;
+  // broadcast (Everyone) and private relay use the same function with their own scope/topic
+  g_noWait.clear();
+  g_noWaitAccepts = false;
+  bool bSkip = !RadioTransport::publishAudioPacket(kGroup, "radio/audio/broadcast", RadioTransport::AUDIO_BROADCAST, nullptr, 0, voice,
+                                                   RadioAudio::kFrameSamples);
+  g_noWaitAccepts = true;
+  bool bOk = RadioTransport::publishAudioPacket(kGroup, "radio/audio/broadcast", RadioTransport::AUDIO_BROADCAST, nullptr, 1, voice,
+                                                RadioAudio::kFrameSamples);
+  std::string privTopic = std::string("radio/audio/") + kPeer;
+  bool pOk = RadioTransport::publishAudioPacket(kGroup, privTopic.c_str(), RadioTransport::AUDIO_PRIVATE, nullptr, 0, voice,
+                                                RadioAudio::kFrameSamples);
+  bool scopes = g_noWait.size() == 3 && g_noWait[2].topic == privTopic && g_noWait[1].data.size() > 6 &&
+                g_noWait[1].data[PacketCodec::kHeaderSize] == RadioTransport::AUDIO_BROADCAST &&
+                g_noWait[2].data[PacketCodec::kHeaderSize] == RadioTransport::AUDIO_PRIVATE;
+  CHECK(raceOk == 4 && raceSkipped == 2 && oneAttemptEach && lastSeq5 && bSkip && bOk && pOk && scopes,
+        "race: sent %d skipped %d, one attempt per frame %d, received 4 with the last seq 5 %d; broadcast skip/recover %d/%d; private topic+scopes %d/%d",
+        raceOk, raceSkipped, oneAttemptEach, lastSeq5, bSkip, bOk, pOk, scopes);
+
+  g_test = "RA3 receiver dispatch by scope: broadcast frames play; private relay frames play only from the call's peer while in the relay; a Race Room frame never reaches the broadcast or private players";
+  g_framesPlayed = 0;
+  auto frameFor = [&](RadioTransport::AudioScope scope, const char* sender) {
+    std::vector<uint8_t> p(1 + 16 + 24 + 2 + 2 + 640, 0);
+    p[0] = scope;
+    strncpy(reinterpret_cast<char*>(&p[1]), sender, 15);
+    p[1 + 16 + 24 + 2] = 640 & 0xFF;  // PCM byte count, little-endian (radio_transport.cpp readU16())
+    p[1 + 16 + 24 + 3] = 640 >> 8;
+    return p;
+  };
+  deliver(PacketCodec::PK_RADIO_AUDIO, frameFor(RadioTransport::AUDIO_BROADCAST, kOther));
+  int bPlayed = g_framesPlayed;
+  RadioTransport::g_call.state = RadioTransport::PrivateState::MQTT_FALLBACK;
+  strcpy(RadioTransport::g_call.peer_device_id, kPeer);
+  deliver(PacketCodec::PK_RADIO_AUDIO, frameFor(RadioTransport::AUDIO_PRIVATE, kPeer));
+  int pPlayed = g_framesPlayed - bPlayed;
+  deliver(PacketCodec::PK_RADIO_AUDIO, frameFor(RadioTransport::AUDIO_PRIVATE, kOther));
+  int pOther = g_framesPlayed - bPlayed - pPlayed;
+  rxCount = 0;
+  int playedBefore = g_framesPlayed;
+  deliver(PacketCodec::PK_RADIO_AUDIO, frameFor(RadioTransport::AUDIO_RACE_ROOM, kOther));
+  CHECK(bPlayed == 1 && pPlayed == 1 && pOther == 0 && rxCount == 1 && g_framesPlayed == playedBefore,
+        "broadcast played %d; private from peer %d, from another %d; race frame to the room handler only %d (players +%d)", bPlayed,
+        pPlayed, pOther, rxCount, g_framesPlayed - playedBefore);
+  RadioTransport::resetPrivateCall();
 
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

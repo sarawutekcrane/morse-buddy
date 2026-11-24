@@ -15,6 +15,13 @@
 #include <string>
 #include <vector>
 #include "race_fixture.h"
+// race_stubs.cpp: what race.cpp hands the radio transport (Gate 3, room voice)
+extern int g_roomFramesPlayed;
+extern RadioAudio::CaptureFrameFn g_roomCapture;
+extern RadioTransport::AudioScopeHandlerFn g_roomAudioHandler;
+struct RoomAudioPub { std::string group, topic; int scope; std::string key; uint16_t seq; size_t samples; };
+extern std::vector<RoomAudioPub> g_roomAudioPubs;
+extern bool g_roomAudioAccept;
 
 static int g_fail = 0, g_pass = 0;
 static std::string g_test;
@@ -1149,6 +1156,52 @@ static void heartbeatOffLoop() {
   T::asyncPublish = false;
 }
 
+
+// Gate 3: Race Room voice end to end on race.cpp's side (the radio transport
+// side -- framing, topic, the receiver's dispatch by scope -- is radio_test
+// RA1-RA3). Before this, race_stubs swallowed both directions untested.
+static void roomVoice() {
+  g_test = "RV1 Room PTT: each mic frame goes to publishAudioPacket(group, radio/audio/broadcast, AUDIO_RACE_ROOM, room key, seq++); a frame the transport skips (congestion) is not retried and the sequence moves on (no backlog after recovery); the release stops capture";
+  ownerLobby(1);
+  g_roomAudioPubs.clear();
+  g_roomAudioAccept = true;
+  press(InputEventType::DOT_PRESS_START, T::now); tick();
+  bool capturing = g_roomPttActive && g_roomCapture != nullptr;
+  int16_t frame[RadioAudio::kFrameSamples] = {0};
+  for (int i = 0; i < 3; i++) if (g_roomCapture) g_roomCapture(frame, RadioAudio::kFrameSamples);
+  g_roomAudioAccept = false;  // congested: three frames skipped by the transport
+  for (int i = 0; i < 3; i++) if (g_roomCapture) g_roomCapture(frame, RadioAudio::kFrameSamples);
+  g_roomAudioAccept = true;
+  for (int i = 0; i < 2; i++) if (g_roomCapture) g_roomCapture(frame, RadioAudio::kFrameSamples);
+  char key[kIdLen];
+  bool haveKey = roomVoiceKey(key, sizeof(key));
+  bool framing = g_roomAudioPubs.size() == 8;
+  for (size_t i = 0; framing && i < g_roomAudioPubs.size(); i++) {
+    const RoomAudioPub& p = g_roomAudioPubs[i];
+    framing = p.group == "GROUP1" && p.topic == "radio/audio/broadcast" && p.scope == RadioTransport::AUDIO_RACE_ROOM &&
+              p.key == key && p.seq == i && p.samples == RadioAudio::kFrameSamples;
+  }
+  press(InputEventType::DOT_RELEASE, T::now); tick();
+  CHECK(capturing && haveKey && framing && !g_roomPttActive && g_roomCapture == nullptr,
+        "capturing %d; key %d; 8 frames, topic/scope/key/seq 0..7 (one attempt each, none resent) %d (%zu); stopped %d", capturing,
+        haveKey, framing, g_roomAudioPubs.size(), !g_roomPttActive && g_roomCapture == nullptr);
+
+  g_test = "RV2 Room voice received: played only on the Room screen and only for this room's key (another room's or no room: silent)";
+  int16_t pcm[RadioAudio::kFrameSamples] = {0};
+  int before = g_roomFramesPlayed;
+  bool registered = g_roomAudioHandler != nullptr;
+  if (registered) g_roomAudioHandler("GROUP1", kPeerIds[0], key, 1, pcm, RadioAudio::kFrameSamples);
+  int played = g_roomFramesPlayed - before;
+  if (registered) g_roomAudioHandler("GROUP1", kPeerIds[0], "OTHERROOM0000000", 2, pcm, RadioAudio::kFrameSamples);
+  int otherRoom = g_roomFramesPlayed - before - played;
+  backP(); tick(2);  // leave the Room screen (Back: navigation only)
+  int beforeOff = g_roomFramesPlayed;
+  if (registered) g_roomAudioHandler("GROUP1", kPeerIds[0], key, 3, pcm, RadioAudio::kFrameSamples);
+  CHECK(registered && played == 1 && otherRoom == 0 && g_roomFramesPlayed == beforeOff && top() != screenRaceRoom,
+        "handler registered %d; this room played %d (want 1); other room %d (want 0); off-screen %d (want 0); left the Room %d",
+        registered, played, otherRoom, g_roomFramesPlayed - beforeOff, top() != screenRaceRoom);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // FAIL lines survive a later crash
   Identity::init();  // the actual identity.cpp: device id from the (fake) MAC
@@ -1163,6 +1216,7 @@ int main() {
   scorePlacement();
   heapDiagnostics();
   heartbeatOffLoop();
+  roomVoice();
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

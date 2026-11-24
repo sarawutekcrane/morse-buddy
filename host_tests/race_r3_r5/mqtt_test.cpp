@@ -1199,6 +1199,50 @@ static void testAsyncPublish() {
   tick();
   CHECK(refusedFull && slotOf("R2")->conn != nullptr, "refused when the chain is full %d", refusedFull);
 
+  g_test = "M23 Gate 1: publishControl() tells PUBLISHED (own connection, written now), QUEUED (lent: a ticket, written later by the worker in order, the callback reports the actual result) and FAILED (no connection / the loan full) apart";
+  resetAll();
+  g_doneLog.clear();
+  connectGroup("R7");
+  std::string r7 = clientIdOf("R7");
+  auto claimsOnWire = [&] {
+    int n = 0;
+    for (auto& e : FakeNet::events())
+      if (e.kind == "publish" && e.clientId == r7 && e.topic.find("/radio/busy/") != std::string::npos) n++;
+    return n;
+  };
+  uint32_t tk = 99;
+  ControlOutcome own = publishControl("R7", "radio/busy/AABBCCDDEEF0", reinterpret_cast<const uint8_t*>("C1"), 2, onPublishDone, &tk);
+  bool ownOk = own == ControlOutcome::PUBLISHED && tk == 0 && claimsOnWire() == 1 && g_doneLog.empty();
+  publishBinaryAsync("R7", "broadcast", reinterpret_cast<const uint8_t*>("h"), 1, true, 1, nullptr);  // Race heartbeat: lent
+  ControlOutcome lent = publishControl("R7", "radio/busy/AABBCCDDEEF0", reinterpret_cast<const uint8_t*>("C2"), 2, onPublishDone, &tk);
+  bool lentOk = lent == ControlOutcome::QUEUED && tk != 0 && claimsOnWire() == 1 && slotOf("R7")->lentPublishes == 2;
+  pumpWorker();
+  tick();
+  bool afterWorker = claimsOnWire() == 2 && g_doneLog.size() == 1 && g_doneLog[0].first == tk && g_doneLog[0].second;
+  for (int i = 0; i < 4; i++) publishBinaryAsync("R7", "broadcast", reinterpret_cast<const uint8_t*>("c"), 1, false, 1, nullptr);
+  ControlOutcome full = publishControl("R7", "radio/busy/AABBCCDDEEF0", reinterpret_cast<const uint8_t*>("C3"), 2, onPublishDone, &tk);
+  bool fullOk = full == ControlOutcome::FAILED && tk == 0;
+  pumpWorker();
+  tick();
+  ControlOutcome none = publishControl("NOPE", "radio/busy/AABBCCDDEEF0", reinterpret_cast<const uint8_t*>("C4"), 2, onPublishDone, &tk);
+  CHECK(ownOk && lentOk && afterWorker && fullOk && none == ControlOutcome::FAILED,
+        "own connection PUBLISHED %d; lent QUEUED (not on the wire yet) %d; written by the worker + callback ok %d; loan full FAILED %d; unknown group FAILED %d",
+        ownOk, lentOk, afterWorker, fullOk, none == ControlOutcome::FAILED);
+  g_test = "M23b a QUEUED control packet whose worker publish fails: the callback reports failure (the caller must not count it as sent)";
+  resetAll();
+  g_doneLog.clear();
+  connectGroup("R8");
+  {
+    std::lock_guard<std::mutex> l(FakeNet::st().m);
+    FakeNet::st().livePublishFailures = 1;  // the heartbeat's PUBACK never comes: the connection closes
+  }
+  publishBinaryAsync("R8", "broadcast", reinterpret_cast<const uint8_t*>("h"), 1, true, 1, nullptr);
+  ControlOutcome q = publishControl("R8", "radio/busy/AABBCCDDEEF0", reinterpret_cast<const uint8_t*>("C"), 1, onPublishDone, &tk);
+  pumpWorker();
+  tick();
+  CHECK(q == ControlOutcome::QUEUED && g_doneLog.size() == 1 && g_doneLog[0].first == tk && !g_doneLog[0].second,
+        "queued %d; callback failure %d", q == ControlOutcome::QUEUED, g_doneLog.size() == 1 && !g_doneLog[0].second);
+
   g_test = "M21 radio audio: publishBinaryNoWait() skips the frame while the connection is lent (no queueing, nothing late)";
   resetAll();
   connectGroup("R3");
@@ -1525,6 +1569,81 @@ static void testBoundedWrite() {
   close(sp[0]);
   close(sp[1]);
 
+  // Gate 2: the zero-wait writability check is not the whole write. lwmqtt
+  // then writes the header and the payload, each through
+  // BoundedWriteClient::write(), which may wait up to kSendBudgetMs for space
+  // -- reached when lwIP refuses a write although select() reported the
+  // socket writable (ERR_MEM: no pbuf/heap; select() only counts free
+  // buffer bytes). Modeled by FakeNet::faultySend(). A full-size frame (the
+  // radio audio packet: codec header + scope + ids + sequence + 640 B PCM).
+  {
+    std::vector<uint8_t> frame(PacketCodec::kHeaderSize + 1 + 13 + 13 + 2 + 2 + 640, 0x11);
+    struct Case {
+      const char* name;
+      long acceptBytes;      // bytes lwIP takes before refusing (-1: no fault)
+      int drainAfterMs;      // a slow receiver: the fault clears after this long (0: never during the call)
+    };
+    const Case cases[] = {
+        {"healthy socket, full frame", -1, 0},
+        {"refused after 10 bytes (header cut), never recovers", 10, 0},
+        {"refused after 300 bytes (payload cut), never recovers", 300, 0},
+        {"refused before any byte", 0, 0},
+        {"slow receiver: refused after 300 bytes, space back after 120 ms", 300, 120},
+    };
+    for (const Case& k : cases) {
+      g_test = "M21c radio audio: publishBinaryNoWait() stays non-blocking through the whole MQTT write, not only the writability check (Gate 2)";
+      resetAll();
+      connectGroup("R6");
+      int sq[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, sq) != 0) {
+        CHECK(false, "socketpair");
+        return;
+      }
+      slotOf("R6")->conn->net.attachFd(sq[0]);
+      bool rt = g_realTime.load();
+      g_realTime = true;
+      FakeNet::sendAcceptBytes() = k.acceptBytes;
+      std::thread drainer;
+      if (k.drainAfterMs > 0) {
+        drainer = std::thread([&] {
+          std::this_thread::sleep_for(std::chrono::milliseconds(k.drainAfterMs));
+          FakeNet::sendAcceptBytes() = -1;
+        });
+      }
+      auto t0 = std::chrono::steady_clock::now();
+      bool sent = publishBinaryNoWait("R6", "radio/audio/broadcast", frame.data(), static_cast<uint16_t>(frame.size()));
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      if (drainer.joinable()) drainer.join();
+      FakeNet::sendAcceptBytes() = -1;
+      g_realTime = rt;
+      bool up = slotOf("R6")->conn != nullptr && slotOf("R6")->conn->mqtt.connected();
+      printf("   MEASURE M21c %s: %zu-byte frame, publishBinaryNoWait() %lld ms, sent=%d connectionUp=%d\n", k.name,
+             frame.size(), static_cast<long long>(ms), sent ? 1 : 0, up ? 1 : 0);
+      if (k.acceptBytes < 0) {
+        // The deadline covers that one publish only: the next ordinary
+        // publish on the connection (a radio control packet here) still gets
+        // the normal write budget.
+        bool g_rt = g_realTime.load();
+        g_realTime = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));  // past the audio frame's 50 ms deadline
+        bool controlAfter = publishBinary("R6", "radio/busy/AABBCCDDEEF0", frame.data(), 47, false, 0);
+        g_realTime = g_rt;
+        CHECK(sent && up && ms < 50 && controlAfter, "%s: sent %d, connection up %d, %lld ms; a later control publish %d", k.name,
+              sent, up, static_cast<long long>(ms), controlAfter);
+      } else {
+        // Bounded by kNoWaitPublishBudgetMs (50 ms) + scheduling slack. A cut
+        // frame leaves a partial MQTT packet on the stream: the connection
+        // must close (the library closes on any write error).
+        CHECK(!sent && ms < 90, "%s: not sent %d after %lld ms (want < 90; the 500 ms write budget would stall the capture tick)",
+              k.name, !sent, static_cast<long long>(ms));
+        CHECK(!up, "%s: the connection closed after the failed write (stream integrity) %d", k.name, !up);
+      }
+      if (slotOf("R6")->conn != nullptr) slotOf("R6")->conn->net.attachFd(-1);
+      close(sq[0]);
+      close(sq[1]);
+    }
+  }
+
   g_test = "M22 receive queue: audio may fill it only while more than 4 slots are free; radio control packets and chat still get in behind a flood of audio";
   resetAll();
   connectGroup("R5");
@@ -1542,6 +1661,41 @@ static void testBoundedWrite() {
         static_cast<unsigned>(kQueueCapacity - kNonAudioReserve), static_cast<unsigned>(afterControl),
         static_cast<unsigned>(kQueueCapacity));
   releaseQueuedPayloads();
+
+  g_test = "M22b the audio reserve touches only radio audio: every other subscribed topic (presence, Text/Enigma msg, broadcast chat, Race r2 and r2q/<id>, Friend, radio CLAIM/GRANT/SESSION) is queued behind 12 audio packets; both audio topics stop at 12; with no audio, non-audio still fills all 16 (unchanged)";
+  resetAll();
+  connectGroup("R9");
+  client = &slotOf("R9")->conn->mqtt;
+  const char* nonAudio[] = {"morsebuddy/R9/presence/AABBCCDDEEFF", "morsebuddy/R9/msg/AABBCCDDEEFF",
+                            "morsebuddy/R9/broadcast",             "morsebuddy/R9/r2/STATE",
+                            "morsebuddy/R9/r2q/AABBCCDDEEFF",     "morsebuddy/R9/radio/busy/AABBCCDDEEFF",
+                            "morsebuddy/R9/radio/busy_reply/AABBCCDDEEFF", "morsebuddy/R9/radio/session"};
+  const char* audioTopics[] = {"morsebuddy/R9/radio/audio/AABBCCDDEEFF", "morsebuddy/R9/radio/audio/broadcast"};
+  bool allIn = true;
+  std::string refusedTopic;
+  for (const char* t : nonAudio) {
+    releaseQueuedPayloads();
+    for (int i = 0; i < 20; i++) {
+      std::vector<char> at(audioTopics[i % 2], audioTopics[i % 2] + strlen(audioTopics[i % 2]) + 1);
+      onMqttMessage(client, at.data(), pcm, 8);
+    }
+    uint8_t before = queueCount();
+    std::vector<char> tt(t, t + strlen(t) + 1);
+    onMqttMessage(client, tt.data(), pcm, 8);
+    if (before != kQueueCapacity - kNonAudioReserve || queueCount() != before + 1) {
+      allIn = false;
+      refusedTopic = t;
+    }
+  }
+  releaseQueuedPayloads();
+  std::vector<char> presenceT(nonAudio[0], nonAudio[0] + strlen(nonAudio[0]) + 1);
+  for (int i = 0; i < 20; i++) onMqttMessage(client, presenceT.data(), pcm, 8);
+  uint8_t nonAudioFill = queueCount();
+  releaseQueuedPayloads();
+  CHECK(allIn && nonAudioFill == kQueueCapacity && !isAudioTopic(nonAudio[7]) && isAudioTopic(audioTopics[0]) &&
+            isAudioTopic(audioTopics[1]),
+        "every non-audio topic admitted behind audio %d (refused: %s); non-audio alone fills %u (want %u)", allIn,
+        refusedTopic.c_str(), static_cast<unsigned>(nonAudioFill), static_cast<unsigned>(kQueueCapacity));
 }
 
 // =============================================================================

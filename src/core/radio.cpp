@@ -268,6 +268,8 @@ void screenTalk() {
     status = "No response";
   } else if (RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::SEND_FAILED) {
     status = "Send failed";
+  } else if (RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::SEND_TIMEOUT) {
+    status = "Send timeout";
   } else if (RadioTransport::getPrivateState() == RadioTransport::PrivateState::IDLE &&
              g_lastPrivateStartResult != RadioTransport::StartCallResult::ACCEPTED) {
     // Fix Phase 1C: still IDLE means nothing has happened since the last

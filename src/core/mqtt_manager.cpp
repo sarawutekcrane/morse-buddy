@@ -76,12 +76,13 @@
 //  - isGroupConnected()/isGroupReady(), the ON/WIFI status: the group has a
 //    live session -- adopted by the main task OR lent to the worker for a
 //    publish chain. A loan never flips ON to WIFI.
-//  - Publishable now on the main task: adopted and not lent. While lent,
-//    publishBinary() returns false at once (a Friend move or radio frame in
-//    that window fails as on any failed publish; QoS0 radio frames are
-//    dropped), publishRaw() (presence) joins the chain, publishBinaryAsync()
-//    joins the chain (at most kMaxLentPublishes). Nothing ever touches the
-//    client from two tasks.
+//  - Publishable now on the main task: adopted and not lent. While lent, a
+//    QoS1 publishBinary() returns false at once (a Friend move in that
+//    window fails as on any failed publish); a QoS0 publishBinary(),
+//    publishRaw() (presence), publishControl() (radio control packets,
+//    reported as QUEUED) and publishBinaryAsync() join the chain (at most
+//    kMaxLentPublishes); publishBinaryNoWait() (radio audio) skips the
+//    frame. Nothing ever touches the client from two tasks.
 //  - Received messages are dispatched on the main task (cooperative drain:
 //    8 ms budget between items; one slow handler is not interrupted).
 //  - OTA maintenance entry and before-sleep: OFFLINE publishes, at most 2 s
@@ -115,6 +116,15 @@ constexpr uint32_t kHandshakeAckTimeoutMs = 5000;  // CONNACK, each SUBACK, the 
 // WiFiClient::write() retries up to 10 x 1 s with no progress): see
 // BoundedWriteClient.
 constexpr uint32_t kSendBudgetMs = 500;
+// Radio audio (publishBinaryNoWait()): the whole publish -- lwmqtt writes the
+// header and then the payload -- gets at most this long, not kSendBudgetMs
+// per write. The zero-wait writability check alone does not bound it: lwIP
+// can refuse a write (ERR_MEM: no pbuf/heap) while select() reports the
+// socket writable, and the 500 ms budget then held the capture tick (host
+// fault model, Gate 2: 499 ms). A frame cut by this deadline leaves a
+// partial packet on the stream, so the library closes the connection, as on
+// any failed write; the group then reconnects through the worker.
+constexpr uint32_t kNoWaitPublishBudgetMs = 50;
 
 // Retry after a failed setup attempt: 2 s, 4, 8, 16, 32, then 60 s, each
 // +-20% jittered; reset by a successful setup. After a connection that
@@ -202,6 +212,11 @@ class BoundedWriteClient : public WiFiClient {
       struct timeval tv;
       tv.tv_sec = 0;
       tv.tv_usec = 20000;
+      if (hasDeadline_) {
+        int32_t left = static_cast<int32_t>(deadline_ - static_cast<uint32_t>(millis()));
+        if (left <= 0) break;
+        if (left < 20) tv.tv_usec = left * 1000;
+      }
       int ready = select(fd + 1, nullptr, &set, nullptr, &tv);
       if (ready < 0) break;
       if (ready > 0) {
@@ -219,6 +234,14 @@ class BoundedWriteClient : public WiFiClient {
     }
     return sent;
   }
+
+  // An absolute deadline over every write() until cleared (on top of the
+  // per-write kSendBudgetMs): one publish's header and payload together.
+  void setWriteDeadline(uint32_t deadlineMs) {
+    deadline_ = deadlineMs;
+    hasDeadline_ = true;
+  }
+  void clearWriteDeadline() { hasDeadline_ = false; }
 
   // True when the socket takes a write right now (select() with no wait).
   // lwIP reports a TCP socket writable only while its send buffer has more
@@ -238,6 +261,10 @@ class BoundedWriteClient : public WiFiClient {
     tv.tv_usec = 0;
     return select(fd + 1, nullptr, &set, nullptr, &tv) > 0;
   }
+
+ private:
+  uint32_t deadline_ = 0;
+  bool hasDeadline_ = false;
 };
 
 struct Conn;
@@ -1845,6 +1872,19 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
   return qos0Result;
 }
 
+ControlOutcome publishControl(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
+                              PublishDoneFn done, uint32_t* ticketOut) {
+  if (ticketOut != nullptr) *ticketOut = 0;
+  GroupClient* gc = findClientSlot(group_code);
+  if (gc != nullptr && isLent(*gc)) {
+    uint32_t ticket = publishBinaryAsync(group_code, topic_suffix, data, len, false, 0, done);
+    if (ticketOut != nullptr) *ticketOut = ticket;
+    return ticket != 0 ? ControlOutcome::QUEUED : ControlOutcome::FAILED;
+  }
+  return publishBinary(group_code, topic_suffix, data, len, false, 0) ? ControlOutcome::PUBLISHED
+                                                                      : ControlOutcome::FAILED;
+}
+
 bool publishBinaryNoWait(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len) {
   GroupClient* gc = findClientSlot(group_code);
   if (gc == nullptr) return false;
@@ -1858,7 +1898,13 @@ bool publishBinaryNoWait(const char* group_code, const char* topic_suffix, const
     }
     return false;
   }
-  return publishBinary(group_code, topic_suffix, data, len, false, 0);
+  // The writability check above does not bound the write itself (see
+  // kNoWaitPublishBudgetMs): the whole publish gets one short deadline.
+  Conn* c = gc->conn;
+  c->net.setWriteDeadline(static_cast<uint32_t>(millis()) + kNoWaitPublishBudgetMs);
+  bool ok = publishBinary(group_code, topic_suffix, data, len, false, 0);
+  c->net.clearWriteDeadline();
+  return ok;
 }
 
 }  // namespace MqttManager

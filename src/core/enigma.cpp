@@ -2384,6 +2384,24 @@ bool refsEqual(const MessageRef& a, const MessageRef& b) {
          a.sequence == b.sequence;
 }
 
+// Gate 6 (owner-approved): a message whose validated embedded sender key has
+// no rotors AND no plugboard pairs went through no substitution at all --
+// the Enigma stage is the identity. Such a message is presented as plain
+// text everywhere: readable (decrypted with that key, then reverseEscape()
+// once), no padlock, and no key editor / Reveal (nothing to unlock). The
+// effective presentation is derived from the embedded key on every
+// render/event, so existing records (received LOCK_BLACK, sent
+// LOCK_UNLOCKED) need no migration; the stored ciphertext, key, local
+// lock byte, message id and wire bytes are untouched.
+bool isZeroKeyMessage(const StoredMessageView& msg) {
+  char ciphertext[EnigmaCrypto::kMaxEscapedLen + 1];
+  uint32_t fp, gen;
+  EnigmaKeyConfig embedded;
+  return EnigmaKeys::decodeEnigmaPayload(msg.typePayload, msg.typePayloadLen, ciphertext, sizeof(ciphertext), &fp,
+                                         &gen, &embedded) &&
+         embedded.rotor_count == 0 && embedded.plugboard_pair_count == 0;
+}
+
 void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t outBufferSize) {
   char ciphertext[EnigmaCrypto::kMaxEscapedLen + 1];
   uint32_t fp, gen;
@@ -2391,6 +2409,17 @@ void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t o
   if (!EnigmaKeys::decodeEnigmaPayload(msg.typePayload, msg.typePayloadLen, ciphertext, sizeof(ciphertext), &fp,
                                        &gen, &embedded)) {
     snprintf(outBuffer, outBufferSize, "?");
+    return;
+  }
+
+  // Gate 6: zero key -> plain text in every state, the DOT hold included
+  // (the hold shows the same readable text, never "[locked]").
+  if (embedded.rotor_count == 0 && embedded.plugboard_pair_count == 0) {
+    char decrypted[EnigmaCrypto::kMaxEscapedLen + 1];
+    EnigmaCrypto::run(ciphertext, decrypted, sizeof(decrypted), embedded);
+    char readable[EnigmaCrypto::kMaxEscapedLen + 1];
+    EnigmaCrypto::reverseEscape(decrypted, readable, sizeof(readable));
+    snprintf(outBuffer, outBufferSize, "%s", readable);
     return;
   }
 
@@ -2416,27 +2445,15 @@ void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t o
     snprintf(outBuffer, outBufferSize, "%s", cachedText);
     return;
   }
-  // Owner request (hardware: "D EE" sent with no rotors and no plugboard
-  // showed as "DXQEE" before decoding): when the key embedded in the
-  // message has no rotors AND no plugboard pairs, the Enigma stage is the
-  // identity, so the text is shown readable -- decrypted with that embedded
-  // key, then reverseEscape() applied once, the same order as a real
-  // decode. Display only: the stored ciphertext, the lock state (icon,
-  // reveal/key flows) and the wire bytes are untouched. A key with rotors,
-  // or with plugboard pairs only, keeps showing the ciphertext: its XQ/XX
-  // are ordinary ciphertext letters until decrypted with the right key.
-  if (embedded.rotor_count == 0 && embedded.plugboard_pair_count == 0) {
-    char decrypted[EnigmaCrypto::kMaxEscapedLen + 1];
-    EnigmaCrypto::run(ciphertext, decrypted, sizeof(decrypted), embedded);
-    char readable[EnigmaCrypto::kMaxEscapedLen + 1];
-    EnigmaCrypto::reverseEscape(decrypted, readable, sizeof(readable));
-    snprintf(outBuffer, outBufferSize, "%s", readable);
-    return;
-  }
+  // A key with rotors, or with plugboard pairs only, keeps showing the
+  // ciphertext until decoded: its XQ/XX are ordinary ciphertext letters
+  // until decrypted with the right key (then reverseEscape() once, in
+  // attemptReceiveKey()).
   snprintf(outBuffer, outBufferSize, "%s", ciphertext);
 }
 
 MessageIconKind enigmaMessageIcon(const StoredMessageView& msg) {
+  if (isZeroKeyMessage(msg)) return MessageIconKind::NONE;  // Gate 6: nothing locked, no padlock
   uint8_t lockState;
   char cachedText[251];
   decodeLocalPayload(msg.localPayload, msg.localPayloadLen, &lockState, cachedText, sizeof(cachedText));
@@ -2458,6 +2475,9 @@ void onEnigmaMessageEvent(const MessageRef& ref, MessageEventType eventType) {
 
   StoredMessageView view;
   if (!MessageStore::loadMessage(ref, &view)) return;
+  // Gate 6: a zero-key message has nothing to unlock -- Encoder short and
+  // the combined Reveal gesture do nothing, as on an unlocked message.
+  if (isZeroKeyMessage(view)) return;
   uint8_t lockState;
   char cachedText[251];
   decodeLocalPayload(view.localPayload, view.localPayloadLen, &lockState, cachedText, sizeof(cachedText));

@@ -201,6 +201,8 @@ bool isBack(const InputEvent& e) { return e.type == InputEventType::ENCODER_LONG
 }  // namespace Input
 
 namespace MqttManager {
+uint32_t publishBinaryAsync(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained,
+                            int qos, PublishDoneFn done);
 bool isGroupConnected(const char*) { return T::connected; }
 bool isAnyGroupConnected() { return T::connected; }
 bool isGroupReady(const char*) { return T::connected; }
@@ -208,8 +210,15 @@ bool publishRaw(const char*, const char* topic, const char* payload, bool retain
   T::seq.push_back(std::string("publishRaw ") + topic + " " + payload + (retained ? " R" : " -") + std::to_string(qos));
   return T::connected;
 }
-bool publishBinary(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained, int) {
+bool publishBinary(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained, int qos) {
   std::vector<uint8_t> bytes(data, data + len);
+  // MqttManager: a QoS0 publishBinary() while the connection is lent joins
+  // the loan (true: queued, not yet published).
+  if (qos == 0 && T::asyncPublish && T::connected) {
+    bool lent = false;
+    for (auto& p : T::asyncPending) lent = lent || p.group == group;
+    if (lent) return publishBinaryAsync(group, topic, data, len, retained, 0, nullptr) != 0;
+  }
   if (!T::connected) { T::pubs.push_back({topic, len, false, true, group, bytes, retained}); T::seq.push_back("publish:rejected"); return false; }
   if (T::duringPublish) T::duringPublish();
   bool r = true;
@@ -239,6 +248,21 @@ uint32_t publishBinaryAsync(const char* group, const char* topic, const uint8_t*
   T::asyncPending.push_back({nextTicket, group, topic, std::vector<uint8_t>(data, data + len), done, retained, qos});
   T::seq.push_back("async:start");
   return nextTicket++;
+}
+// Radio control packets: QUEUED while the asyncPublish model has the
+// group's connection lent (a publish of that group still pending), else the
+// synchronous publishBinary() path (PUBLISHED / FAILED).
+ControlOutcome publishControl(const char* group, const char* topic, const uint8_t* data, uint16_t len,
+                              PublishDoneFn done, uint32_t* ticketOut) {
+  if (ticketOut != nullptr) *ticketOut = 0;
+  bool lent = false;
+  for (auto& p : T::asyncPending) lent = lent || p.group == group;
+  if (T::asyncPublish && lent) {
+    uint32_t t = publishBinaryAsync(group, topic, data, len, false, 0, done);
+    if (ticketOut != nullptr) *ticketOut = t;
+    return t != 0 ? ControlOutcome::QUEUED : ControlOutcome::FAILED;
+  }
+  return publishBinary(group, topic, data, len, false, 0) ? ControlOutcome::PUBLISHED : ControlOutcome::FAILED;
 }
 }  // namespace MqttManager
 

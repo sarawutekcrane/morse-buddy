@@ -17,6 +17,7 @@ typedef enum {
 } lwmqtt_err_t;
 typedef enum { LWMQTT_CONNECTION_ACCEPTED = 0, LWMQTT_UNKNOWN_RETURN_CODE = 6 } lwmqtt_return_code_t;
 
+uint32_t millis();  // the test's clock
 class MQTTClient;
 typedef void (*MQTTClientCallbackAdvanced)(MQTTClient* client, char topic[], char bytes[], int length);
 
@@ -143,6 +144,40 @@ class MQTTClient {
     bool online = std::string(topic).find("/presence/") != std::string::npos && length > 0 &&
                   std::string(payload, static_cast<size_t>(length)).find("|ONLINE|") != std::string::npos;
     FakeNet::maybeGate(online ? "online" : "publish");
+    // A client backed by a real socket (test hook attachFd()) writes the
+    // packet as lwmqtt 2.5.2 does: the fixed header + topic first, then the
+    // payload, each through lwmqtt_write_to_network() -- a loop over
+    // Client::write() bounded by the command timer (setTimeout()), where a
+    // write of 0 bytes is LWMQTT_NETWORK_FAILED_WRITE; any error closes the
+    // client (MQTTClient::publish()).
+    if (static_cast<WiFiClient*>(net_)->fd() >= 0) {
+      std::string topicStr(topic);
+      std::vector<uint8_t> hdr;
+      hdr.push_back(static_cast<uint8_t>(0x30 | (qos << 1) | (retained ? 1 : 0)));
+      size_t rem = 2 + topicStr.size() + (qos > 0 ? 2 : 0) + static_cast<size_t>(length);
+      do {
+        uint8_t b = static_cast<uint8_t>(rem % 128);
+        rem /= 128;
+        if (rem > 0) b |= 0x80;
+        hdr.push_back(b);
+      } while (rem > 0);
+      hdr.push_back(static_cast<uint8_t>(topicStr.size() >> 8));
+      hdr.push_back(static_cast<uint8_t>(topicStr.size() & 0xff));
+      hdr.insert(hdr.end(), topicStr.begin(), topicStr.end());
+      if (qos > 0) {
+        hdr.push_back(0);
+        hdr.push_back(1);
+      }
+      uint32_t timerStart = millis();
+      lwmqtt_err_t err = writeToNetwork(hdr.data(), hdr.size(), timerStart);
+      if (err == LWMQTT_SUCCESS && length > 0)
+        err = writeToNetwork(reinterpret_cast<const uint8_t*>(payload), static_cast<size_t>(length), timerStart);
+      if (err != LWMQTT_SUCCESS) {
+        lastError_ = err;
+        closeSession("close");
+        return false;
+      }
+    }
     FakeNet::Event e = base("publish");
     e.topic = topic;
     e.payload.assign(payload, static_cast<size_t>(length));
@@ -212,6 +247,17 @@ class MQTTClient {
     e.thread = std::this_thread::get_id();
     e.ip = net_ != nullptr ? static_cast<WiFiClient*>(net_)->ip() : 0;
     return e;
+  }
+  lwmqtt_err_t writeToNetwork(const uint8_t* buf, size_t len, uint32_t timerStart) {
+    size_t written = 0;
+    while (written < len) {
+      if (static_cast<int32_t>(timeout_) - static_cast<int32_t>(millis() - timerStart) <= 0)
+        return LWMQTT_NETWORK_TIMEOUT;
+      size_t n = net_->write(buf + written, len - written);
+      if (n == 0) return LWMQTT_NETWORK_FAILED_WRITE;
+      written += n;
+    }
+    return LWMQTT_SUCCESS;
   }
   void noteUseAfterClose() {
     std::lock_guard<std::mutex> l(FakeNet::st().m);
