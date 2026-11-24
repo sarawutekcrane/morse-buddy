@@ -558,17 +558,45 @@ uint32_t g_failedAtMs = 0;
 // Gate 1: a session given up (timeout or PTT release) while its CLAIM was
 // still queued. Its RELEASE goes into the same chain, behind the CLAIM, so
 // the receiver sees them in order. If that RELEASE could not be queued (the
-// chain full), it is owed: published when the CLAIM's own result comes back
-// -- that result frees a place in the chain (or ends the loan), and only a
-// CLAIM that was actually written needs withdrawing. Heap-held: rare, and
-// no static RAM beyond these two words.
+// chain full), it is owed: published when that CLAIM's own result comes back
+// -- the result frees a place in the chain (or ends the loan), and only a
+// CLAIM that was actually written needs withdrawing.
+//
+// One entry per abandoned session, keyed by its CLAIM's ticket (final review:
+// a single slot let a second session abandoned before the first CLAIM's
+// result overwrite -- and delete -- the first session's owed RELEASE, so
+// CLAIM(S1) went out with no RELEASE(S1)). Bounded: an entry lives only
+// while its CLAIM is in the worker's queue (MqttManager: kJobQueueDepth 8,
+// and every queued job reports exactly one result, canceled loans included),
+// and kMaxOwedReleases caps the list besides. Heap-held, a node only while
+// owed (rare); static RAM is the one head pointer.
 struct OwedRelease {
+  uint32_t claimTicket;
   char group_code[33];
   char peer_device_id[kDeviceIdLen];
   char session_id[kIdLen];
+  OwedRelease* next;
 };
-uint32_t g_abandonedClaimTicket = 0;
-OwedRelease* g_owedRelease = nullptr;
+constexpr uint8_t kMaxOwedReleases = 8;
+OwedRelease* g_owedRelease = nullptr;  // list head
+
+uint8_t owedReleaseCount() {
+  uint8_t n = 0;
+  for (OwedRelease* r = g_owedRelease; r != nullptr; r = r->next) n++;
+  return n;
+}
+
+// Unlinks and returns the entry for this CLAIM ticket (nullptr: none).
+OwedRelease* takeOwedRelease(uint32_t ticket) {
+  for (OwedRelease** pp = &g_owedRelease; *pp != nullptr; pp = &(*pp)->next) {
+    if ((*pp)->claimTicket == ticket) {
+      OwedRelease* r = *pp;
+      *pp = r->next;
+      return r;
+    }
+  }
+  return nullptr;
+}
 
 MqttManager::ControlOutcome sendBusyPacket(const char* group_code, const char* peer, uint8_t type, const char* sessionId,
                                            MqttManager::PublishDoneFn done, uint32_t* ticket) {
@@ -638,23 +666,26 @@ void onClaimPublishDone(uint32_t ticket, bool ok) {
                   g_call.session_id, queuedMs);
     return;
   }
-  if (ticket != 0 && ticket == g_abandonedClaimTicket) {
-    g_abandonedClaimTicket = 0;
-    Serial.printf("[RADIO][CLAIM] abandoned-claim %s ticket=%lu (session already given up)\n",
-                  ok ? "published" : "failed", static_cast<unsigned long>(ticket));
-    OwedRelease* r = g_owedRelease;
-    g_owedRelease = nullptr;
-    if (r != nullptr) {
-      // Only a CLAIM that was written needs withdrawing; a failed one closed
-      // the connection and never reached the receiver.
-      if (ok) {
-        MqttManager::ControlOutcome o =
-            sendBusyPacket(r->group_code, r->peer_device_id, BUSY_RELEASE, r->session_id, onControlPublishDone, nullptr);
-        Serial.printf("[RADIO][CLAIM] owed RELEASE sid=%s %s\n", r->session_id, outcomeName(o));
-      }
-      delete r;
-    }
+  // Any other CLAIM result belongs to a session already given up (its
+  // RELEASE either queued behind it, or owed below).
+  if (ticket == 0) return;
+  Serial.printf("[RADIO][CLAIM] abandoned-claim %s ticket=%lu (session already given up)\n",
+                ok ? "published" : "failed", static_cast<unsigned long>(ticket));
+  OwedRelease* r = takeOwedRelease(ticket);
+  if (r == nullptr) return;
+  if (ok) {
+    MqttManager::ControlOutcome o =
+        sendBusyPacket(r->group_code, r->peer_device_id, BUSY_RELEASE, r->session_id, onControlPublishDone, nullptr);
+    // FAILED here is a lost connection (this result freed a place in the
+    // chain): the receiver's busy TTL is then the only release left.
+    Serial.printf("[RADIO][CLAIM] owed RELEASE sid=%s %s%s\n", r->session_id, outcomeName(o),
+                  o == MqttManager::ControlOutcome::FAILED ? " (connection lost: receiver TTL applies)" : "");
+  } else {
+    // A failed or canceled CLAIM was never written (the connection closed or
+    // the loan was canceled): nothing reached the receiver to withdraw.
+    Serial.printf("[RADIO][CLAIM] owed RELEASE sid=%s dropped: its CLAIM was not delivered\n", r->session_id);
   }
+  delete r;
 }
 
 // Definition of the helper forward-declared alongside resetPrivateCall,
@@ -1239,27 +1270,35 @@ void releaseAndResetPrivateCall() {
   if (g_call.isCaller && g_call.state != PrivateState::IDLE) {
     // Gate 1: a CLAIM still queued is published after this point; the
     // RELEASE below joins the same chain behind it (same connection, same
-    // order). Remember the CLAIM so its late result is recognized.
+    // order). Its late result is recognized as an abandoned session's.
     uint32_t queuedClaim = g_call.claimQueuedTicket;
-    if (queuedClaim != 0) {
-      g_abandonedClaimTicket = queuedClaim;
-      delete g_owedRelease;
-      g_owedRelease = nullptr;
-    }
     MqttManager::ControlOutcome o = sendBusyPacket(g_call.group_code, g_call.peer_device_id, BUSY_RELEASE,
                                                    g_call.session_id, onControlPublishDone, nullptr);
+    const char* owed = "-";
     if (o == MqttManager::ControlOutcome::FAILED && queuedClaim != 0) {
-      // The chain is full: owed until the queued CLAIM's result frees a place.
-      g_owedRelease = new (std::nothrow) OwedRelease();
-      if (g_owedRelease != nullptr) {
-        strncpy(g_owedRelease->group_code, g_call.group_code, sizeof(g_owedRelease->group_code) - 1);
-        strncpy(g_owedRelease->peer_device_id, g_call.peer_device_id, sizeof(g_owedRelease->peer_device_id) - 1);
-        strncpy(g_owedRelease->session_id, g_call.session_id, sizeof(g_owedRelease->session_id) - 1);
+      // The chain is full: owed until this CLAIM's result frees a place.
+      // Earlier sessions' owed RELEASEs are kept (one entry each).
+      OwedRelease* r = owedReleaseCount() < kMaxOwedReleases ? new (std::nothrow) OwedRelease() : nullptr;
+      if (r != nullptr) {
+        r->claimTicket = queuedClaim;
+        strncpy(r->group_code, g_call.group_code, sizeof(r->group_code) - 1);
+        r->group_code[sizeof(r->group_code) - 1] = '\0';
+        strncpy(r->peer_device_id, g_call.peer_device_id, sizeof(r->peer_device_id) - 1);
+        r->peer_device_id[sizeof(r->peer_device_id) - 1] = '\0';
+        strncpy(r->session_id, g_call.session_id, sizeof(r->session_id) - 1);
+        r->session_id[sizeof(r->session_id) - 1] = '\0';
+        r->next = g_owedRelease;
+        g_owedRelease = r;
+        owed = "owed";
+      } else {
+        // No memory (or the bound reached): this RELEASE is lost -- reported
+        // as such; the receiver's busy TTL is then the only release.
+        owed = "LOST(no-memory-or-limit)";
       }
     }
     if (o != MqttManager::ControlOutcome::PUBLISHED) {
-      Serial.printf("[RADIO][CLAIM] RELEASE %s sid=%s claimStillQueued=%d owed=%d\n", outcomeName(o), g_call.session_id,
-                    queuedClaim != 0 ? 1 : 0, g_owedRelease != nullptr ? 1 : 0);
+      Serial.printf("[RADIO][CLAIM] RELEASE %s sid=%s claimStillQueued=%d owed=%s\n", outcomeName(o), g_call.session_id,
+                    queuedClaim != 0 ? 1 : 0, owed);
     }
   }
   resetPrivateCall();

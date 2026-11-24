@@ -22,6 +22,30 @@
 #include <string>
 #include <vector>
 
+// ---- low-memory model: the program's allocation functions, malloc-backed
+// (ASan still checks every block); g_failNothrowNew makes the scalar
+// nothrow new -- the one OwedRelease uses -- return nullptr, as on an ESP32
+// out of heap. Array nothrow new (the pre-buffer) is not affected.
+#include <cstdlib>
+#include <new>
+static bool g_failNothrowNew = false;
+static int g_nothrowNewFailures = 0;
+void* operator new(std::size_t n) {
+  void* p = std::malloc(n ? n : 1);
+  if (p == nullptr) throw std::bad_alloc();
+  return p;
+}
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+  if (g_failNothrowNew) { g_nothrowNewFailures++; return nullptr; }
+  return std::malloc(n ? n : 1);
+}
+void* operator new[](std::size_t n) { return operator new(n); }
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept { return std::malloc(n ? n : 1); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
 // ---- what radio.cpp / radio_transport.cpp need beyond stubs.cpp ----
 namespace Sleep { void notifyActivity() {} }
 void playTone(uint16_t, uint16_t, SoundClass) {}
@@ -139,6 +163,23 @@ static void workerNext(bool ok) {
   if (ok) g_wire.push_back({T::asyncPending.front().topic, T::asyncPending.front().data});
   T::completeAsync(ok);
 }
+// The worker finishes the oldest job of ONE group's chain (each group's
+// connection has its own chain; they complete independently).
+static void workerNextFor(const char* group, bool ok) {
+  for (auto it = T::asyncPending.begin(); it != T::asyncPending.end(); ++it) {
+    if (it->group != group) continue;
+    T::AsyncPub p = *it;
+    T::asyncPending.erase(it);
+    if (ok) g_wire.push_back({p.topic, p.data});
+    if (p.done != nullptr) p.done(p.ticket, ok);
+    return;
+  }
+}
+static int pendingFor(const char* group) {
+  int n = 0;
+  for (auto& p : T::asyncPending) n += p.group == group ? 1 : 0;
+  return n;
+}
 static int queuedTo(const std::string& prefix) {
   int n = 0;
   for (auto& p : T::asyncPending) n += p.topic.compare(0, prefix.size(), prefix) == 0 ? 1 : 0;
@@ -152,6 +193,58 @@ static void lendForWorkerPublish(const char* what) {
   MqttManager::publishBinaryAsync(kGroup, what, b, 4, false, 1, nullptr);
 }
 
+
+// Replays what reached the broker (radio/busy/<peer>: CLAIM/RELEASE) into the
+// receiver's ACTUAL busy handler, in wire order, and reports the receiver's
+// busy session after each packet. A RELEASE for one session must never end
+// another; after the last packet the receiver must be free (no reliance on
+// the 5 s busy TTL).
+static std::vector<std::string> replayToReceiver(bool* freeAtEnd) {
+  std::vector<std::string> trace;
+  RadioTransport::g_receiverBusy = RadioTransport::ReceiverBusy{};
+  T::now += 10;  // no TTL expiry: every step within milliseconds
+  const std::vector<WirePkt> wire = g_wire;  // the receiver's own GRANT/DENY replies are not part of the replay
+  for (auto& w : wire) {
+    if (w.topic.compare(0, 11, "radio/busy/") != 0) continue;
+    PacketCodec::Header h;
+    const uint8_t* body = nullptr;
+    if (!PacketCodec::decodeHeader(w.data.data(), w.data.size(), &h, &body)) continue;
+    std::vector<uint8_t> payload(body, body + h.payload_length);
+    NetworkPacketHandlerFn fn = T_packetHandler(PacketCodec::PK_RADIO_BUSY);
+    if (fn != nullptr) fn(kGroup, "", payload.data(), payload.size());
+    trace.push_back(std::string(wType(w) == 0 ? "C(" : "R(") + wSession(w) + ")->" +
+                    (RadioTransport::g_receiverBusy.busy ? RadioTransport::g_receiverBusy.sessionId : "free"));
+  }
+  *freeAtEnd = !RadioTransport::g_receiverBusy.busy;
+  return trace;
+}
+// Every CLAIM on the wire is followed, later on the wire, by the RELEASE of
+// the same session.
+static bool everyClaimReleased(std::string* missing) {
+  for (size_t i = 0; i < g_wire.size(); i++) {
+    if (g_wire[i].topic.compare(0, 11, "radio/busy/") != 0 || wType(g_wire[i]) != 0) continue;
+    bool found = false;
+    for (size_t j = i + 1; j < g_wire.size() && !found; j++)
+      found = g_wire[j].topic.compare(0, 11, "radio/busy/") == 0 && wType(g_wire[j]) == 1 && wSession(g_wire[j]) == wSession(g_wire[i]);
+    if (!found) { *missing = wSession(g_wire[i]); return false; }
+  }
+  return true;
+}
+static void fillChain3() {
+  lendForWorkerPublish("race/state");
+  lendForWorkerPublish("msg/AABBCCDDEEF0");
+  lendForWorkerPublish("msg/AABBCCDDEEF1");
+}
+
+// The Talk screen for another contact, keeping the MQTT worker chain model
+// (pending jobs, the wire log) as it is.
+static void openTalkKeepChain(const char* contact) {
+  strcpy(g_selectedContactKey, contact);
+  Menu::init();
+  Menu::pushScreen(screenTalk);
+  tick(2);
+}
+
 static void openTalk(const char* contact) {
   T::reset();
   g_noWait.clear();
@@ -163,9 +256,11 @@ static void openTalk(const char* contact) {
   RadioTransport::g_receiverBusy = RadioTransport::ReceiverBusy{};
   RadioTransport::g_lastFailure = RadioTransport::PrivateFailure::NONE;
   RadioTransport::g_failedSessionId[0] = '\0';
-  RadioTransport::g_abandonedClaimTicket = 0;
-  delete RadioTransport::g_owedRelease;
-  RadioTransport::g_owedRelease = nullptr;
+  while (RadioTransport::g_owedRelease != nullptr) {
+    RadioTransport::OwedRelease* r = RadioTransport::g_owedRelease;
+    RadioTransport::g_owedRelease = r->next;
+    delete r;
+  }
   g_wire.clear();
   T::onPublished = [](const T::Pub& p) { g_wire.push_back({p.topic, p.data}); };
   T::pubs.clear();
@@ -604,6 +699,185 @@ int main() {
   CHECK(grantQueued && wireCount(replyTo, 0, "S-LATE") == 1 && RadioTransport::g_replyTicket == 0,
         "GRANT queued (not on the wire) %d; after the worker: on the wire %d", grantQueued, wireCount(replyTo, 0, "S-LATE"));
 
+
+
+  // ===========================================================================
+  // Multi-session cancellation: several sessions abandoned while their
+  // CLAIMs are still queued and their RELEASEs could not be queued
+  // ===========================================================================
+  g_test = "RQ8 two sessions released while queued with the chain full (the review's exact sequence): CLAIM(S1)..RELEASE(S1) and CLAIM(S2)..RELEASE(S2) both on the wire; replayed into the receiver, RELEASE(S1) never ends S2 and the receiver ends free";
+  openTalk(kPeer);
+  fillChain3();                       // 1. heartbeat, chat, Outbox
+  pttDown(); tick();                  // 2. CLAIM(S1) = 4th
+  std::string q1 = RadioTransport::g_call.session_id;
+  bool c1Fourth = T::asyncPending.size() == 4 && queuedTo(busyTo) == 1;
+  pttUp(100); tick(2);                // 3. RELEASE(S1) refused: chain full -> owed
+  workerNext(true);                   // 4. heartbeat done: one slot, CLAIM(S1) still pending
+  pttDown(); tick();                  // 5. CLAIM(S2) queued
+  std::string q2 = RadioTransport::g_call.session_id;
+  bool c2Queued = queuedTo(busyTo) == 2 && T::asyncPending.size() == 4;
+  pttUp(100); tick(2);                // 6. RELEASE(S2) refused: chain full again
+  for (int i = 0; i < 10 && !T::asyncPending.empty(); i++) { workerNext(true); tick(); }  // 7. everything completes
+  std::string missing;
+  bool paired = everyClaimReleased(&missing);
+  bool freeAtEnd = false;
+  std::vector<std::string> trace = replayToReceiver(&freeAtEnd);
+  std::string tr;
+  for (auto& t : trace) tr += t + " ";
+  bool s1NeverEndsS2 = true;
+  for (size_t i = 0; i + 1 < trace.size(); i++)
+    if (trace[i].find("->" + q2) != std::string::npos && trace[i + 1].rfind("R(" + q1 + ")", 0) == 0 &&
+        trace[i + 1].find("->" + q2) == std::string::npos)
+      s1NeverEndsS2 = false;
+  CHECK(c1Fourth && c2Queued && q1 != q2 && wireCount(busyTo, 0, q1) == 1 && wireCount(busyTo, 1, q1) == 1 &&
+            wireCount(busyTo, 0, q2) == 1 && wireCount(busyTo, 1, q2) == 1 && paired && s1NeverEndsS2 && freeAtEnd &&
+            RadioTransport::g_owedRelease == nullptr,
+        "C1 4th %d; C2 queued %d; S1 claim/release %d/%d; S2 claim/release %d/%d; paired %d (missing '%s'); receiver: %s; free at end %d",
+        c1Fourth, c2Queued, wireCount(busyTo, 0, q1), wireCount(busyTo, 1, q1), wireCount(busyTo, 0, q2),
+        wireCount(busyTo, 1, q2), paired, missing.c_str(), tr.c_str(), freeAtEnd);
+
+  g_test = "RQ8b three rapid PTT cycles, each released while its CLAIM is queued and the chain is full: every published CLAIM gets its own RELEASE, in order, and the receiver ends free";
+  openTalk(kPeer);
+  fillChain3();
+  std::vector<std::string> sids;
+  for (int cycle = 0; cycle < 3; cycle++) {
+    pttDown(); tick();
+    sids.push_back(RadioTransport::g_call.session_id);
+    pttUp(80); tick(2);
+    workerNext(true);  // one slot frees; the earlier CLAIMs stay pending
+  }
+  for (int i = 0; i < 12 && !T::asyncPending.empty(); i++) { workerNext(true); tick(); }
+  paired = everyClaimReleased(&missing);
+  trace = replayToReceiver(&freeAtEnd);
+  int nClaims = 0, nReleases = 0;
+  for (auto& sidc : sids) { nClaims += wireCount(busyTo, 0, sidc); nReleases += wireCount(busyTo, 1, sidc); }
+  tr.clear();
+  for (auto& t : trace) tr += t + " ";
+  CHECK(sids.size() == 3 && sids[0] != sids[1] && sids[1] != sids[2] && nClaims == nReleases && nClaims >= 2 && paired && freeAtEnd &&
+            RadioTransport::g_owedRelease == nullptr,
+        "claims %d releases %d paired %d (missing '%s') receiver: %s free %d", nClaims, nReleases, paired, missing.c_str(), tr.c_str(),
+        freeAtEnd);
+
+
+  g_test = "RQ8c two sessions to DIFFERENT peers, both released while queued with the chain full: without RELEASE(S1) peer 1 would stay Busy (TTL only); both RELEASEs go out, each after its own CLAIM";
+  openTalk(kPeer);
+  fillChain3();
+  pttDown(); tick();
+  std::string p1sid = RadioTransport::g_call.session_id;
+  pttUp(100); tick(2);
+  workerNext(true);
+  openTalkKeepChain(kOther);
+  pttDown(); tick();
+  std::string p2sid = RadioTransport::g_call.session_id;
+  pttUp(100); tick(2);
+  uint8_t owedBoth = RadioTransport::owedReleaseCount();
+  for (int i = 0; i < 10 && !T::asyncPending.empty(); i++) { workerNext(true); tick(); }
+  const std::string busyOther = std::string("radio/busy/") + kOther;
+  paired = everyClaimReleased(&missing);
+  CHECK(owedBoth == 2 && wireCount(busyTo, 0, p1sid) == 1 && wireCount(busyTo, 1, p1sid) == 1 && wireCount(busyOther, 0, p2sid) == 1 &&
+            wireCount(busyOther, 1, p2sid) == 1 && paired && RadioTransport::g_owedRelease == nullptr,
+        "owed at once %u (want 2); peer1 C/R %d/%d; peer2 C/R %d/%d; paired %d (missing '%s')", owedBoth, wireCount(busyTo, 0, p1sid),
+        wireCount(busyTo, 1, p1sid), wireCount(busyOther, 0, p2sid), wireCount(busyOther, 1, p2sid), paired, missing.c_str());
+
+  g_test = "RQ8d failed worker publishes / canceled loans (Wi-Fi recovery, OTA maintenance cancel the loan: every queued job reports failure): no CLAIM reached the receiver, so the owed RELEASEs are dropped (logged as not delivered), none sent, the list empties";
+  openTalk(kPeer);
+  fillChain3();
+  for (int cycle = 0; cycle < 2; cycle++) {
+    pttDown(); tick();
+    pttUp(80); tick(2);
+    if (cycle == 0) workerNext(true);
+  }
+  uint8_t owedBefore = RadioTransport::owedReleaseCount();
+  T::connected = false;  // the loan canceled / connection gone
+  for (int i = 0; i < 10 && !T::asyncPending.empty(); i++) { workerNext(false); tick(); }
+  T::connected = true;
+  CHECK(owedBefore == 2 && RadioTransport::g_owedRelease == nullptr && wireCount(busyTo, 0) == 0 && wireCount(busyTo, 1) == 0,
+        "owed %u -> list empty %d; CLAIMs on wire %d, RELEASEs %d", owedBefore, RadioTransport::g_owedRelease == nullptr,
+        wireCount(busyTo, 0), wireCount(busyTo, 1));
+
+  g_test = "RQ8e OTA maintenance entered while a CLAIM is queued and the chain is full: the forced stop owes the RELEASE; if the CLAIM is still written, its RELEASE follows; a later session is unaffected";
+  openTalk(kPeer);
+  fillChain3();
+  pttDown(); tick();
+  std::string msid = RadioTransport::g_call.session_id;
+  RadioTransport::setMaintenanceModeActive(true);
+  bool owedOnMaint = RadioTransport::owedReleaseCount() == 1 && RadioTransport::getPrivateState() == RadioTransport::PrivateState::IDLE;
+  for (int i = 0; i < 10 && !T::asyncPending.empty(); i++) { workerNext(true); tick(); }
+  RadioTransport::setMaintenanceModeActive(false);
+  CHECK(owedOnMaint && wireCount(busyTo, 0, msid) == 1 && wireCount(busyTo, 1, msid) == 1 && RadioTransport::g_owedRelease == nullptr,
+        "owed on maintenance %d; C/R %d/%d", owedOnMaint, wireCount(busyTo, 0, msid), wireCount(busyTo, 1, msid));
+  pttUp(50); tick(2);
+
+  g_test = "RQ8f low memory: the owed entry cannot be allocated -> that RELEASE is reported LOST (explicitly, not silently), nothing crashes, an earlier session's owed RELEASE is kept and still sent";
+  openTalk(kPeer);
+  fillChain3();
+  pttDown(); tick();
+  std::string lm1 = RadioTransport::g_call.session_id;
+  pttUp(80); tick(2);             // S1 owed (memory available)
+  workerNext(true);
+  pttDown(); tick();
+  std::string lm2 = RadioTransport::g_call.session_id;
+  g_failNothrowNew = true;
+  int failsBefore = g_nothrowNewFailures;
+  pttUp(80); tick(2);             // S2: no memory for the entry
+  g_failNothrowNew = false;
+  bool allocTried = g_nothrowNewFailures == failsBefore + 1 && RadioTransport::owedReleaseCount() == 1;
+  for (int i = 0; i < 10 && !T::asyncPending.empty(); i++) { workerNext(true); tick(); }
+  CHECK(allocTried && wireCount(busyTo, 1, lm1) == 1 && wireCount(busyTo, 0, lm2) == 1 && wireCount(busyTo, 1, lm2) == 0 &&
+            RadioTransport::g_owedRelease == nullptr,
+        "allocation refused once, S1 entry kept %d; RELEASE(S1) sent %d; S2 CLAIM %d, RELEASE(S2) lost %d", allocTried,
+        wireCount(busyTo, 1, lm1), wireCount(busyTo, 0, lm2), wireCount(busyTo, 1, lm2) == 0);
+
+  g_test = "RQ8g bounded: at most kMaxOwedReleases (8) entries; beyond that a RELEASE is reported lost instead of allocating";
+  openTalk(kPeer);
+  T::asyncPublish = true;
+  T::asyncChainCap = 12;  // a model chain long enough to hold more abandoned CLAIMs than the bound
+  {
+    uint8_t b[4] = {1, 2, 3, 4};
+    for (int i = 0; i < 2; i++) MqttManager::publishBinaryAsync(kGroup, "race/state", b, 4, false, 1, nullptr);
+    int maxOwed = 0;
+    for (int cycle = 0; cycle < 10; cycle++) {
+      pttDown(); tick();
+      // keep the chain full so each RELEASE is refused
+      while (static_cast<int>(T::asyncPending.size()) < T::asyncChainCap) MqttManager::publishBinaryAsync(kGroup, "race/state", b, 4, false, 1, nullptr);
+      pttUp(50); tick(2);
+      if (RadioTransport::owedReleaseCount() > maxOwed) maxOwed = RadioTransport::owedReleaseCount();
+      workerNext(true);  // the oldest filler done: one slot for the next CLAIM
+      while (!T::asyncPending.empty() && T::asyncPending.front().topic == "race/state" && static_cast<int>(T::asyncPending.size()) >= T::asyncChainCap) workerNext(true);
+    }
+    for (int i = 0; i < 40 && !T::asyncPending.empty(); i++) { workerNext(true); tick(); }
+    CHECK(maxOwed == 8 && RadioTransport::g_owedRelease == nullptr, "max entries %d (want 8); list empty after %d",
+          maxOwed, RadioTransport::g_owedRelease == nullptr);
+  }
+  T::asyncChainCap = 4;
+
+
+  g_test = "RQ8h sessions on two Family Groups (separate chains), both released while queued with each chain full; group 1's chain completes first: RELEASE(S1) goes out on group 1, RELEASE(S2) on group 2 once its CLAIM is out -- each owed RELEASE bound to its own CLAIM";
+  openTalk(kPeer);
+  {
+    const char* kGroup2 = "GROUP2";
+    T::asyncPublish = true;
+    uint8_t b[4] = {1, 2, 3, 4};
+    for (int i = 0; i < 3; i++) MqttManager::publishBinaryAsync(kGroup, "race/state", b, 4, false, 1, nullptr);
+    for (int i = 0; i < 3; i++) MqttManager::publishBinaryAsync(kGroup2, "race/state", b, 4, false, 1, nullptr);
+    pttDown(); tick();
+    std::string g1sid = RadioTransport::g_call.session_id;
+    pttUp(80); tick(2);  // owed (group 1 full)
+    strcpy(g_selectedGroupCode, kGroup2);
+    openTalkKeepChain(kPeer);
+    pttDown(); tick();
+    std::string g2sid = RadioTransport::g_call.session_id;
+    pttUp(80); tick(2);  // owed (group 2 full)
+    strcpy(g_selectedGroupCode, kGroup);
+    uint8_t owed2 = RadioTransport::owedReleaseCount();
+    while (pendingFor(kGroup) > 0) { workerNextFor(kGroup, true); tick(); }  // group 1 finishes; group 2 still full
+    bool g1Released = wireCount(busyTo, 1, g1sid) == 1 && wireCount(busyTo, 1, g2sid) == 0;
+    while (pendingFor(kGroup2) > 0) { workerNextFor(kGroup2, true); tick(); }
+    paired = everyClaimReleased(&missing);
+    CHECK(owed2 == 2 && g1Released && paired && wireCount(busyTo, 1, g2sid) == 1 && RadioTransport::g_owedRelease == nullptr,
+          "owed %u; after group 1: RELEASE(S1) %d RELEASE(S2) %d (want 1/0); paired %d (missing '%s'); RELEASE(S2) at the end %d",
+          owed2, wireCount(busyTo, 1, g1sid), wireCount(busyTo, 1, g2sid), paired, missing.c_str(), wireCount(busyTo, 1, g2sid));
+  }
 
   // ===========================================================================
   // Gate 3: the three users of publishAudioPacket() -- framing, topic, the
