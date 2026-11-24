@@ -82,6 +82,10 @@ build mqtsan -std=gnu++17 -g -O1 -fsanitize=thread -Wall -Wextra $MQ && {
   st=0; "$OUT/mqtsan" threads 300 > "$OUT/mqtsan.txt" 2>&1 || st=$?
   grep -E "FAIL|passed|WARNING: ThreadSanitizer" "$OUT/mqtsan.txt" | sort | uniq -c | sed 's/^/   threads (TSan): /' || true
   [ $st -eq 0 ] || fail "mqtt_test threads under TSan exited with status $st"; }
+echo "== 4e. Private radio PTT and radio MQTT paths (hardware: 'Claiming...' back to 'Ready' while held; QoS0 audio 288 ms): ACTUAL radio.cpp + radio_transport.cpp + menu.cpp; the peer modeled by its packets"
+build radt -std=gnu++17 $SAN -Wall -Wextra -I "$H" -I "$H/fake_radio" -I "$H/fake" -I "$REPO/src" "$H/radio_test.cpp" "$H/stubs.cpp" "$R/packet_codec.cpp" "$R/presence.cpp" "$R/crc32.cpp" "$R/morse.cpp" && run radt
+echo "== 4f. Enigma received-message display (zero key readable; rotor/plugboard ciphertext untouched, XQ/XX collisions, real decode round trips): ACTUAL enigma.cpp + enigma_crypto.cpp + enigma_keys.cpp"
+build ent -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -I "$H" -I "$H/fake" -I "$REPO/src" "$H/enigma_test.cpp" "$H/stubs.cpp" "$R/menu.cpp" "$R/notifications.cpp" "$R/text_message.cpp" "$R/number_guessing.cpp" "$R/packet_codec.cpp" "$R/morse.cpp" "$R/enigma_crypto.cpp" "$R/enigma_keys.cpp" "$R/crc32.cpp" "$R/presence.cpp" && run ent
 W=$(cat "$OUT"/*.warnings.txt | grep -E '(race|race_protocol|identity|number_guessing|number_guessing_friend)\.(cpp|h):[0-9]+:[0-9]+: warning' | sed 's|.*/src/core/||' | sort -u | tr '\n' ' ' || true)
 echo "   warnings in changed/related files (all builds): ${W:-none}"
 
@@ -105,6 +109,22 @@ for std in gnu++11 gnu++17; do
   done
 done
 
+echo "== 5b. C++11 / C++17 compile of the other files this round changes (candidate only; no baseline copy in this bundle)"
+for std in gnu++11 gnu++17; do
+  n=0
+  for f in radio_transport.cpp radio.cpp storage_messages.cpp outbox.cpp; do
+    log="$OUT/syntax5b_${std}_${f}.txt"
+    INC="-I $H/fake_radio -I $H/fake_sys"; case $f in storage_messages.cpp|outbox.cpp) INC="-I $H/fake_fs -I $H";; esac
+    if ! $CXX -std=$std -fsyntax-only -Wall -Wextra $INC -I "$H/fake" -I "$REPO/src" "$R/$f" > "$log" 2>&1; then
+      fail "syntax $std $f"; sed 's/^/   /' "$log" | head -10
+    fi
+    c=$(grep -cE "$f:[0-9]+:[0-9]+: warning" "$log" || true)
+    [ "$c" -gt 0 ] && sed 's/^/   /' "$log" | grep warning | head -5
+    n=$((n + c))
+  done
+  echo "   $std: compiled, $n warnings"
+done
+
 echo "== 6. Sizes: encoded by the ACTUAL codec (step 1 E16, step 2 U14) and the RAM of the engine on this host"
 build sizes -std=gnu++17 -I "$REPO/src" "$H/sizes.cpp" && { "$OUT/sizes" | sed 's/^/   /' || fail "sizes"; }
 echo "   (x86-64 host layout: ESP32 is 32-bit, so pointer members are half the size there; not measured on target)"
@@ -125,6 +145,8 @@ else
   python3 "$H/mutate_notify.py" || fail "notification mutations (survivor or build error)"
   echo "== 7c. Targeted mutations of mqtt_manager.cpp's connection worker (each must be caught by mqtt_test; locking mutants under TSan)"
   python3 "$H/mutate_mqtt.py" || fail "MQTT worker mutations (survivor or build error)"
+  echo "== 7d. Targeted mutations of the radio fix (radio_transport.cpp, radio.cpp: radio_test) and the Enigma zero-key display (enigma.cpp: enigma_test)"
+  python3 "$H/mutate_radio.py" || fail "radio/Enigma mutations (survivor or build error)"
 fi
 
 if [ $FAILED -ne 0 ]; then echo "== RESULT: FAILED"; exit 1; fi

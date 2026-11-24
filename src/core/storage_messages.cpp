@@ -419,26 +419,31 @@ bool findGlobalOldestNonPending(MessageRef* outRef) {
 // kMaxRecordFileSize = 1 KB, so one 4 KB data block, plus room for its
 // temporary copy and a new directory); removals are not credited. The
 // exact walk runs again when the estimate gets near the watermark, after
-// kMaxAppendsWithoutExact appends or kMaxEstimateAgeMs, at boot and after
-// any change made outside the store. Below the watermark everything works
-// on exact figures, exactly as before. (Only this file writes to LittleFS.)
+// kMaxAppendsWithoutExact appends and after any change made outside the
+// store. Below the watermark everything works on exact figures, exactly as
+// before. (Only this file writes to LittleFS.)
+//
+// Hardware, device A on 827cd27: "[PERF][STORE_APPEND] total=494 ms
+// freeSpace=364 ms" on a send. The estimate started out invalid, so the
+// first append after boot paid the walk: primeFreeSpaceEstimate() now takes
+// the first exact figure during boot (setup(), before the UI runs). The
+// former 10-minute age limit is gone: it made the first append after any
+// 10 quiet minutes pay the walk again, yet time cannot make a conservative
+// estimate optimistic -- only appends (bounded by kMaxAppendsWithoutExact)
+// and writes outside the store (which invalidate it) change free space.
 constexpr size_t kLowWatermark = 96 * 1024;
 constexpr size_t kTargetFree = 128 * 1024;
 constexpr size_t kEstimatedAppendCost = 12 * 1024;
 constexpr size_t kEstimateMargin = 64 * 1024;
 constexpr uint8_t kMaxAppendsWithoutExact = 32;
-constexpr uint32_t kMaxEstimateAgeMs = 10UL * 60UL * 1000UL;
 bool g_freeEstimateValid = false;
 size_t g_freeEstimate = 0;
 uint8_t g_appendsSinceExact = 0;
-uint32_t g_freeEstimateAtMs = 0;
 
 void invalidateFreeSpaceEstimate() { g_freeEstimateValid = false; }
 
 void ensureFreeSpaceForWrite() {
-  uint32_t now = millis();
   if (g_freeEstimateValid && g_appendsSinceExact < kMaxAppendsWithoutExact &&
-      static_cast<uint32_t>(now - g_freeEstimateAtMs) < kMaxEstimateAgeMs &&
       g_freeEstimate >= kLowWatermark + kEstimateMargin + kEstimatedAppendCost) {
     g_freeEstimate -= kEstimatedAppendCost;
     g_appendsSinceExact++;
@@ -450,7 +455,6 @@ void ensureFreeSpaceForWrite() {
     g_freeEstimateValid = true;
     g_freeEstimate = free >= kEstimatedAppendCost ? free - kEstimatedAppendCost : 0;
     g_appendsSinceExact = 1;
-    g_freeEstimateAtMs = now;
     return;
   }
   g_freeEstimateValid = false;  // low: exact figures on every append until there is room again
@@ -572,6 +576,19 @@ void notifyExternalStorageMutationAttempted() {
 }
 
 void setOnPendingWrittenCallback(PendingWrittenCallback cb) { g_onPendingWritten = cb; }
+
+void primeFreeSpaceEstimate() {
+  uint32_t start = millis();
+  size_t free = LittleFS.totalBytes() - LittleFS.usedBytes();
+  // Below the watermark the estimate stays invalid: appends then work on
+  // exact figures (and evict) exactly as ensureFreeSpaceForWrite() decides.
+  g_freeEstimateValid = free >= kLowWatermark;
+  g_freeEstimate = free;
+  g_appendsSinceExact = 0;
+  Serial.printf("[PERF][STORE] boot free-space measure %lu ms free=%lu valid=%d\n",
+                static_cast<unsigned long>(millis() - start), static_cast<unsigned long>(free),
+                g_freeEstimateValid ? 1 : 0);
+}
 
 uint32_t getExternalMutationCount() { return g_externalMutations; }
 

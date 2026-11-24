@@ -2416,6 +2416,23 @@ void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t o
     snprintf(outBuffer, outBufferSize, "%s", cachedText);
     return;
   }
+  // Owner request (hardware: "D EE" sent with no rotors and no plugboard
+  // showed as "DXQEE" before decoding): when the key embedded in the
+  // message has no rotors AND no plugboard pairs, the Enigma stage is the
+  // identity, so the text is shown readable -- decrypted with that embedded
+  // key, then reverseEscape() applied once, the same order as a real
+  // decode. Display only: the stored ciphertext, the lock state (icon,
+  // reveal/key flows) and the wire bytes are untouched. A key with rotors,
+  // or with plugboard pairs only, keeps showing the ciphertext: its XQ/XX
+  // are ordinary ciphertext letters until decrypted with the right key.
+  if (embedded.rotor_count == 0 && embedded.plugboard_pair_count == 0) {
+    char decrypted[EnigmaCrypto::kMaxEscapedLen + 1];
+    EnigmaCrypto::run(ciphertext, decrypted, sizeof(decrypted), embedded);
+    char readable[EnigmaCrypto::kMaxEscapedLen + 1];
+    EnigmaCrypto::reverseEscape(decrypted, readable, sizeof(readable));
+    snprintf(outBuffer, outBufferSize, "%s", readable);
+    return;
+  }
   snprintf(outBuffer, outBufferSize, "%s", ciphertext);
 }
 

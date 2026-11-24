@@ -359,7 +359,7 @@ static void testSetupContract() {
         conn ? conn->willQos : -1, conn ? conn->willPayload.c_str() : "-");
   const char* expSuffix[10] = {"presence/+", "msg/AABBCCDDEEFF", "broadcast", "r2/+", "r2q/AABBCCDDEEFF",
                                "radio/busy/AABBCCDDEEFF", "radio/busy_reply/AABBCCDDEEFF", "radio/session",
-                               "radio/audio/AABBCCDDEEF" /* truncated by 1 byte, reproduced as before */,
+                               "radio/audio/AABBCCDDEEFF" /* radio fix: the full id (was cut one character short) */,
                                "radio/audio/broadcast"};
   const int expQos[10] = {1, 1, 1, 1, 1, 0, 0, 0, 0, 0};
   bool topicsOk = subs.size() == 10;
@@ -1168,6 +1168,53 @@ static void testAsyncPublish() {
   CHECK(concurrentUse() == 0 && overlaps() == 0 && g_offMainCalls.load() == 0, "concurrent %d overlaps %d off-main %d",
         concurrentUse(), overlaps(), g_offMainCalls.load());
 
+  g_test = "M20 radio fix: a QoS0 publishBinary() (radio CLAIM/GRANT/SESSION) while the connection is lent joins the loan instead of failing unreported; QoS1 still refused; order kept";
+  resetAll();
+  g_doneLog.clear();
+  connectGroup("R1");
+  std::string rid = clientIdOf("R1");
+  publishBinaryAsync("R1", "broadcast", reinterpret_cast<const uint8_t*>("h"), 1, true, 1, onPublishDone);  // e.g. the Race heartbeat
+  bool claimQueued = publishBinary("R1", "radio/busy/AABBCCDDEEF0", reinterpret_cast<const uint8_t*>("CLAIM"), 5, false, 0);
+  bool qos1Refused = !publishBinary("R1", "broadcast", reinterpret_cast<const uint8_t*>("x"), 1, false, 1);
+  bool lentTwo = slotOf("R1")->lentPublishes == 2 && isGroupReady("R1");
+  pumpWorker();
+  tick();
+  std::string seq;
+  int claimQos = -1;
+  for (auto& e : FakeNet::events()) {
+    if (e.kind != "publish" || e.clientId != rid) continue;
+    if (e.topic.find("/radio/busy/") != std::string::npos) { seq += "C"; claimQos = e.qos; }
+    else if (isChat(e)) seq += e.payload;
+  }
+  CHECK(claimQueued && qos1Refused && lentTwo && seq == "hC" && claimQos == 0 && slotOf("R1")->conn != nullptr &&
+            g_doneLog.size() == 1 && concurrentUse() == 0,
+        "CLAIM queued %d (true), QoS1 refused %d, chain of 2 %d, worker order '%s' (want hC), CLAIM qos %d, back %d",
+        claimQueued, qos1Refused, lentTwo, seq.c_str(), claimQos, slotOf("R1")->conn != nullptr);
+  g_test = "M20b with the loan full a QoS0 control publish is refused (false: the caller logs it), nothing waits";
+  resetAll();
+  connectGroup("R2");
+  for (int i = 0; i < 4; i++) publishBinaryAsync("R2", "broadcast", reinterpret_cast<const uint8_t*>("c"), 1, false, 1, nullptr);
+  bool refusedFull = !publishBinary("R2", "radio/busy/AABBCCDDEEF0", reinterpret_cast<const uint8_t*>("CLAIM"), 5, false, 0);
+  pumpWorker();
+  tick();
+  CHECK(refusedFull && slotOf("R2")->conn != nullptr, "refused when the chain is full %d", refusedFull);
+
+  g_test = "M21 radio audio: publishBinaryNoWait() skips the frame while the connection is lent (no queueing, nothing late)";
+  resetAll();
+  connectGroup("R3");
+  std::string r3 = clientIdOf("R3");
+  publishBinaryAsync("R3", "broadcast", reinterpret_cast<const uint8_t*>("h"), 1, true, 1, nullptr);
+  uint32_t skippedBefore = g_qos0Diag.skipped;
+  bool lentSkip = !publishBinaryNoWait("R3", "radio/audio/broadcast", reinterpret_cast<const uint8_t*>("pcm"), 3);
+  bool notQueued = slotOf("R3")->lentPublishes == 1;
+  pumpWorker();
+  tick();
+  int audioPubs = 0;
+  for (auto& e : FakeNet::events())
+    if (e.kind == "publish" && e.clientId == r3 && e.topic.find("/radio/audio/") != std::string::npos) audioPubs++;
+  CHECK(lentSkip && notQueued && audioPubs == 0 && g_qos0Diag.skipped == skippedBefore + 1,
+        "skipped while lent %d, not queued %d, audio published later %d (want 0), skipped counted %u", lentSkip, notQueued,
+        audioPubs, static_cast<unsigned>(g_qos0Diag.skipped - skippedBefore));
   g_test = "M18 async publish fails (no PUBACK): the callback says so, the closed connection is freed, the group reconnects after its window";
   resetAll();
   g_doneLog.clear();
@@ -1443,6 +1490,58 @@ static void testBoundedWrite() {
   CHECK(small == 100, "after the peer reads, a write succeeds (%zu)", small);
   close(sv[0]);
   close(sv[1]);
+
+  g_test = "M21b radio audio on the group's own connection: published when the socket takes it now; with the send buffer full it is skipped at once (hardware: maxMs=288 waiting for TCP space), the connection stays up";
+  resetAll();
+  connectGroup("R4");
+  int sp[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+    CHECK(false, "socketpair");
+    return;
+  }
+  slotOf("R4")->conn->net.attachFd(sp[0]);
+  std::string r4 = clientIdOf("R4");
+  auto audioCount = [&] {
+    int n = 0;
+    for (auto& e : FakeNet::events())
+      if (e.kind == "publish" && e.clientId == r4 && e.topic.find("/radio/audio/") != std::string::npos) n++;
+    return n;
+  };
+  bool sentWhenWritable = publishBinaryNoWait("R4", "radio/audio/broadcast", reinterpret_cast<const uint8_t*>("pcm"), 3);
+  int afterFirst = audioCount();
+  {
+    std::vector<uint8_t> fill(65536, 0x5a);  // the peer never reads: fill the socket's send buffer
+    for (int i = 0; i < 200; i++)
+      if (send(sp[0], fill.data(), fill.size(), MSG_DONTWAIT) <= 0) break;
+  }
+  auto w0 = std::chrono::steady_clock::now();
+  bool skippedWhenFull = !publishBinaryNoWait("R4", "radio/audio/broadcast", reinterpret_cast<const uint8_t*>("pcm"), 3);
+  auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - w0).count();
+  CHECK(sentWhenWritable && afterFirst == 1 && skippedWhenFull && audioCount() == 1 && waitedMs < 20 &&
+            isGroupReady("R4") && slotOf("R4")->conn != nullptr,
+        "sent when writable %d (%d publishes), skipped when full %d after %lld ms (want <20), still ready %d", sentWhenWritable,
+        afterFirst, skippedWhenFull, static_cast<long long>(waitedMs), isGroupReady("R4"));
+  if (slotOf("R4")->conn != nullptr) slotOf("R4")->conn->net.attachFd(-1);
+  close(sp[0]);
+  close(sp[1]);
+
+  g_test = "M22 receive queue: audio may fill it only while more than 4 slots are free; radio control packets and chat still get in behind a flood of audio";
+  resetAll();
+  connectGroup("R5");
+  ConnMqttClient* client = &slotOf("R5")->conn->mqtt;
+  char audioTopic[] = "morsebuddy/R5/radio/audio/broadcast";
+  char grantTopic[] = "morsebuddy/R5/radio/busy_reply/AABBCCDDEEFF";
+  char pcm[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  for (int i = 0; i < 20; i++) onMqttMessage(client, audioTopic, pcm, 8);
+  uint8_t afterAudio = queueCount();
+  for (int i = 0; i < 4; i++) onMqttMessage(client, grantTopic, pcm, 8);
+  uint8_t afterControl = queueCount();
+  onMqttMessage(client, grantTopic, pcm, 8);  // the queue is full now: dropped as before
+  CHECK(afterAudio == kQueueCapacity - kNonAudioReserve && afterControl == kQueueCapacity && queueCount() == kQueueCapacity,
+        "audio stopped at %u (want %u), control filled it to %u (want %u)", static_cast<unsigned>(afterAudio),
+        static_cast<unsigned>(kQueueCapacity - kNonAudioReserve), static_cast<unsigned>(afterControl),
+        static_cast<unsigned>(kQueueCapacity));
+  releaseQueuedPayloads();
 }
 
 // =============================================================================

@@ -25,8 +25,9 @@
         static_cast<unsigned long long>(missing), updated, reread, truth(kBob).files);
 
   g_test = "SL3 close to the watermark every append measures exactly, as before (no estimate trusted there)";
-  freshDevice(); powerOn(); runFor(5);
-  LittleFS.fakeUsedBytes = LittleFS.totalBytes() - 150 * 1024;  // 150 KB free: under watermark + margin + one append
+  freshDevice();
+  LittleFS.fakeUsedBytes = LittleFS.totalBytes() - 150 * 1024;  // 150 KB free at boot: under watermark + margin + one append
+  powerOn(); runFor(5);
   before = g_fs.usedBytesCalls;
   for (int i = 0; i < 10; i++) arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000000u + i * 60);
   walks = g_fs.usedBytesCalls - before;
@@ -34,19 +35,38 @@
         static_cast<unsigned long long>(walks), truth(kBob).files);
   LittleFS.fakeUsedBytes = 200000;
 
-  g_test = "SL4 the estimate is measured again after a change outside the store, and after 10 minutes";
-  freshDevice(); powerOn(); runFor(5);
-  arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000000u);  // measured
+  g_test = "SL4 boot takes the exact free-space figure (device A on 827cd27: freeSpace=364 ms on the first send after boot); the first appends do not walk";
+  freshDevice();
+  uint64_t b0 = g_fs.usedBytesCalls;
+  powerOn();
+  uint64_t atBoot = g_fs.usedBytesCalls - b0;
+  runFor(5);
   before = g_fs.usedBytesCalls;
-  arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000060u);  // estimated
-  uint64_t estimated = g_fs.usedBytesCalls - before;
+  arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000000u);
+  arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000060u);
+  uint64_t firstAppends = g_fs.usedBytesCalls - before;
+  CHECK(atBoot == 1 && firstAppends == 0, "walks at boot %llu (expected 1), during the first two appends %llu (expected 0)",
+        static_cast<unsigned long long>(atBoot), static_cast<unsigned long long>(firstAppends));
+
+  g_test = "SL4b a change outside the store makes the next append measure again; 11 quiet minutes do not (time cannot make the conservative estimate optimistic)";
+  before = g_fs.usedBytesCalls;
   MessageStore::notifyExternalStorageMutationAttempted();
   arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000120u);  // measured again
   uint64_t afterExternal = g_fs.usedBytesCalls - before;
   T::now += 11 * 60 * 1000;
-  arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000180u);  // measured again (age)
-  uint64_t afterAge = g_fs.usedBytesCalls - before;
-  CHECK(estimated == 0 && afterExternal == 1 && afterAge == 2, "estimated %llu, after an outside change %llu, after 11 min %llu",
-        static_cast<unsigned long long>(estimated), static_cast<unsigned long long>(afterExternal),
-        static_cast<unsigned long long>(afterAge));
+  arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000180u);  // estimated
+  uint64_t afterQuiet = g_fs.usedBytesCalls - before;
+  CHECK(afterExternal == 1 && afterQuiet == 1 && truth(kBob).files == 4,
+        "after an outside change %llu (expected 1), after 11 quiet minutes %llu (expected still 1), %d records",
+        static_cast<unsigned long long>(afterExternal), static_cast<unsigned long long>(afterQuiet), truth(kBob).files);
+
+  g_test = "SL4c boot below the watermark: no estimate is trusted, every append measures (and evicts) exactly as before";
+  freshDevice();
+  LittleFS.fakeUsedBytes = LittleFS.totalBytes() - 64 * 1024;  // 64 KB free: below the 96 KB watermark
+  powerOn(); runFor(5);
+  before = g_fs.usedBytesCalls;
+  arrive(kBob, PacketCodec::MSG_TYPE_TEXT, 1700000000u);
+  CHECK(g_fs.usedBytesCalls - before >= 1 && truth(kBob).files == 1, "low-space append: %llu exact measurements, %d records",
+        static_cast<unsigned long long>(g_fs.usedBytesCalls - before), truth(kBob).files);
+  LittleFS.fakeUsedBytes = 200000;
 }

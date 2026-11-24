@@ -95,6 +95,11 @@ void setOnEvictedCallback(EvictedCallback cb);
 using PendingWrittenCallback = void (*)(const MessageRef& ref);
 void setOnPendingWrittenCallback(PendingWrittenCallback cb);
 
+// Takes the first exact free-space figure (a full LittleFS block walk:
+// about 364 ms on device A), so no append pays it. Called once at boot,
+// from setup()'s service initialization, before the UI runs.
+void primeFreeSpaceEstimate();
+
 // How many times notifyExternalStorageMutationAttempted() was called since
 // boot: a change made outside the store (RAM only).
 uint32_t getExternalMutationCount();

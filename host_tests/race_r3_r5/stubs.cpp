@@ -488,5 +488,7 @@ static EmptyLineActionFn g_emptyLine;
 void registerEmptyLineAction(EmptyLineActionFn fn) { g_emptyLine = fn; }
 void invokeEmptyLineAction(uint8_t m, const char* g, const char* c) { if (g_emptyLine) g_emptyLine(m, g, c); }
 bool registerGameSubModeHandler(uint8_t, ScreenHandlerFn) { return true; }
-bool registerNetworkPacketHandler(uint8_t, NetworkPacketHandlerFn) { return true; }
+static NetworkPacketHandlerFn g_packetHandlers[kMaxPacketKinds];
+bool registerNetworkPacketHandler(uint8_t kind, NetworkPacketHandlerFn fn) { if (kind < kMaxPacketKinds) g_packetHandlers[kind] = fn; return true; }
+NetworkPacketHandlerFn T_packetHandler(uint8_t kind) { return kind < kMaxPacketKinds ? g_packetHandlers[kind] : nullptr; }
 void setPendingRadioIntent(const char*, const char*) { T::seq.push_back("radioIntent"); }

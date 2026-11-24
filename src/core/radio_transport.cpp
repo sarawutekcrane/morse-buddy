@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_heap_caps.h>
 #include <new>
 #include <string.h>
 
@@ -16,6 +17,8 @@
 #include "core/mqtt_manager.h"
 
 namespace RadioTransport {
+
+void releaseAndResetPrivateCall();  // defined with the public API, below
 
 namespace {
 
@@ -244,8 +247,13 @@ bool publishAudioPacket(const char* group_code, const char* topic_suffix, AudioS
     return false;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, payloadLen);
-  return MqttManager::publishBinary(group_code, topic_suffix, wireBuf,
-                                    static_cast<uint16_t>(PacketCodec::kHeaderSize + payloadLen), false, 0);
+  // Radio fix (hardware: "[PERF][RADIO_AUDIO] serviceTick 289 ms" with
+  // "[DIAG][MQTT] qos0 ... maxMs=288"): a frame is sent only if the socket
+  // takes it without waiting, else skipped -- 50 frames a second of 640-byte
+  // PCM (about 37 KB/s on the wire) can exceed what TCP carries over a
+  // long round trip, and waiting for buffer space held the main loop.
+  return MqttManager::publishBinaryNoWait(group_code, topic_suffix, wireBuf,
+                                          static_cast<uint16_t>(PacketCodec::kHeaderSize + payloadLen));
 }
 
 namespace {
@@ -310,20 +318,20 @@ ReceiverBusy g_receiverBusy;
 void resetPrivateCall();
 void releaseCalleeCallIfMatches(const char* claimerDeviceId, const char* sessionId);
 
-void sendBusyReply(const char* group_code, const char* toDeviceId, const char* sessionId, uint8_t type) {
+bool sendBusyReply(const char* group_code, const char* toDeviceId, const char* sessionId, uint8_t type) {
   uint8_t payload[1 + kDeviceIdLen + kIdLen];
   size_t len = buildReplyPayload(type, Identity::deviceId(), sessionId, payload, sizeof(payload));
-  if (len == 0) return;
+  if (len == 0) return false;
   uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
   if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY_REPLY, static_cast<uint16_t>(len), wireBuf,
                                  sizeof(wireBuf))) {
-    return;
+    return false;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
   char topicSuffix[32];
   snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy_reply/%s", toDeviceId);
-  MqttManager::publishBinary(group_code, topicSuffix, wireBuf,
-                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  return MqttManager::publishBinary(group_code, topicSuffix, wireBuf,
+                                    static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
 }
 
 void handleRadioBusyPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
@@ -356,7 +364,10 @@ void handleRadioBusyPacket(const char* group_code, const char* topic, const uint
     // apply to BUSY_RELEASE below -- releasing only ever tears down
     // existing state and promises no reply of its own, so it is never held
     // back by this same-group readiness check.
-    if (!MqttManager::isGroupReady(group_code)) return;
+    if (!MqttManager::isGroupReady(group_code)) {
+      Serial.printf("[RADIO][BUSY] claim from=%s sid=%s ignored: group not ready\n", claimer, sessionId);
+      return;
+    }
 
     // Same claimer is accepted even with a different session_id (a fresh
     // re-claim after a clean hang-up) — only a DIFFERENT claimer while
@@ -375,13 +386,21 @@ void handleRadioBusyPacket(const char* group_code, const char* topic, const uint
       if (sameClaimant && strcmp(g_receiverBusy.sessionId, sessionId) != 0) {
         releaseCalleeCallIfMatches(claimer, g_receiverBusy.sessionId);
       }
+      bool firstForSession = !sameClaimant || strcmp(g_receiverBusy.sessionId, sessionId) != 0;
       g_receiverBusy.busy = true;
       strncpy(g_receiverBusy.claimerDeviceId, claimer, sizeof(g_receiverBusy.claimerDeviceId) - 1);
       strncpy(g_receiverBusy.sessionId, sessionId, sizeof(g_receiverBusy.sessionId) - 1);
       g_receiverBusy.lastRefreshMs = millis();
-      sendBusyReply(group_code, claimer, sessionId, REPLY_GRANT);
+      bool sent = sendBusyReply(group_code, claimer, sessionId, REPLY_GRANT);
+      // Logged once per session (the caller's 2 s keep-alive CLAIMs are
+      // re-granted silently) and on every failed reply.
+      if (firstForSession || !sent) {
+        Serial.printf("[RADIO][BUSY] claim from=%s sid=%s -> GRANT sent=%d\n", claimer, sessionId, sent ? 1 : 0);
+      }
     } else {
-      sendBusyReply(group_code, claimer, sessionId, REPLY_DENY);
+      bool sent = sendBusyReply(group_code, claimer, sessionId, REPLY_DENY);
+      Serial.printf("[RADIO][BUSY] claim from=%s sid=%s -> DENY (busy with %s) sent=%d\n", claimer, sessionId,
+                    g_receiverBusy.claimerDeviceId, sent ? 1 : 0);
     }
   } else if (type == BUSY_RELEASE) {
     // Only honor a RELEASE that matches the exact session we granted —
@@ -408,13 +427,41 @@ struct PreBuffer {
   uint16_t count = 0;
 };
 constexpr uint16_t kPreBufferMaxFrames = 100;  // ~2s @ 20ms/frame (Phase 4 section 5)
+// Heap safety (hardware: minimum free heap 12184 bytes): the full pre-buffer
+// is 64000 bytes, by far the largest single allocation in the firmware. It
+// is only as large as leaves kPreBufferHeapReserve of internal heap for the
+// network stack, MQTT and LittleFS (and fits the largest free block); below
+// kPreBufferMinFrames it is not allocated at all -- the same outcome as a
+// failed allocation before (the words spoken while negotiating are lost,
+// the call itself goes ahead).
+constexpr size_t kPreBufferHeapReserve = 32 * 1024;
+constexpr uint16_t kPreBufferMinFrames = 10;  // 200 ms
+constexpr uint32_t kHeapCaps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 PreBuffer g_preBuffer;
+
+uint16_t preBufferFramesFor(size_t freeBytes, size_t largestBlock) {
+  constexpr size_t kFrameBytes = RadioAudio::kFrameSamples * sizeof(int16_t);
+  size_t byFree = freeBytes > kPreBufferHeapReserve ? (freeBytes - kPreBufferHeapReserve) / kFrameBytes : 0;
+  size_t byBlock = largestBlock / kFrameBytes;
+  size_t frames = byFree < byBlock ? byFree : byBlock;
+  if (frames > kPreBufferMaxFrames) frames = kPreBufferMaxFrames;
+  return frames < kPreBufferMinFrames ? 0 : static_cast<uint16_t>(frames);
+}
 
 void allocatePreBuffer() {
   if (g_preBuffer.data != nullptr) return;
-  g_preBuffer.data = new (std::nothrow) int16_t[static_cast<size_t>(kPreBufferMaxFrames) * RadioAudio::kFrameSamples];
-  g_preBuffer.capacityFrames = (g_preBuffer.data != nullptr) ? kPreBufferMaxFrames : 0;
+  size_t freeBefore = heap_caps_get_free_size(kHeapCaps);
+  size_t largestBefore = heap_caps_get_largest_free_block(kHeapCaps);
+  uint16_t frames = preBufferFramesFor(freeBefore, largestBefore);
+  g_preBuffer.data =
+      frames > 0 ? new (std::nothrow) int16_t[static_cast<size_t>(frames) * RadioAudio::kFrameSamples] : nullptr;
+  g_preBuffer.capacityFrames = (g_preBuffer.data != nullptr) ? frames : 0;
   g_preBuffer.count = 0;
+  Serial.printf("[HEAP][RADIO] prebuffer frames=%u bytes=%u freeBefore=%u largestBefore=%u minFree=%u\n",
+                static_cast<unsigned>(g_preBuffer.capacityFrames),
+                static_cast<unsigned>(g_preBuffer.capacityFrames * RadioAudio::kFrameSamples * sizeof(int16_t)),
+                static_cast<unsigned>(freeBefore), static_cast<unsigned>(largestBefore),
+                static_cast<unsigned>(heap_caps_get_minimum_free_size(kHeapCaps)));
 }
 void freePreBuffer() {
   delete[] g_preBuffer.data;
@@ -446,26 +493,44 @@ struct PrivateCall {
   uint16_t peerPort = 0;
   uint16_t txSequence = 0;
   bool denied = false;
+  uint8_t claimSends = 0;      // CLAIMs attempted while CLAIMING (diagnostics, failure kind)
+  uint8_t claimSendFails = 0;  // ...of which publishBinary() refused (no connection)
 };
 PrivateCall g_call;
+
+// Radio fix (hardware: holding PTT, "Claiming..." went back to "Ready"): the
+// outcome of the last claim that ended without a GRANT, kept -- unlike
+// g_call, which the timeout resets -- until the PTT is released or a new
+// press starts. g_failedSessionId lets a GRANT/DENY arriving after the
+// timeout be recognized and logged ("late-reply").
+PrivateFailure g_lastFailure = PrivateFailure::NONE;
+char g_failedSessionId[kIdLen] = {0};
+uint32_t g_failedAtMs = 0;
 
 // Sends (or resends) a CLAIM for the current g_call — used for the initial
 // claim, the 250ms/1s retry cadence while CLAIMING, and the 2s keep-alive
 // refresh once active. Always carries g_call's own session_id so replies
 // and TTL tracking stay correlated to this exact call.
-void sendClaim() {
+bool sendClaim() {
   uint8_t payload[1 + kDeviceIdLen + kIdLen];
   size_t len = buildBusyPayload(BUSY_CLAIM, Identity::deviceId(), g_call.session_id, payload, sizeof(payload));
-  if (len == 0) return;
+  if (len == 0) return false;
   uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
   if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_BUSY, static_cast<uint16_t>(len), wireBuf, sizeof(wireBuf))) {
-    return;
+    return false;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
   char topicSuffix[32];
   snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", g_call.peer_device_id);
-  MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
-                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  bool ok = MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
+                                       static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  if (g_call.state == PrivateState::CLAIMING) {
+    g_call.claimSends++;
+    if (!ok) g_call.claimSendFails++;
+  }
+  if (!ok) Serial.printf("[RADIO][CLAIM] publish failed sid=%s state=%u\n", g_call.session_id,
+                         static_cast<unsigned>(g_call.state));
+  return ok;
 }
 
 // Definition of the helper forward-declared alongside resetPrivateCall,
@@ -637,14 +702,27 @@ void handleRadioBusyReplyPacket(const char* group_code, const char* topic, const
                                 size_t payloadLen) {
   (void)group_code;
   (void)topic;
-  if (g_call.state != PrivateState::CLAIMING) return;
   uint8_t type;
   char responder[kDeviceIdLen];
   char sessionId[kIdLen];
   if (!parseReplyPayload(payload, static_cast<uint16_t>(payloadLen), &type, responder, sessionId)) return;
+  if (g_call.state != PrivateState::CLAIMING) {
+    // A reply to the claim that already timed out: logged (it tells a slow
+    // receiver or broker from a lost CLAIM/GRANT), never acted on -- that
+    // session was released when it timed out.
+    if (g_failedSessionId[0] != '\0' && strcmp(sessionId, g_failedSessionId) == 0) {
+      Serial.printf("[RADIO][CLAIM] late-reply type=%s from=%s sid=%s afterTimeoutMs=%lu\n",
+                    type == REPLY_GRANT ? "GRANT" : "DENY", responder, sessionId,
+                    static_cast<unsigned long>(millis() - g_failedAtMs));
+    }
+    return;
+  }
   if (strcmp(responder, g_call.peer_device_id) != 0) return;
   if (strcmp(sessionId, g_call.session_id) != 0) return;  // stale GRANT/DENY for an earlier attempt
 
+  Serial.printf("[RADIO][CLAIM] %s sid=%s afterMs=%lu sends=%u sendFails=%u\n", type == REPLY_GRANT ? "granted" : "denied",
+                sessionId, static_cast<unsigned long>(millis() - g_call.claimFirstSentMs),
+                static_cast<unsigned>(g_call.claimSends), static_cast<unsigned>(g_call.claimSendFails));
   if (type == REPLY_GRANT) {
     beginNegotiation();
   } else if (type == REPLY_DENY) {
@@ -654,34 +732,38 @@ void handleRadioBusyReplyPacket(const char* group_code, const char* topic, const
   }
 }
 
-void publishSessionStart() {
+bool publishSessionStart() {
   uint8_t payload[1 + kIdLen + kDeviceIdLen + kDeviceIdLen + 4 + 2];
   size_t len = buildSessionPayload(SESSION_START, g_call.session_id, Identity::deviceId(), g_call.peer_device_id,
                                    g_call.myIp, g_call.myPort, payload, sizeof(payload));
-  if (len == 0) return;
+  if (len == 0) return false;
   uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
   if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_SESSION, static_cast<uint16_t>(len), wireBuf,
                                  sizeof(wireBuf))) {
-    return;
+    return false;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
-  MqttManager::publishBinary(g_call.group_code, "radio/session", wireBuf,
-                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  bool ok = MqttManager::publishBinary(g_call.group_code, "radio/session", wireBuf,
+                                       static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  if (!ok) Serial.printf("[RADIO][SESSION] START publish failed sid=%s\n", g_call.session_id);
+  return ok;
 }
 
-void publishSessionAck() {
+bool publishSessionAck() {
   uint8_t payload[1 + kIdLen + kDeviceIdLen + kDeviceIdLen + 4 + 2];
   size_t len = buildSessionPayload(SESSION_ACK, g_call.session_id, Identity::deviceId(), g_call.peer_device_id,
                                    g_call.myIp, g_call.myPort, payload, sizeof(payload));
-  if (len == 0) return;
+  if (len == 0) return false;
   uint8_t wireBuf[PacketCodec::kHeaderSize + sizeof(payload)];
   if (!PacketCodec::encodeHeader(PacketCodec::PK_RADIO_SESSION, static_cast<uint16_t>(len), wireBuf,
                                  sizeof(wireBuf))) {
-    return;
+    return false;
   }
   memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
-  MqttManager::publishBinary(g_call.group_code, "radio/session", wireBuf,
-                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  bool ok = MqttManager::publishBinary(g_call.group_code, "radio/session", wireBuf,
+                                       static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+  if (!ok) Serial.printf("[RADIO][SESSION] ACK publish failed sid=%s\n", g_call.session_id);
+  return ok;
 }
 
 void handleRadioSessionPacket(const char* group_code, const char* topic, const uint8_t* payload, size_t payloadLen) {
@@ -908,7 +990,24 @@ void serviceTick() {
 
   if (g_call.state == PrivateState::CLAIMING) {
     if (now - g_call.claimFirstSentMs >= kClaimTotalTimeoutMs) {
-      resetPrivateCall();  // no matching GRANT within 1s total: fail the PTT attempt
+      // No matching GRANT/DENY within 1 s: the attempt fails, visibly
+      // ("No response", or "Send failed" when not one CLAIM could be
+      // published) until the PTT is released. A release cancels CLAIMING
+      // first, so reaching here means the screen saw no release. RELEASE
+      // goes out for this session, so a grant the receiver sends late is
+      // withdrawn instead of holding its channel for the 5 s busy TTL.
+      PrivateFailure f = (g_call.claimSends > 0 && g_call.claimSendFails == g_call.claimSends)
+                             ? PrivateFailure::SEND_FAILED
+                             : PrivateFailure::NO_RESPONSE;
+      Serial.printf("[RADIO][CLAIM] timeout sid=%s peer=%s elapsedMs=%lu sends=%u sendFails=%u result=%s\n",
+                    g_call.session_id, g_call.peer_device_id, static_cast<unsigned long>(now - g_call.claimFirstSentMs),
+                    static_cast<unsigned>(g_call.claimSends), static_cast<unsigned>(g_call.claimSendFails),
+                    f == PrivateFailure::SEND_FAILED ? "send-failed" : "no-response");
+      strncpy(g_failedSessionId, g_call.session_id, sizeof(g_failedSessionId) - 1);
+      g_failedSessionId[sizeof(g_failedSessionId) - 1] = '\0';
+      g_failedAtMs = now;
+      releaseAndResetPrivateCall();
+      g_lastFailure = f;
     } else if (now - g_call.claimLastSentMs >= kClaimRetryIntervalMs) {
       sendClaim();
       g_call.claimLastSentMs = now;
@@ -972,6 +1071,7 @@ StartCallResult startPrivateCall(const char* group_code, const char* recipient_d
   // button; no state changes at all on this path -- CLAIMING is not
   // entered, no claim timer starts, mic capture is not activated.
   if (!MqttManager::isGroupReady(group_code)) return StartCallResult::NOT_READY;
+  g_lastFailure = PrivateFailure::NONE;
   ensureUdpBegun();
   strncpy(g_call.group_code, group_code, sizeof(g_call.group_code) - 1);
   strncpy(g_call.peer_device_id, recipient_device_id, sizeof(g_call.peer_device_id) - 1);
@@ -983,6 +1083,8 @@ StartCallResult startPrivateCall(const char* group_code, const char* recipient_d
   g_call.claimFirstSentMs = now;
   g_call.claimLastSentMs = now;
   setRadioAudioActive(true);
+  Serial.printf("[RADIO][CLAIM] start sid=%s peer=%s group=%s\n", g_call.session_id, g_call.peer_device_id,
+                g_call.group_code);
   sendClaim();
   return StartCallResult::ACCEPTED;
 }
@@ -1003,8 +1105,9 @@ void releaseAndResetPrivateCall() {
         memcpy(wireBuf + PacketCodec::kHeaderSize, payload, len);
         char topicSuffix[32];
         snprintf(topicSuffix, sizeof(topicSuffix), "radio/busy/%s", g_call.peer_device_id);
-        MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
-                                   static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+        bool ok = MqttManager::publishBinary(g_call.group_code, topicSuffix, wireBuf,
+                                             static_cast<uint16_t>(PacketCodec::kHeaderSize + len), false, 0);
+        if (!ok) Serial.printf("[RADIO][CLAIM] RELEASE publish failed sid=%s\n", g_call.session_id);
       }
     }
   }
@@ -1012,6 +1115,7 @@ void releaseAndResetPrivateCall() {
 }
 
 void stopPrivateCall() {
+  g_lastFailure = PrivateFailure::NONE;  // the failed attempt's status ends with the PTT press
   // Callee side: our own PTT press never actually claims anything while a
   // call is active (startPrivateCall no-ops unless state == IDLE), so the
   // matching release must not tear down an incoming call we're receiving.
@@ -1021,6 +1125,7 @@ void stopPrivateCall() {
 }
 
 PrivateState getPrivateState() { return g_call.state; }
+PrivateFailure getPrivateFailure() { return g_lastFailure; }
 bool isPrivateDenied() { return g_call.denied; }
 
 void startBroadcastCall(const char* group_code) {

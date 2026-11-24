@@ -219,6 +219,25 @@ class BoundedWriteClient : public WiFiClient {
     }
     return sent;
   }
+
+  // True when the socket takes a write right now (select() with no wait).
+  // lwIP reports a TCP socket writable only while its send buffer has more
+  // than TCP_SNDLOWAT free (half of TCP_SND_BUF, at least 2 MSS + 1: about
+  // 2.8 KB on the ESP32 default of 5744), so a frame well under that goes
+  // out without waiting. Radio audio uses this to skip a frame instead of
+  // waiting (up to kSendBudgetMs) for buffer space (hardware: "[DIAG][MQTT]
+  // qos0 ... maxMs=288" inside a capture tick).
+  bool writableNow() {
+    int fd = this->fd();
+    if (fd < 0) return false;
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(fd, &set);
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    return select(fd + 1, nullptr, &set, nullptr, &tv) > 0;
+  }
 };
 
 struct Conn;
@@ -291,9 +310,23 @@ uint8_t queueCount() {
   return n;
 }
 
+// Radio audio arrives at up to 50 frames a second per speaker; a main loop
+// held up for a few hundred milliseconds would otherwise let audio fill the
+// whole queue and drop the radio control packets (CLAIM/GRANT/RELEASE/
+// SESSION) and chat behind it. Audio may only use the queue while more than
+// kNonAudioReserve slots are free; stale audio is worthless anyway.
+constexpr uint8_t kNonAudioReserve = 4;
+std::atomic<uint32_t> g_rxAudioDropped(0);  // audio frames refused by that reserve (diagnostics)
+
+bool isAudioTopic(const char* topic) { return topic != nullptr && strstr(topic, "/radio/audio/") != nullptr; }
+
 void onMqttMessage(MQTTClient* client, char topic[], char bytes[], int length) {
   if (client == nullptr || length < 0 || static_cast<size_t>(length) > kMaxStoredPacketSize) return;
   if (queueCount() >= kQueueCapacity) return;  // full: drop (QoS0 traffic may legitimately be dropped)
+  if (isAudioTopic(topic) && queueCount() >= kQueueCapacity - kNonAudioReserve) {
+    g_rxAudioDropped.fetch_add(1);
+    return;
+  }
   const Conn* conn = static_cast<ConnMqttClient*>(client)->owner();  // every client is a ConnMqttClient
 
   // Allocate and copy before touching the ring; a zero-length payload (a
@@ -502,8 +535,14 @@ const TopicSpec* getTopicSpecs() {
     snprintf(busyReplySuffix, sizeof(busyReplySuffix), "radio/busy_reply/%s", dev);
     char raceSuffix[24];
     snprintf(raceSuffix, sizeof(raceSuffix), "r2q/%s", dev);
-    char audioSuffix[24];
-    snprintf(audioSuffix, sizeof(audioSuffix), "radio/audio/%s", dev);  // truncated by 1 byte, reproduced as-is
+    // Radio fix: audioSuffix was 24 bytes, one short for "radio/audio/" plus
+    // the 12-character device id, so the subscription lost the id's last
+    // character and never matched what callers publish to
+    // (radio_transport.cpp sendMqttVoice(): "radio/audio/<full id>", built
+    // in 32 bytes) -- private MQTT-fallback audio was never delivered. The
+    // publish side is unchanged; only the subscription now matches it.
+    char audioSuffix[32];
+    snprintf(audioSuffix, sizeof(audioSuffix), "radio/audio/%s", dev);
 
     snprintf(specs[0].suffix, sizeof(specs[0].suffix), "presence/+");
     specs[0].qos = 1;
@@ -1472,6 +1511,7 @@ struct Qos0Diag {
   int lastFailErr = 0;
   bool lastFailConnectedAfter = false;
   bool notable = false;
+  uint32_t skipped = 0;  // publishBinaryNoWait() frames not sent: socket not writable now, or connection lent
 };
 Qos0Diag g_qos0Diag;
 
@@ -1508,15 +1548,17 @@ void recordQos0Publish(uint32_t elapsedMs, bool result, int lastErr, bool connec
 void flushQos0DiagIfDue(uint32_t nowMs) {
   uint32_t windowElapsedMs = nowMs - g_qos0Diag.windowStartMs;
   if (windowElapsedMs < kQos0DiagWindowMs) return;
-  if (g_qos0Diag.notable) {
+  uint32_t rxAudioDropped = g_rxAudioDropped.exchange(0);
+  if (g_qos0Diag.notable || g_qos0Diag.skipped != 0 || rxAudioDropped != 0) {
     Serial.printf(
         "[DIAG][MQTT] qos0 tMs=%lu windowMs=%lu attempted=%lu succeeded=%lu failed=%lu sumMs=%lu maxMs=%lu "
-        "lastFailErr=%d lastFailConnAfter=%d\n",
+        "lastFailErr=%d lastFailConnAfter=%d skipped=%lu rxAudioDropped=%lu\n",
         static_cast<unsigned long>(nowMs), static_cast<unsigned long>(windowElapsedMs),
         static_cast<unsigned long>(g_qos0Diag.attempted), static_cast<unsigned long>(g_qos0Diag.succeeded),
         static_cast<unsigned long>(g_qos0Diag.failed), static_cast<unsigned long>(g_qos0Diag.elapsedSumMs),
         static_cast<unsigned long>(g_qos0Diag.elapsedMaxMs), g_qos0Diag.lastFailErr,
-        g_qos0Diag.lastFailConnectedAfter ? 1 : 0);
+        g_qos0Diag.lastFailConnectedAfter ? 1 : 0, static_cast<unsigned long>(g_qos0Diag.skipped),
+        static_cast<unsigned long>(rxAudioDropped));
   }
   g_qos0Diag = Qos0Diag{};
   g_qos0Diag.windowStartMs = nowMs;
@@ -1754,6 +1796,17 @@ bool publishRaw(const char* group_code, const char* topic_suffix, const char* pa
 bool publishBinary(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                    bool retained, int qos) {
   GroupClient* gc = findClientSlot(group_code);
+  // Radio fix: a QoS0 publish (radio CLAIM/RELEASE, GRANT/DENY,
+  // SESSION_START/ACK) while the connection is lent to the worker (a Race
+  // heartbeat, a chat send or the Outbox) used to fail at once, unreported
+  // -- a CLAIM or GRANT lost that way leaves a held PTT to time out. It now
+  // joins the loan, in order, behind the publishes already queued (true:
+  // queued). QoS1 keeps failing at once: its callers (Friend game) read
+  // true as "PUBACK received", which a queued publish is not yet. Radio
+  // audio does not come here (publishBinaryNoWait()).
+  if (qos == 0 && gc != nullptr && isLent(*gc)) {
+    return publishBinaryAsync(group_code, topic_suffix, data, len, retained, 0, nullptr) != 0;
+  }
   if (gc == nullptr || gc->conn == nullptr || !gc->conn->mqtt.connected()) return false;
   char topic[80];
   snprintf(topic, sizeof(topic), "morsebuddy/%s/%s", group_code, topic_suffix);
@@ -1790,6 +1843,22 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
   recordQos0Publish(qos0Elapsed, qos0Result, qos0LastErr, qos0ConnectedAfter);
   flushQos0DiagIfDue(static_cast<uint32_t>(millis()));
   return qos0Result;
+}
+
+bool publishBinaryNoWait(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len) {
+  GroupClient* gc = findClientSlot(group_code);
+  if (gc == nullptr) return false;
+  // Lent to the worker, or the socket's send buffer too full to take the
+  // frame now: skip it (a late frame is worse than a missing one; nothing
+  // is buffered, so nothing stale is ever sent later).
+  if (isLent(*gc) || gc->conn == nullptr || !gc->conn->mqtt.connected() || !gc->conn->net.writableNow()) {
+    if (isLent(*gc) || (gc->conn != nullptr && gc->conn->mqtt.connected())) {
+      g_qos0Diag.skipped++;
+      flushQos0DiagIfDue(static_cast<uint32_t>(millis()));
+    }
+    return false;
+  }
+  return publishBinary(group_code, topic_suffix, data, len, false, 0);
 }
 
 }  // namespace MqttManager

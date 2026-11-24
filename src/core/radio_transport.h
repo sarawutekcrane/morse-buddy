@@ -76,6 +76,14 @@ void stopPrivateCall();
 
 PrivateState getPrivateState();
 
+// Why the last private PTT attempt ended without a call, while that PTT is
+// still held (cleared by stopPrivateCall() -- the release -- and by the next
+// startPrivateCall()). NO_RESPONSE: CLAIMs went out, no GRANT/DENY within
+// the 1 s claim window. SEND_FAILED: not one CLAIM could be published.
+// A DENY is reported by isPrivateDenied() instead, as before.
+enum class PrivateFailure : uint8_t { NONE, NO_RESPONSE, SEND_FAILED };
+PrivateFailure getPrivateFailure();
+
 // True immediately after a DENY while PTT is still held (Talk screen shows
 // the no-mic icon for exactly this window per Phase 4 section 2).
 bool isPrivateDenied();

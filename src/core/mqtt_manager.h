@@ -79,9 +79,17 @@ bool publishBinary(const char* group_code, const char* topic_suffix, const uint8
 // queue full, no memory, OTA maintenance) -- nothing is published then and
 // the caller does what it does after a failed publish (nothing waits).
 // While the connection is lent the group still reads as connected/ready;
-// publishBinary() for it returns false at once, publishRaw() joins the loan.
+// publishBinary() for it returns false at once for QoS1, while publishRaw()
+// and a QoS0 publishBinary() (radio control packets) join the loan.
 using PublishDoneFn = void (*)(uint32_t ticket, bool ok);
 uint32_t publishBinaryAsync(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len,
                             bool retained, int qos, PublishDoneFn done);
+
+// Radio audio frames (QoS0, not retained): published only if it costs no
+// waiting -- the group's own connection, not lent to the worker, its socket
+// writable right now. Otherwise the frame is skipped (false; counted in the
+// "[DIAG][MQTT] qos0 ... skipped=" line) instead of holding the main loop
+// for TCP buffer space. Never queues, so a late frame is never sent.
+bool publishBinaryNoWait(const char* group_code, const char* topic_suffix, const uint8_t* data, uint16_t len);
 
 }  // namespace MqttManager

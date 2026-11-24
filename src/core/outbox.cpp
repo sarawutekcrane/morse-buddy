@@ -326,7 +326,12 @@ void passStep() {
   p.busyMs += millis() - stepStart;
 }
 
-void serviceInit() { MessageStore::setOnPendingWrittenCallback(onPendingWritten); }
+void serviceInit() {
+  MessageStore::setOnPendingWrittenCallback(onPendingWritten);
+  // Boot time, not the first send (hardware: "freeSpace=364 ms" inside
+  // "[PERF][CHAT_SEND] total=513 ms").
+  MessageStore::primeFreeSpaceEstimate();
+}
 
 void serviceTick() {
   uint32_t now = millis();

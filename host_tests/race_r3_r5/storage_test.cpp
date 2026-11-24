@@ -340,6 +340,7 @@ static void powerOn() {  // first boot of a test: empty NVS unless the test wrot
   resetNotifyVolatile();
   resetOutboxVolatile();
   MessageStore::notifyExternalStorageMutationAttempted();
+  Outbox::serviceInit();  // as setup()'s initRegisteredServices(): takes the boot free-space figure
   Menu::init(); g_stackSize = 1; Menu::consumeJustEntered();
   Notifications::serviceInit();
   Menu::pushScreen(menuStub);

@@ -283,9 +283,14 @@ muts = [
  (RR, "rows: a row shown earlier in the visit is dropped on a presence change", "    if (findKey(before->keys[i]) >= 0) continue;\n    if (r.count >= kMaxRows) break;", "    if (true) continue;\n    if (r.count >= kMaxRows) break;"),
  (RR, "rows: identical presence still redraws", "  delete before;\n  return !same;", "  delete before;\n  return true;"),
  (RR, "rows: the selected identity is not kept across a presence rebuild", "  int sel = findKey(selectedKey);\n  return static_cast<uint8_t>(sel >= 0 ? sel : 0);\n}\n\n// Entry", "  return 0;\n}\n\n// Entry"),
+ # ---- free-space estimate (device A on 827cd27: freeSpace=364 ms on the first send after boot) ----
+ (OB, "storage: no boot free-space measure (the first append pays the walk again)", "  MessageStore::primeFreeSpaceEstimate();\n", ""),
+ (SM, "storage: the estimate is trusted past 32 appends", "  if (g_freeEstimateValid && g_appendsSinceExact < kMaxAppendsWithoutExact &&\n", "  if (g_freeEstimateValid &&\n"),
+ (SM, "storage: the boot figure is trusted below the watermark", "  g_freeEstimateValid = free >= kLowWatermark;", "  g_freeEstimateValid = true;"),
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
+ "storage: the boot figure is trusted below the watermark": "redundant guard: ensureFreeSpaceForWrite() only uses the estimate while it is at least watermark + margin + one append (172 KB), so a boot figure under the 96 KB watermark is never used either way; the flag only states it (SL4c pins the exact low-space behaviour)",
  "a full list may reuse an ordinary row": "added rows all lie after the ordinary ones (inserted before Everyone) and the scan runs from the end; it only reaches an ordinary row if no added row is reusable, and one always is when all 66 rows are used (25 added rows, at most 23 unread, at most one selected): the bound states the rule, the count guarantees it",
  "entry: the unread rows wait for the next pass": "the per-pass refresh adds exactly the same rows on the next pass (about 20 ms later), inserting them before Everyone and keeping the selected identity, so input in the entry pass reaches the same row either way; the entry call only avoids a one-frame gap",
  "the feed ignores the open chat (replaces the index it draws from)": "a current open-chat index is still protected by the cache check, and a stale one is reloaded by the chat's per-pass re-sync (CE23) anyway: the flag only saves that reload (cost, not correctness)",
