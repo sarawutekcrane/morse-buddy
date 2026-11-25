@@ -382,8 +382,7 @@ bool parseStrictColorIndex(const char* s, uint8_t* outIndex) {
 
 bool g_ownRadioAvailable = true;
 
-void buildPayload(char* out, size_t outSize, const char* status) {
-  uint32_t ts = WifiManager::getUnixTime();
+void buildPayloadAt(char* out, size_t outSize, const char* status, uint32_t ts) {
   // Hardware Fix #4.3a issue 2: same fallback policy as
   // MessageStore::buildSenderPrefix()/Presence::resolveDisplayName()'s self
   // branch -- a never-configured device broadcasts its own device id in
@@ -399,6 +398,10 @@ void buildPayload(char* out, size_t outSize, const char* status) {
   // when no color is configured yet -- never a fabricated color.
   snprintf(out, outSize, "MBP1|%s|%s|%s|%d|%lu|%u", Identity::deviceId(), name, status, g_ownRadioAvailable ? 1 : 0,
            static_cast<unsigned long>(ts), Settings::getMyColorIndex());
+}
+
+void buildPayload(char* out, size_t outSize, const char* status) {
+  buildPayloadAt(out, outSize, status, WifiManager::getUnixTime());
 }
 
 // Fix Phase 1B: returns MqttManager::publishRaw()'s own result directly --
@@ -560,6 +563,10 @@ void handleIncoming(const char* group_code, const char* payload, uint16_t len) {
 }
 
 uint32_t changeGeneration() { return g_changeGeneration; }
+
+void buildOwnPresencePayload(char* out, size_t outSize, const char* status, uint32_t unixTs) {
+  buildPayloadAt(out, outSize, status, unixTs);
+}
 
 bool publishOnline(const char* group_code) { return publishStatus(group_code, "ONLINE"); }
 // Result intentionally ignored: publishOffline() stays void -- no caller

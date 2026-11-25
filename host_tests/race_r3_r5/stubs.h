@@ -32,6 +32,19 @@ struct Pub { std::string topic; size_t len; bool result; bool guardRejected; std
 extern std::vector<Pub> pubs;
 extern std::function<void()> duringPublish;  // runs INSIDE a connected publishBinary() call
 extern std::function<void(const Pub&)> onPublished;  // after a successful publishBinary() (e.g. a broker model)
+// MqttManager::publishBinaryAsync(): off by default (returns 0, so callers
+// take their synchronous path exactly as before). When on, a connected
+// call records the publish and returns a ticket; completeAsync() delivers
+// the oldest pending result the way MqttManager's service tick does.
+extern bool asyncPublish;
+struct AsyncPub { uint32_t ticket; std::string group, topic; std::vector<uint8_t> data; void (*done)(uint32_t, bool); bool retained; int qos; };
+extern std::deque<AsyncPub> asyncPending;
+void completeAsync(bool ok);
+extern int asyncChainCap;  // per-group publishes the asyncPublish model accepts at once (MqttManager: 4)
+// Default model's results, delivered by deliverDeferred() (T_tickServices() calls it first).
+struct DeferredResult { uint32_t ticket; bool ok; void (*done)(uint32_t, bool); };
+extern std::vector<DeferredResult> deferredResults;
+void deliverDeferred();
 // storage
 struct Rec { MessageRef ref; MessageStore::StoredHeader hdr; PacketCodec::MessageEnvelope env;
              std::vector<uint8_t> wire, typePayload, local; };

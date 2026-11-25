@@ -411,12 +411,53 @@ bool findGlobalOldestNonPending(MessageRef* outRef) {
   return found;
 }
 
+// Free-space estimate (hardware, device A: "[PERF][STORE_APPEND] total=563 ms
+// freeSpace=390 ms"). LittleFS.usedBytes() walks every block of the
+// filesystem (lfs_fs_size), and it ran before every append -- sent and
+// received alike. Now the exact figure is taken once, then each append
+// subtracts a conservative cost from it (a record is at most
+// kMaxRecordFileSize = 1 KB, so one 4 KB data block, plus room for its
+// temporary copy and a new directory); removals are not credited. The
+// exact walk runs again when the estimate gets near the watermark, after
+// kMaxAppendsWithoutExact appends and after any change made outside the
+// store. Below the watermark everything works on exact figures, exactly as
+// before. (Only this file writes to LittleFS.)
+//
+// Hardware, device A on 827cd27: "[PERF][STORE_APPEND] total=494 ms
+// freeSpace=364 ms" on a send. The estimate started out invalid, so the
+// first append after boot paid the walk: primeFreeSpaceEstimate() now takes
+// the first exact figure during boot (setup(), before the UI runs). The
+// former 10-minute age limit is gone: it made the first append after any
+// 10 quiet minutes pay the walk again, yet time cannot make a conservative
+// estimate optimistic -- only appends (bounded by kMaxAppendsWithoutExact)
+// and writes outside the store (which invalidate it) change free space.
+constexpr size_t kLowWatermark = 96 * 1024;
+constexpr size_t kTargetFree = 128 * 1024;
+constexpr size_t kEstimatedAppendCost = 12 * 1024;
+constexpr size_t kEstimateMargin = 64 * 1024;
+constexpr uint8_t kMaxAppendsWithoutExact = 32;
+bool g_freeEstimateValid = false;
+size_t g_freeEstimate = 0;
+uint8_t g_appendsSinceExact = 0;
+
+void invalidateFreeSpaceEstimate() { g_freeEstimateValid = false; }
+
 void ensureFreeSpaceForWrite() {
-  constexpr size_t kLowWatermark = 96 * 1024;
-  constexpr size_t kTargetFree = 128 * 1024;
+  if (g_freeEstimateValid && g_appendsSinceExact < kMaxAppendsWithoutExact &&
+      g_freeEstimate >= kLowWatermark + kEstimateMargin + kEstimatedAppendCost) {
+    g_freeEstimate -= kEstimatedAppendCost;
+    g_appendsSinceExact++;
+    return;
+  }
 
   size_t free = LittleFS.totalBytes() - LittleFS.usedBytes();
-  if (free >= kLowWatermark) return;
+  if (free >= kLowWatermark) {
+    g_freeEstimateValid = true;
+    g_freeEstimate = free >= kEstimatedAppendCost ? free - kEstimatedAppendCost : 0;
+    g_appendsSinceExact = 1;
+    return;
+  }
+  g_freeEstimateValid = false;  // low: exact figures on every append until there is room again
 
   for (int iter = 0; iter < 300; iter++) {
     free = LittleFS.totalBytes() - LittleFS.usedBytes();
@@ -527,6 +568,7 @@ uint32_t getOutboxChangeGeneration() { return g_outboxChangeGeneration; }
 // remove pending records, and this file has no way to know from here
 // whether it did.
 void notifyExternalStorageMutationAttempted() {
+  invalidateFreeSpaceEstimate();         // files changed outside the store: measure again
   bumpGenerationFor(nullptr, nullptr);  // which conversations: unknown -- every cached index goes stale
   g_outboxChangeGeneration++;
   dropAllCachedRecords();
@@ -535,9 +577,23 @@ void notifyExternalStorageMutationAttempted() {
 
 void setOnPendingWrittenCallback(PendingWrittenCallback cb) { g_onPendingWritten = cb; }
 
+void primeFreeSpaceEstimate() {
+  uint32_t start = millis();
+  size_t free = LittleFS.totalBytes() - LittleFS.usedBytes();
+  // Below the watermark the estimate stays invalid: appends then work on
+  // exact figures (and evict) exactly as ensureFreeSpaceForWrite() decides.
+  g_freeEstimateValid = free >= kLowWatermark;
+  g_freeEstimate = free;
+  g_appendsSinceExact = 0;
+  Serial.printf("[PERF][STORE] boot free-space measure %lu ms free=%lu valid=%d\n",
+                static_cast<unsigned long>(millis() - start), static_cast<unsigned long>(free),
+                g_freeEstimateValid ? 1 : 0);
+}
+
 uint32_t getExternalMutationCount() { return g_externalMutations; }
 
 void init() {
+  invalidateFreeSpaceEstimate();
   ensureDirExists("/messages");
   // Dedup rings are rebuilt lazily per-conversation on first touch
   // (getOrCreateRing), which already satisfies "rebuild from newest stored
@@ -599,8 +655,14 @@ namespace {
 uint8_t g_rewriteScratch[kMaxRecordFileSize];
 size_t g_rewriteLen = 0;
 
+// targetIsNew: the record's sequence was just allocated (max + 1) by
+// appendStoredMessage(), so no file exists at the target. The remove() before
+// the rename is then skipped: on the ESP32 it opens the missing path to test
+// it (a directory lookup) and logs "... does not exists or is directory" --
+// that hardware log line was this, not a storage defect.
 bool atomicRewriteFile(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
-                       uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen) {
+                       uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen,
+                       bool targetIsNew = false) {
   // Hardware Diagnostic #4.9h: the generation is bumped by atomicRewrite(),
   // unconditionally, before any of this function's own filesystem work --
   // see g_storageChangeGeneration's own comment above for why this must
@@ -672,7 +734,7 @@ bool atomicRewriteFile(const MessageRef& ref, const StoredHeader& header, const 
     return false;
   }
 
-  LittleFS.remove(finalPath);  // overwrite semantics: clear any prior file at the target first
+  if (!targetIsNew) LittleFS.remove(finalPath);  // overwrite semantics: clear any prior file at the target first
   // Hardware Diagnostic #4.9u: captured rather than returned directly, so
   // a non-pending write that fails here (the one remaining failure exit)
   // can still bump the Outbox generation before returning -- success
@@ -684,16 +746,28 @@ bool atomicRewriteFile(const MessageRef& ref, const StoredHeader& header, const 
 }
 }  // namespace
 
+namespace {
+bool atomicRewriteImpl(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
+                       uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen, bool targetIsNew);
+}  // namespace
+
 bool atomicRewrite(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
                    uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen) {
+  return atomicRewriteImpl(ref, header, wirePacket, wirePacketLen, localPayload, localPayloadLen, false);
+}
+
+namespace {
+bool atomicRewriteImpl(const MessageRef& ref, const StoredHeader& header, const uint8_t* wirePacket,
+                       uint16_t wirePacketLen, const uint8_t* localPayload, uint16_t localPayloadLen, bool targetIsNew) {
   bumpGenerationFor(ref.group_code, ref.contact_key);
-  bool ok = atomicRewriteFile(ref, header, wirePacket, wirePacketLen, localPayload, localPayloadLen);
+  bool ok = atomicRewriteFile(ref, header, wirePacket, wirePacketLen, localPayload, localPayloadLen, targetIsNew);
   afterRecordWrite(ref, header, ok);
   // A record written pending (an offline send, a retried one): Outbox
   // queues it directly instead of scanning storage for it.
   if (ok && (header.flags & FLAG_PENDING_OUTBOX) && g_onPendingWritten != nullptr) g_onPendingWritten(ref);
   return ok;
 }
+}  // namespace
 
 namespace {
 // Hardware Diagnostic #4.9q: called only from appendStoredMessage()'s
@@ -981,7 +1055,8 @@ bool appendStoredMessage(const char* group_code, const char* contact_key, Direct
   uint32_t prepareElapsed = millis() - prepareStart;
 
   uint32_t rewriteStart = millis();
-  bool rewriteOk = atomicRewrite(ref, hdr, wirePacket, wirePacketLen, localPayload, localPayloadLen);
+  bool rewriteOk = atomicRewriteImpl(ref, hdr, wirePacket, wirePacketLen, localPayload, localPayloadLen,
+                                     /*targetIsNew=*/true);
   uint32_t rewriteElapsed = millis() - rewriteStart;
   if (!rewriteOk) {
     uint32_t totalElapsed = millis() - totalStart;

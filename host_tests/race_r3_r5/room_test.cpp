@@ -15,6 +15,14 @@
 #include <string>
 #include <vector>
 #include "race_fixture.h"
+// race_stubs.cpp: what race.cpp hands the radio transport (Gate 3, room voice)
+extern int g_roomFramesPlayed;
+extern RadioAudio::CaptureFrameFn g_roomCapture;
+extern RadioTransport::AudioScopeHandlerFn g_roomAudioHandler;
+struct RoomAudioPub { std::string group, topic; int scope; std::string key; uint16_t seq; size_t samples; };
+extern std::vector<RoomAudioPub> g_roomAudioPubs;
+extern bool g_roomAudioAccept;
+extern bool g_roomRadioAudioActive;
 
 static int g_fail = 0, g_pass = 0;
 static std::string g_test;
@@ -1105,6 +1113,119 @@ static void heapDiagnostics() {
   g_hostSerialSink = nullptr;
 }
 
+// Hardware, both devices on b573ec7: "[PERF][MQTT] publish group=... qos=1
+// retained=1 bytes=130 1506 ms result=0 lastError=-9" about every 60 s --
+// the coordinator's retained room state (78 fixed + 23 per member bytes:
+// a two-member room is 124, plus the 6-byte header) on its 60 s heartbeat,
+// waiting for the PUBACK on the main loop. Now every Race publish goes to
+// the MQTT worker (publishBinaryAsync), in order.
+static void heartbeatOffLoop() {
+  g_test = "RH1 the coordinator's 60 s heartbeat: a retained QoS1 130-byte state for a two-member room, queued to the MQTT worker -- never a publishBinary() on the main loop";
+  ownerLobby(1);
+  T::pubs.clear();
+  T::asyncPublish = true;
+  std::vector<T::AsyncPub> started;
+  uint32_t end = T::now + 125000;
+  while (static_cast<int32_t>(T::now - end) < 0) {
+    T::now += 95; loopOnce();
+    while (!T::asyncPending.empty()) { started.push_back(T::asyncPending.front()); T::completeAsync(true); }
+  }
+  std::string self = std::string("r2/") + Identity::deviceId();
+  int heartbeats = 0, other = 0;
+  for (auto& p : started) {
+    if (p.topic == self && p.retained && p.qos == 1 && p.data.size() == 130) heartbeats++;
+    else other++;
+  }
+  int syncState = 0;
+  for (auto& p : T::pubs) syncState += p.topic.rfind("r2/", 0) == 0 ? 1 : 0;
+  CHECK(heartbeats >= 2 && heartbeats <= 3 && syncState == 0,
+        "heartbeats over 125 s: %d (want 2), other async %d, synchronous state publishes %d", heartbeats, other, syncState);
+  g_test = "RH2 a heartbeat that cannot be queued (connection busy) is simply skipped: the room stays intact, the next one goes out";
+  T::asyncChainCap = 0;  // nothing can be queued
+  settleMs(61000);
+  T::asyncChainCap = 4;
+  started.clear();
+  end = T::now + 61000;
+  while (static_cast<int32_t>(T::now - end) < 0) {
+    T::now += 95; loopOnce();
+    while (!T::asyncPending.empty()) { started.push_back(T::asyncPending.front()); T::completeAsync(true); }
+  }
+  heartbeats = 0;
+  for (auto& p : started) heartbeats += (p.topic == self && p.retained) ? 1 : 0;
+  CHECK(heartbeats >= 1 && g_engine->isCoordinator() && devRoom() && RaceProtocol::activeCount(*devRoom()) == 2,
+        "after a refused heartbeat: %d sent, coordinator %d", heartbeats, g_engine->isCoordinator());
+  T::asyncPublish = false;
+}
+
+
+// Gate 3: Race Room voice end to end on race.cpp's side (the radio transport
+// side -- framing, topic, the receiver's dispatch by scope -- is radio_test
+// RA1-RA3). Before this, race_stubs swallowed both directions untested.
+static void roomVoice() {
+  g_test = "RV1 Room PTT: each mic frame goes to publishAudioPacket(group, radio/audio/broadcast, AUDIO_RACE_ROOM, room key, seq++); a frame the transport skips (congestion) is not retried and the sequence moves on (no backlog after recovery); the release stops capture";
+  ownerLobby(1);
+  g_roomAudioPubs.clear();
+  g_roomAudioAccept = true;
+  press(InputEventType::DOT_PRESS_START, T::now); tick();
+  bool capturing = g_roomPttActive && g_roomCapture != nullptr;
+  int16_t frame[RadioAudio::kFrameSamples] = {0};
+  for (int i = 0; i < 3; i++) if (g_roomCapture) g_roomCapture(frame, RadioAudio::kFrameSamples);
+  g_roomAudioAccept = false;  // congested: three frames skipped by the transport
+  for (int i = 0; i < 3; i++) if (g_roomCapture) g_roomCapture(frame, RadioAudio::kFrameSamples);
+  g_roomAudioAccept = true;
+  for (int i = 0; i < 2; i++) if (g_roomCapture) g_roomCapture(frame, RadioAudio::kFrameSamples);
+  char key[kIdLen];
+  bool haveKey = roomVoiceKey(key, sizeof(key));
+  bool framing = g_roomAudioPubs.size() == 8;
+  for (size_t i = 0; framing && i < g_roomAudioPubs.size(); i++) {
+    const RoomAudioPub& p = g_roomAudioPubs[i];
+    framing = p.group == "GROUP1" && p.topic == "radio/audio/broadcast" && p.scope == RadioTransport::AUDIO_RACE_ROOM &&
+              p.key == key && p.seq == i && p.samples == RadioAudio::kFrameSamples;
+  }
+  press(InputEventType::DOT_RELEASE, T::now); tick();
+  CHECK(capturing && haveKey && framing && !g_roomPttActive && g_roomCapture == nullptr,
+        "capturing %d; key %d; 8 frames, topic/scope/key/seq 0..7 (one attempt each, none resent) %d (%zu); stopped %d", capturing,
+        haveKey, framing, g_roomAudioPubs.size(), !g_roomPttActive && g_roomCapture == nullptr);
+
+  g_test = "RV2 Room voice received: played only on the Room screen and only for this room's key (another room's or no room: silent)";
+  int16_t pcm[RadioAudio::kFrameSamples] = {0};
+  int before = g_roomFramesPlayed;
+  bool registered = g_roomAudioHandler != nullptr;
+  if (registered) g_roomAudioHandler("GROUP1", kPeerIds[0], key, 1, pcm, RadioAudio::kFrameSamples);
+  int played = g_roomFramesPlayed - before;
+  if (registered) g_roomAudioHandler("GROUP1", kPeerIds[0], "OTHERROOM0000000", 2, pcm, RadioAudio::kFrameSamples);
+  int otherRoom = g_roomFramesPlayed - before - played;
+  backP(); tick(2);  // leave the Room screen (Back: navigation only)
+  int beforeOff = g_roomFramesPlayed;
+  if (registered) g_roomAudioHandler("GROUP1", kPeerIds[0], key, 3, pcm, RadioAudio::kFrameSamples);
+  CHECK(registered && played == 1 && otherRoom == 0 && g_roomFramesPlayed == beforeOff && top() != screenRaceRoom,
+        "handler registered %d; this room played %d (want 1); other room %d (want 0); off-screen %d (want 0); left the Room %d",
+        registered, played, otherRoom, g_roomFramesPlayed - beforeOff, top() != screenRaceRoom);
+
+  g_test = "RV3 PTT sleep safety: Room PTT marks the voice session live (setRadioAudioActive(true), which holds deep sleep off) only while transmitting; the release, Back out of the Room and a room that stops being shown all end it";
+  ownerLobby(1);
+  press(InputEventType::DOT_PRESS_START, T::now); tick();
+  bool liveOnPress = g_roomRadioAudioActive && g_roomPttActive;
+  T::now += 10 * 60000; tick();  // held 10 minutes: still live (no maximum duration)
+  bool liveHeld = g_roomRadioAudioActive && g_roomPttActive;
+  press(InputEventType::DOT_RELEASE, T::now); tick();
+  bool endedOnRelease = !g_roomRadioAudioActive && !g_roomPttActive;
+  press(InputEventType::DOT_PRESS_START, T::now); tick();
+  bool liveAgain = g_roomRadioAudioActive;
+  backP(); tick(2);  // Back out of the Room while transmitting
+  bool endedOnBack = !g_roomRadioAudioActive && !g_roomPttActive && top() != screenRaceRoom;
+  for (int i = 0; i < 10; i++) {  // rapid cycles
+    ownerLobby(1);
+    press(InputEventType::DOT_PRESS_START, T::now); tick();
+    press(InputEventType::DOT_RELEASE, T::now); tick();
+  }
+  bool rapidClean = !g_roomRadioAudioActive;
+  CHECK(liveOnPress && liveHeld && endedOnRelease && liveAgain && endedOnBack && rapidClean,
+        "live on press %d, after 10 min held %d; ended on release %d; ended on Back %d; clean after rapid cycles %d", liveOnPress,
+        liveHeld, endedOnRelease, endedOnBack, rapidClean);
+
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IOLBF, 0);  // FAIL lines survive a later crash
   Identity::init();  // the actual identity.cpp: device id from the (fake) MAC
@@ -1118,6 +1239,8 @@ int main() {
   historyBinding();
   scorePlacement();
   heapDiagnostics();
+  heartbeatOffLoop();
+  roomVoice();
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
 }

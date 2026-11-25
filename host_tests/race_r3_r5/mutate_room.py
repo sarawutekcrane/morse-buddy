@@ -7,6 +7,9 @@ import os, subprocess, sys, shutil
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
 UI, PR, ID = "race.cpp", "race_protocol.cpp", "identity.cpp"
 muts = [
+ # ---- race.cpp: Race publishes on the MQTT worker (hardware: the 60 s heartbeat's 1506 ms PUBACK timeout on the main loop) ----
+ (UI, "Race publishes back on the main loop (synchronous PUBACK wait)", "  return MqttManager::publishBinaryAsync(group, suffix, wire, static_cast<uint16_t>(PacketCodec::kHeaderSize + len),\n                                         retained, 1, nullptr) != 0;", "  return MqttManager::publishBinary(group, suffix, wire, static_cast<uint16_t>(PacketCodec::kHeaderSize + len),\n                                    retained, 1);"),
+ (UI, "Race state published without retain", "                                         retained, 1, nullptr) != 0;", "                                         false, 1, nullptr) != 0;"),
  # ---- race.cpp: R1 / R2 (carried over) ----
  (UI, "R2 removed: Start Round stays on the Room", "    if (isRoundActive()) {  // the coordinator's own Start", "    if (false) {  // the coordinator's own Start"),
  (UI, "R2: navigation not reported (rest of batch handled by the Room)", "      enterGuessScreen();\n      return true;\n    }\n    return false;  // a member's START", "      enterGuessScreen();\n      return false;\n    }\n    return false;  // a member's START"),

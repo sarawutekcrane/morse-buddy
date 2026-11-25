@@ -2,10 +2,13 @@
 
 #include <Adafruit_ST7789.h>
 #include <Arduino.h>
+#include <esp_heap_caps.h>
 #include <LittleFS.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <string.h>
+
+#include <atomic>
 
 #if __has_include("sdkconfig.h")
 #include "sdkconfig.h"
@@ -649,6 +652,15 @@ void selectRestartDevice() { ESP.restart(); }
 // Settings > System > Firmware Update > Check for Update.
 // =============================================================================
 bool g_backgroundCheckDone = false;
+// The background check runs on its own one-shot task (hardware, device A:
+// "[PERF] services=1081 ms" around "[ota] background check: firmware is up
+// to date" -- the HTTPS fetch, TLS handshake included, ran inside the main
+// loop's service tick). fetchManifest() uses only its own locals (its
+// WiFiClientSecure/HTTPClient, a heap buffer) and logs; nothing else is
+// shared. A manual check waits while this runs, so two TLS sessions never
+// overlap (and an install, which starts from a manual check, never meets it).
+std::atomic<bool> g_backgroundCheckRunning(false);
+constexpr uint32_t kBackgroundCheckStackBytes = 8192;  // the Arduino loop task's own size, which ran this before
 
 void runBackgroundAvailabilityCheck() {
   if (OtaConfig::isPlaceholderServer()) {
@@ -671,11 +683,42 @@ void runBackgroundAvailabilityCheck() {
 
 void serviceInit() { runPostOtaValidation(); }
 
+void backgroundCheckTask(void*) {
+  // Gate 4 (heap root cause, hardware: min_since_boot=12184 already at ~60 s,
+  // before any radio call): the TLS handshake of this fetch is the largest
+  // transient allocation in that window and overlaps the MQTT setup. Logged
+  // around it so the hardware log shows whether the boot minimum falls here
+  // (diagnostic only; locals, no static RAM).
+  uint32_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t minBefore = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  uint32_t startMs = millis();
+  runBackgroundAvailabilityCheck();
+  Serial.printf(
+      "[HEAP][OTA] background check uptime_s=%lu ms=%lu before: free=%lu min_since_boot=%lu largest=%lu "
+      "after: free=%lu min_since_boot=%lu largest=%lu\n",
+      static_cast<unsigned long>(startMs / 1000), static_cast<unsigned long>(millis() - startMs),
+      static_cast<unsigned long>(freeBefore), static_cast<unsigned long>(minBefore),
+      static_cast<unsigned long>(largestBefore),
+      static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+      static_cast<unsigned long>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+      static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+  g_backgroundCheckRunning.store(false);
+  vTaskDelete(nullptr);
+}
+
 void serviceTick() {
   if (g_backgroundCheckDone) return;
   if (!WifiManager::isConnected() || !WifiManager::isNtpSynced()) return;
   g_backgroundCheckDone = true;
-  runBackgroundAvailabilityCheck();
+  g_backgroundCheckRunning.store(true);
+  // Core 0 (with the network stack), below the Wi-Fi tasks: the TLS work
+  // does not take CPU time from the Arduino loop on core 1.
+  if (xTaskCreatePinnedToCore(backgroundCheckTask, "ota_bgcheck", kBackgroundCheckStackBytes, nullptr, 1, nullptr, 0) !=
+      pdPASS) {
+    g_backgroundCheckRunning.store(false);
+    Serial.println("[ota] background check skipped: could not start its task");
+  }
 }
 
 struct Registrar {
@@ -771,6 +814,7 @@ void screenFirmwareUpdate() {
         g_checkingDrawn = true;
         return;
       }
+      if (g_backgroundCheckRunning.load()) return;  // the boot-time background check finishes first
       g_checkingDrawn = false;
       runCheckForUpdateBlocking();
       return;

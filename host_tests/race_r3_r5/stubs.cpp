@@ -28,6 +28,22 @@ std::vector<Draw> screen, drawLog;
 std::deque<InputEvent> inputQ, raw;
 int updateCount = 0;
 bool connected = true;
+bool asyncPublish = false;
+std::deque<AsyncPub> asyncPending;
+int asyncChainCap = 4;
+std::vector<DeferredResult> deferredResults;
+void completeAsync(bool ok) {
+  if (asyncPending.empty()) { seq.push_back("async:none"); return; }
+  AsyncPub p = asyncPending.front();
+  asyncPending.pop_front();
+  seq.push_back(ok ? "async:true" : "async:false");
+  if (p.done != nullptr) p.done(p.ticket, ok);
+}
+void deliverDeferred() {
+  std::vector<DeferredResult> d;
+  d.swap(deferredResults);
+  for (auto& r : d) r.done(r.ticket, r.ok);
+}
 std::deque<bool> publishScript;
 std::vector<Pub> pubs;
 std::function<void()> duringPublish;
@@ -53,7 +69,7 @@ unsigned listings = 0;
 std::function<void(const std::string&)> onDraw;
 void reset() {
   screen.clear(); drawLog.clear(); inputQ.clear(); raw.clear(); updateCount = 0; inputCap = 0; inputDropped = 0; deviceQueue().clear();
-  connected = true; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
+  connected = true; asyncPublish = false; asyncPending.clear(); deferredResults.clear(); asyncChainCap = 4; publishScript.clear(); pubs.clear(); duringPublish = nullptr; onPublished = nullptr;
   store.clear(); appendResult = updateResult = true; appendCalls = updateCalls = 0; duringUpdate = nullptr;
   seq.clear(); notifications = 0; indexLoads.clear(); onDraw = nullptr; unixTime = 1700000000u; realGlyphs = false; realWrap = false; groupConfigured = true; groupCount = 1; scanUnreliable = false; listUnreliable = false; listings = 0;
 }
@@ -185,6 +201,8 @@ bool isBack(const InputEvent& e) { return e.type == InputEventType::ENCODER_LONG
 }  // namespace Input
 
 namespace MqttManager {
+uint32_t publishBinaryAsync(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained,
+                            int qos, PublishDoneFn done);
 bool isGroupConnected(const char*) { return T::connected; }
 bool isAnyGroupConnected() { return T::connected; }
 bool isGroupReady(const char*) { return T::connected; }
@@ -192,8 +210,15 @@ bool publishRaw(const char*, const char* topic, const char* payload, bool retain
   T::seq.push_back(std::string("publishRaw ") + topic + " " + payload + (retained ? " R" : " -") + std::to_string(qos));
   return T::connected;
 }
-bool publishBinary(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained, int) {
+bool publishBinary(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained, int qos) {
   std::vector<uint8_t> bytes(data, data + len);
+  // MqttManager: a QoS0 publishBinary() while the connection is lent joins
+  // the loan (true: queued, not yet published).
+  if (qos == 0 && T::asyncPublish && T::connected) {
+    bool lent = false;
+    for (auto& p : T::asyncPending) lent = lent || p.group == group;
+    if (lent) return publishBinaryAsync(group, topic, data, len, retained, 0, nullptr) != 0;
+  }
   if (!T::connected) { T::pubs.push_back({topic, len, false, true, group, bytes, retained}); T::seq.push_back("publish:rejected"); return false; }
   if (T::duringPublish) T::duringPublish();
   bool r = true;
@@ -203,6 +228,41 @@ bool publishBinary(const char* group, const char* topic, const uint8_t* data, ui
   if (!r) T::connected = false;  // MQTT 2.5.2: a failed publish closes the connection
   if (r && T::onPublished) { T::Pub p = T::pubs.back(); T::onPublished(p); }
   return r;
+}
+uint32_t publishBinaryAsync(const char* group, const char* topic, const uint8_t* data, uint16_t len, bool retained,
+                            int qos, PublishDoneFn done) {
+  static uint32_t nextTicket = 1;
+  if (!T::connected) return 0;  // not queued: no connection
+  if (!T::asyncPublish) {
+    // Default model: published at once (exactly as publishBinary(), so the
+    // suites written for the synchronous path see the same publishes); the
+    // result is delivered on the next service round (T_tickServices()), as
+    // MqttManager's service tick does -- never from inside this call.
+    bool r = publishBinary(group, topic, data, len, retained, qos);
+    if (done != nullptr) T::deferredResults.push_back({nextTicket, r, done});
+    return nextTicket++;
+  }
+  int sameGroup = 0;
+  for (auto& p : T::asyncPending) sameGroup += p.group == group ? 1 : 0;
+  if (sameGroup >= T::asyncChainCap) return 0;  // the group's chain is full
+  T::asyncPending.push_back({nextTicket, group, topic, std::vector<uint8_t>(data, data + len), done, retained, qos});
+  T::seq.push_back("async:start");
+  return nextTicket++;
+}
+// Radio control packets: QUEUED while the asyncPublish model has the
+// group's connection lent (a publish of that group still pending), else the
+// synchronous publishBinary() path (PUBLISHED / FAILED).
+ControlOutcome publishControl(const char* group, const char* topic, const uint8_t* data, uint16_t len,
+                              PublishDoneFn done, uint32_t* ticketOut) {
+  if (ticketOut != nullptr) *ticketOut = 0;
+  bool lent = false;
+  for (auto& p : T::asyncPending) lent = lent || p.group == group;
+  if (T::asyncPublish && lent) {
+    uint32_t t = publishBinaryAsync(group, topic, data, len, false, 0, done);
+    if (ticketOut != nullptr) *ticketOut = t;
+    return t != 0 ? ControlOutcome::QUEUED : ControlOutcome::FAILED;
+  }
+  return publishBinary(group, topic, data, len, false, 0) ? ControlOutcome::PUBLISHED : ControlOutcome::FAILED;
 }
 }  // namespace MqttManager
 
@@ -297,6 +357,16 @@ uint16_t findMessagesByPredicate(const char* g, const char* c, MessagePredicate 
 uint16_t findMessagesByPredicate(const char*, const char*, MessagePredicate, void*, MessageRef*, uint16_t, bool* rel) {
   if (rel) *rel = true; return 0;
 }
+// (notify_test.cpp defines its own, with REAL_NOTIFICATIONS.) Chat sends
+// clear the pending flag with it once their publish succeeds.
+bool updateLocalFlags(const MessageRef& ref, uint16_t setMask, uint16_t clearMask) {
+  T::updateCalls++;
+  if (!T::updateResult) return false;
+  T::Rec* r = find(ref);
+  if (!r) return false;
+  r->hdr.flags = static_cast<uint16_t>((r->hdr.flags | setMask) & ~clearMask);
+  return true;
+}
 #endif
 uint16_t listMessageSequences(const char* g, const char* c, uint32_t* out, uint16_t cap, bool* reliable, bool* truncated) {
   if (reliable) *reliable = !T::listUnreliable && !T::scanUnreliable;
@@ -381,6 +451,12 @@ FamilyGroup getGroup(uint8_t i) {
   return g;
 }
 uint8_t getGroupCount() { return T::groupCount; }
+bool isGroupCodeUnique(const char* code) {
+  if (!T::groupConfigured) return true;
+  if (strcmp(code, "GROUP1") == 0) return T::groupCount < 1;
+  if (strcmp(code, "GROUP2") == 0) return T::groupCount < 2;
+  return true;
+}
 const char* getMyName() { return ""; }
 uint8_t getMyColorIndex() { return IdentityColor::kInvalidColor; }
 TypingDisplay getTypingDisplay() { return TypingDisplay::LETTERS_ONLY; }
@@ -425,6 +501,7 @@ bool claimBackgroundStorageStep(BackgroundReader who) {
 // A new round of service ticks (as tickRegisteredServices() begins one).
 void T_beginServiceRound() { g_stepWaitingLast = g_stepWaiting; g_stepWaiting = 0; g_stepClaimed = false; }
 void T_tickServices() {
+  T::deliverDeferred();  // MqttManager's service tick delivers publish results
   T_beginServiceRound();
   for (int i = 0; i < g_serviceCount; i++) if (g_services[i].tick) g_services[i].tick();
 }
@@ -435,5 +512,7 @@ static EmptyLineActionFn g_emptyLine;
 void registerEmptyLineAction(EmptyLineActionFn fn) { g_emptyLine = fn; }
 void invokeEmptyLineAction(uint8_t m, const char* g, const char* c) { if (g_emptyLine) g_emptyLine(m, g, c); }
 bool registerGameSubModeHandler(uint8_t, ScreenHandlerFn) { return true; }
-bool registerNetworkPacketHandler(uint8_t, NetworkPacketHandlerFn) { return true; }
+static NetworkPacketHandlerFn g_packetHandlers[kMaxPacketKinds];
+bool registerNetworkPacketHandler(uint8_t kind, NetworkPacketHandlerFn fn) { if (kind < kMaxPacketKinds) g_packetHandlers[kind] = fn; return true; }
+NetworkPacketHandlerFn T_packetHandler(uint8_t kind) { return kind < kMaxPacketKinds ? g_packetHandlers[kind] : nullptr; }
 void setPendingRadioIntent(const char*, const char*) { T::seq.push_back("radioIntent"); }

@@ -19,6 +19,8 @@ struct FsStats {
   uint64_t fileOpens = 0, dirOpens = 0, openFails = 0, dirEntries = 0;
   uint64_t reads = 0, readBytes = 0, writes = 0, writeBytes = 0;
   uint64_t removes = 0, renames = 0, mkdirs = 0, exists = 0;
+  uint64_t removesMissing = 0;  // remove() of a path that does not exist (the ESP32 VFS logs an error for it)
+  uint64_t usedBytesCalls = 0;  // usedBytes(): a walk of the whole filesystem on the device
   void clear() { *this = FsStats(); }
   uint64_t fileWrites() const { return writes; }
 };
@@ -66,6 +68,7 @@ struct HostLittleFS {
   bool rename(const char* from, const char* to);
   size_t totalBytes() { return 1441792; }
   size_t usedBytes();
+  size_t fakeUsedBytes = 200000;  // what usedBytes() reports (tests set it for low-space cases)
   void wipe();  // removes everything under root (test setup only)
 };
 extern HostLittleFS LittleFS;

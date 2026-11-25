@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "core/chat_send.h"
 #include "core/display.h"
 #include "core/held_input.h"
 #include "core/history_dates.h"
@@ -1019,15 +1020,27 @@ SendResult resultForCompletion(bool online, bool published, bool storeOk) {
   return {online ? "Unconfirmed; not saved" : "Offline; not saved", false};  // 2B-1: draft kept
 }
 
+// Completion of an asynchronous send (core/chat_send.h), on the main task.
+// The record was stored before the publish started, so nothing is restored
+// or stored here: the outcome status is shown (only in the conversation it
+// belongs to) and the history redrawn (its pending mark may have cleared).
+void onAsyncSendDone(const ChatSend::Outcome& o) {
+  markIndexDirty();
+  if (strcmp(o.ref.group_code, g_selectedGroupCode) != 0 || strcmp(o.ref.contact_key, g_selectedContactKey) != 0) return;
+  if (o.groupGone) return;  // its conversation went with the group
+  setSendStatus(resultForCompletion(true, o.published, true));
+}
+
 // Hardware Diagnostic #4.9n: instrumentation only -- every existing call,
 // its arguments, and its position in the sequence below are unchanged;
 // this only wraps each already-existing phase in millis()-delta timing
 // and captures already-existing return values (publishBinary()'s bool,
 // and appendStoredMessage()'s bool) into the exit=completion log line.
 //
-// Phase 2B-1: storeOk now also gates clearDraft() in exactly one case --
-// when BOTH the publish and the store report failure, the finalized draft
-// is kept (see the comment at that call below). markIndexDirty() stays
+// Store-first (core/chat_send.h): the record is stored, pending, before any
+// publish; the draft is cleared only once it is stored. Only when the store
+// fails does the synchronous publish path run, with the Phase 2B-1 rule
+// (the draft kept unless the publish succeeded). markIndexDirty() stays
 // unconditional after any storage attempt.
 //
 // Each phase's window is disjoint from the others (sequential, never
@@ -1050,6 +1063,7 @@ SendResult resultForCompletion(bool online, bool published, bool storeOk) {
 SendResult sendComposedMessage() {
   constexpr uint32_t kUnmeasuredMs = 0xFFFFFFFFu;
   uint32_t totalStart = millis();
+
 
   uint32_t identityStart = millis();
   char messageId[PacketCodec::kMessageIdLen];
@@ -1119,6 +1133,49 @@ SendResult sendComposedMessage() {
   bool online = MqttManager::isGroupConnected(g_selectedGroupCode);
   uint32_t topicElapsed = millis() - topicStart;
 
+  // Store first, durably, flagged pending (core/chat_send.h): from here the
+  // message survives a reset, and the Outbox publishes it if nothing else
+  // does. Then, on a connected group, the publish starts on the MQTT worker
+  // (its result: onAsyncSendDone()). Nothing on this path waits for the
+  // network.
+  uint32_t storeStart = millis();
+  MessageRef outRef;
+  bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
+                                                   MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX,
+                                                   env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), nullptr, 0,
+                                                   &outRef);
+  uint32_t storeElapsed = millis() - storeStart;
+  if (storeOk) {
+    uint32_t clearStart = millis();
+    clearDraft();  // the stored record holds the message now
+    markIndexDirty();
+    uint32_t clearElapsed = millis() - clearStart;
+    uint32_t startBegin = millis();
+    bool started = online && ChatSend::start(outRef, topicSuffix, wireBuf, static_cast<uint16_t>(wireLen),
+                                             onAsyncSendDone);
+    uint32_t startElapsed = millis() - startBegin;
+    uint32_t totalElapsed = millis() - totalStart;
+    Serial.printf(
+        "[PERF][CHAT_SEND] total=%lu ms exit=stored identity=%lu ms envelope=%lu ms topic=%lu ms store=%lu ms "
+        "clear=%lu ms start=%lu ms online=%d asyncStarted=%d\n",
+        static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(identityElapsed),
+        static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(topicElapsed),
+        static_cast<unsigned long>(storeElapsed), static_cast<unsigned long>(clearElapsed),
+        static_cast<unsigned long>(startElapsed), online ? 1 : 0, started ? 1 : 0);
+    if (started) return {"Sending...", false};
+    // Connected, but the publish could not be queued now (the group's
+    // publish chain full, maintenance): the Outbox sends it shortly.
+    return {online ? "Queued" : "Offline: queued", true};
+  }
+
+  // The store failed (a storage fault): nothing durable holds this message,
+  // so the original synchronous path decides, as before -- publish, and keep
+  // the finalized draft unless the publish succeeded (Phase 2B-1). This is
+  // the one chat path that can still wait for a PUBACK on the main loop
+  // (bounded: kMqttPublishTimeoutMsExperiment), and only after a failed
+  // store. published=false is no proof the broker received nothing: a
+  // re-send of the kept draft is a NEW message (new message_id) and may
+  // duplicate one that got through.
   uint32_t publishElapsed = kUnmeasuredMs;
   bool published = false;
   if (online) {
@@ -1127,44 +1184,19 @@ SendResult sendComposedMessage() {
                                            false, 1);
     publishElapsed = millis() - publishStart;
   }
-  uint16_t flags = published ? 0 : MessageStore::FLAG_PENDING_OUTBOX;
-
-  uint32_t storeStart = millis();
-  MessageRef outRef;
-  // Hardware Diagnostic #4.9n: storeOk captures appendStoredMessage()'s
-  // existing return value -- for the log line below and (Phase 2B-1) for
-  // the draft-retention decision after it.
-  bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
-                                                   MessageStore::Direction::SENT, flags, env.timestamp, wireBuf,
-                                                   static_cast<uint16_t>(wireLen), nullptr, 0, &outRef);
-  uint32_t storeElapsed = millis() - storeStart;
-
   uint32_t clearStart = millis();
-  // Phase 2B-1: if neither the publish nor the store succeeded, nothing
-  // holds this message (no local record, no Outbox entry to retry), so
-  // clearing the draft would lose it -- keep the finalized draft instead.
-  // Every other outcome clears exactly as before, including publish=true/
-  // store=false (not in local history, but the broker accepted it).
-  //
-  // published=false only means this device got no confirmation (not
-  // connected, or no PUBACK within the timeout) -- NOT proof that the
-  // broker/recipient received nothing. If the user re-sends the kept
-  // draft, it goes out as a NEW message (new message_id) and may
-  // duplicate one that did get through; this is not exactly-once. No
-  // automatic retry happens here.
-  if (published || storeOk) clearDraft();
+  if (published) clearDraft();
   markIndexDirty();  // a storage attempt was made either way (eviction may have run)
   uint32_t clearElapsed = millis() - clearStart;
-
   uint32_t totalElapsed = millis() - totalStart;
   Serial.printf(
-      "[PERF][CHAT_SEND] total=%lu ms exit=completion identity=%lu ms envelope=%lu ms topic=%lu ms publish=%lu ms "
-      "store=%lu ms clear=%lu ms publishAttempted=%d publishOk=%d storeAttempted=1 storeOk=%d\n",
+      "[PERF][CHAT_SEND] total=%lu ms exit=store-failed identity=%lu ms envelope=%lu ms topic=%lu ms store=%lu ms "
+      "publish=%lu ms clear=%lu ms publishAttempted=%d publishOk=%d storeOk=0\n",
       static_cast<unsigned long>(totalElapsed), static_cast<unsigned long>(identityElapsed),
       static_cast<unsigned long>(envelopeElapsed), static_cast<unsigned long>(topicElapsed),
-      static_cast<unsigned long>(publishElapsed), static_cast<unsigned long>(storeElapsed),
-      static_cast<unsigned long>(clearElapsed), online ? 1 : 0, published ? 1 : 0, storeOk ? 1 : 0);
-  return resultForCompletion(online, published, storeOk);
+      static_cast<unsigned long>(storeElapsed), static_cast<unsigned long>(publishElapsed),
+      static_cast<unsigned long>(clearElapsed), online ? 1 : 0, published ? 1 : 0);
+  return resultForCompletion(online, published, false);
 }
 
 void finalizeComposeChar() {

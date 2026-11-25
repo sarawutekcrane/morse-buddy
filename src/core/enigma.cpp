@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "core/chat_send.h"
 #include "core/display.h"
 #include "core/enigma_crypto.h"
 #include "core/enigma_keys.h"
@@ -1500,6 +1501,16 @@ SendResult resultForCompletion(bool online, bool published, bool storeOk) {
   return {online ? "Unconfirmed; not saved" : "Offline; not saved", false};  // 2B-1: draft kept
 }
 
+// Completion of an asynchronous send (core/chat_send.h): same as
+// text_message.cpp's onAsyncSendDone() -- the record was stored before the
+// publish started; only the status (in its own conversation) and a redraw.
+void onAsyncSendDone(const ChatSend::Outcome& o) {
+  markIndexDirty();
+  if (strcmp(o.ref.group_code, g_selectedGroupCode) != 0 || strcmp(o.ref.contact_key, g_selectedContactKey) != 0) return;
+  if (o.groupGone) return;
+  setSendStatus(resultForCompletion(true, o.published, true));
+}
+
 SendResult sendEnigmaMessage() {
   char escaped[EnigmaCrypto::kMaxEscapedLen + 1];
   if (!EnigmaCrypto::normalizeAndEscape(g_composeText, escaped, sizeof(escaped))) {
@@ -1556,32 +1567,41 @@ SendResult sendEnigmaMessage() {
     snprintf(topicSuffix, sizeof(topicSuffix), "msg/%s", g_selectedContactKey);
   }
 
-  bool online = MqttManager::isGroupConnected(g_selectedGroupCode);
-  bool published = false;
-  if (online) {
-    published = MqttManager::publishBinary(g_selectedGroupCode, topicSuffix, wireBuf,
-                                           static_cast<uint16_t>(wireLen), false, 1);
-  }
-  uint16_t flags = published ? 0 : MessageStore::FLAG_PENDING_OUTBOX;
-
   char normalizedPlaintext[EnigmaCrypto::kMaxEscapedLen + 1];
   EnigmaCrypto::reverseEscape(escaped, normalizedPlaintext, sizeof(normalizedPlaintext));
   uint8_t localPayload[280];
   size_t localLen = encodeLocalPayload(LOCK_UNLOCKED, normalizedPlaintext, localPayload, sizeof(localPayload));
 
+  bool online = MqttManager::isGroupConnected(g_selectedGroupCode);
+  // Store first, then publish asynchronously: the same rules as
+  // text_message.cpp's sendComposedMessage() (core/chat_send.h), with this
+  // record's local payload.
   MessageRef outRef;
   bool storeOk = MessageStore::appendStoredMessage(g_selectedGroupCode, g_selectedContactKey,
-                                                   MessageStore::Direction::SENT, flags, env.timestamp, wireBuf,
-                                                   static_cast<uint16_t>(wireLen), localPayload, localLen, &outRef);
-
-  // Phase 2B-1: same draft-retention rule and caveats as text_message.cpp's
-  // sendComposedMessage() -- keep the finalized draft only when BOTH the
-  // publish and the store failed (nothing else holds the message). A
-  // user re-send of that draft is a NEW message and may duplicate one the
-  // broker did receive without confirming; no automatic retry here.
-  if (published || storeOk) clearDraft();
+                                                   MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX,
+                                                   env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), localPayload,
+                                                   localLen, &outRef);
+  if (storeOk) {
+    clearDraft();
+    markIndexDirty();
+    if (online && ChatSend::start(outRef, topicSuffix, wireBuf, static_cast<uint16_t>(wireLen), onAsyncSendDone)) {
+      return {"Sending...", false};
+    }
+    return {online ? "Queued" : "Offline: queued", true};
+  }
+  // The store failed: the synchronous path decides, with the Phase 2B-1
+  // draft-retention rule and caveats of text_message.cpp's
+  // sendComposedMessage() (the draft kept unless the publish succeeded; a
+  // user re-send is a NEW message and may duplicate one the broker did
+  // receive without confirming).
+  bool published = false;
+  if (online) {
+    published = MqttManager::publishBinary(g_selectedGroupCode, topicSuffix, wireBuf,
+                                           static_cast<uint16_t>(wireLen), false, 1);
+  }
+  if (published) clearDraft();
   markIndexDirty();  // a storage attempt was made either way (eviction may have run)
-  return resultForCompletion(online, published, storeOk);
+  return resultForCompletion(online, published, false);
 }
 
 void finalizeComposeChar() {
@@ -2364,6 +2384,24 @@ bool refsEqual(const MessageRef& a, const MessageRef& b) {
          a.sequence == b.sequence;
 }
 
+// Gate 6 (owner-approved): a message whose validated embedded sender key has
+// no rotors AND no plugboard pairs went through no substitution at all --
+// the Enigma stage is the identity. Such a message is presented as plain
+// text everywhere: readable (decrypted with that key, then reverseEscape()
+// once), no padlock, and no key editor / Reveal (nothing to unlock). The
+// effective presentation is derived from the embedded key on every
+// render/event, so existing records (received LOCK_BLACK, sent
+// LOCK_UNLOCKED) need no migration; the stored ciphertext, key, local
+// lock byte, message id and wire bytes are untouched.
+bool isZeroKeyMessage(const StoredMessageView& msg) {
+  char ciphertext[EnigmaCrypto::kMaxEscapedLen + 1];
+  uint32_t fp, gen;
+  EnigmaKeyConfig embedded;
+  return EnigmaKeys::decodeEnigmaPayload(msg.typePayload, msg.typePayloadLen, ciphertext, sizeof(ciphertext), &fp,
+                                         &gen, &embedded) &&
+         embedded.rotor_count == 0 && embedded.plugboard_pair_count == 0;
+}
+
 void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t outBufferSize) {
   char ciphertext[EnigmaCrypto::kMaxEscapedLen + 1];
   uint32_t fp, gen;
@@ -2371,6 +2409,17 @@ void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t o
   if (!EnigmaKeys::decodeEnigmaPayload(msg.typePayload, msg.typePayloadLen, ciphertext, sizeof(ciphertext), &fp,
                                        &gen, &embedded)) {
     snprintf(outBuffer, outBufferSize, "?");
+    return;
+  }
+
+  // Gate 6: zero key -> plain text in every state, the DOT hold included
+  // (the hold shows the same readable text, never "[locked]").
+  if (embedded.rotor_count == 0 && embedded.plugboard_pair_count == 0) {
+    char decrypted[EnigmaCrypto::kMaxEscapedLen + 1];
+    EnigmaCrypto::run(ciphertext, decrypted, sizeof(decrypted), embedded);
+    char readable[EnigmaCrypto::kMaxEscapedLen + 1];
+    EnigmaCrypto::reverseEscape(decrypted, readable, sizeof(readable));
+    snprintf(outBuffer, outBufferSize, "%s", readable);
     return;
   }
 
@@ -2396,10 +2445,15 @@ void renderEnigmaMessage(const StoredMessageView& msg, char* outBuffer, size_t o
     snprintf(outBuffer, outBufferSize, "%s", cachedText);
     return;
   }
+  // A key with rotors, or with plugboard pairs only, keeps showing the
+  // ciphertext until decoded: its XQ/XX are ordinary ciphertext letters
+  // until decrypted with the right key (then reverseEscape() once, in
+  // attemptReceiveKey()).
   snprintf(outBuffer, outBufferSize, "%s", ciphertext);
 }
 
 MessageIconKind enigmaMessageIcon(const StoredMessageView& msg) {
+  if (isZeroKeyMessage(msg)) return MessageIconKind::NONE;  // Gate 6: nothing locked, no padlock
   uint8_t lockState;
   char cachedText[251];
   decodeLocalPayload(msg.localPayload, msg.localPayloadLen, &lockState, cachedText, sizeof(cachedText));
@@ -2421,6 +2475,9 @@ void onEnigmaMessageEvent(const MessageRef& ref, MessageEventType eventType) {
 
   StoredMessageView view;
   if (!MessageStore::loadMessage(ref, &view)) return;
+  // Gate 6: a zero-key message has nothing to unlock -- Encoder short and
+  // the combined Reveal gesture do nothing, as on an unlocked message.
+  if (isZeroKeyMessage(view)) return;
   uint8_t lockState;
   char cachedText[251];
   decodeLocalPayload(view.localPayload, view.localPayloadLen, &lockState, cachedText, sizeof(cachedText));

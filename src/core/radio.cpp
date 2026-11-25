@@ -223,8 +223,20 @@ void screenTalk() {
         RadioTransport::startBroadcastCall(g_selectedGroupCode);
       } else {
         g_lastPrivateStartResult = RadioTransport::startPrivateCall(g_selectedGroupCode, g_selectedContactKey);
+        Serial.printf("[RADIO][PTT] press atMs=%lu start=%u\n", static_cast<unsigned long>(e.eventMs),
+                      static_cast<unsigned>(g_lastPrivateStartResult));
       }
     } else if (e.type == InputEventType::DOT_RELEASE) {
+      // Radio fix diagnostics: the physical release (debounced edge time and
+      // held duration from the input sampler), with the call state it ends --
+      // tells a real release from a claim timeout ("[RADIO][CLAIM] timeout"
+      // is logged before any release when the claim failed while held).
+      if (!isEveryone) {
+        Serial.printf("[RADIO][PTT] release atMs=%lu heldMs=%lu state=%u failure=%u\n",
+                      static_cast<unsigned long>(e.eventMs), static_cast<unsigned long>(e.durationMs),
+                      static_cast<unsigned>(RadioTransport::getPrivateState()),
+                      static_cast<unsigned>(RadioTransport::getPrivateFailure()));
+      }
       if (isEveryone) {
         RadioTransport::stopBroadcastCall();
       } else {
@@ -249,6 +261,15 @@ void screenTalk() {
     if (RadioTransport::isBroadcasting()) status = "Talking...";
   } else if (RadioTransport::isPrivateDenied()) {
     status = "BUSY (no mic)";
+  } else if (RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::NO_RESPONSE) {
+    // Radio fix: a claim that got no GRANT/DENY in time is shown as such
+    // until the PTT is released, instead of falling back to "Ready" while
+    // the button is still held.
+    status = "No response";
+  } else if (RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::SEND_FAILED) {
+    status = "Send failed";
+  } else if (RadioTransport::getPrivateFailure() == RadioTransport::PrivateFailure::SEND_TIMEOUT) {
+    status = "Send timeout";
   } else if (RadioTransport::getPrivateState() == RadioTransport::PrivateState::IDLE &&
              g_lastPrivateStartResult != RadioTransport::StartCallResult::ACCEPTED) {
     // Fix Phase 1C: still IDLE means nothing has happened since the last

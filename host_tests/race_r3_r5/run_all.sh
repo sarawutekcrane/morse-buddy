@@ -6,7 +6,7 @@
 # HOST ONLY -- not firmware, ESP32 timing/memory, flash/NVS hardware, broker
 # or multi-device radio validation.
 # Usage: ./run_all.sh from this directory (REPO defaults to the repository root).
-# SKIP_MUTATIONS=1 skips step 7 (both mutation scripts); SOAK_SEEDS=n widens the randomized soak (default 20).
+# SKIP_MUTATIONS=1 skips step 7 (all three mutation scripts); SOAK_SEEDS=n widens the randomized soak (default 20).
 #
 # Any compiler failure, test failure (non-zero exit) or unexplained mutation
 # survivor fails this script: every compile and run is checked explicitly.
@@ -22,10 +22,10 @@ FNOTE="$R/number_guessing.cpp $R/packet_codec.cpp $R/morse.cpp $R/enigma_crypto.
 UI="$H/stubs.cpp $H/race_stubs.cpp $R/identity.cpp $R/number_guessing.cpp $R/packet_codec.cpp $R/presence.cpp $R/race_protocol.cpp $R/crc32.cpp"
 UIFLAGS="-DREAL_IDENTITY -I $H -I $H/fake_sys -I $H/fake -I $REPO/src"
 OUT=$H/out; rm -rf "$OUT"; mkdir -p "$OUT/base/core"
-CHANGED="race.cpp race_protocol.cpp identity.cpp storage_init.cpp mqtt_manager.cpp notifications.cpp text_message.cpp enigma.cpp"
+CHANGED="race.cpp race_protocol.cpp identity.cpp storage_init.cpp mqtt_manager.cpp notifications.cpp text_message.cpp enigma.cpp presence.cpp"
 FAILED=0
 fail() { echo "!! FAILED: $*"; FAILED=1; }
-for f in race.cpp identity.cpp identity.h storage_init.cpp storage_init.h mqtt_manager.cpp packet_codec.h notifications.cpp notifications.h text_message.cpp enigma.cpp; do
+for f in race.cpp identity.cpp identity.h storage_init.cpp storage_init.h mqtt_manager.cpp mqtt_manager.h packet_codec.h notifications.cpp notifications.h text_message.cpp enigma.cpp presence.cpp presence.h; do
   git -C "$REPO" show $BASE:src/core/$f > "$OUT/base/core/$f"; done
 echo "== toolchain: $($CXX --version | head -1)"
 echo "== repo HEAD: $(git -C "$REPO" rev-parse HEAD)  (working tree: $(git -C "$REPO" status --porcelain | tr '\n' ' '))"
@@ -68,6 +68,24 @@ build stt -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -DREAL_MESSAGE_ST
   st=0; "$OUT/stt" "$FSROOT/t" > "$OUT/stt.txt" 2>&1 || st=$?
   grep -E "FAIL|passed" "$OUT/stt.txt" | sed 's/^/   /' || true
   [ $st -eq 0 ] || fail "stt exited with status $st"; }
+echo "== 4d. MQTT connection worker (mqtt_manager.cpp: setup/cleanup off the main loop, ownership hand-over, lifecycle): ACTUAL mqtt_manager.cpp + crc32.cpp + packet_codec.cpp against a scripted broker (fake_net/)"
+MQ="-I $H/fake_net -I $H/fake -I $REPO/src $H/mqtt_test.cpp $R/crc32.cpp $R/packet_codec.cpp -lpthread"
+build mqm -std=gnu++17 $SAN -Wall -Wextra $MQ && {
+  st=0; "$OUT/mqm" manual > "$OUT/mqm.txt" 2>&1 || st=$?
+  grep -E "FAIL|passed|MEASURE|runtime error|ERROR" "$OUT/mqm.txt" | sed 's/^/   manual (ASan+UBSan): /' || true
+  [ $st -eq 0 ] || fail "mqtt_test manual exited with status $st"; }
+build mqt -std=gnu++17 $SAN -Wall -Wextra $MQ && {
+  st=0; "$OUT/mqt" threads 300 > "$OUT/mqt.txt" 2>&1 || st=$?
+  grep -E "FAIL|passed|MEASURE|runtime error|ERROR" "$OUT/mqt.txt" | sed 's/^/   threads (ASan+UBSan): /' || true
+  [ $st -eq 0 ] || fail "mqtt_test threads exited with status $st"; }
+build mqtsan -std=gnu++17 -g -O1 -fsanitize=thread -Wall -Wextra $MQ && {
+  st=0; "$OUT/mqtsan" threads 300 > "$OUT/mqtsan.txt" 2>&1 || st=$?
+  grep -E "FAIL|passed|WARNING: ThreadSanitizer" "$OUT/mqtsan.txt" | sort | uniq -c | sed 's/^/   threads (TSan): /' || true
+  [ $st -eq 0 ] || fail "mqtt_test threads under TSan exited with status $st"; }
+echo "== 4e. Private radio PTT and radio MQTT paths (hardware: 'Claiming...' back to 'Ready' while held; QoS0 audio 288 ms; Gate 1: CLAIM queued behind worker publishes vs the claim window; Gate 3: framing/dispatch of the three audio paths): ACTUAL radio.cpp + radio_transport.cpp + menu.cpp; the peer and the MQTT worker chain modeled"
+build radt -std=gnu++17 $SAN -Wall -Wextra -I "$H" -I "$H/fake_sleep" -I "$H/fake_radio" -I "$H/fake" -I "$REPO/src" "$H/radio_test.cpp" "$H/stubs.cpp" "$R/packet_codec.cpp" "$R/presence.cpp" "$R/crc32.cpp" "$R/morse.cpp" && run radt
+echo "== 4f. Enigma message display (zero key: readable, no padlock, no key editor/Reveal (Gate 6); rotor/plugboard ciphertext and lock workflow untouched, XQ/XX collisions, real decode round trips): ACTUAL enigma.cpp + enigma_crypto.cpp + enigma_keys.cpp"
+build ent -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -I "$H" -I "$H/fake" -I "$REPO/src" "$H/enigma_test.cpp" "$H/stubs.cpp" "$R/menu.cpp" "$R/notifications.cpp" "$R/text_message.cpp" "$R/number_guessing.cpp" "$R/packet_codec.cpp" "$R/morse.cpp" "$R/enigma_crypto.cpp" "$R/enigma_keys.cpp" "$R/crc32.cpp" "$R/presence.cpp" && run ent
 W=$(cat "$OUT"/*.warnings.txt | grep -E '(race|race_protocol|identity|number_guessing|number_guessing_friend)\.(cpp|h):[0-9]+:[0-9]+: warning' | sed 's|.*/src/core/||' | sort -u | tr '\n' ' ' || true)
 echo "   warnings in changed/related files (all builds): ${W:-none}"
 
@@ -79,7 +97,8 @@ for std in gnu++11 gnu++17; do
     for f in $CHANGED; do
       if [ $tree = base ]; then [ $f = race_protocol.cpp ] && continue; I="-I $OUT/base"; P="$OUT/base/core"; else I=""; P="$R"; fi
       log="$OUT/syntax_${std}_${tree}_${f}.txt"
-      if ! $CXX -std=$std -fsyntax-only -Wall -Wextra -I "$H/fake_sys" -I "$H/fake" $I -I "$REPO/src" "$P/$f" > "$log" 2>&1; then
+      NET=""; [ $f = mqtt_manager.cpp ] && NET="-I $H/fake_net"  # FreeRTOS/lwIP/MQTT surface for the worker
+      if ! $CXX -std=$std -fsyntax-only -Wall -Wextra $NET -I "$H/fake_sys" -I "$H/fake" $I -I "$REPO/src" "$P/$f" > "$log" 2>&1; then
         fail "syntax $std $tree $f"; sed 's/^/   /' "$log" | head -10
       fi
       c=$(grep -cE '(race|race_protocol|identity|storage_init|mqtt_manager|notifications|text_message|enigma)\.(cpp|h):[0-9]+:[0-9]+: warning' "$log" || true)
@@ -88,6 +107,22 @@ for std in gnu++11 gnu++17; do
     done
     echo "   $std $tree: compiled, $n warnings"
   done
+done
+
+echo "== 5b. C++11 / C++17 compile of the other files this round changes (candidate only; no baseline copy in this bundle)"
+for std in gnu++11 gnu++17; do
+  n=0
+  for f in radio_transport.cpp radio.cpp storage_messages.cpp outbox.cpp sleep.cpp sound_facade.cpp; do
+    log="$OUT/syntax5b_${std}_${f}.txt"
+    INC="-I $H/fake_radio -I $H/fake_sys"; case $f in storage_messages.cpp|outbox.cpp) INC="-I $H/fake_fs -I $H";; sleep.cpp) INC="-I $H/fake_sleep";; esac
+    if ! $CXX -std=$std -fsyntax-only -Wall -Wextra $INC -I "$H/fake" -I "$REPO/src" "$R/$f" > "$log" 2>&1; then
+      fail "syntax $std $f"; sed 's/^/   /' "$log" | head -10
+    fi
+    c=$(grep -cE "$f:[0-9]+:[0-9]+: warning" "$log" || true)
+    [ "$c" -gt 0 ] && sed 's/^/   /' "$log" | grep warning | head -5
+    n=$((n + c))
+  done
+  echo "   $std: compiled, $n warnings"
 done
 
 echo "== 6. Sizes: encoded by the ACTUAL codec (step 1 E16, step 2 U14) and the RAM of the engine on this host"
@@ -108,6 +143,10 @@ else
   python3 "$H/mutate_room.py" || fail "mutations (unexplained survivor or build error)"
   echo "== 7b. Targeted mutations of notifications.cpp, text_message.cpp, enigma.cpp and storage_messages.cpp (each must be caught by notify_test or storage_test)"
   python3 "$H/mutate_notify.py" || fail "notification mutations (survivor or build error)"
+  echo "== 7c. Targeted mutations of mqtt_manager.cpp's connection worker (each must be caught by mqtt_test; locking mutants under TSan)"
+  python3 "$H/mutate_mqtt.py" || fail "MQTT worker mutations (survivor or build error)"
+  echo "== 7d. Targeted mutations of the radio fix (radio_transport.cpp, radio.cpp: radio_test) and the Enigma zero-key display (enigma.cpp: enigma_test)"
+  python3 "$H/mutate_radio.py" || fail "radio/Enigma mutations (survivor or build error)"
 fi
 
 if [ $FAILED -ne 0 ]; then echo "== RESULT: FAILED"; exit 1; fi

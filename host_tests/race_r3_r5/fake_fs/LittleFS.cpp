@@ -117,6 +117,7 @@ bool HostLittleFS::remove(const char* path) {
   g_fs.removes++;
   if (failRemove && failRemove(path)) return false;
   std::error_code ec;
+  if (!fs::exists(hostPath(path), ec)) g_fs.removesMissing++;
   return fs::remove(hostPath(path), ec);
 }
 bool HostLittleFS::rmdir(const char* path) { return remove(path); }
@@ -127,9 +128,12 @@ bool HostLittleFS::rename(const char* from, const char* to) {
   fs::rename(hostPath(from), hostPath(to), ec);
   return !ec;
 }
-// Not counted, and fixed: the low-space eviction path is not what these suites
-// measure, and walking every file on each append would make large histories slow.
-size_t HostLittleFS::usedBytes() { return 200000; }
+// Counted (on the device it walks every block); the figure is set by the test,
+// not computed (walking every file on each append would make large histories slow).
+size_t HostLittleFS::usedBytes() {
+  g_fs.usedBytesCalls++;
+  return fakeUsedBytes;
+}
 void HostLittleFS::wipe() {
   std::error_code ec;
   fs::remove_all(root, ec);

@@ -7,6 +7,7 @@
 import os, subprocess, sys, shutil, tempfile
 H = os.path.dirname(os.path.abspath(__file__)); REPO = os.environ.get("REPO", os.path.normpath(os.path.join(H, "..", ".."))); R = REPO + "/src/core"
 RR = "recipient_rows.h"
+CS = "chat_send.h"
 NT, TX, EN, SM, OB, IQ, HD, MN = "notifications.cpp", "text_message.cpp", "enigma.cpp", "storage_messages.cpp", "outbox.cpp", "input_queue.h", "history_dates.h", "menu.cpp"
 muts = [
  # ---- categories ----
@@ -57,14 +58,14 @@ muts = [
  # ---- round 9: every unread conversation has a recipient row ----
  (NT, "the unread-contact walk ignores the group", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;", "    if (summaryShows(s, badgeMask)) return s.contact_key;"),
  (NT, "the unread-contact walk ignores the category", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, badgeMask)) return s.contact_key;", "    if (strcmp(s.group_code, group_code) == 0 && summaryShows(s, 0xFF)) return s.contact_key;"),
- (RR, "entry: the unread rows wait for the next pass", "  refresh(m, 0);  // then", "  // then"),
+ (RR, "entry: the unread rows wait for the next pass", "  addUnreadRows(m, \"\");  // then", "  // then"),
  (RR, "an unread listed contact gets a second row", "    if (findKey(summaryKey) >= 0) continue;", "    if (false) continue;"),
  (RR, "a full list may reuse an unread row", "    if (Notifications::hasUnreadIn(m.group, r.keys[i], m.badgeMask)) continue;\n    removeRow", "    removeRow"),
  (RR, "a full list may reuse Everyone", "    if (i == keep || strcmp(r.keys[i], MessageStore::kEveryone) == 0) continue;", "    if (i == keep) continue;"),
  (RR, "a full list may reuse an ordinary row", "  for (int i = static_cast<int>(r.count) - 1; i >= r.ordinaryEnd; i--) {", "  for (int i = static_cast<int>(r.count) - 1; i >= 0; i--) {"),
  (RR, "while shown: no row added for a new unread conversation", "  if (!changed) return kNoChange;", "  return kNoChange;"),
  (RR, "while shown: the selection keeps its index, not its identity", "  int sel = findKey(selectedKey);", "  int sel = selected;"),
- (RR, "while shown: the new row goes after Everyone", "    int at = findKey(MessageStore::kEveryone);\n    if (at < 0)", "    int at = -1;\n    if (at < 0)"),
+ (RR, "while shown: the new row goes after Everyone", "    int at = findKey(MessageStore::kEveryone);\n    if (at < 0) at = r.count;\n    insertRow(static_cast<uint8_t>(at));\n    setKey(r.keys[at], key);", "    int at = -1;\n    if (at < 0) at = r.count;\n    insertRow(static_cast<uint8_t>(at));\n    setKey(r.keys[at], key);"),
  (RR, "while shown: a full list may replace the selected row", "    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;", "    if (r.count >= kMaxRows && !reuseAddedRow(m, -1)) break;"),
  (RR, "while shown: a full list adds nothing", "    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;", "    if (r.count >= kMaxRows) break;"),
  (RR, "round 10: rows full at round 9's 41 (an ordinary row would give way)", "    if (r.count >= kMaxRows && !reuseAddedRow(m, findKey(selectedKey))) break;", "    if (r.count >= 41 && !reuseAddedRow(m, findKey(selectedKey))) break;"),
@@ -207,10 +208,9 @@ muts = [
  (EN, "Enigma: replayed Shorts not dropped at dispatch", "    if (isReplayedSend(e)) continue;  // Phase 2B-2: Short replayed from the Send window\n    if (backQueued", "    if (backQueued"),
  (EN, "Enigma: a queued Back waits for the rotations before it", "      droppingBeforeBack = true;  // a Back is waiting: history-side work before it is skipped\n      continue;", "      droppingBeforeBack = true;"),
  # ---- Outbox: incremental, header-only, durable ----
- (OB, "a pending write is not queued directly", "void serviceInit() { MessageStore::setOnPendingWrittenCallback(onPendingWritten); }", "void serviceInit() {}"),
+ (OB, "a pending write is not queued directly", "  MessageStore::setOnPendingWrittenCallback(onPendingWritten);\n  // Boot time", "  // Boot time"),
  (OB, "an unreadable record does not make the pass incomplete", "        p.incomplete = true;  // unreadable (or removed since the listing): the next pass looks again\n", ""),
  (OB, "a full queue is not remembered (the rest never found)", "  if (g_queue->count >= kQueueSize) {\n    g_queueOverflowed = true;", "  if (g_queue->count >= kQueueSize) {"),
- (OB, "a failed publish clears the pending flag", "  if (!ok) {\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return true;\n  }", "  if (!ok) {\n    MessageStore::updateLocalFlags(ref, 0, MessageStore::FLAG_PENDING_OUTBOX);\n    removeAt(k);\n    return true;\n  }"),
  (OB, "a whole pass in one step (unbounded)", "constexpr uint8_t kReadsPerStep = 4;", "constexpr uint8_t kReadsPerStep = 255;"),
  (OB, "the pass skips records it found pending", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;\n        enqueue(ref);", "      if (hdr.flags & MessageStore::FLAG_PENDING_OUTBOX) {\n        p.found++;"),
  # ---- review round: held-input overflow without a synchronous load ----
@@ -254,9 +254,43 @@ muts = [
  (EN, "Enigma: an old drop is attributed to the new visit", "  g_inputLost = false;\n  g_inputDropsSeen = Input::droppedEventCount();\n}", "  g_inputLost = false;\n}"),
  (TX, "Text: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
  (EN, "Enigma: a full queue is drained while loading (older input lost instead of newer)", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  return true;", "  while (Input::peekEvent(q) && g_heldInput.hold(q)) Input::popEvent(q);\n  if (Input::queueFull()) while (Input::popEvent(q)) {}\n  return true;"),
+ # ---- chat send: store first, publish asynchronously (core/chat_send.h; device A: CHAT_SEND 1195 ms, PUBACK 605 ms) ----
+ (CS, "async: the pending flag is never cleared after success (the Outbox republishes every message)", "  if (ok && !o.groupGone) o.flagCleared = MessageStore::updateLocalFlags(f->ref, 0, MessageStore::FLAG_PENDING_OUTBOX);", "  (void)0;"),
+ (CS, "async: the flag is cleared although the publish failed (never retried)", "  if (ok && !o.groupGone) o.flagCleared", "  if (!o.groupGone) o.flagCleared"),
+ (CS, "async: a deleted group's record is rewritten", "  o.groupGone = Settings::isGroupCodeUnique(f->ref.group_code);", "  o.groupGone = false;"),
+ (CS, "async: the Outbox is not told a record is in flight (published twice)", "    if (slots()[i] != nullptr && sameRef(slots()[i]->ref, ref)) return true;", "    (void)i;"),
+ (CS, "async: the result is not delivered to the chat", "  if (done != nullptr) done(o);", "  (void)done;"),
+ (TX, "Text: publish before the store (the old order: lost on a reset)", "  if (storeOk) {\n    uint32_t clearStart = millis();", "  if (storeOk && !ChatSend::start(outRef, topicSuffix, wireBuf, static_cast<uint16_t>(wireLen), onAsyncSendDone)) {\n    uint32_t clearStart = millis();"),
+ (TX, "Text: stored without the pending flag (lost if the publish fails)", "MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX,\n                                                   env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), nullptr, 0,", "MessageStore::Direction::SENT, 0,\n                                                   env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), nullptr, 0,"),
+ (TX, "Text: the draft is kept after a successful store", "    clearDraft();  // the stored record holds the message now\n", ""),
+ (TX, "Text: a failed store still clears the draft when the publish failed too", "  if (published) clearDraft();\n  markIndexDirty();  // a storage attempt was made either way (eviction may have run)\n  uint32_t clearElapsed", "  clearDraft();\n  markIndexDirty();  // a storage attempt was made either way (eviction may have run)\n  uint32_t clearElapsed"),
+ (TX, "Text: a failed store skips the publish", "    published = MqttManager::publishBinary(g_selectedGroupCode, topicSuffix, wireBuf, static_cast<uint16_t>(wireLen),\n                                           false, 1);\n    publishElapsed", "    published = false;\n    publishElapsed"),
+ (TX, "Text: never published asynchronously (left to the Outbox)", "    bool started = online && ChatSend::start(", "    bool started = false && ChatSend::start("),
+ (TX, "Text: the outcome is shown in another conversation", "  if (strcmp(o.ref.group_code, g_selectedGroupCode) != 0 || strcmp(o.ref.contact_key, g_selectedContactKey) != 0) return;\n  if (o.groupGone) return;  // its conversation", "  if (o.groupGone) return;  // its conversation"),
+ (TX, "Text: a chain-full send claims it is being sent", "    return {online ? \"Queued\" : \"Offline: queued\", true};\n  }\n\n  // The store failed (a storage fault)", "    return {\"Sending...\", false};\n  }\n\n  // The store failed (a storage fault)"),
+ (EN, "Enigma: stored without the pending flag", "MessageStore::Direction::SENT, MessageStore::FLAG_PENDING_OUTBOX,\n                                                   env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), localPayload,", "MessageStore::Direction::SENT, 0,\n                                                   env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), localPayload,"),
+ (EN, "Enigma: never published asynchronously", "    if (online && ChatSend::start(outRef,", "    if (false && ChatSend::start(outRef,"),
+ (EN, "Enigma: a failed store loses the draft", "  if (published) clearDraft();\n  markIndexDirty();  // a storage attempt was made either way (eviction may have run)\n  return resultForCompletion(online, published, false);", "  clearDraft();\n  markIndexDirty();  // a storage attempt was made either way (eviction may have run)\n  return resultForCompletion(online, published, false);"),
+ (EN, "Enigma: the local payload is not stored", "env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), localPayload,\n                                                   localLen, &outRef);", "env.timestamp, wireBuf, static_cast<uint16_t>(wireLen), nullptr,\n                                                   0, &outRef);"),
+ (EN, "Enigma: the outcome is never shown", "  if (o.groupGone) return;\n  setSendStatus(resultForCompletion(true, o.published, true));", "  if (o.groupGone) return;\n  (void)o;"),
+ # ---- Outbox: asynchronous publish ----
+ (OB, "Outbox: publishes a record a chat send has in flight", "                                ChatSend::holds(g_queue->items[k].ref))) {", "                                false)) {"),
+ (OB, "Outbox: the flag is cleared although the publish failed", "  if (!ok) {\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return;\n  }\n  MessageStore::updateLocalFlags(g_inFlightRef", "  if (!ok) {\n    g_publishRetryAtMs = millis() + kRetryMs;\n  }\n  MessageStore::updateLocalFlags(g_inFlightRef"),
+ (OB, "Outbox: a second publish while one is out", "  if (g_queue == nullptr || g_inFlightTicket != 0) return false;", "  if (g_queue == nullptr) return false;"),
+ (OB, "Outbox: a refused publish is not retried later", "  if (ticket == 0) {  // not queued (connection lent and its chain full, worker queue full, maintenance)\n    g_publishRetryAtMs = millis() + kRetryMs;\n    return true;\n  }", "  if (ticket == 0) {  // not queued (connection lent and its chain full, worker queue full, maintenance)\n    removeAt(k);\n    return true;\n  }"),
+ # ---- recipient rows follow presence while open (hardware: '(offline)' until re-entered) ----
+ (RR, "rows: presence changes ignored while the list is open", "  bool changed = followPresence(m);", "  bool changed = false;"),
+ (RR, "rows: a row shown earlier in the visit is dropped on a presence change", "    if (findKey(before->keys[i]) >= 0) continue;\n    if (r.count >= kMaxRows) break;", "    if (true) continue;\n    if (r.count >= kMaxRows) break;"),
+ (RR, "rows: identical presence still redraws", "  delete before;\n  return !same;", "  delete before;\n  return true;"),
+ (RR, "rows: the selected identity is not kept across a presence rebuild", "  int sel = findKey(selectedKey);\n  return static_cast<uint8_t>(sel >= 0 ? sel : 0);\n}\n\n// Entry", "  return 0;\n}\n\n// Entry"),
+ # ---- free-space estimate (device A on 827cd27: freeSpace=364 ms on the first send after boot) ----
+ (OB, "storage: no boot free-space measure (the first append pays the walk again)", "  MessageStore::primeFreeSpaceEstimate();\n", ""),
+ (SM, "storage: the estimate is trusted past 32 appends", "  if (g_freeEstimateValid && g_appendsSinceExact < kMaxAppendsWithoutExact &&\n", "  if (g_freeEstimateValid &&\n"),
+ (SM, "storage: the boot figure is trusted below the watermark", "  g_freeEstimateValid = free >= kLowWatermark;", "  g_freeEstimateValid = true;"),
 ]
 # Survivors assessed equivalent (no behaviour a test can observe), with the reason.
 equivalent = {
+ "storage: the boot figure is trusted below the watermark": "redundant guard: ensureFreeSpaceForWrite() only uses the estimate while it is at least watermark + margin + one append (172 KB), so a boot figure under the 96 KB watermark is never used either way; the flag only states it (SL4c pins the exact low-space behaviour)",
  "a full list may reuse an ordinary row": "added rows all lie after the ordinary ones (inserted before Everyone) and the scan runs from the end; it only reaches an ordinary row if no added row is reusable, and one always is when all 66 rows are used (25 added rows, at most 23 unread, at most one selected): the bound states the rule, the count guarantees it",
  "entry: the unread rows wait for the next pass": "the per-pass refresh adds exactly the same rows on the next pass (about 20 ms later), inserting them before Everyone and keeping the selected identity, so input in the entry pass reaches the same row either way; the entry call only avoids a one-frame gap",
  "the feed ignores the open chat (replaces the index it draws from)": "a current open-chat index is still protected by the cache check, and a stale one is reloaded by the chat's per-pass re-sync (CE23) anyway: the flag only saves that reload (cost, not correctness)",
@@ -296,7 +330,7 @@ def one(k, mut):
     target, name, old, new = mut
     out = os.path.join(H, "out", "mutn%d" % k)
     shutil.rmtree(out, ignore_errors=True); os.makedirs(out + "/core")
-    for x in (NT, TX, EN, SM, OB, IQ, HD, MN, "menu.h", "list_badges.h", "recipient_rows.h", "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
+    for x in (NT, TX, EN, SM, OB, IQ, HD, MN, "menu.h", "list_badges.h", "recipient_rows.h", "chat_send.h", "notifications.h", "storage_messages.h", "held_input.h", "display.h"): shutil.copy(R + "/" + x, out + "/core/" + x)
     p = out + "/core/" + target; src = open(p).read()
     open(p, "w").write(src.replace(old, new))
     inc = sum([["-I", i] for i in (H, H + "/fake", out, REPO + "/src")], [])
