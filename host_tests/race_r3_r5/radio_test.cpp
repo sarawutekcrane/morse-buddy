@@ -308,6 +308,26 @@ static void privateCallToRelay() {
   holdFor(2100);  // kNegotiateTimeoutMs: MQTT fallback (fake UDP never answers)
 }
 
+
+// ---- cross-mode audio ownership helpers ----
+// An incoming private call from kPeer handled by the shared transport while
+// this device is on another voice mode: the peer's CLAIM (granted: the
+// receiver is free) and its SESSION_START -> a callee-side g_call.
+static void incomingPrivateSession(const char* sid) {
+  deliver(PacketCodec::PK_RADIO_BUSY, idPayload(0, kPeer, sid));
+  uint8_t sp[1 + 24 + 16 + 16 + 4 + 2];
+  size_t n = RadioTransport::buildSessionPayload(0 /*SESSION_START*/, sid, kPeer, "DEADBEEFAAAA", IPAddress(10, 0, 0, 2), 40000,
+                                                 sp, sizeof(sp));
+  deliver(PacketCodec::PK_RADIO_SESSION, std::vector<uint8_t>(sp, sp + n));
+}
+static int g_roomMicFrames = 0;
+static void roomMicFrame(const int16_t*, size_t) { g_roomMicFrames++; }
+// race.cpp startRoomPtt() / stopRoomPtt(), their two calls verbatim (race.cpp
+// is not linkable next to the ACTUAL transport here; room_test RV1-RV3 run
+// race.cpp itself).
+static void raceStartRoomPtt() { setRadioAudioActive(true); RadioAudio::startCapture(roomMicFrame); }
+static void raceStopRoomPtt() { RadioAudio::stopCapture(); setRadioAudioActive(false); }
+
 static void openTalk(const char* contact) {
   T::reset();
   g_noWait.clear();
@@ -1285,6 +1305,93 @@ int main() {
   CHECK(g_deepSleeps >= 1 && g_deepSleptAtMs - act >= 59900 && g_deepSleptAtMs - act <= 60100 && g_beforeSleepHooks >= 1,
         "slept %ld ms after the last activity", g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - act) : -1L);
   Sleep::init(0);
+
+
+  // ===========================================================================
+  // Cross-mode audio ownership: an incoming private call (callee side) ends
+  // while this device transmits in another mode
+  // ===========================================================================
+  for (int how = 0; how < 2; how++) {
+    const char* endName = how == 0 ? "RELEASE" : "busy TTL expiry";
+    g_test = std::string("RX1 Race Room PTT held; an incoming private call (CLAIM granted + SESSION_START: callee g_call) ends by ") + endName +
+             ": the Room mic keeps capturing, the voice session stays live, sleep stays off; the Room release then ends it and the normal timeout follows";
+    openTalk(kPeer);
+    resetSleep(1);
+    g_roomMicFrames = 0;
+    raceStartRoomPtt();
+    holdFor(2000);
+    bool roomLive = g_capture == roomMicFrame && g_audioActive && g_roomMicFrames > 0;
+    incomingPrivateSession(how == 0 ? "S-IN-REL" : "S-IN-TTL");
+    bool calleeUp = !RadioTransport::g_call.isCaller && RadioTransport::g_call.state == RadioTransport::PrivateState::NEGOTIATING;
+    if (how == 0) { deliver(PacketCodec::PK_RADIO_BUSY, idPayload(1, kPeer, "S-IN-REL")); tick(); }
+    else holdFor(6000);  // no keep-alive CLAIM: kBusyTtlMs (5 s) sweep
+    bool calleeGone = RadioTransport::g_call.state == RadioTransport::PrivateState::IDLE && !RadioTransport::g_receiverBusy.busy;
+    int framesBefore = g_roomMicFrames;
+    holdFor(3 * kMin);  // the Room PTT still held, past the 1 min timeout
+    bool roomStillLive = g_capture == roomMicFrame && g_audioActive && g_roomMicFrames > framesBefore && g_deepSleeps == 0;
+    raceStopRoomPtt();
+    uint32_t endAt = T::now;
+    idleFor(61 * 1000);
+    CHECK(roomLive && calleeUp && calleeGone && roomStillLive && g_deepSleeps >= 1 && g_deepSleptAtMs - endAt >= 59900 &&
+              g_deepSleptAtMs - endAt <= 60100,
+          "%s: room live %d; callee up %d; callee ended %d; room mic/voice/sleep after it %d (capture %s, active %d, sleeps %d); slept %ld ms after the Room release",
+          endName, roomLive, calleeUp, calleeGone, roomStillLive, g_capture == roomMicFrame ? "room" : (g_capture ? "other" : "none"),
+          g_audioActive, g_deepSleeps, g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - endAt) : -1L);
+  }
+
+  for (int how = 0; how < 2; how++) {
+    const char* endName = how == 0 ? "RELEASE" : "busy TTL expiry";
+    g_test = std::string("RX2 Everyone broadcast held (the ACTUAL startBroadcastCall()); an incoming private call ends by ") + endName +
+             ": the broadcast keeps capturing and sending, sleep stays off; the release then ends it normally";
+    openTalk(MessageStore::kEveryone);
+    resetSleep(1);
+    pttDown(); tick();
+    bool bLive = RadioTransport::isBroadcasting() && g_capture != nullptr && g_audioActive;
+    incomingPrivateSession(how == 0 ? "S-B-REL" : "S-B-TTL");
+    bool calleeUp = !RadioTransport::g_call.isCaller && RadioTransport::g_call.state == RadioTransport::PrivateState::NEGOTIATING;
+    if (how == 0) { deliver(PacketCodec::PK_RADIO_BUSY, idPayload(1, kPeer, "S-B-REL")); tick(); }
+    else holdFor(6000);
+    g_noWaitRecord = false;
+    long before = g_noWaitCalls;
+    holdFor(3 * kMin);
+    long sent = g_noWaitCalls - before;
+    bool stillLive = RadioTransport::isBroadcasting() && g_capture != nullptr && g_audioActive && sent >= 8990 && g_deepSleeps == 0;
+    pttUp(3 * kMin); tick();
+    uint32_t endAt = T::now;
+    idleFor(61 * 1000);
+    g_noWaitRecord = true;
+    CHECK(bLive && calleeUp && stillLive && !RadioTransport::isBroadcasting() && g_deepSleeps >= 1 && g_deepSleptAtMs - endAt >= 59900 &&
+              g_deepSleptAtMs - endAt <= 60100,
+          "%s: broadcast live %d; callee up %d; after the callee ended: capturing %d, active %d, frames sent %ld (want ~9000), sleeps %d; slept %ld ms after release",
+          endName, bLive, calleeUp, g_capture != nullptr, g_audioActive, sent, g_deepSleeps,
+          g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - endAt) : -1L);
+  }
+
+  g_test = "RX3 a callee session alone (no other voice mode) still cleans up exactly as before: nothing captured, nothing left live, normal timeout";
+  openTalk(kPeer);
+  resetSleep(1);
+  incomingPrivateSession("S-ALONE");
+  deliver(PacketCodec::PK_RADIO_BUSY, idPayload(1, kPeer, "S-ALONE")); tick();
+  uint32_t aloneEnd = T::now;
+  idleFor(61 * 1000);
+  CHECK(g_capture == nullptr && !g_audioActive && RadioTransport::g_call.state == RadioTransport::PrivateState::IDLE && g_deepSleeps >= 1 &&
+            g_deepSleptAtMs - aloneEnd <= 60100,
+        "capture %d active %d state %u sleeps %d", g_capture != nullptr, g_audioActive,
+        static_cast<unsigned>(RadioTransport::getPrivateState()), g_deepSleeps);
+
+  g_test = "RX4 OTA maintenance still silences every microphone (Phase 5: no PTT session runs in maintenance), Race Room's included; OTA keeps sleep off; afterwards the Room release is harmless";
+  openTalk(kPeer);
+  resetSleep(1);
+  raceStartRoomPtt();
+  Sleep::setSuspended(true);
+  RadioTransport::setMaintenanceModeActive(true);
+  bool micOff = g_capture == nullptr;
+  idleFor(3 * kMin);
+  bool otaAwake4 = g_deepSleeps == 0;
+  raceStopRoomPtt();
+  RadioTransport::setMaintenanceModeActive(false);
+  Sleep::setSuspended(false);
+  CHECK(micOff && otaAwake4 && !g_audioActive, "mic off in maintenance %d; awake %d; inactive after %d", micOff, otaAwake4, !g_audioActive);
 
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

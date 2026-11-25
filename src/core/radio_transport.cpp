@@ -819,8 +819,17 @@ void flushPreBuffer() {
 }
 
 void resetPrivateCall() {
-  RadioAudio::stopCapture();
-  setRadioAudioActive(false);
+  // Only a caller-side call owns the microphone and the live-voice flag
+  // (startPrivateCall() sets it, beginNegotiation() starts capture on the
+  // GRANT; a callee never does either). Cross-mode ownership fix: a callee
+  // session ended by RELEASE or the busy TTL while this device transmits in
+  // another mode (Race Room PTT, Everyone broadcast -- the incoming CLAIM is
+  // granted whatever screen is shown) used to stop that mode's capture and
+  // clear its flag (and so its deep-sleep inhibition) mid-transmission.
+  if (g_call.isCaller) {
+    RadioAudio::stopCapture();
+    setRadioAudioActive(false);
+  }
   freePreBuffer();
   g_stunPending = false;
   jitterReset();
@@ -1351,6 +1360,12 @@ void setMaintenanceModeActive(bool active) {
     // regardless of whether we were the caller or the callee.
     releaseAndResetPrivateCall();
     stopBroadcastCall();
+    // No microphone runs in Maintenance Mode, whichever mode opened it (a
+    // Race Room PTT too): resetPrivateCall() no longer stops capture it does
+    // not own, so maintenance does it explicitly, as it effectively did
+    // before. OTA's own sleep reason keeps the device awake meanwhile.
+    RadioAudio::stopCapture();
+    setRadioAudioActive(false);
 
     // g_receiverBusy is separate from g_call: it tracks a claim we, as
     // receiver, GRANTED to some other caller. resetPrivateCall() above
