@@ -83,7 +83,7 @@ build mqtsan -std=gnu++17 -g -O1 -fsanitize=thread -Wall -Wextra $MQ && {
   grep -E "FAIL|passed|WARNING: ThreadSanitizer" "$OUT/mqtsan.txt" | sort | uniq -c | sed 's/^/   threads (TSan): /' || true
   [ $st -eq 0 ] || fail "mqtt_test threads under TSan exited with status $st"; }
 echo "== 4e. Private radio PTT and radio MQTT paths (hardware: 'Claiming...' back to 'Ready' while held; QoS0 audio 288 ms; Gate 1: CLAIM queued behind worker publishes vs the claim window; Gate 3: framing/dispatch of the three audio paths): ACTUAL radio.cpp + radio_transport.cpp + menu.cpp; the peer and the MQTT worker chain modeled"
-build radt -std=gnu++17 $SAN -Wall -Wextra -I "$H" -I "$H/fake_radio" -I "$H/fake" -I "$REPO/src" "$H/radio_test.cpp" "$H/stubs.cpp" "$R/packet_codec.cpp" "$R/presence.cpp" "$R/crc32.cpp" "$R/morse.cpp" && run radt
+build radt -std=gnu++17 $SAN -Wall -Wextra -I "$H" -I "$H/fake_sleep" -I "$H/fake_radio" -I "$H/fake" -I "$REPO/src" "$H/radio_test.cpp" "$H/stubs.cpp" "$R/packet_codec.cpp" "$R/presence.cpp" "$R/crc32.cpp" "$R/morse.cpp" && run radt
 echo "== 4f. Enigma message display (zero key: readable, no padlock, no key editor/Reveal (Gate 6); rotor/plugboard ciphertext and lock workflow untouched, XQ/XX collisions, real decode round trips): ACTUAL enigma.cpp + enigma_crypto.cpp + enigma_keys.cpp"
 build ent -std=gnu++17 $SAN -Wall -Wextra -DREAL_NOTIFICATIONS -I "$H" -I "$H/fake" -I "$REPO/src" "$H/enigma_test.cpp" "$H/stubs.cpp" "$R/menu.cpp" "$R/notifications.cpp" "$R/text_message.cpp" "$R/number_guessing.cpp" "$R/packet_codec.cpp" "$R/morse.cpp" "$R/enigma_crypto.cpp" "$R/enigma_keys.cpp" "$R/crc32.cpp" "$R/presence.cpp" && run ent
 W=$(cat "$OUT"/*.warnings.txt | grep -E '(race|race_protocol|identity|number_guessing|number_guessing_friend)\.(cpp|h):[0-9]+:[0-9]+: warning' | sed 's|.*/src/core/||' | sort -u | tr '\n' ' ' || true)
@@ -112,9 +112,9 @@ done
 echo "== 5b. C++11 / C++17 compile of the other files this round changes (candidate only; no baseline copy in this bundle)"
 for std in gnu++11 gnu++17; do
   n=0
-  for f in radio_transport.cpp radio.cpp storage_messages.cpp outbox.cpp; do
+  for f in radio_transport.cpp radio.cpp storage_messages.cpp outbox.cpp sleep.cpp sound_facade.cpp; do
     log="$OUT/syntax5b_${std}_${f}.txt"
-    INC="-I $H/fake_radio -I $H/fake_sys"; case $f in storage_messages.cpp|outbox.cpp) INC="-I $H/fake_fs -I $H";; esac
+    INC="-I $H/fake_radio -I $H/fake_sys"; case $f in storage_messages.cpp|outbox.cpp) INC="-I $H/fake_fs -I $H";; sleep.cpp) INC="-I $H/fake_sleep";; esac
     if ! $CXX -std=$std -fsyntax-only -Wall -Wextra $INC -I "$H/fake" -I "$REPO/src" "$R/$f" > "$log" 2>&1; then
       fail "syntax $std $f"; sed 's/^/   /' "$log" | head -10
     fi

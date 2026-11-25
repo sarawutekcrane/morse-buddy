@@ -9,6 +9,7 @@ H = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(H, "..", "..")))
 R = os.path.join(REPO, "src", "core")
 RT, RU, EN = "radio_transport.cpp", "radio.cpp", "enigma.cpp"
+SL, SF = "sleep.cpp", "sound_facade.cpp"
 
 # (file, name, old, new)
 muts = [
@@ -108,6 +109,22 @@ muts = [
  (EN, "Enigma: zero-key display skips the decrypt step (unescape of the ciphertext directly)",
   "    EnigmaCrypto::reverseEscape(decrypted, readable, sizeof(readable));",
   "    EnigmaCrypto::reverseEscape(ciphertext, readable, sizeof(readable));"),
+ # ---- PTT sleep safety ----
+ (SF, "sleep: a live voice session does not hold deep sleep off (the hardware risk)",
+  "  Sleep::setInhibited(Sleep::InhibitReason::RADIO_AUDIO, active);\n", ""),
+ (SL, "sleep: one shared flag again (clearing any reason resumes sleep for all)",
+  "  g_inhibitMask &= static_cast<uint8_t>(~bit);", "  g_inhibitMask = 0;"),
+ (SL, "sleep: the end of an inhibited stretch keeps the stale baseline (sleep right after the release)",
+  "  if (wasSet) notifyActivity();\n}", "}"),
+ (SL, "sleep: clearing a reason that was not set postpones sleep",
+  "  if (wasSet) notifyActivity();\n}", "  notifyActivity();\n}"),
+ (SL, "sleep: update() ignores the inhibit reasons",
+  "  if (g_inhibitMask != 0) return;\n", ""),
+ (SL, "sleep: OTA suspension mapped onto the Radio reason",
+  "void setSuspended(bool suspended) { setInhibited(InhibitReason::OTA_MAINTENANCE, suspended); }",
+  "void setSuspended(bool suspended) { setInhibited(InhibitReason::RADIO_AUDIO, suspended); }"),
+ (RT, "sleep: a DENY (BUSY) leaves the voice session marked live (pre-existing clear)",
+  "    g_call.denied = true;\n    setRadioAudioActive(false);", "    g_call.denied = true;"),
  (EN, "Gate 6: a zero-key message shows the red padlock again",
   "  if (isZeroKeyMessage(msg)) return MessageIconKind::NONE;  // Gate 6: nothing locked, no padlock\n", ""),
  (EN, "Gate 6: a zero-key message opens the key editor / Reveal again",
@@ -127,7 +144,7 @@ equivalent = {
 }
 
 SUITE = {
- RT: "radio", RU: "radio", EN: "enigma",
+ RT: "radio", RU: "radio", EN: "enigma", SL: "radio", SF: "radio",
 }
 only = sys.argv[1:]
 todo = [m for m in muts if not only or any(o in m[1] for o in only)]
@@ -141,8 +158,10 @@ def build(suite, d, out):
         src = open(os.path.join(H, "radio_test.cpp")).read()
         src = src.replace('#include "core/radio_transport.cpp"', '#include "%s"' % os.path.join(d, "core", RT))
         src = src.replace('#include "core/radio.cpp"', '#include "%s"' % os.path.join(d, "core", RU))
+        src = src.replace('#include "core/sleep.cpp"', '#include "%s"' % os.path.join(d, "core", SL))
+        src = src.replace('#include "core/sound_facade.cpp"', '#include "%s"' % os.path.join(d, "core", SF))
         open(os.path.join(d, "t.cpp"), "w").write(src)
-        cmd = ["g++", "-std=gnu++17", "-O1", "-I", H, "-I", os.path.join(H, "fake_radio"), "-I", os.path.join(H, "fake"),
+        cmd = ["g++", "-std=gnu++17", "-O1", "-I", H, "-I", os.path.join(H, "fake_sleep"), "-I", os.path.join(H, "fake_radio"), "-I", os.path.join(H, "fake"),
                "-I", os.path.join(REPO, "src"), os.path.join(d, "t.cpp"), os.path.join(H, "stubs.cpp")] + \
               [os.path.join(R, f) for f in ("packet_codec.cpp", "presence.cpp", "crc32.cpp", "morse.cpp")] + ["-o", out]
     else:
@@ -159,7 +178,7 @@ def one(m):
     target, name, old, new = m
     d = tempfile.mkdtemp(prefix="mutr_")
     os.makedirs(os.path.join(d, "core"))
-    for f in (RT, RU, EN):
+    for f in (RT, RU, EN, SL, SF):
         shutil.copy(os.path.join(R, f), os.path.join(d, "core", f))
     p = os.path.join(d, "core", target)
     src = open(p).read().replace(old, new)

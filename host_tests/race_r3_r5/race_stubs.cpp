@@ -38,4 +38,5 @@ void setUiContext(UiContext) {}
 namespace Settings { bool getMuteRadioOutsideRadio() { return false; } }
 namespace Sleep { void notifyActivity() {} }
 void playTone(uint16_t, uint16_t, SoundClass) {}
-void setRadioAudioActive(bool) {}
+bool g_roomRadioAudioActive = false;  // sound_facade: the live-voice flag (it holds deep sleep off)
+void setRadioAudioActive(bool a) { g_roomRadioAudioActive = a; }

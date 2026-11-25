@@ -17,6 +17,11 @@
 #include "core/menu.cpp"
 #include "core/radio_transport.cpp"
 #include "core/radio.cpp"
+// The ACTUAL sleep timeout and sound facade (PTT sleep safety): the main
+// loop's Sleep::update() runs in tick(); esp_deep_sleep_start() is
+// fake_sleep/esp_sleep.h's recorder.
+#include "core/sleep.cpp"
+#include "core/sound_facade.cpp"
 #include <esp_heap_caps.h>
 #include <cstdio>
 #include <string>
@@ -30,28 +35,49 @@
 #include <new>
 static bool g_failNothrowNew = false;
 static int g_nothrowNewFailures = 0;
+// Live C++ heap blocks (every new/new[] minus every delete of a non-null
+// pointer): a long PTT session must not grow it with speaking time.
+static long g_liveBlocks = 0;
 void* operator new(std::size_t n) {
   void* p = std::malloc(n ? n : 1);
   if (p == nullptr) throw std::bad_alloc();
+  g_liveBlocks++;
   return p;
 }
 void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
   if (g_failNothrowNew) { g_nothrowNewFailures++; return nullptr; }
-  return std::malloc(n ? n : 1);
+  void* p = std::malloc(n ? n : 1);
+  if (p != nullptr) g_liveBlocks++;
+  return p;
 }
 void* operator new[](std::size_t n) { return operator new(n); }
-void* operator new[](std::size_t n, const std::nothrow_t&) noexcept { return std::malloc(n ? n : 1); }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
+  void* p = std::malloc(n ? n : 1);
+  if (p != nullptr) g_liveBlocks++;
+  return p;
+}
+void operator delete(void* p) noexcept { if (p != nullptr) g_liveBlocks--; std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { if (p != nullptr) g_liveBlocks--; std::free(p); }
+void operator delete[](void* p) noexcept { if (p != nullptr) g_liveBlocks--; std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { if (p != nullptr) g_liveBlocks--; std::free(p); }
 
 // ---- what radio.cpp / radio_transport.cpp need beyond stubs.cpp ----
-namespace Sleep { void notifyActivity() {} }
-void playTone(uint16_t, uint16_t, SoundClass) {}
-static int g_audioActiveSets = 0;
-static bool g_audioActive = false;
-void setRadioAudioActive(bool a) { g_audioActive = a; g_audioActiveSets++; }
+#define g_audioActive g_radioActive  // sound_facade.cpp's own flag (the ACTUAL setRadioAudioActive())
+static int g_deepSleeps = 0;
+static uint32_t g_deepSleptAtMs = 0;
+void T_deepSleepEntered() {
+  if (g_deepSleeps++ == 0) g_deepSleptAtMs = T::now;
+}
+static int g_beforeSleepHooks = 0;
+void runBeforeSleepHooks() { g_beforeSleepHooks++; }
+namespace Display { void setBacklightPercent(uint8_t) {} }
+namespace Power { void setDividerEnabled(bool) {} }
+static void resetSleep(uint8_t minutes) {
+  g_deepSleeps = 0;
+  g_deepSleptAtMs = 0;
+  Sleep::setSuspended(false);
+  Sleep::init(minutes);
+}
 namespace Settings { bool getMuteRadioOutsideRadio() { return false; } }
 static PendingRadioIntent g_intent;
 const PendingRadioIntent& getPendingRadioIntent() { return g_intent; }
@@ -76,10 +102,13 @@ void playFrame(const int16_t*, size_t) { g_framesPlayed++; }
 struct NoWaitPub { std::string topic; size_t len; bool result; std::vector<uint8_t> data; std::string group; };
 static std::vector<NoWaitPub> g_noWait;
 static bool g_noWaitAccepts = true;
+static bool g_noWaitRecord = true;  // off in the long-session tests: the test's own log would grow
+static long g_noWaitCalls = 0;
 namespace MqttManager {
 bool publishBinaryNoWait(const char* group, const char* topic, const uint8_t* data, uint16_t len) {
   bool r = T::connected && g_noWaitAccepts;
-  g_noWait.push_back({topic, len, r, std::vector<uint8_t>(data, data + len), group});
+  g_noWaitCalls++;
+  if (g_noWaitRecord) g_noWait.push_back({topic, len, r, std::vector<uint8_t>(data, data + len), group});
   return r;
 }
 }  // namespace MqttManager
@@ -106,6 +135,7 @@ static void tick(int n = 1) {
   for (int i = 0; i < n; i++) {
     T_tickServices();
     Menu::tick();
+    Sleep::update();  // main.cpp loop(): the deep-sleep timeout check
     T::now += 5;
   }
 }
@@ -245,6 +275,39 @@ static void openTalkKeepChain(const char* contact) {
   tick(2);
 }
 
+
+// ---- PTT sleep safety helpers ----
+// One 20 ms frame of simulated main loop while the PTT is held: the mic
+// delivers a frame (if capturing), services and the screen tick, then the
+// main loop's sleep check -- no real-time delay.
+static int16_t g_mic[RadioAudio::kFrameSamples];
+static void holdFor(uint32_t ms) {
+  uint32_t end = T::now + ms;
+  while (static_cast<int32_t>(T::now - end) < 0) {
+    if (g_capture != nullptr) g_capture(g_mic, RadioAudio::kFrameSamples);
+    T_tickServices();
+    Menu::tick();
+    Sleep::update();
+    T::now += 20;
+  }
+}
+// Frees the TEST's own logs (publishes, sequence, wire) so a live-block
+// sample counts only what production code holds.
+static void dropTestLogs() {
+  std::vector<T::Pub>().swap(T::pubs);
+  decltype(T::seq)().swap(T::seq);
+  std::vector<WirePkt>().swap(g_wire);
+}
+// Advances with nothing held (no input), checking the sleep timeout each 20 ms.
+static void idleFor(uint32_t ms) { holdFor(ms); }
+// A private call taken to the MQTT relay: CLAIM, GRANT, negotiation timeout.
+static void privateCallToRelay() {
+  pttDown(); tick();
+  std::string sid = RadioTransport::g_call.session_id;
+  peerReply(0, sid); tick();
+  holdFor(2100);  // kNegotiateTimeoutMs: MQTT fallback (fake UDP never answers)
+}
+
 static void openTalk(const char* contact) {
   T::reset();
   g_noWait.clear();
@@ -279,6 +342,7 @@ static std::string status() {  // the Talk screen's status row
 }
 
 int main() {
+  Sleep::init(0);  // the suites before RS1 do not model the sleep timeout (RS* set their own)
   T::reset();
   T_initServices();
 
@@ -972,6 +1036,255 @@ int main() {
         "broadcast played %d; private from peer %d, from another %d; race frame to the room handler only %d (players +%d)", bPlayed,
         pPlayed, pOther, rxCount, g_framesPlayed - playedBefore);
   RadioTransport::resetPrivateCall();
+
+
+  // ===========================================================================
+  // PTT sleep safety: holding PTT produces no input events after the press;
+  // the deep-sleep timeout must not end a live voice session, and must work
+  // normally again once it ends (the ACTUAL sleep.cpp + sound_facade.cpp).
+  // Simulated time, 20 ms per main-loop pass with a mic frame each.
+  // ===========================================================================
+  const uint32_t kMin = 60000;
+  g_test = "RS1 private call on the MQTT relay, PTT held 10 min with a 1 min Sleep Timeout: no deep sleep, audio streamed every frame; after the release the full timeout runs again (no sleep at 59 s, sleep at 60 s)";
+  openTalk(kPeer);
+  resetSleep(1);
+  privateCallToRelay();
+  bool onRelay = RadioTransport::getPrivateState() == RadioTransport::PrivateState::MQTT_FALLBACK;
+  g_noWaitRecord = false;
+  long callsBefore = g_noWaitCalls;
+  holdFor(10 * kMin);
+  long frames10 = g_noWaitCalls - callsBefore;
+  bool awakeWhileHeld = g_deepSleeps == 0 && RadioTransport::getPrivateState() == RadioTransport::PrivateState::MQTT_FALLBACK;
+  pttUp(10 * kMin); tick();
+  uint32_t releasedAt = T::now;
+  idleFor(59 * 1000);
+  bool awakeAt59 = g_deepSleeps == 0;
+  idleFor(2 * 1000);
+  g_noWaitRecord = true;
+  CHECK(onRelay && awakeWhileHeld && frames10 >= 29990 && awakeAt59 && g_deepSleeps >= 1 &&
+            g_deepSleptAtMs - releasedAt >= 59900 && g_deepSleptAtMs - releasedAt <= 60100,
+        "relay %d; awake through 10 min held %d (sleeps %d); frames sent %ld (want ~30000); awake 59 s after release %d; slept %ld ms after release",
+        onRelay, awakeWhileHeld, g_deepSleeps, frames10, awakeAt59,
+        g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - releasedAt) : -1L);
+
+  g_test = "RS1b 30-minute private relay session: live heap blocks do not grow with speaking time (pre-buffer freed at the fallback; nothing retained per frame)";
+  openTalk(kPeer);
+  resetSleep(5);
+  privateCallToRelay();
+  g_noWaitRecord = false;
+  holdFor(kMin);
+  dropTestLogs();
+  long blocks1 = g_liveBlocks;
+  bool preFreed = RadioTransport::g_preBuffer.data == nullptr;
+  holdFor(9 * kMin);
+  dropTestLogs();
+  long blocks10 = g_liveBlocks;
+  holdFor(20 * kMin);
+  dropTestLogs();
+  long blocks30 = g_liveBlocks;
+  bool awake30 = g_deepSleeps == 0;
+  pttUp(30 * kMin); tick(2);
+  dropTestLogs();
+  long blocksAfter = g_liveBlocks;
+  g_noWaitRecord = true;
+  printf("   MEASURE RS1b live heap blocks (production only): 1 min %ld, 10 min %ld, 30 min %ld, after release %ld\n", blocks1,
+         blocks10, blocks30, blocksAfter);
+  CHECK(preFreed && blocks10 == blocks1 && blocks30 == blocks1 && awake30 && blocksAfter <= blocks1,
+        "pre-buffer freed %d; live blocks at 1 min %ld, at 30 min %ld, after release %ld; awake %d", preFreed, blocks1, blocks30,
+        blocksAfter, awake30);
+
+  g_test = "RS2 private call on UDP Direct (state set after GRANT: the fake UDP has no peer), held 10 min: no deep sleep; release -> normal timeout";
+  openTalk(kPeer);
+  resetSleep(1);
+  pttDown(); tick();
+  peerReply(0, RadioTransport::g_call.session_id); tick();
+  RadioTransport::g_call.state = RadioTransport::PrivateState::UDP_DIRECT;
+  holdFor(10 * kMin);
+  bool udpAwake = g_deepSleeps == 0 && RadioTransport::getPrivateState() == RadioTransport::PrivateState::UDP_DIRECT;
+  pttUp(10 * kMin); tick();
+  releasedAt = T::now;
+  idleFor(61 * 1000);
+  CHECK(udpAwake && g_deepSleeps >= 1 && g_deepSleptAtMs - releasedAt <= 60100 && g_deepSleptAtMs - releasedAt >= 59900,
+        "awake on UDP Direct %d; slept %ld ms after release", udpAwake, g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - releasedAt) : -1L);
+
+  g_test = "RS3 Everyone (broadcast), held 10 min with a 1 min timeout: no deep sleep, frames streamed; release -> normal timeout";
+  openTalk(MessageStore::kEveryone);
+  resetSleep(1);
+  pttDown(); tick();
+  g_noWaitRecord = false;
+  callsBefore = g_noWaitCalls;
+  holdFor(10 * kMin);
+  long bFrames = g_noWaitCalls - callsBefore;
+  bool bAwake = g_deepSleeps == 0 && RadioTransport::isBroadcasting();
+  pttUp(10 * kMin); tick();
+  releasedAt = T::now;
+  idleFor(61 * 1000);
+  g_noWaitRecord = true;
+  CHECK(bAwake && bFrames >= 29990 && !RadioTransport::isBroadcasting() && g_deepSleeps >= 1 &&
+            g_deepSleptAtMs - releasedAt >= 59900 && g_deepSleptAtMs - releasedAt <= 60100,
+        "broadcasting and awake %d; frames %ld; slept %ld ms after release", bAwake, bFrames,
+        g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - releasedAt) : -1L);
+
+  g_test = "RS4 Race Room voice's own call (setRadioAudioActive(true) around room capture, race.cpp startRoomPtt/stopRoomPtt) holds sleep off for 10 min; false -> normal timeout";
+  resetSleep(1);
+  setRadioAudioActive(true);
+  idleFor(10 * kMin);
+  bool raceAwake = g_deepSleeps == 0;
+  setRadioAudioActive(false);
+  releasedAt = T::now;
+  idleFor(61 * 1000);
+  CHECK(raceAwake && g_deepSleeps >= 1 && g_deepSleptAtMs - releasedAt <= 60100 && g_deepSleptAtMs - releasedAt >= 59900,
+        "awake %d; slept %ld ms after the session ended", raceAwake, g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - releasedAt) : -1L);
+
+  struct FailCase { const char* name; int kind; };
+  const FailCase fails[] = {{"NO_RESPONSE", 0}, {"BUSY (DENY)", 1}, {"SEND_FAILED", 2}, {"SEND_TIMEOUT", 3}};
+  for (const FailCase& fc : fails) {
+    g_test = std::string("RS5 a failed call does not hold sleep off: ") + fc.name +
+             " with the PTT still held -> sleep one timeout after the failure ended the session (not inhibited indefinitely)";
+    openTalk(kPeer);
+    resetSleep(1);
+    if (fc.kind == 3) lendForWorkerPublish("race/state");
+    pttDown(); tick();
+    if (fc.kind == 1) { peerReply(1, RadioTransport::g_call.session_id); tick(); }
+    if (fc.kind == 2) T::publishScript = {false, false, false, false, false, false};
+    holdFor(4000);  // the claim fails within 1-3 s
+    bool ended = !g_audioActive;
+    holdFor(2 * kMin);
+    CHECK(ended && g_deepSleeps >= 1 && g_deepSleptAtMs <= T::now, "%s: session ended %d (status '%s'); slept %d", fc.name, ended,
+          status().c_str(), g_deepSleeps);
+    T::connected = true;
+    pttUp(100); tick(2);
+  }
+
+  g_test = "RS6 Wi-Fi/MQTT lost during a relay call: frames are skipped but the session (and the PTT) is live -> no sleep for 5 min; reconnect, release -> normal timeout";
+  openTalk(kPeer);
+  resetSleep(1);
+  privateCallToRelay();
+  T::connected = false;
+  g_noWaitRecord = false;
+  holdFor(5 * kMin);
+  bool lostAwake = g_deepSleeps == 0;
+  T::connected = true;
+  holdFor(1000);
+  pttUp(5 * kMin); tick();
+  releasedAt = T::now;
+  idleFor(61 * 1000);
+  g_noWaitRecord = true;
+  CHECK(lostAwake && g_deepSleeps >= 1 && g_deepSleptAtMs - releasedAt <= 60100, "awake while disconnected %d; slept %ld ms after release",
+        lostAwake, g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - releasedAt) : -1L);
+
+  g_test = "RS7 leaving the Radio screen (Back) while transmitting ends the session and the inhibition: sleep one timeout later";
+  openTalk(kPeer);
+  resetSleep(1);
+  privateCallToRelay();
+  T::raw.push_back(InputEvent(InputEventType::ENCODER_LONG, 0, 0, T::now)); tick(2);
+  bool leftEnded = !g_audioActive && RadioTransport::getPrivateState() == RadioTransport::PrivateState::IDLE;
+  uint32_t leftAt = T::now;
+  idleFor(61 * 1000);
+  CHECK(leftEnded && g_deepSleeps >= 1 && g_deepSleptAtMs - leftAt <= 60100 && g_deepSleptAtMs - leftAt >= 59900,
+        "session ended on Back %d; slept %ld ms later", leftEnded, g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - leftAt) : -1L);
+  pttUp(100); tick(2);
+
+  g_test = "RS8a OTA maintenance starts during a held PTT (the forced stop ends the voice session): OTA keeps sleep off for 10 min; the PTT release changes nothing; OTA end -> normal timeout";
+  openTalk(kPeer);
+  resetSleep(1);
+  privateCallToRelay();
+  Sleep::setSuspended(true);                     // ota_manager.cpp enterMaintenanceMode()
+  RadioTransport::setMaintenanceModeActive(true);
+  bool stopped = !g_audioActive;
+  holdFor(5 * kMin);
+  pttUp(5 * kMin); tick();
+  idleFor(5 * kMin);
+  bool otaAwake = g_deepSleeps == 0;
+  RadioTransport::setMaintenanceModeActive(false);  // leaveMaintenanceMode()
+  Sleep::setSuspended(false);
+  uint32_t otaEnd = T::now;
+  idleFor(61 * 1000);
+  CHECK(stopped && otaAwake && g_deepSleeps >= 1 && g_deepSleptAtMs - otaEnd <= 60100 && g_deepSleptAtMs - otaEnd >= 59900,
+        "voice stopped by maintenance %d; awake through OTA %d; slept %ld ms after OTA end", stopped, otaAwake,
+        g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - otaEnd) : -1L);
+
+  g_test = "RS8b OTA maintenance ENDS while a voice session is still live (Race Room voice is not stopped by maintenance): sleep stays off until the PTT release, then the normal timeout";
+  resetSleep(1);
+  setRadioAudioActive(true);   // a live room PTT
+  Sleep::setSuspended(true);
+  idleFor(3 * kMin);
+  Sleep::setSuspended(false);  // OTA over; the voice session continues
+  idleFor(10 * kMin);
+  bool stillAwake = g_deepSleeps == 0;
+  setRadioAudioActive(false);
+  uint32_t endAt = T::now;
+  idleFor(61 * 1000);
+  CHECK(stillAwake && g_deepSleeps >= 1 && g_deepSleptAtMs - endAt <= 60100 && g_deepSleptAtMs - endAt >= 59900,
+        "awake 10 min after OTA ended while voice live %d; slept %ld ms after the release", stillAwake,
+        g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - endAt) : -1L);
+
+  g_test = "RS8c the voice session ends DURING an OTA update: sleep stays off until OTA ends (a Radio release never resumes sleep for OTA)";
+  resetSleep(1);
+  setRadioAudioActive(true);
+  Sleep::setSuspended(true);
+  setRadioAudioActive(false);
+  idleFor(10 * kMin);
+  bool otaHolds = g_deepSleeps == 0;
+  Sleep::setSuspended(false);
+  endAt = T::now;
+  idleFor(61 * 1000);
+  CHECK(otaHolds && g_deepSleeps >= 1 && g_deepSleptAtMs - endAt <= 60100, "awake through OTA after the release %d; slept %ld ms after OTA end",
+        otaHolds, g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - endAt) : -1L);
+
+  const uint8_t minutesList[] = {0, 1, 5, 30};
+  for (uint8_t m : minutesList) {
+    g_test = std::string("RS9 Sleep Timeout ") + std::to_string(m) +
+             " min: a 31-minute relay PTT never sleeps; afterwards sleep exactly one timeout after the release (0 = Disabled: never); the setting itself is unchanged";
+    openTalk(kPeer);
+    resetSleep(m);
+    privateCallToRelay();
+    g_noWaitRecord = false;
+    holdFor(31 * kMin);
+    bool held = g_deepSleeps == 0;
+    pttUp(31 * kMin); tick();
+    uint32_t rel = T::now;
+    if (m == 0) {
+      idleFor(60 * kMin);
+      CHECK(held && g_deepSleeps == 0 && Sleep::getTimeoutMinutes() == 0, "disabled: sleeps %d", g_deepSleeps);
+    } else {
+      idleFor(m * kMin - 1000);
+      bool before = g_deepSleeps == 0;
+      idleFor(2000);
+      CHECK(held && before && g_deepSleeps >= 1 && Sleep::getTimeoutMinutes() == m,
+            "awake held %d; awake 1 s before the timeout %d; slept %ld ms after release (timeout %u min)", held, before,
+            g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - rel) : -1L, static_cast<unsigned>(m));
+    }
+    g_noWaitRecord = true;
+  }
+
+  g_test = "RS10 rapid PTT press/release cycles (20 x 200 ms): nothing left inhibited -- sleep one timeout after the last release";
+  openTalk(kPeer);
+  resetSleep(1);
+  for (int i = 0; i < 20; i++) {
+    pttDown(); tick();
+    if (i % 2 == 0) { peerReply(0, RadioTransport::g_call.session_id); tick(); }
+    holdFor(200);
+    pttUp(200); tick(2);
+  }
+  uint32_t lastRel = T::now;
+  idleFor(61 * 1000);
+  CHECK(!g_audioActive && g_deepSleeps >= 1 && g_deepSleptAtMs - lastRel <= 60100 && g_deepSleptAtMs - lastRel >= 59900,
+        "audio inactive %d; slept %ld ms after the last release", !g_audioActive, g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - lastRel) : -1L);
+
+  g_test = "RS11 no voice session: the plain inactivity timeout is unchanged (sleep exactly 1 min after the last activity; clearing a reason that was not set does not postpone it)";
+  openTalk(kPeer);
+  resetSleep(1);
+  idleFor(40 * 1000);
+  Sleep::notifyActivity();
+  uint32_t act = T::now;
+  idleFor(30 * 1000);
+  setRadioAudioActive(false);  // a reset path with no live session: must not postpone sleep
+  Sleep::setSuspended(false);  // nor a redundant OTA clear
+  idleFor(31 * 1000);
+  CHECK(g_deepSleeps >= 1 && g_deepSleptAtMs - act >= 59900 && g_deepSleptAtMs - act <= 60100 && g_beforeSleepHooks >= 1,
+        "slept %ld ms after the last activity", g_deepSleeps ? static_cast<long>(g_deepSleptAtMs - act) : -1L);
+  Sleep::init(0);
 
   printf("%d checks passed, %d failed\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

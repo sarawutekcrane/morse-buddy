@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+#include "core/sleep.h"
+
 namespace {
 ToneBackendFn g_toneFn = nullptr;
 ToneSequenceBackendFn g_sequenceFn = nullptr;
@@ -66,6 +68,13 @@ void stopCurrentToneSound() {
 
 void setRadioAudioActive(bool active) {
   g_radioActive = active;
+  // PTT sleep safety (owner-approved): holding PTT produces no further input
+  // events after the press, so a voice session longer than the Sleep
+  // Timeout used to end in deep sleep mid-transmission. Every Radio/Race
+  // voice session brackets itself with this call (private call from CLAIM
+  // to reset, broadcast, Race Room PTT), so it holds the sleep timeout off
+  // for exactly that long -- its own reason, independent of OTA's.
+  Sleep::setInhibited(Sleep::InhibitReason::RADIO_AUDIO, active);
   if (active) {
     stopCurrentToneSound();
   }

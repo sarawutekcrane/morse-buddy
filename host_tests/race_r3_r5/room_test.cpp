@@ -22,6 +22,7 @@ extern RadioTransport::AudioScopeHandlerFn g_roomAudioHandler;
 struct RoomAudioPub { std::string group, topic; int scope; std::string key; uint16_t seq; size_t samples; };
 extern std::vector<RoomAudioPub> g_roomAudioPubs;
 extern bool g_roomAudioAccept;
+extern bool g_roomRadioAudioActive;
 
 static int g_fail = 0, g_pass = 0;
 static std::string g_test;
@@ -1200,6 +1201,29 @@ static void roomVoice() {
   CHECK(registered && played == 1 && otherRoom == 0 && g_roomFramesPlayed == beforeOff && top() != screenRaceRoom,
         "handler registered %d; this room played %d (want 1); other room %d (want 0); off-screen %d (want 0); left the Room %d",
         registered, played, otherRoom, g_roomFramesPlayed - beforeOff, top() != screenRaceRoom);
+
+  g_test = "RV3 PTT sleep safety: Room PTT marks the voice session live (setRadioAudioActive(true), which holds deep sleep off) only while transmitting; the release, Back out of the Room and a room that stops being shown all end it";
+  ownerLobby(1);
+  press(InputEventType::DOT_PRESS_START, T::now); tick();
+  bool liveOnPress = g_roomRadioAudioActive && g_roomPttActive;
+  T::now += 10 * 60000; tick();  // held 10 minutes: still live (no maximum duration)
+  bool liveHeld = g_roomRadioAudioActive && g_roomPttActive;
+  press(InputEventType::DOT_RELEASE, T::now); tick();
+  bool endedOnRelease = !g_roomRadioAudioActive && !g_roomPttActive;
+  press(InputEventType::DOT_PRESS_START, T::now); tick();
+  bool liveAgain = g_roomRadioAudioActive;
+  backP(); tick(2);  // Back out of the Room while transmitting
+  bool endedOnBack = !g_roomRadioAudioActive && !g_roomPttActive && top() != screenRaceRoom;
+  for (int i = 0; i < 10; i++) {  // rapid cycles
+    ownerLobby(1);
+    press(InputEventType::DOT_PRESS_START, T::now); tick();
+    press(InputEventType::DOT_RELEASE, T::now); tick();
+  }
+  bool rapidClean = !g_roomRadioAudioActive;
+  CHECK(liveOnPress && liveHeld && endedOnRelease && liveAgain && endedOnBack && rapidClean,
+        "live on press %d, after 10 min held %d; ended on release %d; ended on Back %d; clean after rapid cycles %d", liveOnPress,
+        liveHeld, endedOnRelease, endedOnBack, rapidClean);
+
 }
 
 int main() {
